@@ -848,6 +848,10 @@ int run_indexer(Settings& settings) {
     }
 
     const bool was_stopped = stopping();
+    if (was_stopped) {
+        pr.set_message(L"Stopping indexer…");
+        pr.publish();
+    }
     queue.close();
     {
         py::gil_scoped_release release;

@@ -599,9 +599,13 @@ private:
         x += 16;
         if (sh_.indexer_running) {
             const auto& d = sh_.indexer;
-            piece(L"Indexing ", color::outline);
-            if (d.phase == Phase::Embedding) piece(format_count(d.embedded) + L" / " + format_count(d.found), color::amber, Font::SmallSemi);
-            else piece(phase_label(d.phase), color::amber, Font::SmallSemi);
+            if (sh_.indexer_stopping) {
+                piece(L"Stopping indexer…", color::amber, Font::SmallSemi);
+            } else {
+                piece(L"Indexing ", color::outline);
+                if (d.phase == Phase::Embedding) piece(format_count(d.embedded) + L" / " + format_count(d.found), color::amber, Font::SmallSemi);
+                else piece(phase_label(d.phase), color::amber, Font::SmallSemi);
+            }
         } else {
             piece(L"Last indexed ", color::outline);
             piece(format_ago(sh_.index_state.last_index_unix), color::on_surface_variant, Font::SmallSemi);

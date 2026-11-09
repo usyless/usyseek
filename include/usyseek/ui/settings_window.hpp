@@ -406,6 +406,7 @@ private:
             cv.text(L"LOCAL MEDIA EMBEDDING STATUS", rect(lx, y + 16.0f, 320.0f, 16.0f), Font::Label, color::primary);
 
             const bool running = sh_.indexer_running;
+            const bool stopping = running && sh_.indexer_stopping;
             const auto& d = sh_.indexer;
             const uint64_t embedded = running ? d.embedded : sh_.db_count.value_or(sh_.index_state.last_index_found);
             const uint64_t total = running && d.found ? d.found : std::max(embedded, sh_.index_state.last_index_found);
@@ -421,13 +422,16 @@ private:
             // Start / Stop button
             draw_button(cv, rect(rx - 156.0f, y + 26.0f, 156.0f, 40.0f),
                         running ? glyph::pause : glyph::play,
-                        running ? L"Stop Indexing" : L"Start Indexing",
+                        stopping ? L"Stopping…" : (running ? L"Stop Indexing" : L"Start Indexing"),
                         IdToggleIndex, 0, running ? 2 : 1);
 
             // Status badge + rate
-            std::wstring status_txt = running ? phase_label(d.phase) : (sh_.index_state.last_error.empty() ? L"Up to date" : L"Error");
+            std::wstring status_txt = stopping ? L"Stopping…" : (running ? phase_label(d.phase) : (sh_.index_state.last_error.empty() ? L"Up to date" : L"Error"));
             D2D1_COLOR_F badge_col = running ? color::amber : (sh_.index_state.last_error.empty() ? color::mint : color::error);
-            if (!running && sh_.index_state.last_index_unix == 0) {
+            if (!running && d.phase == Phase::Stopped && sh_.index_state.last_error.empty()) {
+                status_txt = L"Stopped";
+                badge_col = color::amber;
+            } else if (!running && sh_.index_state.last_index_unix == 0) {
                 status_txt = L"Never indexed";
                 badge_col = color::outline;
             }
@@ -483,9 +487,10 @@ private:
             wchar_t pbuf[32];
             swprintf_s(pbuf, L"%.1f%% completed", pct * 100.0f);
             cv.text(pbuf, rect(lx, y + 132.0f, 140.0f, 20.0f), Font::Caption, color::outline);
-            std::wstring cur = running && d.current[0] ? (std::wstring{L"Processing: "} + d.current)
-                             : (running && d.message[0] ? std::wstring{d.message} : L"On-demand scanner idle — zero background GPU/RAM usage");
-            cv.text(cur, rect(lx + 150.0f, y + 132.0f, w - 194.0f, 20.0f), Font::MonoSmall, color::on_surface_variant, Align::Right);
+            std::wstring cur = stopping ? L"Stopping indexer — finishing current batch…"
+                             : (running && d.current[0] ? (std::wstring{L"Processing: "} + d.current)
+                             : (running && d.message[0] ? std::wstring{d.message} : L"On-demand scanner idle — zero background GPU/RAM usage"));
+            cv.text(cur, rect(lx + 150.0f, y + 132.0f, w - 194.0f, 20.0f), Font::MonoSmall, stopping ? color::amber : color::on_surface_variant, Align::Right);
 
             // Database management row
             const float dby = y + 162.0f;
@@ -1109,7 +1114,15 @@ private:
             case IdTab0: set_tab(0); return;
             case IdTab1: set_tab(1); return;
             case IdToggleIndex:
-                send_to_launcher(sh_.indexer_running ? Cmd::StopIndex : Cmd::StartIndex);
+                if (sh_.indexer_running) {
+                    if (!sh_.indexer_stopping) {
+                        sh_.indexer_stopping = true;
+                        send_to_launcher(Cmd::StopIndex);
+                    }
+                } else {
+                    sh_.indexer_stopping = false;
+                    send_to_launcher(Cmd::StartIndex);
+                }
                 sh_.poll_indexer();
                 break;
             case IdOpenQdrantUi:

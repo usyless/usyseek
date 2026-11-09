@@ -29,7 +29,9 @@ struct Shared {
     IndexState index_state;
     std::vector<FailedFile> failed_files;
     bool indexer_running = false;
+    bool indexer_stopping = false;
     StatusData indexer{};
+    wil::unique_event_nothrow stop_event_;
 
     HWND call_hwnd = nullptr;        // window that runs marshalled callbacks
     bool test_mode = false;
@@ -61,6 +63,7 @@ struct Shared {
 
     bool poll_indexer(bool force = false) {
         const bool was_running = indexer_running;
+        const bool prev_stopping = indexer_stopping;
         const uint64_t prev_embedded = indexer.embedded;
         const uint64_t prev_failed = indexer.failed;
         const Phase prev_phase = indexer.phase;
@@ -72,6 +75,17 @@ struct Shared {
             indexer_running = false;
         }
 
+        if (indexer_running) {
+            if (!stop_event_) {
+                stop_event_.reset(OpenEventW(SYNCHRONIZE, FALSE, INDEXER_STOP_EVENT));
+            }
+            if (stop_event_ && WaitForSingleObject(stop_event_.get(), 0) == WAIT_OBJECT_0) {
+                indexer_stopping = true;
+            }
+        } else {
+            indexer_stopping = false;
+        }
+
         const bool finished = was_running && !indexer_running;
         const bool failed_changed = indexer_running && indexer.failed != prev_failed;
         if (force || finished || failed_changed || !polled_once_) {
@@ -80,7 +94,7 @@ struct Shared {
             failed_files = load_failed_files(settings.model_name);
         }
 
-        return force || finished || indexer_running != was_running ||
+        return force || finished || indexer_running != was_running || indexer_stopping != prev_stopping ||
                (indexer_running && (indexer.embedded != prev_embedded || indexer.failed != prev_failed || indexer.phase != prev_phase));
     }
 

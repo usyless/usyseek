@@ -275,14 +275,18 @@ private:
         env.push_back(L'\0');
 
         indexer_ = spawn(exe_dir() / L"usyseek-indexer.exe", L"", true, L"indexer.log", &env);
+        stopping_index_ = false;
         notify_ui();
         update_tip();
     }
 
     void stop_index() {
         if (!indexer_.hProcess) return;
+        stopping_index_ = true;
         SetEvent(stop_event_.get());
         SetTimer(hwnd_, TIMER_STOP_INDEX, 6000, nullptr);
+        notify_ui();
+        update_tip();
     }
 
     void close_everything_instance() {
@@ -301,6 +305,7 @@ private:
         } else if (h == indexer_.hProcess) {
             KillTimer(hwnd_, TIMER_STOP_INDEX);
             indexer_.reset();
+            stopping_index_ = false;
             close_everything_instance();
             notify_ui();
             maybe_stop_qdrant();
@@ -358,6 +363,7 @@ private:
 
     std::wstring status_line() const {
         if (!indexer_.hProcess) return std::wstring{APP_NAME} + L"  v" + APP_VERSION;
+        if (stopping_index_) return L"Stopping indexer…";
         std::wstring line = L"Indexing";
         if (auto block = StatusBlock::open()) {
             const StatusData d = block->read();
@@ -370,7 +376,9 @@ private:
     void update_tip() {
         NOTIFYICONDATAW nid = tray_data();
         nid.uFlags = NIF_TIP | NIF_SHOWTIP;
-        const std::wstring tip = indexer_.hProcess ? std::wstring{APP_NAME} + L" - indexing" : std::wstring{APP_NAME};
+        const std::wstring tip = indexer_.hProcess
+            ? (std::wstring{APP_NAME} + (stopping_index_ ? L" - stopping indexer" : L" - indexing"))
+            : std::wstring{APP_NAME};
         wcscpy_s(nid.szTip, tip.c_str());
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
@@ -398,7 +406,8 @@ private:
         AppendMenuW(menu.get(), MF_STRING, IdSearch, search.c_str());
         AppendMenuW(menu.get(), MF_STRING, IdSettings, L"Open Settings");
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu.get(), MF_STRING, IdToggleIndex, indexer_.hProcess ? L"Stop Indexing" : L"Start Indexing");
+        AppendMenuW(menu.get(), MF_STRING, IdToggleIndex,
+                    indexer_.hProcess ? (stopping_index_ ? L"Stopping Indexing…" : L"Stop Indexing") : L"Start Indexing");
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu.get(), MF_STRING, IdQuit, L"Quit usyseek");
         SetMenuDefaultItem(menu.get(), IdSearch, FALSE);
@@ -428,6 +437,7 @@ private:
     wil::unique_process_information ui_;
     wil::unique_process_information indexer_;
     wil::unique_process_information qdrant_;
+    bool stopping_index_ = false;
 };
 
 } // namespace
