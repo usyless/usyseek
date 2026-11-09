@@ -1,0 +1,41 @@
+log_level: WARN
+
+storage:
+  on_disk_payload: true
+  update_concurrency: 1
+  wal:
+    wal_capacity_mb: 32
+    wal_segments_ahead: 0
+  node_type: "Normal"
+  performance:
+    max_search_threads: 0
+    optimizer_cpu_budget: 0
+  optimizers:
+    deleted_threshold: 0.2
+    vacuum_min_vector_number: 1000
+    default_segment_number: 0
+    indexing_threshold_kb: 10000
+    flush_interval_sec: 5
+  hnsw_index:
+    m: 0
+    ef_construct: 100
+    full_scan_threshold_kb: 10000
+    max_indexing_threads: 0
+    on_disk: true
+  collection:
+    replication_factor: 1
+    write_consistency_factor: 1
+    vectors:
+      on_disk: true
+
+service:
+  max_request_size_mb: 64
+  max_workers: 2
+  host: 127.0.0.1
+  enable_cors: false
+  enable_tls: false
+
+cluster:
+  enabled: false
+
+telemetry_disabled: true

@@ -1,0 +1,22 @@
+[package]
+name = "usyseek_rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "usyseek_rust"
+crate-type = ["staticlib"]
+
+[dependencies]
+qdrant-client = { version = "1.20.0", default-features = false, features = ["serde"] }
+tokio = { version = "1.54", default-features = false, features = ["rt-multi-thread", "time"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+serde_json = "1.0"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+strip = true
+opt-level = 3

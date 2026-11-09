@@ -1,0 +1,4 @@
+#include "resource.h"
+
+IDI_APP_ICON       ICON   "@USYSEEK_RES_DIR@/icon.ico"
+IDR_EVERYTHING_EXE RCDATA "@EVERYTHING_EXE@"
