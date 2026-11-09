@@ -154,6 +154,19 @@ public:
     [[nodiscard]] IDWriteTextFormat* get(Font f) const noexcept { return formats_[static_cast<size_t>(f)].get(); }
     [[nodiscard]] IDWriteFactory3* dwrite() const noexcept { return dw_; }
 
+    float measure(std::wstring_view s, Font f) {
+        if (s.empty()) return 0.0f;
+        const uint64_t key = rapidhash(s.data(), s.size() * sizeof(wchar_t)) ^ (static_cast<uint64_t>(f) * 0x9e3779b97f4a7c15ull);
+        if (const auto it = width_cache_.find(key); it != width_cache_.end()) return it->second;
+        wil::com_ptr<IDWriteTextLayout> layout;
+        if (FAILED(dw_->CreateTextLayout(s.data(), static_cast<UINT32>(s.size()), get(f), 100000.0f, 100.0f, &layout))) return 0.0f;
+        DWRITE_TEXT_METRICS m{};
+        layout->GetMetrics(&m);
+        if (width_cache_.size() > 2048) width_cache_.clear();
+        width_cache_.emplace(key, m.widthIncludingTrailingWhitespace);
+        return m.widthIncludingTrailingWhitespace;
+    }
+
 private:
     std::wstring pick(const wchar_t* preferred, const wchar_t* fallback) {
         wil::com_ptr<IDWriteFontCollection> sys;
@@ -167,6 +180,7 @@ private:
 
     IDWriteFactory3* dw_ = nullptr;
     std::array<wil::com_ptr<IDWriteTextFormat>, static_cast<size_t>(Font::Count)> formats_;
+    std::unordered_map<uint64_t, float> width_cache_;
 };
 
 struct Hit {
@@ -227,12 +241,25 @@ public:
     }
 
     float measure(std::wstring_view s, Font f) {
-        if (s.empty()) return 0.0f;
-        wil::com_ptr<IDWriteTextLayout> layout;
-        if (FAILED(fonts_.dwrite()->CreateTextLayout(s.data(), static_cast<UINT32>(s.size()), fonts_.get(f), 100000.0f, 100.0f, &layout))) return 0.0f;
-        DWRITE_TEXT_METRICS m{};
-        layout->GetMetrics(&m);
-        return m.widthIncludingTrailingWhitespace;
+        return fonts_.measure(s, f);
+    }
+
+    void fill_bitmap_round(ID2D1Bitmap1* bmp, D2D1_RECT_F tr, float radius) {
+        const D2D1_SIZE_F bs = bmp->GetSize();
+        if (bs.width <= 0.0f || bs.height <= 0.0f) return;
+        const float s = std::max(width(tr) / bs.width, height(tr) / bs.height);
+        const float ox = tr.left + (width(tr) - bs.width * s) * 0.5f;
+        const float oy = tr.top + (height(tr) - bs.height * s) * 0.5f;
+        if (!bmp_brush_) {
+            const auto bp = D2D1::BitmapBrushProperties1(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_INTERPOLATION_MODE_LINEAR);
+            dc_->CreateBitmapBrush(bmp, &bp, nullptr, &bmp_brush_);
+        } else {
+            bmp_brush_->SetBitmap(bmp);
+        }
+        if (bmp_brush_) {
+            bmp_brush_->SetTransform(D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(ox, oy));
+            dc_->FillRoundedRectangle(D2D1::RoundedRect(tr, radius, radius), bmp_brush_.get());
+        }
     }
 
     /// Height of wrapped text in `w` DIPs.
@@ -262,6 +289,7 @@ private:
     Fonts& fonts_;
     std::vector<Hit>& hits_;
     wil::com_ptr<ID2D1SolidColorBrush> brush_;
+    wil::com_ptr<ID2D1BitmapBrush1> bmp_brush_;
 };
 
 inline const Hit* hit_test(const std::vector<Hit>& hits, D2D1_POINT_2F p) {

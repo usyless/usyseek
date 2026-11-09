@@ -36,6 +36,7 @@ struct Shared {
     std::function<void()> open_settings;
     std::function<void()> visibility_changed;
     std::function<void()> settings_changed; // repaint dependants
+    std::function<void()> tags_refreshed;
     std::function<void()> redraw_all;
 
     /// Runs `fn` on the UI thread (safe from any thread).
@@ -51,6 +52,7 @@ struct Shared {
             call([this, t = std::move(t), c]() mutable {
                 tags = std::move(t);
                 db_count = c;
+                if (tags_refreshed) tags_refreshed();
                 if (redraw_all) redraw_all();
             });
         });

@@ -172,7 +172,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.engine.start(sh.settings);
     sh.engine.encoder().load_async(to_wide(sh.settings.model_dir), sh.settings.model_name);
 
-    sh.open_settings = [&] { settings_win.show(); };
+    sh.open_settings = [&] {
+        settings_win.show();
+        if (pill.visible()) pill.hide();
+    };
+    sh.tags_refreshed = [&] { pill.on_tags_refreshed(); };
     sh.redraw_all = [&] {
         if (pill.visible()) pill.render();
         if (settings_win.visible()) settings_win.render();
@@ -185,10 +189,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     const auto arm_idle_timer = [&] {
         KillTimer(pill.hwnd(), TIMER_IDLE_EXIT);
-        if (!pill.visible() && !settings_win.visible()) {
+        if (!pill.visible() && !settings_win.visible() && !sh.test_mode) {
             SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
-            if (sh.settings.ui_idle_timeout_s > 0 && !sh.test_mode) {
-                SetTimer(pill.hwnd(), TIMER_IDLE_EXIT, sh.settings.ui_idle_timeout_s * 1000u, nullptr);
+            if (sh.settings.ui_idle_timeout_s == 0) {
+                PostQuitMessage(0);
+            } else if (sh.settings.ui_idle_timeout_s > 0) {
+                SetTimer(pill.hwnd(), TIMER_IDLE_EXIT, static_cast<UINT>(sh.settings.ui_idle_timeout_s) * 1000u, nullptr);
             }
         }
     };
@@ -207,6 +213,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         if (msg == m_settings && m_settings) {
             done = true;
             settings_win.show();
+            if (pill.visible()) pill.hide();
             return 0;
         }
         if (msg == m_idx && m_idx) {

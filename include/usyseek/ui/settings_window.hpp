@@ -89,7 +89,10 @@ public:
     }
 
     void render() {
+        if (rendering_) return;
         if (!ensure_target()) return;
+        rendering_ = true;
+        const bool anim = step_anim();
         auto* dc = target_.dc();
         hits_.clear();
         dc->BeginDraw();
@@ -98,13 +101,15 @@ public:
         Canvas cv{dc, sh_.fonts, hits_};
         draw(cv);
         if (!target_.present(!in_sizemove_)) recover();
+        rendering_ = false;
+        if (anim) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
 private:
     static constexpr float TABS_H = 52.0f;
     static constexpr float PAD = 24.0f;
     static constexpr float CARD_GAP = 16.0f;
-    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_ANIM = 2, TIMER_POLL = 3, TIMER_DEVICE = 4;
+    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_POLL = 3, TIMER_DEVICE = 4;
 
     enum Id {
         IdNone = 0,
@@ -604,10 +609,12 @@ private:
             cv.text(L"Hide pill when clicking outside", rect(lx, ry + 14.0f, 260.0f, 22.0f), Font::Body, color::on_surface);
             draw_switch(cv, lx + 290.0f, ry + 25.0f, sh_.settings.hide_on_focus_loss, IdToggleHideFocus);
 
-            const std::wstring idle_lbl = sh_.settings.ui_idle_timeout_s == 0
+            const std::wstring idle_lbl = sh_.settings.ui_idle_timeout_s < 0
                 ? L"UI process timeout: Never"
-                : L"UI process timeout: " + std::to_wstring(sh_.settings.ui_idle_timeout_s) + L"s";
-            draw_button(cv, rect(lx + rw - 210.0f, ry + 10.0f, 210.0f, 32.0f), glyph::clock, idle_lbl, IdIdleStep);
+                : (sh_.settings.ui_idle_timeout_s == 0
+                    ? L"UI process timeout: 0s (Immediate)"
+                    : L"UI process timeout: " + std::to_wstring(sh_.settings.ui_idle_timeout_s) + L"s");
+            draw_button(cv, rect(lx + rw - 238.0f, ry + 10.0f, 238.0f, 32.0f), glyph::clock, idle_lbl, IdIdleStep);
             y = next_y;
         }
 
@@ -872,7 +879,15 @@ private:
             exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", L"https://download.pytorch.org/whl/cpu",
                              L"torch", L"torchvision"});
         }
-        exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"open-clip-torch", L"timm", L"safetensors", L"onnx", L"onnxscript"});
+        fs::path req = exe_dir() / L"python" / L"requirements.txt";
+        if (!fs::exists(req)) {
+            if (auto found = find_upwards(L"python\\requirements.txt")) req = *found;
+        }
+        if (fs::exists(req)) {
+            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"-r", req.wstring()});
+        } else {
+            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"open-clip-torch", L"timm", L"safetensors", L"onnx", L"onnxscript"});
+        }
         append_venv_log(L"Packages up to date.");
     }
 
@@ -887,7 +902,27 @@ private:
         return std::max(0.0f, content_h_ - view_height());
     }
 
-    void start_anim() { SetTimer(hwnd_, TIMER_ANIM, USER_TIMER_MINIMUM, nullptr); }
+    void start_anim() {
+        last_anim_ = std::chrono::steady_clock::now();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    bool step_anim() {
+        const auto now = std::chrono::steady_clock::now();
+        const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
+        last_anim_ = now;
+        const float d = target_scroll_ - scroll_;
+        if (std::abs(d) < 0.5f) {
+            scroll_ = target_scroll_;
+            return false;
+        }
+        scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
+        if (std::abs(target_scroll_ - scroll_) < 0.5f) {
+            scroll_ = target_scroll_;
+            return false;
+        }
+        return true;
+    }
 
     void commit_fields() {
         bool changed = false;
@@ -1049,8 +1084,8 @@ private:
                 sh_.save();
                 break;
             case IdIdleStep: {
-                static constexpr uint32_t steps[] = {60, 180, 600, 1800, 0};
-                uint32_t next = 180;
+                static constexpr int32_t steps[] = {0, 60, 180, 600, 1800, -1};
+                int32_t next = 0;
                 for (size_t i = 0; i < std::size(steps); ++i) {
                     if (sh_.settings.ui_idle_timeout_s == steps[i]) {
                         next = steps[(i + 1) % std::size(steps)];
@@ -1236,6 +1271,9 @@ private:
                 BeginPaint(hwnd_, &ps);
                 render();
                 EndPaint(hwnd_, &ps);
+                if (std::abs(target_scroll_ - scroll_) >= 0.5f) {
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
                 return 0;
             }
             case WM_SIZE:
@@ -1286,12 +1324,17 @@ private:
                 }
                 const D2D1_POINT_2F p = to_dip(lp);
                 if (dragging_scroll_) {
-                    const float track = view_height() - 8.0f - height(scroll_thumb_);
-                    if (track > 0.0f) {
-                        scroll_ = target_scroll_ = std::clamp(drag_scroll_start_ + (p.y - drag_y_) / track * max_scroll(), 0.0f, max_scroll());
+                    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+                        dragging_scroll_ = false;
+                        ReleaseCapture();
+                    } else {
+                        const float track = view_height() - 8.0f - height(scroll_thumb_);
+                        if (track > 0.0f) {
+                            scroll_ = target_scroll_ = std::clamp(drag_scroll_start_ + (p.y - drag_y_) / track * max_scroll(), 0.0f, max_scroll());
+                        }
+                        render();
+                        return 0;
                     }
-                    render();
-                    return 0;
                 }
                 const Hit* h = hit_test(hits_, p);
                 const int id = h ? h->id : IdNone;
@@ -1316,8 +1359,11 @@ private:
                 dragging_scroll_ = false;
                 ReleaseCapture();
                 return 0;
+            case WM_CAPTURECHANGED:
+                dragging_scroll_ = false;
+                return 0;
             case WM_MOUSEWHEEL:
-                target_scroll_ = std::clamp(target_scroll_ - GET_WHEEL_DELTA_WPARAM(wp) * 0.8f, 0.0f, max_scroll());
+                target_scroll_ = std::clamp(target_scroll_ - GET_WHEEL_DELTA_WPARAM(wp) * 0.9f, 0.0f, max_scroll());
                 start_anim();
                 return 0;
             case WM_KEYDOWN:
@@ -1334,13 +1380,6 @@ private:
                             render();
                         }
                         return 0;
-                    case TIMER_ANIM: {
-                        const float d = target_scroll_ - scroll_;
-                        scroll_ = std::abs(d) < 0.5f ? target_scroll_ : scroll_ + d * 0.32f;
-                        if (std::abs(d) < 0.5f) KillTimer(hwnd_, TIMER_ANIM);
-                        render();
-                        return 0;
-                    }
                     case TIMER_POLL:
                         sh_.poll_indexer();
                         render();
@@ -1363,6 +1402,7 @@ private:
     WindowTarget target_;
     std::vector<Hit> hits_;
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
+    bool rendering_ = false;
 
     int tab_ = 0;
     int hover_id_ = IdNone;
@@ -1371,6 +1411,7 @@ private:
     bool in_sizemove_ = false;
 
     float scroll_ = 0.0f, target_scroll_ = 0.0f, content_h_ = 0.0f;
+    std::chrono::steady_clock::time_point last_anim_ = std::chrono::steady_clock::now();
     bool dragging_scroll_ = false;
     float drag_y_ = 0.0f, drag_scroll_start_ = 0.0f;
     D2D1_RECT_F scroll_thumb_{};

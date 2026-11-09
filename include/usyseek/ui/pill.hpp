@@ -45,6 +45,9 @@ public:
 
     void show() {
         if (!visible()) place();
+        shown_tick_ = GetTickCount64();
+        selecting_text_ = false;
+        dragging_scroll_ = false;
         ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
@@ -59,6 +62,8 @@ public:
     }
 
     void hide() {
+        selecting_text_ = false;
+        dragging_scroll_ = false;
         close_popups();
         KillTimer(hwnd_, TIMER_STATUS);
         ShowWindow(hwnd_, SW_HIDE);
@@ -71,7 +76,10 @@ public:
     }
 
     void render() {
+        if (rendering_) return;
         if (!ensure_target()) return;
+        rendering_ = true;
+        const bool anim = step_anim();
         auto* dc = target_.dc();
         hits_.clear();
         dc->BeginDraw();
@@ -80,6 +88,8 @@ public:
         Canvas cv{dc, sh_.fonts, hits_};
         draw(cv);
         if (!target_.present(!in_sizemove_)) recover();
+        rendering_ = false;
+        if (anim || searching_ || loading_more_) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     /// Test hook: puts the pill into a given state without going through input.
@@ -112,11 +122,11 @@ private:
     static constexpr float PAD = 14.0f;
     static constexpr float GAP = 12.0f;
     static constexpr float CARD_MIN_W = 228.0f;
-    static constexpr float CARD_BODY_H = 108.0f;
+    static constexpr float CARD_BODY_H = 124.0f;
     static constexpr float DEFAULT_W = 880.0f;
     static constexpr float DEFAULT_H = 640.0f;
     static constexpr float MENU_W = 256.0f;
-    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_DEBOUNCE = 2, TIMER_ANIM = 3, TIMER_STATUS = 4, TIMER_DEVICE = 5;
+    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_DEBOUNCE = 2, TIMER_STATUS = 4, TIMER_DEVICE = 5;
 
     enum Id {
         IdNone = 0,
@@ -201,13 +211,20 @@ private:
         SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
     }
 
+    [[nodiscard]] float dropdown_height_dip() const noexcept {
+        if (!drop_open_) return 0.0f;
+        const float row = 32.0f;
+        const float h = drop_items_.empty() ? 44.0f : 8.0f + row * static_cast<float>(drop_items_.size());
+        return (HEADER_H - 4.0f) + h + 12.0f;
+    }
+
     [[nodiscard]] float current_height_dip() const {
-        if (!expanded()) return HEADER_H + STATUS_H;
+        if (!expanded()) return std::max(HEADER_H + STATUS_H, dropdown_height_dip());
         return sh_.settings.pill_h > 0 ? static_cast<float>(sh_.settings.pill_h) : DEFAULT_H;
     }
 
     void apply_height() {
-        if (fullscreen_ || in_sizemove_) return;
+        if (fullscreen_ || in_sizemove_ || rendering_) return;
         RECT wr;
         GetWindowRect(hwnd_, &wr);
         const int h = static_cast<int>(current_height_dip() * target_.scale());
@@ -279,6 +296,11 @@ private:
 
     void schedule_search() {
         update_dropdown();
+        if (trim(field_.text).empty()) {
+            run_search(0);
+            return;
+        }
+        apply_height();
         SetTimer(hwnd_, TIMER_DEBOUNCE, 140, nullptr);
     }
 
@@ -341,6 +363,11 @@ public:
         render();
     }
 
+    void on_tags_refreshed() {
+        if (drop_open_) update_dropdown();
+        if (visible()) render();
+    }
+
 private:
     // ------------------------------------------------------------------------------------------
     // Grid geometry
@@ -389,7 +416,27 @@ private:
         start_anim();
     }
 
-    void start_anim() { SetTimer(hwnd_, TIMER_ANIM, USER_TIMER_MINIMUM, nullptr); }
+    void start_anim() {
+        last_anim_ = std::chrono::steady_clock::now();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    bool step_anim() {
+        const auto now = std::chrono::steady_clock::now();
+        const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
+        last_anim_ = now;
+        const float d = target_scroll_ - scroll_;
+        if (std::abs(d) < 0.5f) {
+            scroll_ = target_scroll_;
+            return false;
+        }
+        scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
+        if (std::abs(target_scroll_ - scroll_) < 0.5f) {
+            scroll_ = target_scroll_;
+            return false;
+        }
+        return true;
+    }
 
     // ------------------------------------------------------------------------------------------
     // Drawing
@@ -600,19 +647,10 @@ private:
         else cv.stroke_round(r, 14, with_alpha(color::outline_variant, hov ? 0.9f : 0.45f));
         cv.hit(r, IdCard, i);
 
-        // Thumbnail (cover-cropped through a bitmap brush so the corners stay rounded)
+        // Thumbnail (cover-cropped through a reusable bitmap brush so the corners stay rounded)
         const D2D1_RECT_F tr = rect(r.left + 6, r.top + 6, g.card_w - 12, g.thumb_h);
         if (ID2D1Bitmap1* bmp = sh_.thumbs.get(it.pt.id)) {
-            const D2D1_SIZE_F bs = bmp->GetSize();
-            const float s = std::max(width(tr) / bs.width, height(tr) / bs.height);
-            const float ox = tr.left + (width(tr) - bs.width * s) / 2;
-            const float oy = tr.top + (height(tr) - bs.height * s) / 2;
-            wil::com_ptr<ID2D1BitmapBrush1> brush;
-            const auto bp = D2D1::BitmapBrushProperties1(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_INTERPOLATION_MODE_LINEAR);
-            if (SUCCEEDED(cv.dc()->CreateBitmapBrush(bmp, &bp, nullptr, &brush))) {
-                brush->SetTransform(D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(ox, oy));
-                cv.dc()->FillRoundedRectangle(D2D1::RoundedRect(tr, 10, 10), brush.get());
-            }
+            cv.fill_bitmap_round(bmp, tr, 10.0f);
         } else {
             cv.fill_round(tr, 10, with_alpha(color::surface_highest, 0.6f));
             cv.icon(it.pt.p.k == 1 ? glyph::video : glyph::photo, tr, with_alpha(color::outline, 0.6f), Font::IconLarge);
@@ -634,35 +672,35 @@ private:
             cv.hit(sb, IdSimilar, i);
         }
 
-        float y = tr.bottom + 10;
-        const float lx = r.left + 12, rw = g.card_w - 24;
-        cv.text(it.name, rect(lx, y, rw, 18), Font::BodySemi, color::on_surface);
-        y += 19;
-        cv.text(it.dir, rect(lx, y, rw, 16), Font::MonoSmall, color::outline);
-        y += 22;
+        float y = tr.bottom + 10.0f;
+        const float lx = r.left + 12.0f, rw = g.card_w - 24.0f;
+        cv.text(it.name, rect(lx, y, rw, 18.0f), Font::BodySemi, color::on_surface);
+        y += 20.0f;
+        cv.text(it.dir, rect(lx, y, rw, 16.0f), Font::MonoSmall, color::outline);
+        y += 22.0f;
 
         // Tags (single line, +N overflow)
         float tx = lx;
         size_t shown = 0;
         for (const auto& t : it.tags_w) {
-            const float w = cv.measure(t, Font::Caption) + 23;
-            if (tx + w > lx + rw - 34 && shown < it.tags_w.size()) break;
+            const float w = cv.measure(t, Font::Caption) + 23.0f;
+            if (tx + w > lx + rw - 34.0f && shown < it.tags_w.size()) break;
             draw_tag_chip(cv, tx, y, t, tag_color(it.pt.p.t[shown]));
-            cv.hit(rect(tx, y, w, 20), IdTagChip, i);
-            tx += w + 5;
+            cv.hit(rect(tx, y, w, 20.0f), IdTagChip, i);
+            tx += w + 5.0f;
             ++shown;
         }
         if (shown < it.tags_w.size()) {
             const std::wstring more = L"+" + std::to_wstring(it.tags_w.size() - shown);
-            const float w = cv.measure(more, Font::Caption) + 12;
-            cv.fill_round(rect(tx, y, w, 20), 10, with_alpha(color::on_surface, 0.08f));
-            cv.text(more, rect(tx, y, w, 20), Font::Caption, color::on_surface_variant, Align::Center);
+            const float w = cv.measure(more, Font::Caption) + 12.0f;
+            cv.fill_round(rect(tx, y, w, 20.0f), 10.0f, with_alpha(color::on_surface, 0.08f));
+            cv.text(more, rect(tx, y, w, 20.0f), Font::Caption, color::on_surface_variant, Align::Center);
         }
-        y += 29;
+        y += 28.0f;
         cv.hline(lx, lx + rw, y, with_alpha(color::outline_variant, 0.6f));
-        y += 6;
-        cv.text(it.meta, rect(lx, y, rw * 0.62f, 20), Font::MonoSmall, color::on_surface_variant);
-        cv.text(it.date, rect(lx + rw * 0.5f, y, rw * 0.5f, 20), Font::Caption, color::outline, Align::Right);
+        y += 8.0f;
+        cv.text(it.meta, rect(lx, y, rw * 0.62f, 18.0f), Font::MonoSmall, color::on_surface_variant);
+        cv.text(it.date, rect(lx + rw * 0.5f, y, rw * 0.5f, 18.0f), Font::Caption, color::outline, Align::Right);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -686,30 +724,32 @@ private:
     void update_dropdown() {
         const auto tok = tag_token();
         if (!tok && !drop_from_button_) {
-            drop_open_ = false;
+            if (drop_open_) {
+                drop_open_ = false;
+                apply_height();
+            }
             return;
         }
         const std::wstring prefix = tok ? tok->first : L"";
         drop_items_.clear();
-        for (size_t i = 0; i < sh_.tags.size(); ++i) {
-            const std::wstring w = to_wide(sh_.tags[i].v);
-            if (prefix.empty() || w.find(prefix) != std::wstring::npos) drop_items_.push_back(i);
+        for (const auto& tc : sh_.tags) {
+            const std::wstring w = to_wide(tc.v);
+            if (prefix.empty() || w.find(prefix) != std::wstring::npos) drop_items_.push_back(tc);
         }
-        std::stable_sort(drop_items_.begin(), drop_items_.end(), [&](size_t a, size_t b) {
-            const bool pa = to_wide(sh_.tags[a].v).starts_with(prefix), pb = to_wide(sh_.tags[b].v).starts_with(prefix);
+        std::stable_sort(drop_items_.begin(), drop_items_.end(), [&](const TagCount& a, const TagCount& b) {
+            const bool pa = to_wide(a.v).starts_with(prefix), pb = to_wide(b.v).starts_with(prefix);
             return pa > pb;
         });
         if (drop_items_.size() > 8) drop_items_.resize(8);
         drop_open_ = !drop_items_.empty() || drop_from_button_;
-        drop_sel_ = drop_items_.empty() ? -1 : 0;
-        if (drop_open_ && !expanded_for_drop_ && !expanded()) {
-            expanded_for_drop_ = true;
-        }
+        if (drop_items_.empty()) drop_sel_ = -1;
+        else if (drop_sel_ < 0 || drop_sel_ >= static_cast<int>(drop_items_.size())) drop_sel_ = 0;
+        apply_height();
     }
 
     void accept_dropdown(int index) {
         if (index < 0 || index >= static_cast<int>(drop_items_.size())) return;
-        const std::wstring tag = to_wide(sh_.tags[drop_items_[index]].v);
+        const std::wstring tag = to_wide(drop_items_[index].v);
         const std::wstring value = tag.find(L' ') != std::wstring::npos ? L"\"" + tag + L"\"" : tag;
         if (auto tok = tag_token()) {
             size_t end = field_.caret;
@@ -724,15 +764,15 @@ private:
         }
         drop_open_ = false;
         drop_from_button_ = false;
+        field_.focused = true;
         run_search(0);
     }
 
     void draw_dropdown(Canvas& cv) {
-        const float x = 44, y = HEADER_H - 4, w = 300;
-        const float row = 32;
-        const float h = drop_items_.empty() ? 44.0f : 8 + row * drop_items_.size();
+        const float x = 44.0f, y = HEADER_H - 4.0f, w = 300.0f;
+        const float row = 32.0f;
+        const float h = drop_items_.empty() ? 44.0f : 8.0f + row * static_cast<float>(drop_items_.size());
         const D2D1_RECT_F r = rect(x, y, w, h);
-        ensure_space_for(y + h + 8);
         cv.shadow(r, 12);
         cv.fill_round(r, 12, color::surface_high);
         cv.stroke_round(r, 12, color::outline_variant);
@@ -742,7 +782,7 @@ private:
             return;
         }
         for (size_t i = 0; i < drop_items_.size(); ++i) {
-            const auto& t = sh_.tags[drop_items_[i]];
+            const auto& t = drop_items_[i];
             const D2D1_RECT_F rr = rect(x + 4, y + 4 + row * i, w - 8, row);
             if (static_cast<int>(i) == drop_sel_) cv.fill_round(rr, 8, with_alpha(color::primary, 0.14f));
             const D2D1_COLOR_F c = tag_color(t.v);
@@ -750,18 +790,6 @@ private:
             cv.text(to_wide(t.v), D2D1::RectF(rr.left + 28, rr.top, rr.right - 60, rr.bottom), Font::Body, color::on_surface);
             cv.text(format_count(t.c), D2D1::RectF(rr.right - 70, rr.top, rr.right - 12, rr.bottom), Font::Caption, color::outline, Align::Right);
             cv.hit(rr, IdDropItem, static_cast<int>(i));
-        }
-    }
-
-    /// Popups need room: grow a collapsed pill temporarily.
-    void ensure_space_for(float bottom) {
-        if (expanded()) return;
-        RECT wr;
-        GetWindowRect(hwnd_, &wr);
-        const int h = static_cast<int>(bottom * target_.scale());
-        if (wr.bottom - wr.top < h) {
-            SetWindowPos(hwnd_, nullptr, 0, 0, wr.right - wr.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-            PostMessageW(hwnd_, WM_APP_CALL, 2, 0);
         }
     }
 
@@ -778,6 +806,8 @@ private:
         menu_field_.focused = true;
         field_.focused = false;
         drop_open_ = false;
+        drop_from_button_ = false;
+        apply_height();
         // Tags to offer: everything on the selection first, then the most used ones
         menu_tags_.clear();
         std::set<std::string> seen;
@@ -800,6 +830,7 @@ private:
         drop_open_ = false;
         drop_from_button_ = false;
         field_.focused = true;
+        apply_height();
     }
 
     /// 0 = none of the selection has it, 1 = some, 2 = all
@@ -967,19 +998,29 @@ private:
             tracking_ = true;
         }
         if (dragging_scroll_) {
-            const Grid g = grid();
-            const float track = height(g.view) - 8 - height(scroll_thumb_);
-            if (track > 0) {
-                scroll_ = target_scroll_ = std::clamp(drag_scroll_start_ + (p.y - drag_y_) / track * max_scroll(), 0.0f, max_scroll());
+            if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+                dragging_scroll_ = false;
+                ReleaseCapture();
+            } else {
+                const Grid g = grid();
+                const float track = height(g.view) - 8 - height(scroll_thumb_);
+                if (track > 0) {
+                    scroll_ = target_scroll_ = std::clamp(drag_scroll_start_ + (p.y - drag_y_) / track * max_scroll(), 0.0f, max_scroll());
+                }
+                render();
+                return;
             }
-            render();
-            return;
         }
         if (selecting_text_) {
-            Canvas cv{target_.dc(), sh_.fonts, hits_};
-            field_.click(cv, p.x, true);
-            render();
-            return;
+            if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+                selecting_text_ = false;
+                ReleaseCapture();
+            } else {
+                Canvas cv{target_.dc(), sh_.fonts, hits_};
+                field_.click(cv, p.x, true);
+                render();
+                return;
+            }
         }
         const Hit* h = hit_test(hits_, p);
         const int id = h ? h->id : IdNone;
@@ -992,6 +1033,8 @@ private:
     }
 
     void on_lbutton_down(D2D1_POINT_2F p, bool dbl) {
+        selecting_text_ = false;
+        dragging_scroll_ = false;
         SetFocus(hwnd_);
         const Hit* h = hit_test(hits_, p);
         const int id = h ? h->id : IdNone;
@@ -1006,6 +1049,7 @@ private:
         if (drop_open_ && id != IdDrop && id != IdDropItem && id != IdTagBtn && id != IdField) {
             drop_open_ = false;
             drop_from_button_ = false;
+            apply_height();
         }
         switch (id) {
             case IdField: {
@@ -1030,10 +1074,12 @@ private:
                     update_dropdown();
                 } else {
                     drop_open_ = false;
+                    apply_height();
                 }
                 break;
             case IdSettings:
                 if (sh_.open_settings) sh_.open_settings();
+                else hide();
                 return;
             case IdFullscreen: toggle_fullscreen(); return;
             case IdClose: hide(); return;
@@ -1297,6 +1343,9 @@ private:
                 BeginPaint(hwnd_, &ps);
                 render();
                 EndPaint(hwnd_, &ps);
+                if (std::abs(target_scroll_ - scroll_) >= 0.5f || searching_ || loading_more_) {
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
                 return 0;
             }
             case WM_SIZE:
@@ -1330,12 +1379,12 @@ private:
             }
             case WM_ACTIVATE:
                 if (LOWORD(wp) == WA_INACTIVE && sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode) {
-                    // Don't hide when focus moves to our own settings window
-                    HWND other = reinterpret_cast<HWND>(lp);
-                    DWORD pid = 0;
-                    if (other) GetWindowThreadProcessId(other, &pid);
-                    if (pid != GetCurrentProcessId()) hide();
+                    if (GetTickCount64() - shown_tick_ > 250) hide();
                 }
+                return 0;
+            case WM_CAPTURECHANGED:
+                selecting_text_ = false;
+                dragging_scroll_ = false;
                 return 0;
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) {
@@ -1383,14 +1432,6 @@ private:
                         if (field_.focused || menu_open_) render();
                         return 0;
                     case TIMER_DEBOUNCE: run_search(0); return 0;
-                    case TIMER_ANIM: {
-                        const float d = target_scroll_ - scroll_;
-                        scroll_ = std::abs(d) < 0.5f ? target_scroll_ : scroll_ + d * 0.32f;
-                        const bool spinning = searching_ || loading_more_;
-                        if (std::abs(d) < 0.5f && !spinning) KillTimer(hwnd_, TIMER_ANIM);
-                        render();
-                        return 0;
-                    }
                     case TIMER_STATUS:
                         sh_.poll_indexer();
                         render();
@@ -1422,6 +1463,8 @@ private:
     WindowTarget target_;
     std::vector<Hit> hits_;
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
+    bool rendering_ = false;
+    ULONGLONG shown_tick_ = 0;
 
     TextField field_;
     int chip_ = -1;
@@ -1443,6 +1486,7 @@ private:
     bool selecting_text_ = false;
 
     float scroll_ = 0, target_scroll_ = 0;
+    std::chrono::steady_clock::time_point last_anim_ = std::chrono::steady_clock::now();
     bool dragging_scroll_ = false;
     float drag_y_ = 0, drag_scroll_start_ = 0;
     D2D1_RECT_F scroll_thumb_{};
@@ -1459,8 +1503,7 @@ private:
 
     bool drop_open_ = false;
     bool drop_from_button_ = false;
-    bool expanded_for_drop_ = false;
-    std::vector<size_t> drop_items_;
+    std::vector<TagCount> drop_items_;
     int drop_sel_ = 0;
 };
 

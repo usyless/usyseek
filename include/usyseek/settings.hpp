@@ -11,7 +11,7 @@ struct Settings {
     bool hotkey_enabled = true;
     uint32_t hotkey_mods = MOD_ALT;
     uint32_t hotkey_vk = VK_SPACE;
-    uint32_t ui_idle_timeout_s = 180;
+    int32_t ui_idle_timeout_s = 180; // 0 = immediate exit on hide, >0 = seconds, <0 = never
     bool hide_on_focus_loss = true;
     int32_t pill_x = INT32_MIN; // physical pixels, INT32_MIN = centre of the active monitor
     int32_t pill_y = INT32_MIN;

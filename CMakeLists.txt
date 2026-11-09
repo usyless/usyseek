@@ -249,5 +249,6 @@ add_custom_target(usyseek_runtime ALL
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${USYSEEK_QDRANT_EXE}" "${USYSEEK_BIN_DIR}/qdrant/qdrant.exe"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/config/qdrant.yaml" "${USYSEEK_BIN_DIR}/config/qdrant.yaml"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/python/usyseek_vision.py" "${USYSEEK_BIN_DIR}/python/usyseek_vision.py"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/python/requirements.txt" "${USYSEEK_BIN_DIR}/python/requirements.txt"
     VERBATIM
 )

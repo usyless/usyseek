@@ -112,7 +112,6 @@ private:
                 return 0;
             case WM_TRAY:
                 switch (LOWORD(lp)) {
-                    case WM_LBUTTONUP:
                     case NIN_SELECT:
                     case NIN_KEYSELECT:
                         toggle_search();
@@ -230,6 +229,7 @@ private:
     void toggle_search() {
         if (ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_)) {
             AllowSetForegroundWindow(ui_.dwProcessId);
+            SetForegroundWindow(ui_hwnd_);
             PostMessageW(ui_hwnd_, msg_toggle_search(), 0, 0);
         } else if (!ui_.hProcess) {
             spawn_ui(L"--show");
@@ -239,6 +239,7 @@ private:
     void open_settings() {
         if (ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_)) {
             AllowSetForegroundWindow(ui_.dwProcessId);
+            SetForegroundWindow(ui_hwnd_);
             PostMessageW(ui_hwnd_, msg_open_settings(), 0, 0);
         } else if (!ui_.hProcess) {
             spawn_ui(L"--settings");
