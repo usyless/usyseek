@@ -13,6 +13,7 @@ struct Settings {
     uint32_t hotkey_vk = VK_SPACE;
     int32_t ui_idle_timeout_s = 180; // 0 = immediate exit on hide, >0 = seconds, <0 = never
     bool hide_on_focus_loss = true;
+    bool launch_on_startup = false;
     int32_t pill_x = INT32_MIN; // physical pixels, INT32_MIN = centre of the active monitor
     int32_t pill_y = INT32_MIN;
     int32_t pill_w = 0;         // DIPs, 0 = default
@@ -100,10 +101,43 @@ inline std::vector<std::string> default_excludes() {
     return v;
 }
 
+inline bool is_startup_enabled() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return false;
+    }
+    wchar_t buf[MAX_PATH * 2]{};
+    DWORD sz = sizeof(buf);
+    DWORD type = 0;
+    const LSTATUS st = RegQueryValueExW(key, L"usyseek", nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz);
+    RegCloseKey(key);
+    return st == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ) && buf[0] != L'\0';
+}
+
+inline bool set_startup_enabled(bool enable) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    LSTATUS st = ERROR_SUCCESS;
+    if (enable) {
+        const fs::path exe = exe_dir() / L"usyseek.exe";
+        const std::wstring cmd = L"\"" + exe.wstring() + L"\"";
+        st = RegSetValueExW(key, L"usyseek", 0, REG_SZ, reinterpret_cast<const BYTE*>(cmd.c_str()),
+                            static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
+    } else {
+        st = RegDeleteValueW(key, L"usyseek");
+        if (st == ERROR_FILE_NOT_FOUND) st = ERROR_SUCCESS;
+    }
+    RegCloseKey(key);
+    return st == ERROR_SUCCESS;
+}
+
 inline Settings load_settings() {
     std::error_code ec;
     const bool existed = fs::exists(settings_path(), ec);
     Settings s = load_json_file<Settings>(settings_path());
+    s.launch_on_startup = is_startup_enabled();
     if (!existed) {
         s.exclude_dirs = default_excludes();
     }

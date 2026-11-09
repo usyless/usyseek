@@ -45,6 +45,7 @@ public:
 
         exclude_field_.placeholder = L"Pattern or path (e.g. *\\cache or D:\\Temp)";
         model_field_.placeholder = L"PE-Core-L-14-336";
+        batch_field_.placeholder = L"Custom";
         arch_field_.placeholder = L"gfx1030";
         torch_field_.placeholder = L"Optional custom pip args (e.g. --index-url ... torch==2.7.1 torchvision==0.22.1)";
         sync_fields();
@@ -138,6 +139,7 @@ private:
         IdToggleHotkey,
         IdRecordHotkey,
         IdResetHotkey,
+        IdToggleStartup,
         IdToggleHideFocus,
         IdIdleStep,
         IdBrowseModelDir,
@@ -146,6 +148,7 @@ private:
         IdDeviceAuto,
         IdDeviceCpu,
         IdBatchPreset,
+        IdBatchField,
         IdBrowseScript,
         IdClearScript,
         IdBrowseVenv,
@@ -161,7 +164,9 @@ private:
     };
 
     void sync_fields() {
+        sh_.settings.launch_on_startup = is_startup_enabled();
         model_field_.set(to_wide(sh_.settings.model_name));
+        batch_field_.set(sh_.settings.batch_size > 0 ? std::to_wstring(sh_.settings.batch_size) : L"");
         arch_field_.set(to_wide(sh_.settings.rocm_arch));
         torch_field_.set(to_wide(sh_.settings.torch_pip_args));
     }
@@ -665,11 +670,14 @@ private:
                         recording_hotkey_ ? L"Cancel Recording" : L"Record Keybind", IdRecordHotkey, 0, recording_hotkey_ ? 1 : 0);
             draw_button(cv, rect(lx + 420.0f, y + 68.0f, 118.0f, 40.0f), 0, L"Reset (Alt+Space)", IdResetHotkey, 0, 3);
 
-            // Pill options row
+            // Pill & startup options row
             const float ry = y + 122.0f;
             cv.hline(lx, lx + rw, ry, with_alpha(color::outline_variant, 0.5f));
-            cv.text(L"Hide pill when clicking outside", rect(lx, ry + 14.0f, 260.0f, 22.0f), Font::Body, color::on_surface);
-            draw_switch(cv, lx + 290.0f, ry + 25.0f, sh_.settings.hide_on_focus_loss, IdToggleHideFocus);
+            cv.text(L"Open on PC startup", rect(lx, ry + 14.0f, 150.0f, 22.0f), Font::Body, color::on_surface);
+            draw_switch(cv, lx + 196.0f, ry + 25.0f, sh_.settings.launch_on_startup, IdToggleStartup);
+
+            cv.text(L"Hide pill when clicking outside", rect(lx + 220.0f, ry + 14.0f, 224.0f, 22.0f), Font::Body, color::on_surface);
+            draw_switch(cv, lx + 486.0f, ry + 25.0f, sh_.settings.hide_on_focus_loss, IdToggleHideFocus);
 
             const std::wstring idle_lbl = sh_.settings.ui_idle_timeout_s < 0
                 ? L"UI process timeout: Never"
@@ -715,21 +723,30 @@ private:
 
             // Device & VRAM Batch size
             cy += 44.0f;
-            cv.text(L"Device:", rect(lx, cy, 56.0f, 32.0f), Font::SmallSemi, color::on_surface_variant);
+            cv.text(L"Device:", rect(lx, cy, 52.0f, 32.0f), Font::SmallSemi, color::on_surface_variant);
             const bool is_cpu = sh_.settings.device == "cpu";
-            draw_button(cv, rect(lx + 58.0f, cy, 142.0f, 32.0f), glyph::chip, L"GPU (ROCm / CUDA)", IdDeviceAuto, 0, !is_cpu ? 1 : 0);
-            draw_button(cv, rect(lx + 208.0f, cy, 96.0f, 32.0f), 0, L"CPU Only", IdDeviceCpu, 0, is_cpu ? 1 : 0);
+            draw_button(cv, rect(lx + 54.0f, cy, 138.0f, 32.0f), glyph::chip, L"GPU (ROCm / CUDA)", IdDeviceAuto, 0, !is_cpu ? 1 : 0);
+            draw_button(cv, rect(lx + 198.0f, cy, 86.0f, 32.0f), 0, L"CPU Only", IdDeviceCpu, 0, is_cpu ? 1 : 0);
 
-            cv.text(L"Batch size:", rect(lx + 324.0f, cy, 76.0f, 32.0f), Font::SmallSemi, color::on_surface_variant);
+            cv.text(L"Batch size:", rect(lx + 298.0f, cy, 72.0f, 32.0f), Font::SmallSemi, color::on_surface_variant);
             static constexpr uint32_t batches[] = {0, 32, 64, 128, 256};
-            float bx = lx + 402.0f;
+            float bx = lx + 372.0f;
             for (int i = 0; i < 5; ++i) {
                 const std::wstring bl = batches[i] == 0 ? L"Auto (VRAM)" : std::to_wstring(batches[i]);
-                const float bw = batches[i] == 0 ? 96.0f : 52.0f;
+                const float bw = batches[i] == 0 ? 92.0f : 44.0f;
                 draw_button(cv, rect(bx, cy, bw, 32.0f), 0, bl, IdBatchPreset, static_cast<int>(batches[i]),
                             sh_.settings.batch_size == batches[i] ? 1 : 0);
-                bx += bw + 6.0f;
+                bx += bw + 5.0f;
             }
+            const bool custom_batch = sh_.settings.batch_size > 0 &&
+                sh_.settings.batch_size != 32 && sh_.settings.batch_size != 64 &&
+                sh_.settings.batch_size != 128 && sh_.settings.batch_size != 256;
+            const D2D1_RECT_F bfr = rect(bx, cy, std::max(64.0f, lx + rw - bx), 32.0f);
+            cv.fill_round(bfr, 8.0f, color::surface_low);
+            cv.stroke_round(bfr, 8.0f, (active_field_ == &batch_field_ || custom_batch) ? color::primary : color::outline_variant,
+                            (active_field_ == &batch_field_ || custom_batch) ? 1.5f : 1.0f);
+            batch_field_.draw(cv, inset(bfr, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+            cv.hit(bfr, IdBatchField);
 
             cy += 38.0f;
             if (sh_.settings.batch_size >= 128) {
@@ -1021,6 +1038,21 @@ private:
             sh_.settings.torch_pip_args = tp;
             changed = true;
         }
+        const std::wstring bs_txt = trim(batch_field_.text);
+        uint32_t new_bs = 0;
+        if (!bs_txt.empty() && _wcsicmp(bs_txt.c_str(), L"auto") != 0) {
+            try {
+                const long v = std::stol(bs_txt);
+                if (v > 0) new_bs = static_cast<uint32_t>(std::clamp(v, 1L, 4096L));
+            } catch (...) {
+                new_bs = sh_.settings.batch_size;
+            }
+        }
+        if (new_bs != sh_.settings.batch_size) {
+            sh_.settings.batch_size = new_bs;
+            changed = true;
+        }
+        batch_field_.set(sh_.settings.batch_size > 0 ? std::to_wstring(sh_.settings.batch_size) : L"");
         if (changed) {
             sh_.save();
             if (sh_.settings_changed) sh_.settings_changed();
@@ -1049,7 +1081,7 @@ private:
         const int idx = h ? h->index : 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;
 
-        if (active_field_ && id != IdExcludeField && id != IdModelField && id != IdArchField && id != IdTorchField) {
+        if (active_field_ && id != IdExcludeField && id != IdModelField && id != IdBatchField && id != IdArchField && id != IdTorchField) {
             commit_fields();
             active_field_->focused = false;
             active_field_ = nullptr;
@@ -1206,6 +1238,11 @@ private:
                 sh_.save();
                 send_to_launcher(Cmd::ReloadSettings);
                 break;
+            case IdToggleStartup:
+                sh_.settings.launch_on_startup = !sh_.settings.launch_on_startup;
+                set_startup_enabled(sh_.settings.launch_on_startup);
+                sh_.save();
+                break;
             case IdToggleHideFocus:
                 sh_.settings.hide_on_focus_loss = !sh_.settings.hide_on_focus_loss;
                 sh_.save();
@@ -1250,8 +1287,10 @@ private:
                 break;
             case IdBatchPreset:
                 sh_.settings.batch_size = static_cast<uint32_t>(idx);
+                batch_field_.set(idx > 0 ? std::to_wstring(idx) : L"");
                 sh_.save();
                 break;
+            case IdBatchField: focus_field(batch_field_); break;
             case IdBrowseScript:
                 if (auto f = pick_path(false, L"Python Script", L"*.py")) {
                     sh_.settings.vision_script = to_utf8(f->wstring());
@@ -1365,6 +1404,7 @@ private:
 
     void on_char(wchar_t c) {
         if (!active_field_ || recording_hotkey_) return;
+        if (active_field_ == &batch_field_ && (c < L'0' || c > L'9')) return;
         if (active_field_->on_char(c)) {
             active_field_->caret_on = true;
             render();
@@ -1439,7 +1479,7 @@ private:
                     ScreenToClient(hwnd_, &pt);
                     const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
                     const int id = h ? h->id : 0;
-                    const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdArchField || id == IdTorchField;
+                    const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdBatchField || id == IdArchField || id == IdTorchField;
                     SetCursor(ibeam ? cursor_ibeam_ : (id ? cursor_hand_ : cursor_arrow_));
                     return TRUE;
                 }
@@ -1546,6 +1586,7 @@ private:
 
     TextField exclude_field_;
     TextField model_field_;
+    TextField batch_field_;
     TextField arch_field_;
     TextField torch_field_;
     TextField* active_field_ = nullptr;
