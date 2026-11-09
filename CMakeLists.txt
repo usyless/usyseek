@@ -22,8 +22,12 @@ include(CMakeDependentOption)
 include(FetchContent)
 
 ##### Options
-option(USYSEEK_USE_INTERPROCEDURAL_OPTIMIZATION "Enable LTCG" ON)
-cmake_dependent_option(USYSEEK_USE_STATIC_MSVCRT "Use the static MSVCRT" ON "MSVC" OFF)
+option(USYSEEK_USE_MIMALLOC "Replace default allocator with mimalloc" ON)
+option(USYSEEK_USE_INTERPROCEDURAL_OPTIMIZATION "Enable FLTO/LTCG" ON)
+cmake_dependent_option(USYSEEK_USE_STATIC_MSVCRT
+    "Use the static release/debug MSVCRT - or set the flag yourself before including the project" ON
+    "MSVC" OFF
+)
 
 macro(set_tracked_cache_version VAR_NAME DEFAULT_VAL DOCSTRING)
     if(NOT "${${VAR_NAME}_LAST_DEFAULT}" STREQUAL "${DEFAULT_VAL}")
@@ -37,10 +41,21 @@ endmacro()
 set_tracked_cache_version(USYSEEK_USYLIBPP_VERSION "main" "usylibpp git tag/branch")
 set_tracked_cache_version(USYSEEK_GLAZE_VERSION "v9.1.0" "glaze git tag")
 set_tracked_cache_version(USYSEEK_PYBIND11_VERSION "v3.1.0" "pybind11 git tag")
+set_tracked_cache_version(USYSEEK_MIMALLOC_VERSION "v3.5.3" "Version (git tag/branch) to use for mimalloc")
 set_tracked_cache_version(USYSEEK_ORT_VERSION "1.31.1" "onnxruntime release")
 set_tracked_cache_version(USYSEEK_QDRANT_VERSION "v1.20.0" "qdrant release")
 set_tracked_cache_version(USYSEEK_QDRANT_WEB_UI_VERSION "v0.2.20" "qdrant-web-ui release")
 set_tracked_cache_version(USYSEEK_EVERYTHING_VERSION "1.5.0.1424b" "Voidtools Everything release")
+
+# Status Reports
+if(WIN32)
+    message(STATUS "[${PROJECT_NAME}] Using static MSVCRT: ${USYSEEK_USE_STATIC_MSVCRT} (USYSEEK_USE_STATIC_MSVCRT)")
+endif()
+message(STATUS "[${PROJECT_NAME}] Using interprocedural optimization: ${USYSEEK_USE_INTERPROCEDURAL_OPTIMIZATION} (USYSEEK_USE_INTERPROCEDURAL_OPTIMIZATION)")
+message(STATUS "[${PROJECT_NAME}] Using mimalloc: ${USYSEEK_USE_MIMALLOC} (USYSEEK_USE_MIMALLOC)")
+if(USYSEEK_USE_MIMALLOC)
+    message(STATUS "[${PROJECT_NAME}] Using mimalloc version: ${USYSEEK_MIMALLOC_VERSION} (USYSEEK_MIMALLOC_VERSION)")
+endif()
 
 if(USYSEEK_USE_STATIC_MSVCRT)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -193,6 +208,38 @@ if(MSVC)
     target_link_options(usyseek_common INTERFACE
         $<$<CONFIG:Debug>:/DEBUG>
         $<$<CONFIG:Release>:/OPT:REF /OPT:ICF>
+    )
+endif()
+
+# mimalloc Configuration
+if(USYSEEK_USE_MIMALLOC)
+    target_compile_definitions(usyseek_common INTERFACE
+        USYSEEK_USE_MIMALLOC
+    )
+
+    if(WIN32)
+        if(NOT CMAKE_MSVC_RUNTIME_LIBRARY OR CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+            message(WARNING "[${PROJECT_NAME}] mimalloc static overloading on Windows requires the static CRT runtime (/MT). Currently CMAKE_MSVC_RUNTIME_LIBRARY is '${CMAKE_MSVC_RUNTIME_LIBRARY}' (defaults to /MD). Set CMAKE_MSVC_RUNTIME_LIBRARY before fetching ${PROJECT_NAME} to 'MultiThreaded' or 'MultiThreaded$<$<CONFIG:Debug>:Debug>' to ensure mimalloc takes precedence over the CRT.")
+        endif()
+    endif()
+
+    set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
+    set(MI_BUILD_OBJECT ON CACHE BOOL "" FORCE)
+    set(MI_BUILD_STATIC OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+
+    FetchContent_Declare(
+        mimalloc
+        GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+        GIT_TAG "${USYSEEK_MIMALLOC_VERSION}"
+        EXCLUDE_FROM_ALL
+        SYSTEM
+    )
+    FetchContent_MakeAvailable(mimalloc)
+
+    target_link_libraries(usyseek_common INTERFACE
+        mimalloc-obj
     )
 endif()
 
