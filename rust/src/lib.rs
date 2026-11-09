@@ -475,6 +475,20 @@ pub unsafe extern "C" fn usy_qd_delete(q: *mut UsyQdrant, name: UsyStr, ids: *co
     })
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn usy_qd_drop_collection(q: *mut UsyQdrant, name: UsyStr, out: *mut UsyBuf) -> i32 {
+    let q = unsafe { &*q };
+    let name = name.as_str().to_owned();
+    run(out, || {
+        runtime().block_on(async {
+            if q.client.collection_exists(&name).await.map_err(err)? {
+                q.client.delete_collection(&name).await.map_err(err)?;
+            }
+            Ok("dropped".to_owned())
+        })
+    })
+}
+
 /// Exact count; result is the number as a string. Missing collection counts as 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_count(q: *mut UsyQdrant, name: UsyStr, out: *mut UsyBuf) -> i32 {

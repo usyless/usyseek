@@ -322,31 +322,47 @@ std::vector<FileEntry> walk_dirs(const Scope& scope) {
 
 struct FailureCache {
     fs::path path;
-    std::unordered_map<uint64_t, std::pair<int64_t, uint64_t>> entries;
+    std::unordered_map<uint64_t, FailedFile> entries;
 
-    explicit FailureCache(fs::path p) : path{std::move(p)} {
-        if (auto bytes = ulp::fs::read_as_bytes(path)) {
-            const char* s = bytes->c_str();
-            unsigned long long id = 0, size = 0;
-            long long mtime = 0;
-            int consumed = 0;
-            while (std::sscanf(s, "%llu %lld %llu\n%n", &id, &mtime, &size, &consumed) == 3) {
-                entries[id] = {mtime, size};
-                s += consumed;
-            }
+    explicit FailureCache(std::string_view coll) : path{failed_path(coll)} {
+        for (auto& f : load_failed_files(coll)) {
+            entries[f.id] = std::move(f);
         }
     }
-    [[nodiscard]] bool known(const FileEntry& e) const {
+    [[nodiscard]] bool known(const FileEntry& e) {
         const auto it = entries.find(e.id);
-        return it != entries.end() && it->second.first == e.mtime && it->second.second == e.size;
+        if (it == entries.end() || it->second.mtime != e.mtime || it->second.size != e.size) return false;
+        if (it->second.path.empty()) it->second.path = e.path;
+        return true;
     }
-    void add(const FileEntry& e) { entries[e.id] = {e.mtime, e.size}; }
+    void add(const FileEntry& e, std::wstring_view reason = L"Decode failed (corrupt or unsupported media)") {
+        std::wstring clean{reason};
+        for (wchar_t& c : clean) {
+            if (c == L'\t' || c == L'\r' || c == L'\n') c = L' ';
+        }
+        entries[e.id] = FailedFile{e.id, e.mtime, e.size, e.path, std::move(clean)};
+    }
+    void remove(uint64_t id) { entries.erase(id); }
+    void prune(const Scope& scope) {
+        std::erase_if(entries, [&](const auto& kv) {
+            const auto& f = kv.second;
+            if (f.path.empty()) return false;
+            return !scope.in_scope(f.path) || GetFileAttributesW(f.path.c_str()) == INVALID_FILE_ATTRIBUTES;
+        });
+    }
     void save() const {
         std::string out;
-        char line[96];
-        for (const auto& [id, v] : entries) {
-            std::snprintf(line, sizeof(line), "%llu %lld %llu\n", static_cast<unsigned long long>(id), static_cast<long long>(v.first), static_cast<unsigned long long>(v.second));
-            out += line;
+        char prefix[96];
+        for (const auto& [id, f] : entries) {
+            std::snprintf(prefix, sizeof(prefix), "%llu\t%lld\t%llu\t",
+                          static_cast<unsigned long long>(id),
+                          static_cast<long long>(f.mtime),
+                          static_cast<unsigned long long>(f.size));
+            out += prefix;
+            out += to_utf8(f.path);
+            out += '\t';
+            out += to_utf8(f.reason.empty() ? L"Decode failed" : f.reason);
+            out += '\n';
         }
         (void)ulp::fs::write(path, std::string_view{out});
     }
@@ -442,6 +458,35 @@ std::wstring py_error_text(const std::exception& e) {
     std::string s = e.what();
     if (const auto nl = s.find_last_of('\n', s.size() > 1 ? s.size() - 2 : 0); nl != std::string::npos && s.size() > 300) s = s.substr(nl + 1);
     return to_wide(s.substr(0, 250));
+}
+
+int export_text_only(const Settings& settings) {
+    const VenvInfo venv = read_venv(to_wide(settings.venv_dir));
+    if (!venv.exists || major_minor(venv.version) != USYSEEK_PYTHON_VERSION) return 1;
+
+    PyConfig config;
+    PyConfig_InitIsolatedConfig(&config);
+    config.site_import = 0;
+    config.install_signal_handlers = 0;
+    PyConfig_SetString(&config, &config.home, venv.home.c_str());
+    PyConfig_SetString(&config, &config.program_name, venv.python_exe.c_str());
+    py::scoped_interpreter interpreter{&config, 0, nullptr, false};
+    PyConfig_Clear(&config);
+
+    try {
+        py::module_ site = py::module_::import("site");
+        site.attr("addsitedir")(settings.venv_dir + "\\Lib\\site-packages");
+        py::list sys_path = py::module_::import("sys").attr("path");
+        fs::path script = settings.vision_script.empty() ? exe_dir() / L"python" / L"usyseek_vision.py" : fs::path{to_wide(settings.vision_script)};
+        sys_path.insert(0, to_utf8(script.parent_path().wstring()));
+        py::object mod = py::module_::import(to_utf8(script.stem().wstring()).c_str());
+        if (!py::hasattr(mod, "export_text")) return 1;
+        mod.attr("export_text")(settings.model_dir, settings.model_name);
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "%s\n", e.what());
+        return 1;
+    }
 }
 
 int run_indexer(Settings& settings) {
@@ -567,7 +612,7 @@ int run_indexer(Settings& settings) {
     // --- Compare against the database (carry tags over for changed files)
     pr.phase(Phase::Comparing);
     pr.d.found = files.size();
-    FailureCache failures{data_dir() / (L"failed-" + to_wide(coll) + L".txt")};
+    FailureCache failures{coll};
     std::vector<size_t> todo;
     std::unordered_set<uint64_t> found_ids;
     found_ids.reserve(files.size());
@@ -592,6 +637,7 @@ int run_indexer(Settings& settings) {
                 if (it != existing.end()) {
                     if (it->second.m == f.mtime && it->second.s == f.size) {
                         ++pr.d.embedded;
+                        failures.remove(f.id);
                         continue;
                     }
                     f.tags = std::move(it->second.t);
@@ -611,6 +657,7 @@ int run_indexer(Settings& settings) {
     pr.phase(Phase::Cleaning);
     {
         py::gil_scoped_release release;
+        failures.prune(scope);
         std::optional<uint64_t> cursor;
         std::vector<uint64_t> stale;
         do {
@@ -623,7 +670,7 @@ int run_indexer(Settings& settings) {
             for (const auto& p : page->points) {
                 if (found_ids.contains(p.id)) continue;
                 const std::wstring path = to_wide(p.p.p);
-                if (scope.excluded(path) || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) stale.push_back(p.id);
+                if (!scope.in_scope(path) || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) stale.push_back(p.id);
             }
             cursor = page->next;
         } while (cursor && !stopping());
@@ -640,6 +687,7 @@ int run_indexer(Settings& settings) {
     });
     pr.d.todo = todo.size();
     if (todo.empty() || stopping()) {
+        failures.save();
         pr.phase(stopping() ? Phase::Stopped : Phase::Done);
         IndexState st{unix_now(), files.size(), {}};
         save_json_file(state_path(), st);
@@ -760,10 +808,11 @@ int run_indexer(Settings& settings) {
             }
         } catch (const std::exception& e) {
             std::printf("embed failed: %s\n", e.what());
-            pr.set_message(py_error_text(e));
+            const std::wstring reason = py_error_text(e);
+            pr.set_message(reason);
             for (const auto& it : pending) {
                 ++pr.d.failed;
-                failures.add(files[it.index]);
+                failures.add(files[it.index], reason);
             }
             continue;
         }
@@ -784,6 +833,7 @@ int run_indexer(Settings& settings) {
                 for (float& x : v) x *= inv;
             }
             const FileEntry& f = files[it.index];
+            failures.remove(f.id);
             up_ids.push_back(f.id);
             up_vecs.insert(up_vecs.end(), v.begin(), v.end());
             up_payloads.push_back(make_payload(f, *it.data));
@@ -815,11 +865,17 @@ int run_indexer(Settings& settings) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    bool export_only = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::wstring_view{argv[i]} == L"--no-everything") g_no_everything = true;
+        const std::wstring_view a{argv[i]};
+        if (a == L"--no-everything") g_no_everything = true;
+        else if (a == L"--export-text") export_only = true;
     }
     SetConsoleOutputCP(CP_UTF8);
     setvbuf(stdout, nullptr, _IONBF, 0);
+    if (export_only) {
+        return export_text_only(load_settings());
+    }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
     MFStartup(MF_VERSION, MFSTARTUP_LITE);

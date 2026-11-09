@@ -517,7 +517,7 @@ private:
         if (sh_.indexer_running) return color::amber;
         const auto st = sh_.engine.encoder().state();
         if (st == TextEncoder::State::Failed || !error_.empty() || (!sh_.engine.db_ready() && !sh_.test_mode)) return color::error;
-        if (st == TextEncoder::State::Loading) return color::primary;
+        if (st == TextEncoder::State::Loading || st == TextEncoder::State::Exporting) return color::primary;
         return color::mint;
     }
 
@@ -548,7 +548,10 @@ private:
             piece(format_count(*sh_.db_count) + L" files", color::outline);
         }
         const auto enc = sh_.engine.encoder().state();
-        if (enc == TextEncoder::State::Loading) {
+        if (enc == TextEncoder::State::Exporting) {
+            sep();
+            piece(L"Exporting text ONNX…", color::primary);
+        } else if (enc == TextEncoder::State::Loading) {
             sep();
             piece(L"Loading model…", color::primary);
         } else if (enc == TextEncoder::State::Failed) {

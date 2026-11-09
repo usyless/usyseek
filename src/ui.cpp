@@ -169,6 +169,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.engine.on_result = [&](std::unique_ptr<SearchResult> r) {
         PostMessageW(pill.hwnd(), WM_APP_RESULT, 0, reinterpret_cast<LPARAM>(r.release()));
     };
+    sh.engine.encoder().on_state_changed = [&] {
+        sh.call([&] { sh.redraw_all(); });
+    };
     sh.engine.start(sh.settings);
     sh.engine.encoder().load_async(to_wide(sh.settings.model_dir), sh.settings.model_name);
 

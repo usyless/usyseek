@@ -37,9 +37,10 @@ struct Settings {
     // Python environment
     std::string venv_dir;
     std::string base_python;
-    std::string vision_script; // empty = bundled usyseek_vision.py
-    std::string torch_backend = "rocm"; // cuda | rocm | cpu
+    std::string vision_script;          // empty = bundled usyseek_vision.py
+    std::string torch_backend = "rocm"; // rocm | cuda | cpu | manual
     std::string rocm_arch = "gfx1030";
+    std::string torch_pip_args;         // optional custom pip install args for torch/torchvision
 
     // Database
     uint16_t qdrant_http_port = 6389;
@@ -107,14 +108,13 @@ inline Settings load_settings() {
         s.exclude_dirs = default_excludes();
     }
     if (s.model_dir.empty()) {
-        if (auto p = find_upwards(L"usybooru\\clip-model")) s.model_dir = to_utf8(p->wstring());
-        else s.model_dir = to_utf8((data_dir() / L"models").wstring());
+        const fs::path models = data_dir() / L"models";
+        fs::create_directories(models, ec);
+        s.model_dir = to_utf8(models.wstring());
     }
     if (s.venv_dir.empty()) {
         const fs::path own = data_dir() / L"venv";
-        if (fs::exists(own / L"pyvenv.cfg", ec)) s.venv_dir = to_utf8(own.wstring());
-        else if (auto p = find_upwards(L"usybooru\\venv_torch_native_new")) s.venv_dir = to_utf8(p->wstring());
-        else s.venv_dir = to_utf8(own.wstring());
+        s.venv_dir = to_utf8(own.wstring());
     }
     if (!existed) save_json_file(settings_path(), s);
     return s;
@@ -122,6 +122,72 @@ inline Settings load_settings() {
 
 inline bool save_settings(const Settings& s) {
     return save_json_file(settings_path(), s);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Failed files log (shared between indexer and UI)
+// ---------------------------------------------------------------------------------------------
+
+struct FailedFile {
+    uint64_t id = 0;
+    int64_t mtime = 0;
+    uint64_t size = 0;
+    std::wstring path;
+    std::wstring reason;
+};
+
+inline fs::path failed_path(std::string_view coll) {
+    return data_dir() / (L"failed-" + to_wide(coll) + L".txt");
+}
+
+inline std::vector<FailedFile> load_failed_files(std::string_view coll) {
+    std::vector<FailedFile> out;
+    const auto bytes = ulp::fs::read_as_bytes(failed_path(coll));
+    if (!bytes) return out;
+    std::string_view rest{*bytes};
+    while (!rest.empty()) {
+        const auto nl = rest.find('\n');
+        std::string_view line = rest.substr(0, nl);
+        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (line.empty()) continue;
+
+        FailedFile f;
+        // Tab-separated format: id \t mtime \t size \t path \t reason
+        if (const auto t1 = line.find('\t'); t1 != std::string_view::npos) {
+            f.id = std::strtoull(std::string{line.substr(0, t1)}.c_str(), nullptr, 10);
+            const auto r1 = line.substr(t1 + 1);
+            const auto t2 = r1.find('\t');
+            if (t2 == std::string_view::npos) continue;
+            f.mtime = std::strtoll(std::string{r1.substr(0, t2)}.c_str(), nullptr, 10);
+            const auto r2 = r1.substr(t2 + 1);
+            const auto t3 = r2.find('\t');
+            if (t3 == std::string_view::npos) continue;
+            f.size = std::strtoull(std::string{r2.substr(0, t3)}.c_str(), nullptr, 10);
+            const auto r3 = r2.substr(t3 + 1);
+            const auto t4 = r3.find('\t');
+            if (t4 == std::string_view::npos) {
+                f.path = to_wide(r3);
+                f.reason = L"Decode failed";
+            } else {
+                f.path = to_wide(r3.substr(0, t4));
+                f.reason = to_wide(r3.substr(t4 + 1));
+            }
+            out.push_back(std::move(f));
+        } else {
+            // Legacy space-separated format: id mtime size
+            unsigned long long id = 0, sz = 0;
+            long long mt = 0;
+            if (std::sscanf(std::string{line}.c_str(), "%llu %lld %llu", &id, &mt, &sz) == 3) {
+                f.id = id;
+                f.mtime = mt;
+                f.size = sz;
+                f.reason = L"Decode failed";
+                out.push_back(std::move(f));
+            }
+        }
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------------------------

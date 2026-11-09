@@ -32,6 +32,7 @@ int32_t usy_qd_scroll(UsyQdrant* q, UsyStr name, UsyStr request, UsyBuf* out);
 int32_t usy_qd_retrieve(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, UsyStr request, UsyBuf* out);
 int32_t usy_qd_set_payload(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, UsyStr payload, UsyBuf* out);
 int32_t usy_qd_delete(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, UsyBuf* out);
+int32_t usy_qd_drop_collection(UsyQdrant* q, UsyStr name, UsyBuf* out);
 int32_t usy_qd_count(UsyQdrant* q, UsyStr name, UsyBuf* out);
 int32_t usy_qd_facet_tags(UsyQdrant* q, UsyStr name, uint64_t limit, UsyBuf* out);
 
@@ -212,6 +213,13 @@ public:
         return usy_qd_delete(q_, ustr(coll), ids.data(), ids.size(), &out.b) == 0;
     }
 
+    bool drop_collection(std::string_view coll, std::string* error = nullptr) {
+        RustBuf out;
+        const bool ok = usy_qd_drop_collection(q_, ustr(coll), &out.b) == 0;
+        if (!ok && error) *error = out.str();
+        return ok;
+    }
+
     std::optional<uint64_t> count(std::string_view coll) {
         RustBuf out;
         if (usy_qd_count(q_, ustr(coll), &out.b) != 0) return std::nullopt;
@@ -269,6 +277,7 @@ inline wil::unique_process_information start_qdrant(const Settings& s, HANDLE jo
     add_env(L"QDRANT__SERVICE__HOST=127.0.0.1");
     add_env(L"QDRANT__SERVICE__HTTP_PORT=" + std::to_wstring(s.qdrant_http_port));
     add_env(L"QDRANT__SERVICE__GRPC_PORT=" + std::to_wstring(s.qdrant_grpc_port));
+    add_env(L"QDRANT__SERVICE__STATIC_CONTENT_DIR=" + (exe.parent_path() / L"static").wstring());
     env.push_back(L'\0');
 
     std::wstring cmd = L"\"" + exe.wstring() + L"\" --disable-telemetry --config-path \"" + (exe_dir() / L"config" / L"qdrant.yaml").wstring() + L"\"";
@@ -285,9 +294,10 @@ inline wil::unique_process_information start_qdrant(const Settings& s, HANDLE jo
         si.hStdInput = nullptr;
     }
 
+    const fs::path work_dir = exe.parent_path();
     if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
                         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
-                        env.data(), storage.c_str(), &si, &pi)) {
+                        env.data(), work_dir.c_str(), &si, &pi)) {
         return {};
     }
     if (job) AssignProcessToJobObject(job, pi.hProcess);

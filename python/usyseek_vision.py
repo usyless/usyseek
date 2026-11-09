@@ -213,13 +213,22 @@ def export_text(model_dir, model_name):
             return self.inner.encode_text(x)
 
     ctx = getattr(m, "context_length", 32)
-    with torch.no_grad():
-        torch.onnx.export(
-            TextWrapper(m).eval(),
-            (torch.zeros((1, ctx), dtype=torch.long),),
-            str(onnx_path),
-            input_names=["input_ids"],
-            output_names=["text_embeddings"],
-            opset_version=18,
-        )
+    tmp_path = onnx_path.with_suffix(".onnx.tmp")
+    try:
+        with torch.no_grad():
+            torch.onnx.export(
+                TextWrapper(m).eval(),
+                (torch.zeros((1, ctx), dtype=torch.long),),
+                str(tmp_path),
+                input_names=["input_ids"],
+                output_names=["text_embeddings"],
+                opset_version=18,
+            )
+        os.replace(tmp_path, onnx_path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
     return str(onnx_path)

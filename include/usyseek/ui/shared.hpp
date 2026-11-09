@@ -27,6 +27,7 @@ struct Shared {
     std::vector<TagCount> tags;      // facet counts
     std::optional<uint64_t> db_count;
     IndexState index_state;
+    std::vector<FailedFile> failed_files;
     bool indexer_running = false;
     StatusData indexer{};
 
@@ -60,6 +61,7 @@ struct Shared {
 
     void poll_indexer() {
         index_state = load_json_file<IndexState>(state_path());
+        failed_files = load_failed_files(settings.model_name);
         if (auto b = StatusBlock::open()) {
             indexer = b->read();
             indexer_running = indexer.pid != 0 && indexer.phase != Phase::Done && indexer.phase != Phase::Stopped && indexer.phase != Phase::Error;

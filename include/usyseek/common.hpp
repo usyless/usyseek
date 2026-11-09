@@ -184,7 +184,7 @@ inline const fs::path& data_dir() {
 inline fs::path settings_path() { return data_dir() / L"settings.json"; }
 inline fs::path state_path() { return data_dir() / L"state.json"; }
 
-/// Looks for a sibling project folder (e.g. usybooru) walking up from the executable directory.
+/// Looks for a relative path walking up from the executable directory.
 inline std::optional<fs::path> find_upwards(const fs::path& relative) {
     std::error_code ec;
     for (fs::path d = exe_dir(); !d.empty(); d = d.parent_path()) {

@@ -132,7 +132,8 @@ inline ParsedQuery parse_query(std::wstring_view q) {
 
 class TextEncoder {
 public:
-    enum class State { Idle, Loading, Ready, Failed };
+    enum class State { Idle, Exporting, Loading, Ready, Failed };
+    std::function<void()> on_state_changed;
 
     ~TextEncoder() {
         if (tok_) usy_tok_free(tok_);
@@ -141,17 +142,49 @@ public:
     void load_async(fs::path model_dir, std::string model_name) {
         {
             std::lock_guard lk{m_};
-            if (state_ == State::Loading || (state_ == State::Ready && model_name == name_)) return;
+            if (state_ == State::Loading || state_ == State::Exporting ||
+                (state_ == State::Ready && model_name == name_ && model_dir == dir_)) return;
             state_ = State::Loading;
             name_ = model_name;
+            dir_ = model_dir;
         }
+        if (on_state_changed) on_state_changed();
         loader_ = std::jthread([this, model_dir = std::move(model_dir), model_name = std::move(model_name)] {
-            std::wstring err;
             try {
+                const fs::path weights = model_dir / (to_wide(model_name) + L".safetensors");
                 const fs::path onnx = model_dir / (to_wide(model_name) + L"-text.onnx");
-                const fs::path tok = model_dir / (to_wide(model_name) + L"-tokenizer.json");
+                fs::path tok = model_dir / (to_wide(model_name) + L"-tokenizer.json");
                 std::error_code ec;
-                if (!fs::exists(onnx, ec)) throw std::runtime_error("Text model missing - run indexing once to export it");
+                if (!fs::exists(tok, ec)) {
+                    const fs::path alt = model_dir / L"tokenizer.json";
+                    if (fs::exists(alt, ec)) tok = alt;
+                }
+                if (!fs::exists(onnx, ec)) {
+                    if (!fs::exists(weights, ec)) {
+                        throw std::runtime_error("Model weights missing (" + to_utf8(weights.filename().wstring()) + ")");
+                    }
+                    {
+                        std::lock_guard lk{m_};
+                        state_ = State::Exporting;
+                    }
+                    if (on_state_changed) on_state_changed();
+
+                    const fs::path idx_exe = exe_dir() / L"usyseek-indexer.exe";
+                    std::wstring cmd = L"\"" + idx_exe.wstring() + L"\" --export-text";
+                    STARTUPINFOW si{sizeof(si)};
+                    wil::unique_process_information pi;
+                    if (CreateProcessW(idx_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, exe_dir().c_str(), &si, &pi)) {
+                        WaitForSingleObject(pi.hProcess, 180'000);
+                    }
+                    {
+                        std::lock_guard lk{m_};
+                        state_ = State::Loading;
+                    }
+                    if (on_state_changed) on_state_changed();
+                    if (!fs::exists(onnx, ec)) {
+                        throw std::runtime_error("Text ONNX export failed - check Python .venv in Settings");
+                    }
+                }
                 if (!fs::exists(tok, ec)) throw std::runtime_error("Tokenizer missing (" + to_utf8(tok.filename().wstring()) + ")");
 
                 if (!env_) env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_ERROR, "usyseek");
@@ -185,6 +218,7 @@ public:
                 in_name_ = in_name;
                 out_name_ = out_name;
                 cache_.clear();
+                error_.clear();
                 state_ = State::Ready;
             } catch (const std::exception& e) {
                 std::lock_guard lk{m_};
@@ -192,6 +226,7 @@ public:
                 state_ = State::Failed;
             }
             cv_.notify_all();
+            if (on_state_changed) on_state_changed();
             SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
         });
     }
@@ -250,6 +285,7 @@ private:
     State state_ = State::Idle;
     std::wstring error_;
     std::string name_;
+    fs::path dir_;
     std::unique_ptr<Ort::Env> env_;
     std::unique_ptr<Ort::Session> session_;
     UsyTokenizer* tok_ = nullptr;

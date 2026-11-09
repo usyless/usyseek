@@ -46,6 +46,7 @@ public:
         exclude_field_.placeholder = L"Pattern or path (e.g. *\\cache or D:\\Temp)";
         model_field_.placeholder = L"PE-Core-L-14-336";
         arch_field_.placeholder = L"gfx1030";
+        torch_field_.placeholder = L"Optional custom pip args (e.g. --index-url ... torch==2.7.1 torchvision==0.22.1)";
         sync_fields();
         probe_venv();
         scan_models();
@@ -116,6 +117,11 @@ private:
         IdTab0,
         IdTab1,
         IdToggleIndex,
+        IdOpenQdrantUi,
+        IdClearDatabase,
+        IdClearFailed,
+        IdOpenFailedLog,
+        IdFailedRow,
         IdScopeAll,
         IdScopeCustom,
         IdAddInclude,
@@ -146,6 +152,7 @@ private:
         IdBrowseBasePy,
         IdBackendChip,
         IdArchField,
+        IdTorchField,
         IdOpenTerminal,
         IdUpdateVenv,
         IdRecreateVenv,
@@ -156,6 +163,7 @@ private:
     void sync_fields() {
         model_field_.set(to_wide(sh_.settings.model_name));
         arch_field_.set(to_wide(sh_.settings.rocm_arch));
+        torch_field_.set(to_wide(sh_.settings.torch_pip_args));
     }
 
     void scan_models() {
@@ -378,7 +386,7 @@ private:
     float draw_tab_progress(Canvas& cv, float x, float y, float w) {
         // 1. Hero status card
         {
-            const float h = 168.0f;
+            const float h = 216.0f;
             const float next_y = card_begin(cv, x, y, w, h);
             const float lx = x + 22.0f, rx = x + w - 22.0f;
 
@@ -416,6 +424,17 @@ private:
             cv.fill_circle({br.left + 11.0f, br.top + 11.0f}, 3.5f, badge_col);
             cv.text(status_txt, rect(br.left + 20.0f, br.top, bw - 22.0f, 22.0f), Font::Caption, badge_col);
 
+            float sx = br.right + 12.0f;
+            const uint64_t fail_cnt = running ? d.failed : sh_.failed_files.size();
+            if (fail_cnt > 0) {
+                const std::wstring ftxt = format_count(fail_cnt) + L" failed";
+                const float fw = cv.measure(ftxt, Font::Caption) + 18.0f;
+                const D2D1_RECT_F fr = rect(sx, y + 82.0f, fw, 22.0f);
+                cv.fill_round(fr, 11.0f, with_alpha(color::error, 0.14f));
+                cv.text(ftxt, fr, Font::Caption, color::error, Align::Center);
+                sx = fr.right + 12.0f;
+            }
+
             std::wstring sub;
             if (running) {
                 if (d.rate > 0.05f) {
@@ -437,7 +456,7 @@ private:
             } else {
                 sub = L"Last indexed " + format_ago(sh_.index_state.last_index_unix);
             }
-            cv.text(sub, rect(br.right + 12.0f, y + 82.0f, rx - br.right - 12.0f, 22.0f), Font::Caption, color::on_surface_variant);
+            cv.text(sub, rect(sx, y + 82.0f, rx - sx, 22.0f), Font::Caption, color::on_surface_variant);
 
             // Progress bar
             const D2D1_RECT_F track = rect(lx, y + 116.0f, w - 44.0f, 8.0f);
@@ -454,6 +473,49 @@ private:
             std::wstring cur = running && d.current[0] ? (std::wstring{L"Processing: "} + d.current)
                              : (running && d.message[0] ? std::wstring{d.message} : L"On-demand scanner idle — zero background GPU/RAM usage");
             cv.text(cur, rect(lx + 150.0f, y + 132.0f, w - 194.0f, 20.0f), Font::MonoSmall, color::on_surface_variant, Align::Right);
+
+            // Database management row
+            const float dby = y + 162.0f;
+            cv.hline(lx, rx, dby, with_alpha(color::outline_variant, 0.5f));
+            const std::wstring db_info = L"Qdrant collection: " + to_wide(sh_.settings.model_name) +
+                                         L"  •  127.0.0.1:" + std::to_wstring(sh_.settings.qdrant_http_port);
+            cv.text(db_info, rect(lx, dby + 12.0f, w - 370.0f, 30.0f), Font::Caption, color::outline);
+            draw_button(cv, rect(rx - 304.0f, dby + 11.0f, 166.0f, 32.0f), glyph::open, L"Open Qdrant Web UI", IdOpenQdrantUi);
+            draw_button(cv, rect(rx - 130.0f, dby + 11.0f, 130.0f, 32.0f), glyph::del, L"Clear Database", IdClearDatabase, 0, 2);
+            y = next_y;
+        }
+
+        // 1b. Failed files card (shown when decode/embed failures exist)
+        if (!sh_.failed_files.empty()) {
+            const size_t show_n = std::min<size_t>(sh_.failed_files.size(), 6);
+            const float h = 76.0f + show_n * 36.0f + (sh_.failed_files.size() > show_n ? 24.0f : 0.0f);
+            const float next_y = card_begin(cv, x, y, w, h);
+            const float lx = x + 22.0f, rw = w - 44.0f, rx = lx + rw;
+
+            const std::wstring title = L"Failed Media Files (" + format_count(sh_.failed_files.size()) + L")";
+            cv.text(title, rect(lx, y + 16.0f, 320.0f, 22.0f), Font::Large, color::error);
+            cv.text(L"Skipped until modified — click a file to reveal in Explorer, or retry all",
+                    rect(lx, y + 38.0f, rw - 280.0f, 18.0f), Font::Small, color::on_surface_variant);
+            draw_button(cv, rect(rx - 266.0f, y + 18.0f, 126.0f, 32.0f), glyph::open, L"Open Log File", IdOpenFailedLog);
+            draw_button(cv, rect(rx - 132.0f, y + 18.0f, 132.0f, 32.0f), glyph::refresh, L"Retry Failed", IdClearFailed);
+
+            float cy = y + 64.0f;
+            for (size_t i = 0; i < show_n; ++i) {
+                const auto& ff = sh_.failed_files[i];
+                const D2D1_RECT_F ir = rect(lx, cy, rw, 32.0f);
+                const bool hov = hovered(IdFailedRow, static_cast<int>(i));
+                cv.fill_round(ir, 8.0f, hov ? color::surface_high : color::surface_low);
+                cv.icon(glyph::warning, rect(ir.left + 8.0f, ir.top, 20.0f, 32.0f), color::error, Font::IconSmall);
+                const std::wstring label = ff.path.empty() ? (L"ID " + std::to_wstring(ff.id)) : ff.path;
+                cv.text(label, rect(ir.left + 32.0f, ir.top, rw * 0.62f, 32.0f), Font::MonoSmall, color::on_surface);
+                cv.text(ff.reason, rect(ir.left + rw * 0.64f, ir.top, rw * 0.36f - 10.0f, 32.0f), Font::Caption, color::outline, Align::Right);
+                if (!ff.path.empty()) cv.hit(ir, IdFailedRow, static_cast<int>(i));
+                cy += 36.0f;
+            }
+            if (sh_.failed_files.size() > show_n) {
+                const std::wstring more = L"+ " + format_count(sh_.failed_files.size() - show_n) + L" more in " + failed_path(sh_.settings.model_name).filename().wstring();
+                cv.text(more, rect(lx, cy, rw, 20.0f), Font::Caption, color::outline);
+            }
             y = next_y;
         }
 
@@ -694,7 +756,7 @@ private:
         // 3. Python Virtual Environment (.venv) Card
         {
             const bool has_log = !venv_log_.empty();
-            const float h = 290.0f + (has_log ? 84.0f : 0.0f);
+            const float h = 330.0f + (has_log ? 84.0f : 0.0f);
             const float next_y = card_begin(cv, x, y, w, h);
             const float lx = x + 22.0f, rw = w - 44.0f;
 
@@ -731,23 +793,33 @@ private:
             // Torch installer backend row
             cy += 96.0f;
             cv.text(L"PyTorch stack:", rect(lx, cy, 94.0f, 30.0f), Font::SmallSemi, color::on_surface_variant);
-            const char* backends[3] = {"rocm", "cuda", "cpu"};
-            const wchar_t* blabels[3] = {L"AMD ROCm", L"NVIDIA CUDA", L"CPU"};
+            const char* backends[4] = {"rocm", "cuda", "cpu", "manual"};
+            const wchar_t* blabels[4] = {L"AMD ROCm", L"NVIDIA CUDA", L"CPU", L"Manual"};
             float bx = lx + 96.0f;
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < 4; ++i) {
                 const bool on = sh_.settings.torch_backend == backends[i];
-                draw_button(cv, rect(bx, cy, 106.0f, 30.0f), 0, blabels[i], IdBackendChip, i, on ? 1 : 0);
-                bx += 112.0f;
+                const float w_chip = i == 3 ? 78.0f : 98.0f;
+                draw_button(cv, rect(bx, cy, w_chip, 30.0f), 0, blabels[i], IdBackendChip, i, on ? 1 : 0);
+                bx += w_chip + 6.0f;
             }
             if (sh_.settings.torch_backend == "rocm") {
-                cv.text(L"Arch:", rect(bx + 6.0f, cy, 40.0f, 30.0f), Font::Small, color::outline);
-                const D2D1_RECT_F ar = rect(bx + 46.0f, cy, 96.0f, 30.0f);
+                cv.text(L"Arch:", rect(bx + 4.0f, cy, 38.0f, 30.0f), Font::Small, color::outline);
+                const D2D1_RECT_F ar = rect(bx + 42.0f, cy, 86.0f, 30.0f);
                 cv.fill_round(ar, 8.0f, color::surface_low);
                 cv.stroke_round(ar, 8.0f, active_field_ == &arch_field_ ? color::primary : color::outline_variant);
                 arch_field_.draw(cv, inset(ar, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
                 cv.hit(ar, IdArchField);
             }
-            draw_button(cv, rect(lx + rw - 210.0f, cy, 210.0f, 30.0f), glyph::terminal, L"Open Command Line in .venv", IdOpenTerminal);
+            draw_button(cv, rect(lx + rw - 196.0f, cy, 196.0f, 30.0f), glyph::terminal, L"Open CMD in .venv", IdOpenTerminal);
+
+            // Optional custom Torch pip args row
+            cy += 38.0f;
+            cv.text(L"Torch pip args:", rect(lx, cy, 94.0f, 30.0f), Font::SmallSemi, color::on_surface_variant);
+            const D2D1_RECT_F tfr = rect(lx + 96.0f, cy, rw - 96.0f, 30.0f);
+            cv.fill_round(tfr, 8.0f, color::surface_low);
+            cv.stroke_round(tfr, 8.0f, active_field_ == &torch_field_ ? color::primary : color::outline_variant);
+            torch_field_.draw(cv, inset(tfr, 10.0f, 2.0f), Font::MonoSmall, color::on_surface, color::outline);
+            cv.hit(tfr, IdTorchField);
 
             // Action buttons
             cy += 42.0f;
@@ -852,11 +924,9 @@ private:
         if (!venv_.home.empty() && fs::exists(fs::path{venv_.home} / L"python.exe")) {
             return fs::path{venv_.home} / L"python.exe";
         }
-        if (auto p = find_upwards(L"usybooru\\venv_torch_native_new")) {
-            const auto v = read_venv(*p);
-            if (!v.home.empty() && fs::exists(fs::path{v.home} / L"python.exe")) return fs::path{v.home} / L"python.exe";
-        }
-        const fs::path local = known_folder(FOLDERID_LocalAppData) + L"\\Programs\\Python\\Python312\\python.exe";
+        std::wstring ver_nodot{USYSEEK_PYTHON_VERSION};
+        std::erase(ver_nodot, L'.');
+        const fs::path local = known_folder(FOLDERID_LocalAppData) + L"\\Programs\\Python\\Python" + ver_nodot + L"\\python.exe";
         if (fs::exists(local)) return local;
         return L"python.exe";
     }
@@ -868,7 +938,17 @@ private:
             return;
         }
         exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"pip"});
-        if (sh_.settings.torch_backend == "rocm") {
+        const std::wstring custom_args = trim(to_wide(sh_.settings.torch_pip_args));
+        if (!custom_args.empty()) {
+            int argc = 0;
+            LPWSTR* argv = CommandLineToArgvW(custom_args.c_str(), &argc);
+            std::vector<std::wstring> args = {L"-m", L"pip", L"install", L"--upgrade"};
+            for (int i = 0; i < argc; ++i) args.emplace_back(argv[i]);
+            if (argv) LocalFree(argv);
+            exec_logged(py, args);
+        } else if (sh_.settings.torch_backend == "manual") {
+            append_venv_log(L"Manual PyTorch mode: skipping Torch install, installing requirements.txt…");
+        } else if (sh_.settings.torch_backend == "rocm") {
             const std::wstring arch = to_wide(sh_.settings.rocm_arch.empty() ? "gfx1030" : sh_.settings.rocm_arch);
             exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", L"https://stable.repo.amd.com/rocm/whl-next/",
                              L"torch[device-" + arch + L"]", L"torchvision[device-" + arch + L"]", L"rocm[libraries,device-" + arch + L"]"});
@@ -936,6 +1016,11 @@ private:
             sh_.settings.rocm_arch = a;
             changed = true;
         }
+        const std::string tp = to_utf8(trim(torch_field_.text));
+        if (tp != sh_.settings.torch_pip_args) {
+            sh_.settings.torch_pip_args = tp;
+            changed = true;
+        }
         if (changed) {
             sh_.save();
             if (sh_.settings_changed) sh_.settings_changed();
@@ -964,7 +1049,7 @@ private:
         const int idx = h ? h->index : 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;
 
-        if (active_field_ && id != IdExcludeField && id != IdModelField && id != IdArchField) {
+        if (active_field_ && id != IdExcludeField && id != IdModelField && id != IdArchField && id != IdTorchField) {
             commit_fields();
             active_field_->focused = false;
             active_field_ = nullptr;
@@ -988,6 +1073,48 @@ private:
             case IdToggleIndex:
                 send_to_launcher(sh_.indexer_running ? Cmd::StopIndex : Cmd::StartIndex);
                 sh_.poll_indexer();
+                break;
+            case IdOpenQdrantUi:
+                send_to_launcher(Cmd::NeedQdrant);
+                open_file(L"http://127.0.0.1:" + std::to_wstring(sh_.settings.qdrant_http_port) + L"/dashboard");
+                break;
+            case IdClearDatabase: {
+                const std::wstring msg = L"Clear all indexed embeddings and tags in collection '" +
+                                         to_wide(sh_.settings.model_name) + L"'?\n\nYour media files on disk will not be touched.";
+                if (MessageBoxW(hwnd_, msg.c_str(), L"Clear Database", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES) {
+                    if (sh_.indexer_running) send_to_launcher(Cmd::StopIndex);
+                    const std::string coll = sh_.settings.model_name;
+                    std::error_code ec;
+                    fs::remove(failed_path(coll), ec);
+                    fs::remove(state_path(), ec);
+                    sh_.index_state = {};
+                    sh_.failed_files.clear();
+                    sh_.db_count = 0;
+                    sh_.tags.clear();
+                    sh_.engine.post([this, coll](Db& db) {
+                        db.drop_collection(coll);
+                        sh_.call([this] {
+                            sh_.poll_indexer();
+                            sh_.refresh_tags();
+                            if (sh_.redraw_all) sh_.redraw_all();
+                        });
+                    });
+                }
+                break;
+            }
+            case IdClearFailed: {
+                std::error_code ec;
+                fs::remove(failed_path(sh_.settings.model_name), ec);
+                sh_.failed_files.clear();
+                break;
+            }
+            case IdOpenFailedLog:
+                open_file(failed_path(sh_.settings.model_name).wstring());
+                break;
+            case IdFailedRow:
+                if (idx >= 0 && idx < static_cast<int>(sh_.failed_files.size()) && !sh_.failed_files[idx].path.empty()) {
+                    reveal_in_explorer(sh_.failed_files[idx].path);
+                }
                 break;
             case IdScopeAll:
                 sh_.settings.whole_pc = true;
@@ -1143,12 +1270,13 @@ private:
                 }
                 break;
             case IdBackendChip: {
-                static constexpr const char* b[3] = {"rocm", "cuda", "cpu"};
-                sh_.settings.torch_backend = b[std::clamp(idx, 0, 2)];
+                static constexpr const char* b[4] = {"rocm", "cuda", "cpu", "manual"};
+                sh_.settings.torch_backend = b[std::clamp(idx, 0, 3)];
                 sh_.save();
                 break;
             }
             case IdArchField: focus_field(arch_field_); break;
+            case IdTorchField: focus_field(torch_field_); break;
             case IdOpenTerminal: open_venv_terminal(); break;
             case IdUpdateVenv:
                 run_venv_task([this] { install_packages_in_worker(); });
@@ -1311,7 +1439,7 @@ private:
                     ScreenToClient(hwnd_, &pt);
                     const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
                     const int id = h ? h->id : 0;
-                    const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdArchField;
+                    const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdArchField || id == IdTorchField;
                     SetCursor(ibeam ? cursor_ibeam_ : (id ? cursor_hand_ : cursor_arrow_));
                     return TRUE;
                 }
@@ -1419,6 +1547,7 @@ private:
     TextField exclude_field_;
     TextField model_field_;
     TextField arch_field_;
+    TextField torch_field_;
     TextField* active_field_ = nullptr;
     bool recording_hotkey_ = false;
 

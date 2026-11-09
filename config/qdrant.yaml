@@ -32,8 +32,9 @@ service:
   max_request_size_mb: 64
   max_workers: 2
   host: 127.0.0.1
-  enable_cors: false
+  enable_cors: true
   enable_tls: false
+  static_content_dir: ./static
 
 cluster:
   enabled: false
