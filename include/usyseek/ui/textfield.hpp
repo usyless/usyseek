@@ -138,10 +138,6 @@ public:
         if (caret_x - scroll_ < 0.0f) scroll_ = caret_x;
         scroll_ = std::max(0.0f, scroll_);
 
-        DWRITE_TEXT_METRICS tm{};
-        layout->GetMetrics(&tm);
-        const float ty = r.top + (height(r) - tm.height) * 0.5f;
-
         cv.push_clip(D2D1::RectF(r.left - 1.0f, r.top, r.right + 2.0f, r.bottom));
         if (text.empty() && !placeholder.empty()) {
             cv.text(placeholder, r, f, placeholder_col);
@@ -153,14 +149,16 @@ public:
             std::vector<DWRITE_HIT_TEST_METRICS> ranges(count);
             if (count && SUCCEEDED(layout->HitTestTextRange(static_cast<UINT32>(a), static_cast<UINT32>(b - a), 0, 0, ranges.data(), count, &count))) {
                 for (const auto& m : ranges) {
-                    cv.fill(D2D1::RectF(r.left + m.left - scroll_, ty + m.top, r.left + m.left + m.width - scroll_, ty + m.top + m.height), with_alpha(color::primary, 0.35f));
+                    cv.fill(D2D1::RectF(r.left + m.left - scroll_, r.top + m.top, r.left + m.left + m.width - scroll_, r.top + m.top + m.height), with_alpha(color::primary, 0.35f));
                 }
             }
         }
-        cv.dc()->DrawTextLayout(D2D1::Point2F(r.left - scroll_, ty), layout.get(), cv.brush(col), D2D1_DRAW_TEXT_OPTIONS_NONE);
+        cv.dc()->DrawTextLayout(D2D1::Point2F(r.left - scroll_, r.top), layout.get(), cv.brush(col), D2D1_DRAW_TEXT_OPTIONS_NONE);
         if (focused && caret_on) {
             const float x = std::round(r.left + caret_x - scroll_);
-            cv.fill(D2D1::RectF(x, ty + 1.0f, x + 1.5f, ty + tm.height - 1.0f), color::primary);
+            const float cy0 = r.top + hm.top + 1.0f;
+            const float cy1 = r.top + hm.top + hm.height - 1.0f;
+            cv.fill(D2D1::RectF(x, cy0, x + 1.5f, cy1), color::primary);
         }
         cv.pop_clip();
         caret_screen_x_ = r.left + caret_x - scroll_;

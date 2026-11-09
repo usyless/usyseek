@@ -1,2 +1,263 @@
-#include <windows.h>
-int WINAPI wWinMain(HINSTANCE,HINSTANCE,LPWSTR,int){return 0;}
+// usyseek-ui.exe - the search pill and settings window process.
+// Runs ONNX Runtime on CPU for the text tower, talks to Qdrant over gRPC, and exits after
+// `ui_idle_timeout_s` of inactivity when hidden so idle memory drops back to zero.
+
+#include <usyseek/ui/pill.hpp>
+#include <usyseek/ui/settings_window.hpp>
+
+#include <shellapi.h>
+
+namespace {
+
+using namespace usyseek;
+using namespace usyseek::ui;
+
+constexpr UINT_PTR TIMER_IDLE_EXIT = 900;
+
+void pump_messages(DWORD ms) {
+    const ULONGLONG deadline = GetTickCount64() + ms;
+    for (;;) {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) return;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) break;
+        MsgWaitForMultipleObjectsEx(0, nullptr, static_cast<DWORD>(deadline - now), QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    }
+}
+
+void wait_search(Pill& pill, DWORD timeout_ms = 15000) {
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    while (GetTickCount64() < deadline) {
+        pump_messages(25);
+        if (!pill.searching()) break;
+    }
+    pump_messages(180);
+}
+
+bool capture_window(WindowTarget& wt, std::function<void()> render_fn, const fs::path& png) {
+    wt.request_capture(png);
+    render_fn();
+    return wt.capture_ok();
+}
+
+int run_automated_test(Shared& sh, Pill& pill, SettingsWindow& settings_win, const fs::path& out_dir) {
+    std::error_code ec;
+    fs::create_directories(out_dir, ec);
+    sh.test_mode = true;
+
+    // Wait briefly for the text encoder and Qdrant connection to settle
+    const ULONGLONG t0 = GetTickCount64();
+    while (GetTickCount64() - t0 < 15000) {
+        pump_messages(40);
+        const auto st = sh.engine.encoder().state();
+        if (sh.engine.db_ready() && (st == TextEncoder::State::Ready || st == TextEncoder::State::Failed)) break;
+    }
+    sh.refresh_tags();
+    sh.poll_indexer();
+    pump_messages(200);
+
+    pill.show();
+    pump_messages(100);
+    capture_window(pill.target(), [&] { pill.render(); }, out_dir / L"01_pill_collapsed.png");
+
+    // Semantic search
+    pill.test_set_query(L"red circle");
+    wait_search(pill);
+    capture_window(pill.target(), [&] { pill.render(); }, out_dir / L"02_pill_semantic.png");
+
+    // Context menu + tag assignment on first card
+    if (pill.result_count() > 0) {
+        pill.test_open_menu(0);
+        pump_messages(80);
+        capture_window(pill.target(), [&] { pill.render(); }, out_dir / L"03_pill_context_menu.png");
+        SendMessageW(pill.hwnd(), WM_CHAR, L'f', 0);
+        SendMessageW(pill.hwnd(), WM_CHAR, L'a', 0);
+        SendMessageW(pill.hwnd(), WM_CHAR, L'v', 0);
+        SendMessageW(pill.hwnd(), WM_KEYDOWN, VK_RETURN, 0);
+        pump_messages(250);
+        SendMessageW(pill.hwnd(), WM_KEYDOWN, VK_ESCAPE, 0);
+        pump_messages(60);
+    }
+
+    // Tag autocomplete dropdown
+    pill.test_dropdown(L"tag:");
+    pump_messages(80);
+    capture_window(pill.target(), [&] { pill.render(); }, out_dir / L"04_pill_tag_dropdown.png");
+
+    // Filter by tag:fav
+    SendMessageW(pill.hwnd(), WM_KEYDOWN, VK_ESCAPE, 0);
+    pill.test_set_query(L"tag:fav");
+    wait_search(pill);
+    capture_window(pill.target(), [&] { pill.render(); }, out_dir / L"05_pill_tag_search.png");
+
+    // Clean up test tag from first result
+    if (pill.result_count() > 0) {
+        pill.test_open_menu(0);
+        pump_messages(40);
+        SendMessageW(pill.hwnd(), WM_CHAR, L'f', 0);
+        SendMessageW(pill.hwnd(), WM_CHAR, L'a', 0);
+        SendMessageW(pill.hwnd(), WM_CHAR, L'v', 0);
+        SendMessageW(pill.hwnd(), WM_KEYDOWN, VK_ESCAPE, 0);
+    }
+
+    // Settings window: Tab 1 (Progress & Scope) and Tab 2 (Application & Venv)
+    settings_win.show(0);
+    pump_messages(120);
+    capture_window(settings_win.target(), [&] { settings_win.render(); }, out_dir / L"06_settings_progress.png");
+
+    settings_win.set_tab(1);
+    pump_messages(120);
+    capture_window(settings_win.target(), [&] { settings_win.render(); }, out_dir / L"07_settings_venv.png");
+
+    settings_win.hide();
+    pill.hide();
+    return 0;
+}
+
+} // namespace
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    ulp::win::COMWrapper<false> com{COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE};
+    ulp::win::dark::init_dark_mode();
+
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    bool show_pill = true;
+    bool show_settings = false;
+    std::optional<fs::path> test_dir;
+    for (int i = 1; i < argc; ++i) {
+        const std::wstring_view a{argv[i]};
+        if (a == L"--settings") {
+            show_settings = true;
+            show_pill = false;
+        } else if (a == L"--show") {
+            show_pill = true;
+        } else if (a == L"--test" && i + 1 < argc) {
+            test_dir = fs::path{argv[++i]};
+        }
+    }
+    if (argv) LocalFree(argv);
+
+    // If an instance is already running, forward the request and exit
+    if (!test_dir) {
+        if (HWND existing = FindWindowW(PILL_CLASS, nullptr)) {
+            AllowSetForegroundWindow( ASFW_ANY );
+            PostMessageW(existing, show_settings ? msg_open_settings() : msg_toggle_search(), 0, 0);
+            return 0;
+        }
+    }
+
+    Shared sh;
+    sh.settings = load_settings();
+    if (!sh.gfx.init()) return 1;
+    if (!sh.fonts.init(sh.gfx.dwrite())) return 1;
+
+    Pill pill{sh};
+    SettingsWindow settings_win{sh};
+    if (!pill.create(inst)) return 1;
+    if (!settings_win.create(inst)) return 1;
+
+    sh.call_hwnd = pill.hwnd();
+    sh.gfx.on_device_changed = [&] { sh.thumbs.reset_gpu(); };
+    sh.thumbs.start(pill.hwnd(), WM_APP_THUMBS);
+
+    sh.engine.on_result = [&](std::unique_ptr<SearchResult> r) {
+        PostMessageW(pill.hwnd(), WM_APP_RESULT, 0, reinterpret_cast<LPARAM>(r.release()));
+    };
+    sh.engine.start(sh.settings);
+    sh.engine.encoder().load_async(to_wide(sh.settings.model_dir), sh.settings.model_name);
+
+    sh.open_settings = [&] { settings_win.show(); };
+    sh.redraw_all = [&] {
+        if (pill.visible()) pill.render();
+        if (settings_win.visible()) settings_win.render();
+    };
+    sh.settings_changed = [&] {
+        sh.engine.encoder().load_async(to_wide(sh.settings.model_dir), sh.settings.model_name);
+        sh.refresh_tags();
+        sh.redraw_all();
+    };
+
+    const auto arm_idle_timer = [&] {
+        KillTimer(pill.hwnd(), TIMER_IDLE_EXIT);
+        if (!pill.visible() && !settings_win.visible()) {
+            SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+            if (sh.settings.ui_idle_timeout_s > 0 && !sh.test_mode) {
+                SetTimer(pill.hwnd(), TIMER_IDLE_EXIT, sh.settings.ui_idle_timeout_s * 1000u, nullptr);
+            }
+        }
+    };
+    sh.visibility_changed = arm_idle_timer;
+
+    const UINT m_toggle = msg_toggle_search();
+    const UINT m_settings = msg_open_settings();
+    const UINT m_idx = msg_indexer_changed();
+
+    pill.extra_handler = [&](UINT msg, WPARAM wp, LPARAM lp, bool& done) -> LRESULT {
+        if (msg == m_toggle && m_toggle) {
+            done = true;
+            pill.toggle();
+            return 0;
+        }
+        if (msg == m_settings && m_settings) {
+            done = true;
+            settings_win.show();
+            return 0;
+        }
+        if (msg == m_idx && m_idx) {
+            done = true;
+            pill.on_indexer_changed();
+            if (settings_win.visible()) settings_win.render();
+            return 0;
+        }
+        if (msg == WM_APP_RESULT) {
+            done = true;
+            std::unique_ptr<SearchResult> r{reinterpret_cast<SearchResult*>(lp)};
+            if (r) pill.on_result(std::move(r));
+            return 0;
+        }
+        if (msg == WM_TIMER && wp == TIMER_IDLE_EXIT) {
+            done = true;
+            KillTimer(pill.hwnd(), TIMER_IDLE_EXIT);
+            if (!pill.visible() && !settings_win.visible()) PostQuitMessage(0);
+            return 0;
+        }
+        return 0;
+    };
+
+    if (HWND launcher = find_launcher()) {
+        send_cmd_value(launcher, Cmd::UiHello, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pill.hwnd())));
+    }
+
+    wil::unique_handle own_job;
+    wil::unique_process_information own_qdrant;
+    if (!find_launcher()) {
+        // Standalone run (e.g. from IDE or --test): start qdrant ourselves if it isn't already up
+        own_job = make_kill_on_close_job();
+        own_qdrant = start_qdrant(sh.settings, own_job.get());
+    }
+
+    int code = 0;
+    if (test_dir) {
+        code = run_automated_test(sh, pill, settings_win, *test_dir);
+    } else {
+        if (show_settings) settings_win.show();
+        else if (show_pill) pill.show();
+
+        MSG msg;
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        code = static_cast<int>(msg.wParam);
+    }
+
+    sh.thumbs.stop();
+    sh.engine.stop();
+    return code;
+}

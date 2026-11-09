@@ -3,6 +3,8 @@
 #include "shared.hpp"
 #include "textfield.hpp"
 
+#include <shellscalingapi.h>
+
 #include <set>
 #include <unordered_set>
 
