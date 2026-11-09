@@ -1144,6 +1144,10 @@ private:
                 std::error_code ec;
                 fs::remove(failed_path(sh_.settings.model_name), ec);
                 sh_.failed_files.clear();
+                if (!sh_.indexer_running) {
+                    send_to_launcher(Cmd::StartIndex);
+                    sh_.poll_indexer(true);
+                }
                 break;
             }
             case IdOpenFailedLog:

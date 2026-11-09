@@ -240,6 +240,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         return 0;
     };
 
+    if (!find_launcher() && !test_dir) {
+        const fs::path launcher_exe = exe_dir() / L"usyseek.exe";
+        std::error_code ec;
+        if (fs::exists(launcher_exe, ec)) {
+            std::wstring cmd = L"\"" + launcher_exe.wstring() + L"\"";
+            STARTUPINFOW si{sizeof(si)};
+            wil::unique_process_information pi;
+            if (CreateProcessW(launcher_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, exe_dir().c_str(), &si, &pi)) {
+                for (int i = 0; i < 40 && !find_launcher(); ++i) Sleep(25);
+            }
+        }
+    }
+
     if (HWND launcher = find_launcher()) {
         send_cmd_value(launcher, Cmd::UiHello, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pill.hwnd())));
     }
