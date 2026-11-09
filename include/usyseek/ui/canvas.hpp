@@ -215,7 +215,18 @@ public:
         return brush_.get();
     }
 
-    void hit(D2D1_RECT_F r, int id, int index = 0) { hits_.push_back({r, id, index}); }
+    void hit(D2D1_RECT_F r, int id, int index = 0) {
+        if (!clips_.empty()) {
+            const D2D1_RECT_F& c = clips_.back();
+            r.left = std::max(r.left, c.left);
+            r.top = std::max(r.top, c.top);
+            r.right = std::min(r.right, c.right);
+            r.bottom = std::min(r.bottom, c.bottom);
+        }
+        if (r.left < r.right && r.top < r.bottom) {
+            hits_.push_back({r, id, index});
+        }
+    }
 
     void fill(D2D1_RECT_F r, D2D1_COLOR_F c) { dc_->FillRectangle(r, brush(c)); }
     void fill_round(D2D1_RECT_F r, float radius, D2D1_COLOR_F c) { dc_->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), brush(c)); }
@@ -271,8 +282,21 @@ public:
         return m.height;
     }
 
-    void push_clip(D2D1_RECT_F r) { dc_->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED); }
-    void pop_clip() { dc_->PopAxisAlignedClip(); }
+    void push_clip(D2D1_RECT_F r) {
+        dc_->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED);
+        if (!clips_.empty()) {
+            const D2D1_RECT_F& c = clips_.back();
+            r.left = std::max(r.left, c.left);
+            r.top = std::max(r.top, c.top);
+            r.right = std::min(r.right, c.right);
+            r.bottom = std::min(r.bottom, c.bottom);
+        }
+        clips_.push_back(r);
+    }
+    void pop_clip() {
+        dc_->PopAxisAlignedClip();
+        if (!clips_.empty()) clips_.pop_back();
+    }
 
     /// Soft drop shadow approximated with stacked translucent rounded rects (cheap, no effects).
     void shadow(D2D1_RECT_F r, float radius, float spread = 10.0f, float alpha = 0.28f) {
@@ -288,6 +312,7 @@ private:
     ID2D1DeviceContext6* dc_;
     Fonts& fonts_;
     std::vector<Hit>& hits_;
+    std::vector<D2D1_RECT_F> clips_;
     wil::com_ptr<ID2D1SolidColorBrush> brush_;
     wil::com_ptr<ID2D1BitmapBrush1> bmp_brush_;
 };
