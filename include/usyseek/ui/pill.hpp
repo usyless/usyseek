@@ -24,9 +24,10 @@ public:
         wc.lpszClassName = PILL_CLASS;
         RegisterClassExW(&wc);
 
-        hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP, PILL_CLASS, APP_NAME,
+        hwnd_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED, PILL_CLASS, APP_NAME,
                                 WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN, 0, 0, 100, 100, nullptr, nullptr, inst, this);
         if (!hwnd_) return false;
+        SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
         style_window(hwnd_, DWMSBT_TRANSIENTWINDOW);
         const COLORREF border = RGB(0x44, 0x41, 0x48);
         DwmSetWindowAttribute(hwnd_, DWMWA_BORDER_COLOR, &border, sizeof(border));
@@ -44,7 +45,13 @@ public:
     WindowTarget& target() noexcept { return target_; }
 
     void show() {
-        if (!visible()) place();
+        if (!visible()) {
+            place();
+            fade_ = sh_.test_mode ? 1.0f : 0.0f;
+        }
+        fading_out_ = false;
+        target_fade_ = 1.0f;
+        apply_fade();
         shown_tick_ = GetTickCount64();
         selecting_text_ = false;
         dragging_scroll_ = false;
@@ -58,20 +65,37 @@ public:
         sh_.poll_indexer();
         SetTimer(hwnd_, TIMER_STATUS, 1000, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
+        start_anim();
         render();
     }
 
-    void hide() {
-        selecting_text_ = false;
-        dragging_scroll_ = false;
-        close_popups();
-        KillTimer(hwnd_, TIMER_STATUS);
+    void finish_hide() {
+        fading_out_ = false;
+        fade_ = target_fade_ = 0.0f;
         ShowWindow(hwnd_, SW_HIDE);
         if (sh_.visibility_changed) sh_.visibility_changed();
     }
 
+    void hide() {
+        if (!visible()) return;
+        selecting_text_ = false;
+        dragging_scroll_ = false;
+        ReleaseCapture();
+        close_popups();
+        KillTimer(hwnd_, TIMER_STATUS);
+        if (sh_.test_mode) {
+            finish_hide();
+            return;
+        }
+        if (fading_out_) return;
+        fading_out_ = true;
+        target_fade_ = 0.0f;
+        start_anim();
+        render();
+    }
+
     void toggle() {
-        if (visible() && GetForegroundWindow() == hwnd_) hide();
+        if (visible() && !fading_out_ && GetForegroundWindow() == hwnd_) hide();
         else show();
     }
 
@@ -89,6 +113,10 @@ public:
         draw(cv);
         if (!target_.present(!in_sizemove_)) recover();
         rendering_ = false;
+        if (fading_out_ && fade_ <= 0.01f) {
+            finish_hide();
+            return;
+        }
         if (anim || searching_ || loading_more_) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
@@ -416,6 +444,10 @@ private:
         start_anim();
     }
 
+    void apply_fade() {
+        SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(std::round(std::clamp(fade_, 0.0f, 1.0f) * 255.0f)), LWA_ALPHA);
+    }
+
     void start_anim() {
         last_anim_ = std::chrono::steady_clock::now();
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -425,17 +457,28 @@ private:
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
         last_anim_ = now;
+        bool active = false;
+
         const float d = target_scroll_ - scroll_;
         if (std::abs(d) < 0.5f) {
             scroll_ = target_scroll_;
-            return false;
+        } else {
+            scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
+            if (std::abs(target_scroll_ - scroll_) < 0.5f) scroll_ = target_scroll_;
+            else active = true;
         }
-        scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
-        if (std::abs(target_scroll_ - scroll_) < 0.5f) {
-            scroll_ = target_scroll_;
-            return false;
+
+        const float fd = target_fade_ - fade_;
+        if (std::abs(fd) < 0.01f) {
+            fade_ = target_fade_;
+            apply_fade();
+        } else {
+            fade_ += fd * (1.0f - std::exp(-dt * 28.0f));
+            if (std::abs(target_fade_ - fade_) < 0.01f) fade_ = target_fade_;
+            else active = true;
+            apply_fade();
         }
-        return true;
+        return active;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1346,7 +1389,7 @@ private:
                 BeginPaint(hwnd_, &ps);
                 render();
                 EndPaint(hwnd_, &ps);
-                if (std::abs(target_scroll_ - scroll_) >= 0.5f || searching_ || loading_more_) {
+                if (std::abs(target_scroll_ - scroll_) >= 0.5f || std::abs(target_fade_ - fade_) >= 0.01f || searching_ || loading_more_) {
                     InvalidateRect(hwnd_, nullptr, FALSE);
                 }
                 return 0;
@@ -1489,6 +1532,8 @@ private:
     bool selecting_text_ = false;
 
     float scroll_ = 0, target_scroll_ = 0;
+    float fade_ = 1.0f, target_fade_ = 1.0f;
+    bool fading_out_ = false;
     std::chrono::steady_clock::time_point last_anim_ = std::chrono::steady_clock::now();
     bool dragging_scroll_ = false;
     float drag_y_ = 0, drag_scroll_start_ = 0;

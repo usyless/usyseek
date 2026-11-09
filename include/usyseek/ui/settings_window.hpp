@@ -575,12 +575,10 @@ private:
                         IdToggleVideos, 0, sh_.settings.index_videos ? 1 : 0);
 
             const std::wstring min_lbl = L"Min size: " + std::to_wstring(sh_.settings.min_file_kb) + L" KB";
-            draw_button(cv, rect(lx + rw - 290.0f, cy, 136.0f, 32.0f), 0, min_lbl, IdMinKbStep);
-            const std::wstring vf_lbl = L"Video frames: " + std::to_wstring(sh_.settings.video_frames);
-            draw_button(cv, rect(lx + rw - 146.0f, cy, 146.0f, 32.0f), 0, vf_lbl, IdVideoFramesStep);
+            draw_button(cv, rect(lx + rw - 136.0f, cy, 136.0f, 32.0f), 0, min_lbl, IdMinKbStep);
 
             cy += 42.0f;
-            cv.text(L"Click Min size or Video frames to cycle presets. Videos are embedded by averaging keyframes.",
+            cv.text(L"Click Min size to cycle minimum file size threshold. Videos are embedded by averaging keyframes.",
                     rect(lx, cy, rw, 18.0f), Font::Caption, color::outline);
             y = next_y;
         }
@@ -1188,19 +1186,6 @@ private:
                     }
                 }
                 sh_.settings.min_file_kb = next;
-                sh_.save();
-                break;
-            }
-            case IdVideoFramesStep: {
-                static constexpr uint32_t steps[] = {4, 8, 12, 16, 24};
-                uint32_t next = steps[0];
-                for (size_t i = 0; i < std::size(steps); ++i) {
-                    if (sh_.settings.video_frames == steps[i]) {
-                        next = steps[(i + 1) % std::size(steps)];
-                        break;
-                    }
-                }
-                sh_.settings.video_frames = next;
                 sh_.save();
                 break;
             }
