@@ -62,17 +62,29 @@ public:
         field_.select_all();
         caret_reset();
         sh_.refresh_tags();
-        sh_.poll_indexer();
+        sh_.poll_indexer(true);
         SetTimer(hwnd_, TIMER_STATUS, 1000, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
-        start_anim();
         render();
+        if (!sh_.test_mode && fade_ < 1.0f) {
+            last_fade_ = std::chrono::steady_clock::now();
+            SetTimer(hwnd_, TIMER_FADE, 15, nullptr);
+        }
     }
 
     void finish_hide() {
         fading_out_ = false;
         fade_ = target_fade_ = 0.0f;
+        searching_ = false;
+        loading_more_ = false;
+        debounce_pending_ = false;
+        KillTimer(hwnd_, TIMER_CARET);
+        KillTimer(hwnd_, TIMER_DEBOUNCE);
+        KillTimer(hwnd_, TIMER_STATUS);
+        KillTimer(hwnd_, TIMER_DEVICE);
+        KillTimer(hwnd_, TIMER_FADE);
         ShowWindow(hwnd_, SW_HIDE);
+        ValidateRect(hwnd_, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
     }
 
@@ -82,6 +94,7 @@ public:
         dragging_scroll_ = false;
         ReleaseCapture();
         close_popups();
+        KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_STATUS);
         if (sh_.test_mode) {
             finish_hide();
@@ -90,8 +103,8 @@ public:
         if (fading_out_) return;
         fading_out_ = true;
         target_fade_ = 0.0f;
-        start_anim();
-        render();
+        last_fade_ = std::chrono::steady_clock::now();
+        SetTimer(hwnd_, TIMER_FADE, 15, nullptr);
     }
 
     void toggle() {
@@ -100,7 +113,7 @@ public:
     }
 
     void render() {
-        if (rendering_) return;
+        if (rendering_ || (!visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         rendering_ = true;
         const bool anim = step_anim();
@@ -113,11 +126,7 @@ public:
         draw(cv);
         if (!target_.present(!in_sizemove_)) recover();
         rendering_ = false;
-        if (fading_out_ && fade_ <= 0.01f) {
-            finish_hide();
-            return;
-        }
-        if (anim || searching_ || loading_more_) InvalidateRect(hwnd_, nullptr, FALSE);
+        if (visible() && (anim || searching_ || loading_more_)) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     /// Test hook: puts the pill into a given state without going through input.
@@ -154,7 +163,7 @@ private:
     static constexpr float DEFAULT_W = 880.0f;
     static constexpr float DEFAULT_H = 640.0f;
     static constexpr float MENU_W = 256.0f;
-    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_DEBOUNCE = 2, TIMER_STATUS = 4, TIMER_DEVICE = 5;
+    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_DEBOUNCE = 2, TIMER_STATUS = 4, TIMER_DEVICE = 5, TIMER_FADE = 6;
 
     enum Id {
         IdNone = 0,
@@ -328,12 +337,14 @@ private:
             run_search(0);
             return;
         }
+        debounce_pending_ = true;
         apply_height();
         SetTimer(hwnd_, TIMER_DEBOUNCE, 140, nullptr);
     }
 
     void run_search(uint64_t offset) {
         KillTimer(hwnd_, TIMER_DEBOUNCE);
+        debounce_pending_ = false;
         if (offset == 0) {
             const std::wstring q = trim(field_.text);
             if (q.empty()) {
@@ -386,9 +397,9 @@ public:
     }
 
     void on_indexer_changed() {
-        sh_.poll_indexer();
+        sh_.poll_indexer(true);
         sh_.refresh_tags();
-        render();
+        if (visible()) render();
     }
 
     void on_tags_refreshed() {
@@ -445,40 +456,49 @@ private:
     }
 
     void apply_fade() {
-        SetLayeredWindowAttributes(hwnd_, 0, static_cast<BYTE>(std::round(std::clamp(fade_, 0.0f, 1.0f) * 255.0f)), LWA_ALPHA);
+        const BYTE a = static_cast<BYTE>(std::round(std::clamp(fade_, 0.0f, 1.0f) * 255.0f));
+        if (a != last_alpha_) {
+            last_alpha_ = a;
+            SetLayeredWindowAttributes(hwnd_, 0, a, LWA_ALPHA);
+        }
+    }
+
+    void on_fade_timer() {
+        const auto now = std::chrono::steady_clock::now();
+        const float dt = std::clamp(std::chrono::duration<float>(now - last_fade_).count(), 0.001f, 0.05f);
+        last_fade_ = now;
+        const float step = dt / 0.11f;
+        if (target_fade_ > fade_) fade_ = std::min(target_fade_, fade_ + step);
+        else fade_ = std::max(target_fade_, fade_ - step);
+        apply_fade();
+        if (std::abs(target_fade_ - fade_) < 0.005f) {
+            fade_ = target_fade_;
+            apply_fade();
+            KillTimer(hwnd_, TIMER_FADE);
+            if (fading_out_) finish_hide();
+        }
     }
 
     void start_anim() {
         last_anim_ = std::chrono::steady_clock::now();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     bool step_anim() {
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
         last_anim_ = now;
-        bool active = false;
-
         const float d = target_scroll_ - scroll_;
         if (std::abs(d) < 0.5f) {
             scroll_ = target_scroll_;
-        } else {
-            scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
-            if (std::abs(target_scroll_ - scroll_) < 0.5f) scroll_ = target_scroll_;
-            else active = true;
+            return false;
         }
-
-        const float fd = target_fade_ - fade_;
-        if (std::abs(fd) < 0.01f) {
-            fade_ = target_fade_;
-            apply_fade();
-        } else {
-            fade_ += fd * (1.0f - std::exp(-dt * 28.0f));
-            if (std::abs(target_fade_ - fade_) < 0.01f) fade_ = target_fade_;
-            else active = true;
-            apply_fade();
+        scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
+        if (std::abs(target_scroll_ - scroll_) < 0.5f) {
+            scroll_ = target_scroll_;
+            return false;
         }
-        return active;
+        return true;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -627,7 +647,7 @@ private:
         cv.push_clip(g.view);
 
         if (items_.empty()) {
-            const wchar_t* msg = searching_ ? L"" : (error_.empty() ? L"No matches" : L"");
+            const wchar_t* msg = (searching_ || debounce_pending_) ? L"" : (error_.empty() ? L"No matches" : L"");
             cv.text(msg, D2D1::RectF(g.view.left, g.view.top, g.view.right, g.view.top + 120), Font::Body, color::outline, Align::Center);
             if (searching_) draw_spinner(cv, {(g.view.left + g.view.right) / 2, g.view.top + 60});
         }
@@ -1387,9 +1407,9 @@ private:
             case WM_PAINT: {
                 PAINTSTRUCT ps;
                 BeginPaint(hwnd_, &ps);
-                render();
+                if (visible() || sh_.test_mode) render();
                 EndPaint(hwnd_, &ps);
-                if (std::abs(target_scroll_ - scroll_) >= 0.5f || std::abs(target_fade_ - fade_) >= 0.01f || searching_ || loading_more_) {
+                if (visible() && (std::abs(target_scroll_ - scroll_) >= 0.5f || searching_ || loading_more_)) {
                     InvalidateRect(hwnd_, nullptr, FALSE);
                 }
                 return 0;
@@ -1479,12 +1499,14 @@ private:
                         return 0;
                     case TIMER_DEBOUNCE: run_search(0); return 0;
                     case TIMER_STATUS:
-                        sh_.poll_indexer();
-                        render();
+                        if (sh_.poll_indexer()) render();
                         return 0;
                     case TIMER_DEVICE:
                         KillTimer(hwnd_, TIMER_DEVICE);
                         render();
+                        return 0;
+                    case TIMER_FADE:
+                        on_fade_timer();
                         return 0;
                 }
                 return 0;
@@ -1516,6 +1538,7 @@ private:
     int chip_ = -1;
     std::wstring last_query_;
     uint64_t seq_ = 0;
+    bool debounce_pending_ = false;
     bool searching_ = false;
     bool loading_more_ = false;
     bool has_more_ = false;
@@ -1533,8 +1556,10 @@ private:
 
     float scroll_ = 0, target_scroll_ = 0;
     float fade_ = 1.0f, target_fade_ = 1.0f;
+    BYTE last_alpha_ = 255;
     bool fading_out_ = false;
     std::chrono::steady_clock::time_point last_anim_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_fade_ = std::chrono::steady_clock::now();
     bool dragging_scroll_ = false;
     float drag_y_ = 0, drag_scroll_start_ = 0;
     D2D1_RECT_F scroll_thumb_{};

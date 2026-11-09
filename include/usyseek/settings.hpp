@@ -77,15 +77,18 @@ inline bool save_json_file(const fs::path& p, const T& value) {
 }
 
 /// Exclusions that can never be removed (shown with a lock in settings).
-inline std::vector<std::wstring> locked_excludes() {
-    std::vector<std::wstring> v;
-    std::wstring win = known_folder(FOLDERID_Windows);
-    if (win.empty()) win = L"C:\\Windows";
-    v.push_back(win);
-    const std::wstring drive = win.substr(0, 2);
-    v.push_back(drive + L"\\$Recycle.Bin");
-    v.push_back(drive + L"\\System Volume Information");
-    v.push_back(data_dir().wstring());
+inline const std::vector<std::wstring>& locked_excludes() {
+    static const std::vector<std::wstring> v = [] {
+        std::vector<std::wstring> out;
+        std::wstring win = known_folder(FOLDERID_Windows);
+        if (win.empty()) win = L"C:\\Windows";
+        out.push_back(win);
+        const std::wstring drive = win.substr(0, 2);
+        out.push_back(drive + L"\\$Recycle.Bin");
+        out.push_back(drive + L"\\System Volume Information");
+        out.push_back(data_dir().wstring());
+        return out;
+    }();
     return v;
 }
 

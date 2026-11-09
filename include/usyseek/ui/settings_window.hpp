@@ -66,7 +66,7 @@ public:
         sync_fields();
         probe_venv();
         scan_models();
-        sh_.poll_indexer();
+        sh_.poll_indexer(true);
         sh_.refresh_tags();
         ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
@@ -78,8 +78,16 @@ public:
 
     void hide() {
         stop_recording();
+        if (active_field_) {
+            commit_fields();
+            active_field_->focused = false;
+            active_field_ = nullptr;
+        }
+        KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_POLL);
+        KillTimer(hwnd_, TIMER_DEVICE);
         ShowWindow(hwnd_, SW_HIDE);
+        ValidateRect(hwnd_, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
     }
 
@@ -91,7 +99,7 @@ public:
     }
 
     void render() {
-        if (rendering_) return;
+        if (rendering_ || (!visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         rendering_ = true;
         const bool anim = step_anim();
@@ -104,7 +112,7 @@ public:
         draw(cv);
         if (!target_.present(!in_sizemove_)) recover();
         rendering_ = false;
-        if (anim) InvalidateRect(hwnd_, nullptr, FALSE);
+        if (visible() && anim) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
 private:
@@ -999,7 +1007,7 @@ private:
 
     void start_anim() {
         last_anim_ = std::chrono::steady_clock::now();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     bool step_anim() {
@@ -1422,9 +1430,9 @@ private:
             case WM_PAINT: {
                 PAINTSTRUCT ps;
                 BeginPaint(hwnd_, &ps);
-                render();
+                if (visible() || sh_.test_mode) render();
                 EndPaint(hwnd_, &ps);
-                if (std::abs(target_scroll_ - scroll_) >= 0.5f) {
+                if (visible() && std::abs(target_scroll_ - scroll_) >= 0.5f) {
                     InvalidateRect(hwnd_, nullptr, FALSE);
                 }
                 return 0;
@@ -1534,8 +1542,7 @@ private:
                         }
                         return 0;
                     case TIMER_POLL:
-                        sh_.poll_indexer();
-                        render();
+                        if (sh_.poll_indexer()) render();
                         return 0;
                     case TIMER_DEVICE:
                         KillTimer(hwnd_, TIMER_DEVICE);

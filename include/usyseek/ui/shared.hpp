@@ -59,16 +59,32 @@ struct Shared {
         });
     }
 
-    void poll_indexer() {
-        index_state = load_json_file<IndexState>(state_path());
-        failed_files = load_failed_files(settings.model_name);
+    bool poll_indexer(bool force = false) {
+        const bool was_running = indexer_running;
+        const uint64_t prev_embedded = indexer.embedded;
+        const uint64_t prev_failed = indexer.failed;
+        const Phase prev_phase = indexer.phase;
+
         if (auto b = StatusBlock::open()) {
             indexer = b->read();
             indexer_running = indexer.pid != 0 && indexer.phase != Phase::Done && indexer.phase != Phase::Stopped && indexer.phase != Phase::Error;
         } else {
             indexer_running = false;
         }
+
+        const bool finished = was_running && !indexer_running;
+        const bool failed_changed = indexer_running && indexer.failed != prev_failed;
+        if (force || finished || failed_changed || !polled_once_) {
+            polled_once_ = true;
+            index_state = load_json_file<IndexState>(state_path());
+            failed_files = load_failed_files(settings.model_name);
+        }
+
+        return force || finished || indexer_running != was_running ||
+               (indexer_running && (indexer.embedded != prev_embedded || indexer.failed != prev_failed || indexer.phase != prev_phase));
     }
+
+    bool polled_once_ = false;
 
     void save() {
         if (!test_mode) save_settings(settings);

@@ -203,7 +203,8 @@ enum class Align { Left, Center, Right };
 /// Immediate-mode drawing helpers over one device context, plus hit-region recording.
 class Canvas {
 public:
-    Canvas(ID2D1DeviceContext6* dc, Fonts& fonts, std::vector<Hit>& hits) : dc_{dc}, fonts_{fonts}, hits_{hits} {
+    Canvas(ID2D1DeviceContext6* dc, Fonts& fonts, std::vector<Hit>& hits, float opacity = 1.0f)
+        : dc_{dc}, fonts_{fonts}, hits_{hits}, opacity_{std::clamp(opacity, 0.0f, 1.0f)} {
         dc_->CreateSolidColorBrush(color::on_surface, &brush_);
     }
 
@@ -211,6 +212,7 @@ public:
     [[nodiscard]] Fonts& fonts() const noexcept { return fonts_; }
 
     ID2D1SolidColorBrush* brush(D2D1_COLOR_F c) {
+        c.a *= opacity_;
         brush_->SetColor(c);
         return brush_.get();
     }
@@ -268,6 +270,7 @@ public:
             bmp_brush_->SetBitmap(bmp);
         }
         if (bmp_brush_) {
+            bmp_brush_->SetOpacity(opacity_);
             bmp_brush_->SetTransform(D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(ox, oy));
             dc_->FillRoundedRectangle(D2D1::RoundedRect(tr, radius, radius), bmp_brush_.get());
         }
@@ -312,6 +315,7 @@ private:
     ID2D1DeviceContext6* dc_;
     Fonts& fonts_;
     std::vector<Hit>& hits_;
+    float opacity_ = 1.0f;
     std::vector<D2D1_RECT_F> clips_;
     wil::com_ptr<ID2D1SolidColorBrush> brush_;
     wil::com_ptr<ID2D1BitmapBrush1> bmp_brush_;
