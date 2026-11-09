@@ -698,7 +698,7 @@ int run_indexer(Settings& settings) {
     uint32_t batch = settings.batch_size;
     if (batch == 0) {
         try {
-            batch = vision.module.attr("suggest_batch")(1024).cast<uint32_t>();
+            batch = vision.module.attr("suggest_batch")(128).cast<uint32_t>();
         } catch (const std::exception& e) {
             std::printf("suggest_batch failed: %s\n", e.what());
             batch = 16;

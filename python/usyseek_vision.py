@@ -156,22 +156,43 @@ def batch_hint():
     return _hint
 
 
-def suggest_batch(limit=512):
-    """Measures VRAM per image with a small probe and fits the batch into ~80% of the free memory."""
+def suggest_batch(limit=128):
+    """Measures VRAM per image with a small probe and fits the batch conservatively
+    so Windows WDDM never spills into shared system RAM when other apps are open."""
     torch = _torch
     if _device != "cuda":
         return max(1, min(limit, 16))
     import numpy as np
 
     torch.cuda.empty_cache()
-    probe_n = 4
+    base_alloc = torch.cuda.memory_allocated()
+    base_res = torch.cuda.memory_reserved()
+    probe_n = 8
     torch.cuda.reset_peak_memory_stats()
-    base = torch.cuda.memory_allocated()
     _run(np.zeros((probe_n, _size, _size, 3), dtype=np.uint8))
-    per_image = max(1, (torch.cuda.max_memory_allocated() - base) / probe_n)
-    free, _total = torch.cuda.mem_get_info()
+    peak_delta = max(
+        torch.cuda.max_memory_allocated() - base_alloc,
+        torch.cuda.max_memory_reserved() - base_res,
+    )
+    # 2x safety factor for MIOpen/cuBLAS workspaces + caching allocator fragmentation,
+    # with a minimum floor proportional to image resolution (~22 MB at 336x336).
+    min_per_img = max(16 << 20, _size * _size * 3 * 64)
+    per_image = max(min_per_img, int((peak_delta / probe_n) * 2.0))
+
+    free, total = torch.cuda.mem_get_info()
     torch.cuda.empty_cache()
-    return int(max(1, min(limit, (free * 0.8) // per_image)))
+    model_bytes = max(torch.cuda.memory_allocated(), torch.cuda.memory_reserved())
+    # On some Windows ROCm/HIP drivers mem_get_info() does not subtract this process's pool
+    if free > total - model_bytes:
+        free = max(0, total - model_bytes)
+
+    # Leave at least 1.5 GiB or 25% of total VRAM untouched for Windows DWM & other open apps
+    headroom = max(int(1.5 * (1 << 30)), int(total * 0.25))
+    usable = max(0, free - headroom)
+    raw = int((usable * 0.55) // per_image)
+    # Snap to a clean multiple of 8 within [8, min(limit, 128)]
+    capped = max(8, min(int(limit), 128, raw))
+    return max(8, (capped // 8) * 8)
 
 
 def export_text(model_dir, model_name):
