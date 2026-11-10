@@ -199,20 +199,7 @@ bool write_everything_exe(const fs::path& target) {
 class EverythingSession {
 public:
     bool open(const std::set<wchar_t>& drives, std::wstring& error) {
-        // 1. Use an Everything the user already runs (no elevation prompt)
-        static const wchar_t* const classes[] = {L"EVERYTHING_TASKBAR_NOTIFICATION", L"EVERYTHING_TASKBAR_NOTIFICATION_(1.5a)"};
-        for (const wchar_t* cls : classes) {
-            if (FindWindowW(cls, nullptr)) {
-                _Everything_IPC_WndClass = cls;
-                if (Everything_IsDBLoaded()) {
-                    wlog(L"Using running Everything instance (%s)\n", cls);
-                    return true;
-                }
-            }
-        }
-        _Everything_IPC_WndClass = L"EVERYTHING_TASKBAR_NOTIFICATION";
-
-        // 2. Private instance, indexing only the drives we need (requires elevation to read the MFT)
+        // Always run our own private Everything instance (never use or interfere with a user-running instance)
         const fs::path exe = data_dir() / L"Everything" / L"Everything.exe";
         if (!write_everything_exe(exe)) {
             error = L"Could not extract Everything.exe";
