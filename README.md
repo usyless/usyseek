@@ -5,6 +5,7 @@
 > **Notice: This entire application, architecture, and codebase is 100% AI-generated.**
 
 - **100% On-Device & Privacy-First**: All scanning, decoding, embedding, vector storage, and search inference run locally. Zero telemetry, zero analytics, zero cloud dependencies.
+- **No System-Wide Python Dependency**: System Python is completely optional. A self-contained portable Python runtime can be downloaded and managed directly from the Settings UI with one click.
 - **Found a bug or have a suggestion?** Feel free to open an issue or reach out to `@usy_` on Discord!
 - **Contributions are welcome**: PRs and improvements will always be considered!
 
@@ -12,7 +13,7 @@
 
 ## Overview
 
-**usyseek** is a modern, high-performance semantic desktop search engine for Windows 10/11 built with **C++23**, **Rust**, **Direct2D**, and **embedded Python/PyTorch**.
+**usyseek** is a modern, high-performance semantic desktop search engine for Windows 10/11 built with **C++23**, **Rust**, **Direct2D**, and **PyTorch**.
 
 Instead of relying solely on file names or manually tagged metadata, `usyseek` allows you to search your entire local image and video library using natural language descriptions (e.g., *"sunset over snowy mountain"*, *"cyberpunk street in the rain"*, *"diagram with purple flowchart"*), visual similarity (*"Find Similar"*), directory path scoping, and interactive color-coded tags.
 
@@ -22,7 +23,7 @@ Designed around a decoupled multi-process architecture, `usyseek` delivers insta
 
 ## Architecture & Process Model
 
-To avoid the massive idle resource consumption common to AI and Electron-based desktop utilities, `usyseek` splits responsibilities across three dedicated processes coordinated via Windows Job Objects, shared memory, and window messages:
+To avoid the massive idle resource consumption common to AI and Electron-based desktop utilities, `usyseek` splits responsibilities across dedicated processes coordinated via Windows Job Objects, shared memory, and window messages:
 
 ```
                   ┌────────────────────────────────────────┐
@@ -36,10 +37,17 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
         │       usyseek-ui.exe      │    │    usyseek-indexer.exe    │
         │  • Direct2D / DirectWrite │    │  • Voidtools Everything   │
         │  • Spotlight Search Pill  │    │  • WIC / Media Foundation │
-        │  • ONNX Runtime Text Tower│    │  • Embedded PyTorch Vision│
+        │  • ONNX Runtime Text Tower│    │  • Zero-copy Shared Memory│
         │  • Exits on idle timeout  │    │  • Exits when scan finishes│
         └─────────────┬─────────────┘    └─────────────┬─────────────┘
-                      │                                │
+                      │                                │ Shared Memory IPC
+                      │                                ▼
+                      │                  ┌───────────────────────────┐
+                      │                  │    usyseek_vision.py      │
+                      │                  │  • PyTorch Vision Tower   │
+                      │                  │  • ROCm / CUDA / CPU      │
+                      │                  │  • Portable Python Worker │
+                      │                  └─────────────┬─────────────┘
                       │ gRPC (Rust staticlib)          │ gRPC (Rust staticlib)
                       ▼                                ▼
         ┌────────────────────────────────────────────────────────────┐
@@ -63,7 +71,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
    - On-demand worker process that exists only while indexing is active.
    - Embeds an isolated instance of **Voidtools Everything** (`uk.usyless.usyseek`) for instant NTFS file discovery across local drives.
    - Utilizes **Windows Imaging Component (WIC)** for high-throughput image decoding and **Media Foundation (MF)** for multi-threaded video keyframe extraction.
-   - Embeds **CPython via pybind11** to run the PyTorch vision tower on AMD (ROCm), NVIDIA (CUDA), or CPU.
+   - **Zero C++ Python Dependency**: Completely decoupled from CPython at compile and link time (no `pybind11` or `python3XY.dll` link requirement). Communicates with an out-of-process Python worker (`usyseek_vision.py`) via zero-copy **named shared memory**, executing the vision tower on AMD (ROCm), NVIDIA (CUDA), or CPU.
    - Reports live progress, throughput, and status through shared memory (`Local\usyseek.indexer.status`).
 
 4. **`qdrant.exe` (Embedded Vector Engine)**:
@@ -99,7 +107,8 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 ### ⚙️ Settings & Environment Management
 - **Interactive Global Hotkey Recorder**: Easily rebind the spotlight shortcut (e.g. `Alt + Space`, `Ctrl + Shift + Space`) or disable it entirely.
 - **AI Model Selection**: Supports OpenCLIP and Perception Engine vision models (default: `PE-Core-L-14-336`). Automatically exports ONNX text towers for CPU search.
-- **Embedded Python Virtualenv Control**: Manage the PyTorch venv directly from settings—rebuild, upgrade requirements, or configure hardware acceleration (ROCm / CUDA / CPU).
+- **Zero-Setup Portable Python**: System-wide Python is **not required**. `usyseek` can download and bootstrap a self-contained portable Python runtime (via NuGet, supporting 3.14, 3.13, 3.12, 3.11) with one click from Settings, or use an existing `.venv`.
+- **Hardware Acceleration**: Configure hardware acceleration (ROCm / CUDA / CPU) with custom PyTorch arguments directly within the UI.
 
 ---
 
@@ -124,7 +133,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 - **CMake**: `3.31+`
 - **Build System**: [Ninja](https://github.com/ninja-build/ninja)
 - **Rust Toolchain**: `cargo` / `rustc` (used to compile the `usyseek_rust` static library)
-- **Python**: Python 3.10 to 3.12 (matches embedded `pybind11` link)
+- **Python**: **Not required!** System-wide Python is no longer a dependency. The application can automatically download and manage a portable Python runtime directly from the Settings UI (or you can optionally point it to an existing virtualenv / local install).
 - **GPU (Optional but recommended for indexing)**:
   - **AMD**: ROCm for Windows (default target: `gfx1030` / RDNA2+)
   - **NVIDIA**: CUDA 11.8+ / 12.x
@@ -136,7 +145,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 
 ### 1. Environment Setup
 
-Ensure MSVC, CMake, Ninja, Rust, and Python are available in your `PATH`. If you use portable development environments, you can configure them via `build.bat` or load your environment scripts.
+Ensure MSVC, CMake, Ninja, and Rust (`cargo`) are available in your `PATH`. Python is **not needed** to build `usyseek`. If you use portable development environments, you can configure them via `build.bat` or load your environment scripts.
 
 ### 2. Build via `build.bat`
 
@@ -180,7 +189,7 @@ build/bin/
 │   ├── qdrant.exe           # Qdrant vector database server
 │   └── static/              # Qdrant Web UI static assets
 ├── python/
-│   ├── usyseek_vision.py    # PyTorch vision tower backend
+│   ├── usyseek_vision.py    # PyTorch vision tower worker
 │   └── requirements.txt     # Python dependencies
 └── config/
     └── qdrant.yaml          # Qdrant configuration
@@ -197,7 +206,6 @@ build/bin/
 | `USYSEEK_USE_STATIC_MSVCRT` | `ON` | Link against static MSVC runtime (`/MT`) |
 | `USYSEEK_USYLIBPP_VERSION` | `main` | Git branch/tag for `usylibpp` |
 | `USYSEEK_GLAZE_VERSION` | `v9.1.0` | Git tag for `glaze` (high-performance JSON) |
-| `USYSEEK_PYBIND11_VERSION` | `v3.1.0` | Git tag for `pybind11` |
 | `USYSEEK_MIMALLOC_VERSION` | `v3.5.3` | Git tag for `mimalloc` |
 | `USYSEEK_ORT_VERSION` | `1.31.1` | Prebuilt ONNX Runtime Windows x64 release |
 | `USYSEEK_QDRANT_VERSION` | `v1.20.0` | Prebuilt Qdrant Windows x64 release |
