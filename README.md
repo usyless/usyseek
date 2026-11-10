@@ -147,21 +147,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 
 Ensure MSVC, CMake, Ninja, and Rust (`cargo`) are available in your `PATH`. Python is **not needed** to build `usyseek`. If you use portable development environments, you can configure them via `build.bat` or load your environment scripts.
 
-### 2. Build via `build.bat`
-
-A convenience script is provided in the repository root:
-
-```cmd
-build.bat
-```
-
-To pass additional CMake build options (such as clean rebuild or specific targets):
-
-```cmd
-build.bat --clean-first
-```
-
-### 3. Manual CMake Build
+### 2. CMake Build
 
 Alternatively, configure and build using CMake directly:
 
@@ -175,7 +161,7 @@ cmake -S . -B build -G Ninja ^
 cmake --build build --parallel
 ```
 
-### 4. Build Output Layout
+### 3. Build Output Layout
 
 All built executables, dependencies, and runtime assets are automatically assembled in `build/bin/`:
 
