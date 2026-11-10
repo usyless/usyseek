@@ -282,20 +282,11 @@ inline wil::unique_process_information start_qdrant(const Settings& s, HANDLE jo
 
     std::wstring cmd = L"\"" + exe.wstring() + L"\" --disable-telemetry --config-path \"" + (exe_dir() / L"config" / L"qdrant.yaml").wstring() + L"\"";
 
-    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
-    wil::unique_handle log{CreateFileW((data_dir() / L"qdrant.log").c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr)};
-
     STARTUPINFOW si{};
     si.cb = sizeof(si);
-    if (log.get() != INVALID_HANDLE_VALUE && log) {
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdOutput = log.get();
-        si.hStdError = log.get();
-        si.hStdInput = nullptr;
-    }
 
     const fs::path work_dir = exe.parent_path();
-    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
                         CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                         env.data(), work_dir.c_str(), &si, &pi)) {
         return {};

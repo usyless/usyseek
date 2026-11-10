@@ -6,22 +6,18 @@
 #include <usyseek/db.hpp>
 #include <usyseek/indexer/media.hpp>
 
-#include <pybind11/embed.h>
-#include <pybind11/numpy.h>
-#include <pybind11/stl.h>
-
 #include <condition_variable>
 #include <deque>
 #include <future>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "resource.h"
 
-namespace py = pybind11;
 using namespace usyseek;
 
 namespace {
@@ -444,14 +440,246 @@ MediaPayload make_payload(const FileEntry& e, const media::Decoded& d) {
     return p;
 }
 
-struct PyVision {
-    py::object module;
-    py::object embed_fn;
-    py::object hint_fn;
+} // namespace
+
+namespace usyseek {
+
+struct PyLoadCfg {
+    std::string model_dir;
+    std::string model_name;
+    std::string device;
+};
+struct PyLoadReq {
+    std::string cmd = "load";
+    PyLoadCfg cfg;
+};
+struct PyExportReq {
+    std::string cmd = "export_text";
+    std::string model_dir;
+    std::string model_name;
+};
+struct PySuggestReq {
+    std::string cmd = "suggest_batch";
+    uint32_t limit = 128;
+};
+struct PyEmbedReq {
+    std::string cmd = "embed";
+    std::string shm;
+    uint64_t shm_bytes = 0;
+    uint32_t frames = 0;
+};
+struct PyLoadInfo {
     uint32_t size = 0;
     uint32_t dim = 0;
+    std::string resize_mode;
+    std::string device;
+    std::string backend;
+};
+struct PyResp {
+    bool ok = false;
+    std::string error;
+    PyLoadInfo info{};
+    std::string path;
+    uint32_t batch = 16;
+    uint32_t hint = 0;
+};
+
+} // namespace usyseek
+
+namespace {
+
+struct PyVision {
+    uint32_t size = 0;
+    uint32_t dim = 0;
+    uint32_t last_hint = 0;
     media::ResizeMode mode = media::ResizeMode::Squash;
     std::wstring device;
+
+    wil::unique_handle job;
+    wil::unique_process_information proc;
+    wil::unique_handle pipe;
+    wil::unique_event_nothrow ov_event;
+    wil::unique_handle shm;
+    void* shm_view = nullptr;
+    size_t shm_bytes = 0;
+    uint32_t shm_gen = 0;
+    std::string shm_name;
+    std::string read_buf;
+
+    ~PyVision() {
+        unmap_shm();
+    }
+
+    void unmap_shm() noexcept {
+        if (shm_view) {
+            UnmapViewOfFile(shm_view);
+            shm_view = nullptr;
+        }
+        shm.reset();
+        shm_bytes = 0;
+    }
+
+    void start(const VenvInfo& venv, const Settings& settings) {
+        std::error_code ec;
+        if (!venv.exists || !fs::exists(venv.python_exe, ec)) {
+            throw std::runtime_error("Python environment not found");
+        }
+        const fs::path worker_script = exe_dir() / L"python" / L"usyseek_vision.py";
+        if (!fs::exists(worker_script, ec)) {
+            throw std::runtime_error("usyseek_vision.py not found");
+        }
+
+        const DWORD pid = GetCurrentProcessId();
+        const std::wstring pipe_name = L"\\\\.\\pipe\\usyseek.vision." + std::to_wstring(pid);
+        pipe.reset(CreateNamedPipeW(
+            pipe_name.c_str(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1, 65536, 65536, 0, nullptr));
+        if (!pipe) {
+            throw std::runtime_error("Could not create vision IPC pipe");
+        }
+        ov_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        job = make_kill_on_close_job();
+
+        std::wstring cmd = L"\"" + venv.python_exe + L"\" -u \"" + worker_script.wstring() + L"\" --worker \"" + pipe_name + L"\"";
+        if (!settings.vision_script.empty()) {
+            cmd += L" \"" + to_wide(settings.vision_script) + L"\"";
+        }
+
+        STARTUPINFOW si{sizeof(si)};
+        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                            CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
+                            exe_dir().c_str(), &si, &proc)) {
+            throw std::runtime_error("Failed to start Python vision worker");
+        }
+        if (job) AssignProcessToJobObject(job.get(), proc.hProcess);
+        ResumeThread(proc.hThread);
+
+        OVERLAPPED ov{};
+        ov.hEvent = ov_event.get();
+        ResetEvent(ov_event.get());
+        if (!ConnectNamedPipe(pipe.get(), &ov)) {
+            const DWORD err = GetLastError();
+            if (err == ERROR_IO_PENDING) {
+                wait_ov(ov, "Python worker exited before connecting");
+            } else if (err != ERROR_PIPE_CONNECTED) {
+                throw std::runtime_error("Vision pipe connection failed");
+            }
+        }
+
+        PyResp r = call(PyLoadReq{.cfg = {settings.model_dir, settings.model_name, settings.device}});
+        size = r.info.size;
+        dim = r.info.dim;
+        mode = media::parse_resize_mode(r.info.resize_mode);
+        device = to_wide(r.info.device + " \xc2\xb7 " + r.info.backend);
+    }
+
+    void export_text(const std::string& model_dir, const std::string& model_name) {
+        (void)call(PyExportReq{.model_dir = model_dir, .model_name = model_name});
+    }
+
+    uint32_t suggest_batch(uint32_t limit = 128) {
+        return call(PySuggestReq{.limit = limit}).batch;
+    }
+
+    uint8_t* prepare_shm(size_t frames) {
+        const size_t in_bytes = frames * size * size * 3;
+        const size_t out_bytes = frames * dim * sizeof(float);
+        const size_t needed = std::max<size_t>(65536, std::max(in_bytes, out_bytes));
+        if (needed > shm_bytes || !shm_view) {
+            unmap_shm();
+            const size_t alloc = std::max(needed, shm_bytes * 2);
+            shm_name = "Local\\usyseek.vision.shm." + std::to_string(GetCurrentProcessId()) + "." + std::to_string(++shm_gen);
+            shm.reset(CreateFileMappingA(
+                INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                static_cast<DWORD>(alloc >> 32), static_cast<DWORD>(alloc & 0xFFFFFFFFu),
+                shm_name.c_str()));
+            if (!shm) throw std::runtime_error("Shared memory allocation failed");
+            shm_view = MapViewOfFile(shm.get(), FILE_MAP_ALL_ACCESS, 0, 0, alloc);
+            if (!shm_view) {
+                shm.reset();
+                throw std::runtime_error("Shared memory map failed");
+            }
+            shm_bytes = alloc;
+        }
+        return static_cast<uint8_t*>(shm_view);
+    }
+
+    const float* embed(size_t frames) {
+        PyResp r = call(PyEmbedReq{
+            .shm = shm_name,
+            .shm_bytes = shm_bytes,
+            .frames = static_cast<uint32_t>(frames),
+        });
+        last_hint = r.hint;
+        return static_cast<const float*>(shm_view);
+    }
+
+private:
+    DWORD wait_ov(OVERLAPPED& ov, const char* crash_msg) {
+        HANDLE handles[3] = {ov_event.get(), proc.hProcess, g_stop};
+        const DWORD count = g_stop ? 3 : 2;
+        const DWORD w = WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+        if (w != WAIT_OBJECT_0) {
+            CancelIoEx(pipe.get(), &ov);
+            DWORD dummy = 0;
+            GetOverlappedResult(pipe.get(), &ov, &dummy, TRUE);
+            if (w == WAIT_OBJECT_0 + 2) throw std::runtime_error("Indexing stopped");
+            throw std::runtime_error(crash_msg);
+        }
+        DWORD bytes = 0;
+        if (!GetOverlappedResult(pipe.get(), &ov, &bytes, FALSE)) {
+            throw std::runtime_error(crash_msg);
+        }
+        return bytes;
+    }
+
+    template <typename Req>
+    PyResp call(const Req& req) {
+        std::string line;
+        (void)glz::write_json(req, line);
+        line.push_back('\n');
+
+        size_t written = 0;
+        while (written < line.size()) {
+            OVERLAPPED ov{};
+            ov.hEvent = ov_event.get();
+            ResetEvent(ov_event.get());
+            DWORD n = 0;
+            if (!WriteFile(pipe.get(), line.data() + written, static_cast<DWORD>(line.size() - written), &n, &ov)) {
+                if (GetLastError() != ERROR_IO_PENDING) throw std::runtime_error("Pipe write failed");
+                n = wait_ov(ov, "Python worker terminated unexpectedly");
+            }
+            written += n;
+        }
+
+        for (;;) {
+            if (const auto nl = read_buf.find('\n'); nl != std::string::npos) {
+                std::string msg = read_buf.substr(0, nl);
+                read_buf.erase(0, nl + 1);
+                PyResp resp{};
+                if (glz::read<JSON_READ>(resp, msg)) {
+                    throw std::runtime_error("Invalid response from Python worker");
+                }
+                if (!resp.ok) {
+                    throw std::runtime_error(resp.error.empty() ? "Python worker error" : resp.error);
+                }
+                return resp;
+            }
+            char chunk[4096];
+            OVERLAPPED ov{};
+            ov.hEvent = ov_event.get();
+            ResetEvent(ov_event.get());
+            DWORD n = 0;
+            if (!ReadFile(pipe.get(), chunk, sizeof(chunk), &n, &ov)) {
+                if (GetLastError() != ERROR_IO_PENDING) throw std::runtime_error("Python worker closed pipe");
+                n = wait_ov(ov, "Python worker terminated unexpectedly");
+            }
+            if (n == 0) throw std::runtime_error("Python worker closed pipe");
+            read_buf.append(chunk, n);
+        }
+    }
 };
 
 std::wstring py_error_text(const std::exception& e) {
@@ -462,31 +690,25 @@ std::wstring py_error_text(const std::exception& e) {
 
 int export_text_only(const Settings& settings) {
     const VenvInfo venv = read_venv(to_wide(settings.venv_dir));
-    if (!venv.exists || major_minor(venv.version) != USYSEEK_PYTHON_VERSION) return 1;
+    std::error_code ec;
+    if (!venv.exists || !fs::exists(venv.python_exe, ec)) return 1;
 
-    PyConfig config;
-    PyConfig_InitIsolatedConfig(&config);
-    config.site_import = 0;
-    config.install_signal_handlers = 0;
-    PyConfig_SetString(&config, &config.home, venv.home.c_str());
-    PyConfig_SetString(&config, &config.program_name, venv.python_exe.c_str());
-    py::scoped_interpreter interpreter{&config, 0, nullptr, false};
-    PyConfig_Clear(&config);
+    const fs::path script = settings.vision_script.empty() ? exe_dir() / L"python" / L"usyseek_vision.py" : fs::path{to_wide(settings.vision_script)};
+    if (!fs::exists(script, ec)) return 1;
 
-    try {
-        py::module_ site = py::module_::import("site");
-        site.attr("addsitedir")(settings.venv_dir + "\\Lib\\site-packages");
-        py::list sys_path = py::module_::import("sys").attr("path");
-        fs::path script = settings.vision_script.empty() ? exe_dir() / L"python" / L"usyseek_vision.py" : fs::path{to_wide(settings.vision_script)};
-        sys_path.insert(0, to_utf8(script.parent_path().wstring()));
-        py::object mod = py::module_::import(to_utf8(script.stem().wstring()).c_str());
-        if (!py::hasattr(mod, "export_text")) return 1;
-        mod.attr("export_text")(settings.model_dir, settings.model_name);
-        return 0;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "%s\n", e.what());
+    std::wstring cmd = L"\"" + venv.python_exe + L"\" -u \"" + script.wstring() + L"\" --export-text \"" + to_wide(settings.model_dir) + L"\" \"" + to_wide(settings.model_name) + L"\"";
+    wil::unique_handle job = make_kill_on_close_job();
+    STARTUPINFOW si{sizeof(si)};
+    wil::unique_process_information pi;
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, exe_dir().c_str(), &si, &pi)) {
         return 1;
     }
+    if (job) AssignProcessToJobObject(job.get(), pi.hProcess);
+    ResumeThread(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    return static_cast<int>(code);
 }
 
 int run_indexer(Settings& settings) {
@@ -535,59 +757,30 @@ int run_indexer(Settings& settings) {
         files = walk_dirs(scope);
     });
 
-    // --- Python vision tower
+    // --- Python vision tower (out-of-process worker via shared memory)
     pr.phase(Phase::LoadingModel, to_wide(settings.model_name));
     const VenvInfo venv = read_venv(to_wide(settings.venv_dir));
-    if (!venv.exists) {
+    std::error_code venv_ec;
+    if (!venv.exists || !fs::exists(venv.python_exe, venv_ec)) {
         pr.phase(Phase::Error, L"Python environment not found");
         return 1;
     }
-    if (major_minor(venv.version) != USYSEEK_PYTHON_VERSION) {
-        pr.phase(Phase::Error, std::wstring{L"Python "} + USYSEEK_PYTHON_VERSION + L" environment required, found " + venv.version);
-        return 1;
-    }
 
-    PyConfig config;
-    PyConfig_InitIsolatedConfig(&config);
-    config.site_import = 0;
-    config.install_signal_handlers = 0;
-    PyConfig_SetString(&config, &config.home, venv.home.c_str());
-    PyConfig_SetString(&config, &config.program_name, venv.python_exe.c_str());
-    py::scoped_interpreter interpreter{&config, 0, nullptr, false};
-    PyConfig_Clear(&config);
-    PyVision vision; // after the interpreter so its objects are released first
-
+    PyVision vision;
     try {
-        py::module_ site = py::module_::import("site");
-        site.attr("addsitedir")(settings.venv_dir + "\\Lib\\site-packages");
-        py::list sys_path = py::module_::import("sys").attr("path");
-
-        fs::path script = settings.vision_script.empty() ? exe_dir() / L"python" / L"usyseek_vision.py" : fs::path{to_wide(settings.vision_script)};
-        sys_path.insert(0, to_utf8(script.parent_path().wstring()));
-        vision.module = py::module_::import(to_utf8(script.stem().wstring()).c_str());
-
-        py::dict cfg;
-        cfg["model_dir"] = settings.model_dir;
-        cfg["model_name"] = settings.model_name;
-        cfg["device"] = settings.device;
-        py::dict info = vision.module.attr("load")(cfg);
-        vision.size = info["size"].cast<uint32_t>();
-        vision.dim = info["dim"].cast<uint32_t>();
-        vision.mode = media::parse_resize_mode(info["resize_mode"].cast<std::string>());
-        vision.device = to_wide(info["device"].cast<std::string>() + " \xc2\xb7 " + info["backend"].cast<std::string>());
-        vision.embed_fn = vision.module.attr("embed");
-        vision.hint_fn = vision.module.attr("batch_hint");
+        vision.start(venv, settings);
         wcsncpy_s(pr.d.device, vision.device.c_str(), std::size(pr.d.device) - 1);
 
         // The search UI needs the text tower as ONNX; export it once if missing
         const fs::path onnx = fs::path{to_wide(settings.model_dir)} / (to_wide(settings.model_name) + L"-text.onnx");
         std::error_code ec;
-        if (!fs::exists(onnx, ec) && py::hasattr(vision.module, "export_text")) {
+        if (!fs::exists(onnx, ec)) {
             pr.phase(Phase::LoadingModel, L"Exporting text model");
-            vision.module.attr("export_text")(settings.model_dir, settings.model_name);
+            vision.export_text(settings.model_dir, settings.model_name);
         }
     } catch (const std::exception& e) {
         scanner.request_stop();
+        if (stopping()) return 2;
         pr.phase(Phase::Error, py_error_text(e));
         std::printf("%s\n", e.what());
         return 1;
@@ -599,10 +792,7 @@ int run_indexer(Settings& settings) {
     }
 
     pr.phase(Phase::Scanning);
-    {
-        py::gil_scoped_release release;
-        scanner.join();
-    }
+    scanner.join();
     if (stopping()) return 2;
     if (!scan_error.empty()) {
         pr.phase(Phase::Error, scan_error);
@@ -617,7 +807,6 @@ int run_indexer(Settings& settings) {
     std::unordered_set<uint64_t> found_ids;
     found_ids.reserve(files.size());
     {
-        py::gil_scoped_release release;
         constexpr size_t CHUNK = 1024;
         std::vector<uint64_t> ids;
         for (size_t i = 0; i < files.size() && !stopping(); i += CHUNK) {
@@ -656,7 +845,6 @@ int run_indexer(Settings& settings) {
     // --- Remove entries for deleted / newly excluded files
     pr.phase(Phase::Cleaning);
     {
-        py::gil_scoped_release release;
         failures.prune(scope);
         std::optional<uint64_t> cursor;
         std::vector<uint64_t> stale;
@@ -698,7 +886,7 @@ int run_indexer(Settings& settings) {
     uint32_t batch = settings.batch_size;
     if (batch == 0) {
         try {
-            batch = vision.module.attr("suggest_batch")(128).cast<uint32_t>();
+            batch = vision.suggest_batch(128);
         } catch (const std::exception& e) {
             std::printf("suggest_batch failed: %s\n", e.what());
             batch = 16;
@@ -788,25 +976,24 @@ int run_indexer(Settings& settings) {
             continue;
         }
 
-        // Pack into one uint8 tensor
-        py::array_t<uint8_t> arr({static_cast<py::ssize_t>(frames), static_cast<py::ssize_t>(vision.size), static_cast<py::ssize_t>(vision.size), py::ssize_t{3}});
-        uint8_t* dst = arr.mutable_data();
-        for (const auto& it : pending) {
-            for (const auto& fr : it.data->frames) {
-                std::memcpy(dst, fr.rgb.data(), frame_bytes);
-                dst += frame_bytes;
-            }
-        }
-
-        py::array_t<float, py::array::c_style | py::array::forcecast> emb;
+        const float* rows = nullptr;
         try {
-            emb = vision.embed_fn(arr);
-            if (const uint32_t hint = vision.hint_fn().cast<uint32_t>(); hint > 0 && hint < batch) {
+            // Pack directly into shared memory
+            uint8_t* dst = vision.prepare_shm(frames);
+            for (const auto& it : pending) {
+                for (const auto& fr : it.data->frames) {
+                    std::memcpy(dst, fr.rgb.data(), frame_bytes);
+                    dst += frame_bytes;
+                }
+            }
+            rows = vision.embed(frames);
+            if (const uint32_t hint = vision.last_hint; hint > 0 && hint < batch) {
                 batch = hint;
                 pr.d.batch = batch;
                 std::printf("Reduced batch size to %u after running out of VRAM\n", batch);
             }
         } catch (const std::exception& e) {
+            if (stopping()) break;
             std::printf("embed failed: %s\n", e.what());
             const std::wstring reason = py_error_text(e);
             pr.set_message(reason);
@@ -817,7 +1004,6 @@ int run_indexer(Settings& settings) {
             continue;
         }
 
-        const float* rows = emb.data();
         const size_t dim = vision.dim;
         size_t row = 0;
         for (const auto& it : pending) {
@@ -853,11 +1039,8 @@ int run_indexer(Settings& settings) {
         pr.publish();
     }
     queue.close();
-    {
-        py::gil_scoped_release release;
-        pool.clear();
-        flush(true);
-    }
+    pool.clear();
+    flush(true);
     failures.save();
 
     IndexState st{unix_now(), files.size(), {}};

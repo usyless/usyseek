@@ -161,20 +161,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(usylibpp glaze)
 
-# Embedded CPython for the vision tower (torch). Must match the venv's major.minor version.
-set(Python_FIND_REGISTRY NEVER)
-set(PYBIND11_FINDPYTHON ON CACHE BOOL "" FORCE)
-find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Embed)
-message(STATUS "[usyseek] Embedding Python ${Python_VERSION_MAJOR}.${Python_VERSION_MINOR} from ${Python_EXECUTABLE}")
-
-FetchContent_Declare(
-    pybind11
-    GIT_REPOSITORY https://github.com/pybind/pybind11.git
-    GIT_TAG "${USYSEEK_PYBIND11_VERSION}"
-    GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(pybind11)
-
 ##### Common compile settings
 add_library(usyseek_common INTERFACE)
 target_include_directories(usyseek_common INTERFACE
@@ -269,7 +255,7 @@ add_custom_command(TARGET usyseek-ui POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${ORT_ROOT}/lib/onnxruntime.dll" "$<TARGET_FILE_DIR:usyseek-ui>/onnxruntime.dll"
 )
 
-##### usyseek-indexer.exe - scanning + embedding (Everything, WIC, Media Foundation, embedded torch)
+##### usyseek-indexer.exe - scanning + embedding (Everything, WIC, Media Foundation, shared-memory Python worker)
 set(USYSEEK_RES_DIR "${PROJECT_SOURCE_DIR}/resources")
 configure_file("${PROJECT_SOURCE_DIR}/resources/indexer.rc.in" "${CMAKE_BINARY_DIR}/indexer.rc" @ONLY)
 add_executable(usyseek-indexer
@@ -277,19 +263,11 @@ add_executable(usyseek-indexer
     "${CMAKE_BINARY_DIR}/indexer.rc"
 )
 set_target_properties(usyseek-indexer PROPERTIES CXX_SCAN_FOR_MODULES OFF)
-target_include_directories(usyseek-indexer PRIVATE "${pybind11_SOURCE_DIR}/include")
 target_link_libraries(usyseek-indexer PRIVATE
     usyseek_common
     usyseek_rust
-    pybind11::embed
     windowscodecs mfplat mfreadwrite mfuuid propsys
     shell32 shlwapi ole32 oleaut32 user32
-)
-target_compile_definitions(usyseek-indexer PRIVATE
-    USYSEEK_PYTHON_VERSION=L"${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}"
-)
-target_compile_definitions(usyseek-ui PRIVATE
-    USYSEEK_PYTHON_VERSION=L"${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}"
 )
 
 ##### Runtime layout next to the executables

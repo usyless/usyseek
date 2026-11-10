@@ -1,4 +1,4 @@
-"""usyseek vision backend, embedded in usyseek-indexer.exe through pybind11.
+"""usyseek vision backend, run as a persistent worker process over Win32 shared memory + named pipe.
 
 Interface (a custom script set in settings must provide the same functions):
     load(cfg: dict) -> dict
@@ -9,8 +9,9 @@ Interface (a custom script set in settings must provide the same functions):
     batch_hint() -> int        (0 = no limit; lowered automatically after an out-of-memory error)
     export_text(model_dir, model_name) -> str   (path of the text tower onnx, exported if missing)
 
-The C++ side decodes and resizes images to size x size RGB (using resize_mode), so this module only
-uploads uint8 pixels, normalises on the device and runs the vision tower.
+The C++ side decodes and resizes images to size x size RGB (using resize_mode) directly into a Win32
+pagefile-backed shared memory mapping, so this module reads uint8 pixels zero-copy from RAM,
+normalises on the device, runs the vision tower, and writes float32 embeddings back into shared memory.
 """
 
 import os
@@ -259,3 +260,93 @@ def export_text(model_dir, model_name):
             except OSError:
                 pass
     return str(onnx_path)
+
+
+def _run_worker(pipe_name, custom_script=""):
+    import importlib.util
+    import json
+    import mmap
+    import sys
+    import numpy as np
+
+    target = sys.modules[__name__]
+    if custom_script:
+        spec = importlib.util.spec_from_file_location("usyseek_custom_vision", custom_script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        target = mod
+
+    shm_name = ""
+    shm_bytes = 0
+    shm_map = None
+    size = 0
+    dim = 0
+
+    with open(pipe_name, "r+b", buffering=0) as pipe:
+        buf = b""
+
+        def read_msg():
+            nonlocal buf
+            while b"\n" not in buf:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    return None
+                buf += chunk
+            line, _, buf = buf.partition(b"\n")
+            return json.loads(line.decode("utf-8"))
+
+        def send_msg(obj):
+            pipe.write((json.dumps(obj) + "\n").encode("utf-8"))
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            cmd = msg.get("cmd")
+            if cmd == "quit":
+                break
+            try:
+                if cmd == "load":
+                    info = target.load(msg["cfg"])
+                    size = int(info["size"])
+                    dim = int(info["dim"])
+                    send_msg({"ok": True, "info": info})
+                elif cmd == "export_text":
+                    p = target.export_text(msg["model_dir"], msg["model_name"]) if hasattr(target, "export_text") else ""
+                    send_msg({"ok": True, "path": str(p)})
+                elif cmd == "suggest_batch":
+                    b = int(target.suggest_batch(int(msg.get("limit", 128)))) if hasattr(target, "suggest_batch") else 16
+                    send_msg({"ok": True, "batch": b})
+                elif cmd == "embed":
+                    req_shm = msg["shm"]
+                    req_bytes = int(msg["shm_bytes"])
+                    frames = int(msg["frames"])
+                    if req_shm != shm_name or req_bytes != shm_bytes or shm_map is None:
+                        if shm_map is not None:
+                            shm_map.close()
+                        shm_map = mmap.mmap(-1, req_bytes, tagname=req_shm, access=mmap.ACCESS_WRITE)
+                        shm_name = req_shm
+                        shm_bytes = req_bytes
+                    in_count = frames * size * size * 3
+                    arr = np.frombuffer(shm_map, dtype=np.uint8, count=in_count).reshape((frames, size, size, 3))
+                    emb = np.ascontiguousarray(target.embed(arr), dtype=np.float32)
+                    out_count = frames * dim
+                    np.frombuffer(shm_map, dtype=np.float32, count=out_count)[:] = emb.ravel()[:out_count]
+                    hint = int(target.batch_hint()) if hasattr(target, "batch_hint") else 0
+                    send_msg({"ok": True, "hint": hint})
+                else:
+                    send_msg({"ok": False, "error": f"unknown cmd: {cmd}"})
+            except Exception as e:
+                send_msg({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    if shm_map is not None:
+        shm_map.close()
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) >= 3 and sys.argv[1] == "--worker":
+        _run_worker(sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else "")
+    elif len(sys.argv) >= 4 and sys.argv[1] == "--export-text":
+        export_text(sys.argv[2], sys.argv[3])

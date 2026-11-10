@@ -789,12 +789,13 @@ private:
             const float lx = x + 22.0f, rw = w - 44.0f;
 
             cv.text(L"Python Virtual Environment (.venv)", rect(lx, y + 16.0f, 360.0f, 22.0f), Font::Large, color::on_surface);
-            cv.text(L"Embedded via pybind11 inside usyseek-indexer.exe (must match Python " USYSEEK_PYTHON_VERSION L")",
+            cv.text(L"Connected via shared memory (supports any Python 3.10+ .venv with PyTorch & open-clip)",
                     rect(lx, y + 38.0f, rw - 140.0f, 18.0f), Font::Small, color::on_surface_variant);
 
             // Status pill
-            const bool ver_ok = venv_.exists && major_minor(venv_.version) == USYSEEK_PYTHON_VERSION;
-            const std::wstring st_txt = venv_busy_ ? L"Running task…" : (ver_ok ? L".venv Ready" : (venv_.exists ? L"Wrong Python version" : L"Not found"));
+            std::error_code ec;
+            const bool ver_ok = venv_.exists && fs::exists(venv_.python_exe, ec);
+            const std::wstring st_txt = venv_busy_ ? L"Running task…" : (ver_ok ? L".venv Ready" : (venv_.exists ? L"Missing python.exe" : L"Not found"));
             const D2D1_COLOR_F st_col = venv_busy_ ? color::amber : (ver_ok ? color::mint : color::error);
             const float sw = cv.measure(st_txt, Font::Caption) + 26.0f;
             const D2D1_RECT_F sbr = rect(lx + rw - sw, y + 18.0f, sw, 24.0f);
@@ -952,10 +953,11 @@ private:
         if (!venv_.home.empty() && fs::exists(fs::path{venv_.home} / L"python.exe")) {
             return fs::path{venv_.home} / L"python.exe";
         }
-        std::wstring ver_nodot{USYSEEK_PYTHON_VERSION};
-        std::erase(ver_nodot, L'.');
-        const fs::path local = known_folder(FOLDERID_LocalAppData) + L"\\Programs\\Python\\Python" + ver_nodot + L"\\python.exe";
-        if (fs::exists(local)) return local;
+        const fs::path py_root = fs::path{known_folder(FOLDERID_LocalAppData)} / L"Programs" / L"Python";
+        for (const wchar_t* ver : {L"Python314", L"Python313", L"Python312", L"Python311", L"Python310"}) {
+            const fs::path candidate = py_root / ver / L"python.exe";
+            if (fs::exists(candidate)) return candidate;
+        }
         return L"python.exe";
     }
 

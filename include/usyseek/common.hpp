@@ -234,15 +234,4 @@ inline bool send_to_launcher(Cmd cmd) noexcept {
     return send_cmd(find_launcher(), cmd);
 }
 
-/// Writes a line to data/<name>.log (best-effort, append).
-inline void log_line(const wchar_t* name, std::string_view line) {
-    const fs::path p = data_dir() / (std::wstring{name} + L".log");
-    HANDLE h = CreateFileW(p.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    DWORD written = 0;
-    WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
-    WriteFile(h, "\r\n", 2, &written, nullptr);
-    CloseHandle(h);
-}
-
 } // namespace usyseek

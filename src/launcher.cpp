@@ -184,27 +184,14 @@ private:
     // Processes
     // ------------------------------------------------------------------------------------------
 
-    wil::unique_process_information spawn(const fs::path& exe, std::wstring args, bool console_log, const wchar_t* log_name,
-                                          const std::wstring* env = nullptr) {
+    wil::unique_process_information spawn(const fs::path& exe, std::wstring args, bool no_window) {
         wil::unique_process_information pi;
         std::wstring cmd = L"\"" + exe.wstring() + L"\" " + args;
         STARTUPINFOW si{sizeof(si)};
-        wil::unique_handle log;
-        if (console_log) {
-            SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
-            log.reset(CreateFileW((data_dir() / log_name).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
-                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
-            if (log.get() == INVALID_HANDLE_VALUE) log.release();
-            if (log) {
-                si.dwFlags = STARTF_USESTDHANDLES;
-                si.hStdOutput = log.get();
-                si.hStdError = log.get();
-            }
-        }
         DWORD flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
-        if (console_log) flags |= CREATE_NO_WINDOW;
-        if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, log ? TRUE : FALSE, flags,
-                            env ? const_cast<wchar_t*>(env->data()) : nullptr, exe_dir().c_str(), &si, &pi)) {
+        if (no_window) flags |= CREATE_NO_WINDOW;
+        if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, flags,
+                            nullptr, exe_dir().c_str(), &si, &pi)) {
             return {};
         }
         AssignProcessToJobObject(job_.get(), pi.hProcess);
@@ -228,7 +215,7 @@ private:
 
     void spawn_ui(const wchar_t* arg) {
         ensure_qdrant();
-        ui_ = spawn(exe_dir() / L"usyseek-ui.exe", arg, false, nullptr);
+        ui_ = spawn(exe_dir() / L"usyseek-ui.exe", arg, false);
     }
 
     void toggle_search() {
@@ -288,29 +275,7 @@ private:
         ensure_qdrant();
         ResetEvent(stop_event_.get());
 
-        // python3XX.dll is resolved at load time, so expose the venv's base interpreter on PATH
-        std::wstring env;
-        const VenvInfo venv = read_venv(to_wide(settings_.venv_dir));
-        std::wstring prefix;
-        if (!venv.home.empty()) prefix = venv.home + L";" + venv.home + L"\\DLLs;" + to_wide(settings_.venv_dir) + L"\\Scripts;";
-        if (wchar_t* block = GetEnvironmentStringsW()) {
-            for (const wchar_t* p = block; *p; p += wcslen(p) + 1) {
-                if (_wcsnicmp(p, L"PATH=", 5) == 0) {
-                    env += L"PATH=" + prefix + (p + 5);
-                } else if (_wcsnicmp(p, L"PYTHON", 6) == 0) {
-                    continue; // never let a global PYTHONHOME/PYTHONPATH leak into the embedded interpreter
-                } else {
-                    env += p;
-                }
-                env.push_back(L'\0');
-            }
-            FreeEnvironmentStringsW(block);
-        }
-        env += L"PYTHONUNBUFFERED=1";
-        env.push_back(L'\0');
-        env.push_back(L'\0');
-
-        indexer_ = spawn(exe_dir() / L"usyseek-indexer.exe", L"", true, L"indexer.log", &env);
+        indexer_ = spawn(exe_dir() / L"usyseek-indexer.exe", L"", true);
         stopping_index_ = false;
         if (indexer_.hProcess) SetTimer(hwnd_, TIMER_TRAY_PROGRESS, 1000, nullptr);
         notify_ui();
