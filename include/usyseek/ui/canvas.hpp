@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fit.hpp"
 #include "gfx.hpp"
 
 #include <array>
@@ -245,8 +246,16 @@ public:
     void text(std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c, Align a = Align::Left) {
         if (s.empty()) return;
         IDWriteTextFormat* fmt = fonts_.get(f);
-        fmt->SetTextAlignment(a == Align::Left ? DWRITE_TEXT_ALIGNMENT_LEADING : a == Align::Center ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_TRAILING);
+        fmt->SetTextAlignment(text_alignment(a));
         dc_->DrawText(s.data(), static_cast<UINT32>(s.size()), fmt, r, brush(c), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    void text_wrap(std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c, Align a = Align::Left) {
+        if (s.empty()) return;
+        wil::com_ptr<IDWriteTextLayout> layout = wrapped_layout(s, f, width(r));
+        if (!layout) return;
+        layout->SetTextAlignment(text_alignment(a));
+        dc_->DrawTextLayout(D2D1::Point2F(r.left, r.top), layout.get(), brush(c), D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 
     void icon(wchar_t g, D2D1_RECT_F r, D2D1_COLOR_F c, Font f = Font::Icon) {
@@ -258,12 +267,12 @@ public:
         return fonts_.measure(s, f);
     }
 
-    void fill_bitmap_round(ID2D1Bitmap1* bmp, D2D1_RECT_F tr, float radius) {
+    void fill_bitmap_round(ID2D1Bitmap1* bmp, D2D1_RECT_F tr, float radius, ThumbFit fit = ThumbFit::Crop) {
         const D2D1_SIZE_F bs = bmp->GetSize();
         if (bs.width <= 0.0f || bs.height <= 0.0f) return;
-        const float s = std::max(width(tr) / bs.width, height(tr) / bs.height);
-        const float ox = tr.left + (width(tr) - bs.width * s) * 0.5f;
-        const float oy = tr.top + (height(tr) - bs.height * s) * 0.5f;
+        const FitRect dest = fit_image(bs.width, bs.height, FitRect{tr.left, tr.top, width(tr), height(tr)}, fit);
+        const float s = dest.width / bs.width;
+        const D2D1_RECT_F drawn = fit == ThumbFit::Contain ? rect(dest.left, dest.top, dest.width, dest.height) : tr;
         if (!bmp_brush_) {
             const auto bp = D2D1::BitmapBrushProperties1(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_INTERPOLATION_MODE_LINEAR);
             dc_->CreateBitmapBrush(bmp, &bp, nullptr, &bmp_brush_);
@@ -272,15 +281,16 @@ public:
         }
         if (bmp_brush_) {
             bmp_brush_->SetOpacity(opacity_);
-            bmp_brush_->SetTransform(D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(ox, oy));
-            dc_->FillRoundedRectangle(D2D1::RoundedRect(tr, radius, radius), bmp_brush_.get());
+            bmp_brush_->SetTransform(D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(dest.left, dest.top));
+            dc_->FillRoundedRectangle(D2D1::RoundedRect(drawn, radius, radius), bmp_brush_.get());
         }
     }
 
     /// Height of wrapped text in `w` DIPs.
     float measure_height(std::wstring_view s, Font f, float w) {
-        wil::com_ptr<IDWriteTextLayout> layout;
-        if (FAILED(fonts_.dwrite()->CreateTextLayout(s.data(), static_cast<UINT32>(s.size()), fonts_.get(f), w, 10000.0f, &layout))) return 0.0f;
+        if (s.empty()) return 0.0f;
+        wil::com_ptr<IDWriteTextLayout> layout = wrapped_layout(s, f, w);
+        if (!layout) return 0.0f;
         DWRITE_TEXT_METRICS m{};
         layout->GetMetrics(&m);
         return m.height;
@@ -313,6 +323,20 @@ public:
     }
 
 private:
+    static DWRITE_TEXT_ALIGNMENT text_alignment(Align a) noexcept {
+        return a == Align::Left ? DWRITE_TEXT_ALIGNMENT_LEADING : a == Align::Center ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_TRAILING;
+    }
+
+    wil::com_ptr<IDWriteTextLayout> wrapped_layout(std::wstring_view s, Font f, float w) {
+        wil::com_ptr<IDWriteTextLayout> layout;
+        if (FAILED(fonts_.dwrite()->CreateTextLayout(s.data(), static_cast<UINT32>(s.size()), fonts_.get(f), std::max(1.0f, w), 10000.0f, &layout))) return nullptr;
+        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        const DWRITE_TRIMMING no_trim{DWRITE_TRIMMING_GRANULARITY_NONE, 0, 0};
+        layout->SetTrimming(&no_trim, nullptr);
+        return layout;
+    }
+
     ID2D1DeviceContext6* dc_;
     Fonts& fonts_;
     std::vector<Hit>& hits_;

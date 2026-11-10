@@ -735,10 +735,12 @@ private:
         else cv.stroke_round(r, 14, with_alpha(color::outline_variant, hov ? 0.9f : 0.45f));
         cv.hit(r, IdCard, i);
 
-        // Thumbnail (cover-cropped through a reusable bitmap brush so the corners stay rounded)
+        // Thumbnail (cropped or letterboxed through a reusable bitmap brush so the corners stay rounded)
         const D2D1_RECT_F tr = rect(r.left + 6, r.top + 6, g.card_w - 12, g.thumb_h);
         if (ID2D1Bitmap1* bmp = sh_.thumbs.get(it.pt.id)) {
-            cv.fill_bitmap_round(bmp, tr, 10.0f);
+            const ThumbFit fit = parse_thumb_fit(sh_.settings.thumb_fit);
+            if (fit == ThumbFit::Contain) cv.fill_round(tr, 10, color::surface_lowest);
+            cv.fill_bitmap_round(bmp, tr, 10.0f, fit);
         } else {
             cv.fill_round(tr, 10, with_alpha(color::surface_highest, 0.6f));
             cv.icon(it.pt.p.k == 1 ? glyph::video : glyph::photo, tr, with_alpha(color::outline, 0.6f), Font::IconLarge);

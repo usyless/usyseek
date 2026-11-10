@@ -18,6 +18,7 @@ struct Settings {
     int32_t pill_y = INT32_MIN;
     int32_t pill_w = 0;         // DIPs, 0 = default
     int32_t pill_h = 0;
+    std::string thumb_fit = "crop"; // crop | contain
 
     // Indexing scope
     bool whole_pc = true;
@@ -54,6 +55,8 @@ struct IndexState {
     int64_t last_index_unix = 0;
     uint64_t last_index_found = 0;
     std::string last_error;
+    uint32_t auto_batch = 0; // batch size benchmarked for auto_batch_key, 0 = not measured
+    std::string auto_batch_key;
 };
 
 inline constexpr auto JSON_READ = glz::opts{.error_on_unknown_keys = false};

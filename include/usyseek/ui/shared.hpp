@@ -4,6 +4,7 @@
 #include "search.hpp"
 #include "thumbs.hpp"
 
+#include <usyseek/progress.hpp>
 #include <usyseek/status.hpp>
 
 #include <dwmapi.h>

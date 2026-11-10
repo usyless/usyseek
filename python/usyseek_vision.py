@@ -6,6 +6,7 @@ Interface (a custom script set in settings must provide the same functions):
         returns: size (int), resize_mode ("squash" | "shortest" | "longest"), dim, device, backend
     embed(batch: numpy.ndarray[uint8, N x H x W x 3]) -> numpy.ndarray[float32, N x dim]   (L2 normalised)
     suggest_batch(limit: int) -> int
+    benchmark_batch(limit: int) -> int   (fastest batch size that fits in VRAM, optional: falls back to suggest_batch)
     batch_hint() -> int        (0 = no limit; lowered automatically after an out-of-memory error)
     export_text(model_dir, model_name) -> str   (path of the text tower onnx, exported if missing)
 
@@ -27,6 +28,11 @@ _std = None
 _dim = 0
 _size = 0
 _hint = 0
+
+_BENCH_FIRST_SIZE = 8
+_BENCH_TIMED_RUNS = 3
+_BENCH_DROP_RATIO = 0.75
+_BENCH_GAIN_RATIO = 1.03
 
 
 def _model_paths(model_dir, model_name):
@@ -199,6 +205,64 @@ def suggest_batch(limit=128):
     return max(8, (capped // 8) * 8)
 
 
+def candidate_sizes(cap):
+    """Powers of two from the first benchmark size up to the cap, always ending on the cap."""
+    sizes = []
+    n = _BENCH_FIRST_SIZE
+    while n < cap:
+        sizes.append(n)
+        n *= 2
+    sizes.append(max(1, cap))
+    return sizes
+
+
+def search_batch(sizes, measure):
+    """Walks sizes in ascending order and returns the fastest. measure(size) gives images per second,
+    or None when the size ran out of memory. Stops at the first out-of-memory size or once throughput
+    falls below _BENCH_DROP_RATIO of the best. A larger size only wins by beating the best by _BENCH_GAIN_RATIO."""
+    best_size = sizes[0]
+    best_rate = 0.0
+    for size in sizes:
+        rate = measure(size)
+        if rate is None:
+            break
+        if rate > best_rate * _BENCH_GAIN_RATIO:
+            best_size = size
+            best_rate = rate
+        elif rate < best_rate * _BENCH_DROP_RATIO:
+            break
+    return best_size
+
+
+def benchmark_batch(limit=128):
+    """Times embedding at increasing batch sizes up to what suggest_batch fits in VRAM and returns the fastest.
+    On CPU throughput barely depends on batch size, so the suggested size is kept."""
+    cap = suggest_batch(limit)
+    if _device != "cuda":
+        return cap
+    import time
+    import numpy as np
+
+    def measure(size):
+        frames = np.zeros((size, _size, _size, 3), dtype=np.uint8)
+        try:
+            _run(frames)
+            start = time.perf_counter()
+            for _ in range(_BENCH_TIMED_RUNS):
+                _run(frames)
+            elapsed = time.perf_counter() - start
+        except Exception as e:  # torch.OutOfMemoryError, HIP/CUDA OOM RuntimeError
+            if "out of memory" not in str(e).lower():
+                raise
+            return None
+        return size * _BENCH_TIMED_RUNS / elapsed
+
+    try:
+        return search_batch(candidate_sizes(cap), measure)
+    finally:
+        _torch.cuda.empty_cache()
+
+
 def export_text(model_dir, model_name):
     """One-time export of the text tower to ONNX so the search UI never needs torch."""
     weights, onnx_path = _model_paths(model_dir, model_name)
@@ -316,6 +380,10 @@ def _run_worker(pipe_name, custom_script=""):
                     send_msg({"ok": True, "path": str(p)})
                 elif cmd == "suggest_batch":
                     b = int(target.suggest_batch(int(msg.get("limit", 128)))) if hasattr(target, "suggest_batch") else 16
+                    send_msg({"ok": True, "batch": b})
+                elif cmd == "benchmark_batch":
+                    fn = target.benchmark_batch if hasattr(target, "benchmark_batch") else target.suggest_batch
+                    b = int(fn(int(msg.get("limit", 128)))) if hasattr(target, "suggest_batch") else 16
                     send_msg({"ok": True, "batch": b})
                 elif cmd == "embed":
                     req_shm = msg["shm"]

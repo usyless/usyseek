@@ -449,6 +449,10 @@ struct PySuggestReq {
     std::string cmd = "suggest_batch";
     uint32_t limit = 128;
 };
+struct PyBenchmarkReq {
+    std::string cmd = "benchmark_batch";
+    uint32_t limit = 128;
+};
 struct PyEmbedReq {
     std::string cmd = "embed";
     std::string shm;
@@ -574,6 +578,10 @@ struct PyVision {
 
     uint32_t suggest_batch(uint32_t limit = 128) {
         return call(PySuggestReq{.limit = limit}).batch;
+    }
+
+    uint32_t benchmark_batch(uint32_t limit = 128) {
+        return call(PyBenchmarkReq{.limit = limit}).batch;
     }
 
     uint8_t* prepare_shm(size_t frames) {
@@ -795,7 +803,7 @@ int run_indexer(Settings& settings) {
 
     // --- Compare against the database (carry tags over for changed files)
     pr.phase(Phase::Comparing);
-    pr.d.found = files.size();
+    uint64_t already_embedded = 0;
     FailureCache failures{coll};
     std::vector<size_t> todo;
     std::unordered_set<uint64_t> found_ids;
@@ -819,7 +827,7 @@ int run_indexer(Settings& settings) {
                 const auto it = existing.find(f.id);
                 if (it != existing.end()) {
                     if (it->second.m == f.mtime && it->second.s == f.size) {
-                        ++pr.d.embedded;
+                        ++already_embedded;
                         failures.remove(f.id);
                         continue;
                     }
@@ -834,6 +842,8 @@ int run_indexer(Settings& settings) {
             pr.publish();
         }
     }
+    pr.d.found = files.size();
+    pr.d.embedded = already_embedded;
     if (stopping()) return 2;
 
     // --- Remove entries for deleted / newly excluded files
@@ -871,19 +881,32 @@ int run_indexer(Settings& settings) {
     if (todo.empty() || stopping()) {
         failures.save();
         pr.phase(stopping() ? Phase::Stopped : Phase::Done);
-        IndexState st{unix_now(), files.size(), {}};
+        IndexState st = load_json_file<IndexState>(state_path());
+        st.last_index_unix = unix_now();
+        st.last_index_found = files.size();
+        st.last_error.clear();
         save_json_file(state_path(), st);
         return 0;
     }
 
     // --- Batch size
     uint32_t batch = settings.batch_size;
-    if (batch == 0) {
-        try {
-            batch = vision.suggest_batch(128);
-        } catch (const std::exception& e) {
-            std::printf("suggest_batch failed: %s\n", e.what());
-            batch = 16;
+    const bool auto_batch = batch == 0;
+    const std::string auto_batch_key = settings.model_name + "|" + to_utf8(vision.device) + "|" + std::to_string(vision.size);
+    if (auto_batch) {
+        IndexState cached = load_json_file<IndexState>(state_path());
+        if (cached.auto_batch > 0 && cached.auto_batch_key == auto_batch_key) {
+            batch = cached.auto_batch;
+        } else {
+            try {
+                batch = vision.benchmark_batch(128);
+            } catch (const std::exception& e) {
+                std::printf("benchmark_batch failed: %s\n", e.what());
+                batch = 16;
+            }
+            cached.auto_batch = batch;
+            cached.auto_batch_key = auto_batch_key;
+            save_json_file(state_path(), cached);
         }
     }
     batch = std::max(1u, batch);
@@ -1037,7 +1060,11 @@ int run_indexer(Settings& settings) {
     flush(true);
     failures.save();
 
-    IndexState st{unix_now(), files.size(), {}};
+    IndexState st = load_json_file<IndexState>(state_path());
+    st.last_index_unix = unix_now();
+    st.last_index_found = files.size();
+    st.last_error.clear();
+    if (auto_batch && batch < st.auto_batch) st.auto_batch = batch;
     save_json_file(state_path(), st);
     pr.phase(was_stopped ? Phase::Stopped : Phase::Done);
     return was_stopped ? 2 : 0;

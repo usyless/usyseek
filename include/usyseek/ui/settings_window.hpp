@@ -1,7 +1,9 @@
 #pragma once
 
 #include "shared.hpp"
+#include "flow.hpp"
 #include "textfield.hpp"
+#include "../exclusions.hpp"
 
 #include <shobjidl.h>
 #include <urlmon.h>
@@ -48,6 +50,47 @@ public:
 
 private:
     std::function<void(ULONG, ULONG)> on_progress_;
+};
+
+class Flow {
+public:
+    Flow(float gap_x, float gap_y) : gap_x_{gap_x}, gap_y_{gap_y} {}
+
+    void add(float w, float h, std::function<void(D2D1_RECT_F)> draw, bool grow = false) {
+        items_.push_back({w, h, grow});
+        draws_.push_back(std::move(draw));
+    }
+
+    void add_group(const Flow& inner, float avail, bool grow = false) {
+        const float group_w = std::min(inner.natural_width(), avail);
+        add(group_w, inner.height(group_w), [inner](D2D1_RECT_F r) { inner.draw(r.left, r.top, width(r)); }, grow);
+    }
+
+    [[nodiscard]] float natural_width() const {
+        float total = 0.0f;
+        for (const FlowItem& item : items_) {
+            total += item.width;
+        }
+        return items_.empty() ? 0.0f : total + gap_x_ * static_cast<float>(items_.size() - 1);
+    }
+
+    [[nodiscard]] float height(float avail) const {
+        return flow_layout(items_, gap_x_, gap_y_, avail).height;
+    }
+
+    void draw(float x, float y, float avail) const {
+        const FlowResult layout = flow_layout(items_, gap_x_, gap_y_, avail);
+        for (size_t i = 0; i < items_.size(); ++i) {
+            const FlowPlacement& p = layout.placements[i];
+            draws_[i](rect(x + p.x, y + p.y, p.width, items_[i].height));
+        }
+    }
+
+private:
+    float gap_x_;
+    float gap_y_;
+    std::vector<FlowItem> items_;
+    std::vector<std::function<void(D2D1_RECT_F)>> draws_;
 };
 
 class SettingsWindow {
@@ -194,6 +237,7 @@ private:
         IdToggleStartup,
         IdToggleHideFocus,
         IdIdleStep,
+        IdThumbFit,
         IdBrowseModelDir,
         IdModelChip,
         IdModelField,
@@ -352,6 +396,70 @@ private:
         cv.hit(r, id, idx);
     }
 
+    float text_height(Canvas& cv, std::wstring_view s, Font f, float w, float min_h) {
+        return std::max(min_h, cv.measure_height(s, f, w));
+    }
+
+    float mono_row_height(Canvas& cv, std::wstring_view s, float text_w, float min_h) {
+        return std::max(min_h, 12.0f + cv.measure_height(s, Font::MonoSmall, text_w));
+    }
+
+    float button_width(Canvas& cv, std::wstring_view label, bool has_icon, float min_w) {
+        return std::max(min_w, cv.measure(label, Font::SmallSemi) + (has_icon ? 24.0f : 0.0f) + 28.0f);
+    }
+
+    void text_middle(Canvas& cv, std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c) {
+        const float th = cv.measure_height(s, f, width(r));
+        cv.text_wrap(s, rect(r.left, r.top + std::max(0.0f, (height(r) - th) * 0.5f), width(r), th), f, c);
+    }
+
+    void flow_text(Canvas& cv, Flow& flow, std::wstring_view s, Font f, D2D1_COLOR_F c, float avail, float line_h,
+                   bool grow = false, Align a = Align::Left) {
+        const float natural = cv.measure(s, f) + 4.0f;
+        if (natural <= avail) {
+            flow.add(natural, line_h, [&cv, text = std::wstring{s}, f, c, a](D2D1_RECT_F r) { cv.text(text, r, f, c, a); }, grow);
+            return;
+        }
+        const float wrapped_h = text_height(cv, s, f, avail, line_h);
+        flow.add(avail, wrapped_h, [&cv, text = std::wstring{s}, f, c, a](D2D1_RECT_F r) { cv.text_wrap(text, r, f, c, a); });
+    }
+
+    struct CardHeader {
+        std::wstring title;
+        std::wstring caption;
+        D2D1_COLOR_F title_color;
+        float side_w;
+        float side_h;
+        bool beside;
+        float text_w;
+        float title_h;
+        float caption_h;
+        float h;
+    };
+
+    CardHeader make_header(Canvas& cv, float rw, std::wstring title, D2D1_COLOR_F title_color, std::wstring caption,
+                           float side_w = 0.0f, float side_h = 0.0f) {
+        CardHeader hd{std::move(title), std::move(caption), title_color, side_w, side_h};
+        const float beside_w = rw - side_w - (side_w > 0.0f ? 12.0f : 0.0f);
+        hd.beside = side_w <= 0.0f || beside_w >= 200.0f;
+        hd.text_w = hd.beside ? beside_w : rw;
+        hd.title_h = text_height(cv, hd.title, Font::Large, hd.text_w, 22.0f);
+        hd.caption_h = hd.caption.empty() ? 0.0f : text_height(cv, hd.caption, Font::Small, hd.text_w, 18.0f);
+        hd.h = hd.title_h + hd.caption_h + (hd.beside ? 0.0f : 8.0f + side_h);
+        return hd;
+    }
+
+    D2D1_RECT_F draw_header(Canvas& cv, float lx, float y, float rw, const CardHeader& hd) {
+        cv.text_wrap(hd.title, rect(lx, y + 16.0f, hd.text_w, hd.title_h), Font::Large, hd.title_color);
+        cv.text_wrap(hd.caption, rect(lx, y + 16.0f + hd.title_h, hd.text_w, hd.caption_h), Font::Small, color::on_surface_variant);
+        if (hd.beside) return rect(lx + rw - hd.side_w, y + 18.0f, hd.side_w, hd.side_h);
+        return rect(lx, y + 16.0f + hd.title_h + hd.caption_h + 8.0f, hd.side_w, hd.side_h);
+    }
+
+    float radio_height(Canvas& cv, float w, std::wstring_view title, std::wstring_view desc) {
+        return 8.0f + text_height(cv, title, Font::BodySemi, w - 54.0f, 20.0f) + text_height(cv, desc, Font::Caption, w - 54.0f, 18.0f) + 10.0f;
+    }
+
     void draw_radio(Canvas& cv, D2D1_RECT_F r, bool on, std::wstring_view title, std::wstring_view desc, int id) {
         const bool hov = hovered(id);
         cv.fill_round(r, 12.0f, on ? with_alpha(color::primary_container, 0.32f) : (hov ? color::surface_high : color::surface_low));
@@ -359,8 +467,10 @@ private:
         const D2D1_POINT_2F c{r.left + 22.0f, (r.top + r.bottom) * 0.5f};
         cv.stroke_circle(c, 8.0f, on ? color::primary : color::outline, 1.8f);
         if (on) cv.fill_circle(c, 4.5f, color::primary);
-        cv.text(title, rect(r.left + 42.0f, r.top + 8.0f, width(r) - 54.0f, 20.0f), Font::BodySemi, color::on_surface);
-        cv.text(desc, rect(r.left + 42.0f, r.top + 28.0f, width(r) - 54.0f, 18.0f), Font::Caption, color::on_surface_variant);
+        const float title_h = text_height(cv, title, Font::BodySemi, width(r) - 54.0f, 20.0f);
+        const float desc_h = text_height(cv, desc, Font::Caption, width(r) - 54.0f, 18.0f);
+        cv.text_wrap(title, rect(r.left + 42.0f, r.top + 8.0f, width(r) - 54.0f, title_h), Font::BodySemi, color::on_surface);
+        cv.text_wrap(desc, rect(r.left + 42.0f, r.top + 8.0f + title_h, width(r) - 54.0f, desc_h), Font::Caption, color::on_surface_variant);
         cv.hit(r, id);
     }
 
@@ -375,6 +485,31 @@ private:
     // Main draw
     // ------------------------------------------------------------------------------------------
 
+    struct TabDef {
+        wchar_t g;
+        const wchar_t* label;
+        int id;
+    };
+
+    static std::array<TabDef, 2> tab_defs() {
+        return {{
+            {glyph::clock, L"Embeddings & Progress", IdTab0},
+            {glyph::settings, L"Application & Venv Settings", IdTab1},
+        }};
+    }
+
+    FlowResult tab_layout(float total_w) const {
+        std::vector<FlowItem> items;
+        for (const TabDef& t : tab_defs()) {
+            items.push_back({sh_.fonts.measure(t.label, Font::BodySemi) + 46.0f, TABS_H - 16.0f});
+        }
+        return flow_layout(items, 8.0f, 8.0f, total_w - PAD * 2.0f);
+    }
+
+    [[nodiscard]] float tabs_height(float total_w) const {
+        return tab_layout(total_w).height + 16.0f;
+    }
+
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(color::bg, 0.88f));
@@ -382,7 +517,7 @@ private:
         // Top tab bar
         draw_tabs(cv, sz);
 
-        const D2D1_RECT_F view = D2D1::RectF(0, TABS_H + 1.0f, sz.width, sz.height);
+        const D2D1_RECT_F view = D2D1::RectF(0, tabs_height(sz.width) + 1.0f, sz.width, sz.height);
         cv.push_clip(view);
 
         const float cw = std::min(860.0f, sz.width - PAD * 2.0f);
@@ -413,21 +548,15 @@ private:
     }
 
     void draw_tabs(Canvas& cv, D2D1_SIZE_F sz) {
-        cv.fill(D2D1::RectF(0, 0, sz.width, TABS_H), with_alpha(color::surface_lowest, 0.75f));
-        struct TabDef {
-            wchar_t g;
-            const wchar_t* label;
-            int id;
-        };
-        const TabDef tabs[2] = {
-            {glyph::clock, L"Embeddings & Progress", IdTab0},
-            {glyph::settings, L"Application & Venv Settings", IdTab1},
-        };
-        float x = PAD;
+        const float strip_h = tabs_height(sz.width);
+        cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(color::surface_lowest, 0.75f));
+        const auto tabs = tab_defs();
+        const FlowResult layout = tab_layout(sz.width);
         for (int i = 0; i < 2; ++i) {
+            const FlowPlacement& p = layout.placements[i];
+            const float x = PAD + p.x;
             const float tw = cv.measure(tabs[i].label, Font::BodySemi);
-            const float w = tw + 46.0f;
-            const D2D1_RECT_F r = rect(x, 8.0f, w, TABS_H - 16.0f);
+            const D2D1_RECT_F r = rect(x, 8.0f + p.y, p.width, TABS_H - 16.0f);
             const bool on = tab_ == i;
             if (on) cv.fill_round(r, 10.0f, color::primary_container);
             else if (hovered(tabs[i].id)) cv.fill_round(r, 10.0f, with_alpha(color::on_surface, 0.07f));
@@ -435,9 +564,8 @@ private:
             cv.icon(tabs[i].g, rect(x + 12.0f, r.top, 18.0f, height(r)), fg, Font::IconSmall);
             cv.text(tabs[i].label, rect(x + 34.0f, r.top, tw + 4.0f, height(r)), Font::BodySemi, fg);
             cv.hit(r, tabs[i].id, i);
-            x += w + 8.0f;
         }
-        cv.hline(0, sz.width, TABS_H, with_alpha(color::outline_variant, 0.65f));
+        cv.hline(0, sz.width, strip_h, with_alpha(color::outline_variant, 0.65f));
     }
 
     // ------------------------------------------------------------------------------------------
@@ -447,11 +575,7 @@ private:
     float draw_tab_progress(Canvas& cv, float x, float y, float w) {
         // 1. Hero status card
         {
-            const float h = 216.0f;
-            const float next_y = card_begin(cv, x, y, w, h);
-            const float lx = x + 22.0f, rx = x + w - 22.0f;
-
-            cv.text(L"LOCAL MEDIA EMBEDDING STATUS", rect(lx, y + 16.0f, 320.0f, 16.0f), Font::Label, color::primary);
+            const float lx = x + 22.0f, rw = w - 44.0f;
 
             const bool running = sh_.indexer_running;
             const bool stopping = running && sh_.indexer_stopping;
@@ -463,17 +587,7 @@ private:
             const std::wstring num_b = L" / " + format_count(total);
             const float wa = cv.measure(num_a, Font::Hero);
             const float wb = cv.measure(num_b, Font::Title);
-            cv.text(num_a, rect(lx, y + 34.0f, wa + 4.0f, 40.0f), Font::Hero, color::on_surface);
-            cv.text(num_b, rect(lx + wa + 2.0f, y + 42.0f, wb + 4.0f, 32.0f), Font::Title, color::outline);
-            cv.text(L"files embedded", rect(lx + wa + wb + 10.0f, y + 46.0f, 160.0f, 28.0f), Font::Body, color::on_surface_variant);
 
-            // Start / Stop button
-            draw_button(cv, rect(rx - 156.0f, y + 26.0f, 156.0f, 40.0f),
-                        running ? glyph::pause : glyph::play,
-                        stopping ? L"Stopping…" : (running ? L"Stop Indexing" : L"Start Indexing"),
-                        IdToggleIndex, 0, running ? 2 : 1);
-
-            // Status badge + rate
             std::wstring status_txt = stopping ? L"Stopping…" : (running ? phase_label(d.phase) : (sh_.index_state.last_error.empty() ? L"Up to date" : L"Error"));
             D2D1_COLOR_F badge_col = running ? color::amber : (sh_.index_state.last_error.empty() ? color::mint : color::error);
             if (!running && d.phase == Phase::Stopped && sh_.index_state.last_error.empty()) {
@@ -484,21 +598,9 @@ private:
                 badge_col = color::outline;
             }
             const float bw = cv.measure(status_txt, Font::Caption) + 28.0f;
-            const D2D1_RECT_F br = rect(lx, y + 82.0f, bw, 22.0f);
-            cv.fill_round(br, 11.0f, with_alpha(badge_col, 0.15f));
-            cv.fill_circle({br.left + 11.0f, br.top + 11.0f}, 3.5f, badge_col);
-            cv.text(status_txt, rect(br.left + 20.0f, br.top, bw - 22.0f, 22.0f), Font::Caption, badge_col);
-
-            float sx = br.right + 12.0f;
             const uint64_t fail_cnt = running ? d.failed : sh_.failed_files.size();
-            if (fail_cnt > 0) {
-                const std::wstring ftxt = format_count(fail_cnt) + L" failed";
-                const float fw = cv.measure(ftxt, Font::Caption) + 18.0f;
-                const D2D1_RECT_F fr = rect(sx, y + 82.0f, fw, 22.0f);
-                cv.fill_round(fr, 11.0f, with_alpha(color::error, 0.14f));
-                cv.text(ftxt, fr, Font::Caption, color::error, Align::Center);
-                sx = fr.right + 12.0f;
-            }
+            const std::wstring ftxt = format_count(fail_cnt) + L" failed";
+            const float fw = cv.measure(ftxt, Font::Caption) + 18.0f;
 
             std::wstring sub;
             if (running) {
@@ -521,66 +623,152 @@ private:
             } else {
                 sub = L"Last indexed " + format_ago(sh_.index_state.last_index_unix);
             }
-            cv.text(sub, rect(sx, y + 82.0f, rx - sx, 22.0f), Font::Caption, color::on_surface_variant);
 
-            // Progress bar
-            const D2D1_RECT_F track = rect(lx, y + 116.0f, w - 44.0f, 8.0f);
-            cv.fill_round(track, 4.0f, color::surface_highest);
             float pct = total > 0 ? static_cast<float>(embedded) / static_cast<float>(total) : (running ? 0.05f : 0.0f);
             pct = std::clamp(pct, 0.0f, 1.0f);
+            wchar_t pbuf[32];
+            swprintf_s(pbuf, L"%.1f%% completed", pct * 100.0f);
+            const std::wstring cur = stopping ? L"Stopping indexer — finishing current batch…"
+                                   : (running && d.current[0] ? (std::wstring{L"Processing: "} + d.current)
+                                   : (running && d.message[0] ? std::wstring{d.message} : L"On-demand scanner idle — zero background GPU/RAM usage"));
+            const std::wstring db_info = L"Qdrant collection: " + to_wide(sh_.settings.model_name) +
+                                         L"  •  127.0.0.1:" + std::to_wstring(sh_.settings.qdrant_http_port);
+
+            const wchar_t* label = L"LOCAL MEDIA EMBEDDING STATUS";
+            const float label_h = text_height(cv, label, Font::Label, rw, 16.0f);
+
+            Flow numbers{0.0f, 0.0f};
+            numbers.add(wa + 4.0f, 40.0f, [&](D2D1_RECT_F r) {
+                cv.text(num_a, rect(r.left, r.top, width(r), 40.0f), Font::Hero, color::on_surface);
+            });
+            numbers.add(wb + 8.0f, 40.0f, [&](D2D1_RECT_F r) {
+                cv.text(num_b, rect(r.left, r.top + 8.0f, width(r), 32.0f), Font::Title, color::outline);
+            });
+            numbers.add(cv.measure(L"files embedded", Font::Body) + 4.0f, 40.0f, [&](D2D1_RECT_F r) {
+                cv.text(L"files embedded", rect(r.left, r.top + 12.0f, width(r), 28.0f), Font::Body, color::on_surface_variant);
+            });
+
+            const wchar_t* start_label = stopping ? L"Stopping…" : (running ? L"Stop Indexing" : L"Start Indexing");
+            Flow headline{16.0f, 8.0f};
+            headline.add_group(numbers, rw, true);
+            headline.add(button_width(cv, start_label, true, 156.0f), 40.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, running ? glyph::pause : glyph::play, start_label, IdToggleIndex, 0, running ? 2 : 1);
+            });
+
+            Flow status{12.0f, 6.0f};
+            status.add(bw, 22.0f, [&](D2D1_RECT_F br) {
+                cv.fill_round(br, 11.0f, with_alpha(badge_col, 0.15f));
+                cv.fill_circle({br.left + 11.0f, br.top + 11.0f}, 3.5f, badge_col);
+                cv.text(status_txt, rect(br.left + 20.0f, br.top, bw - 22.0f, 22.0f), Font::Caption, badge_col);
+            });
+            if (fail_cnt > 0) {
+                status.add(fw, 22.0f, [&](D2D1_RECT_F fr) {
+                    cv.fill_round(fr, 11.0f, with_alpha(color::error, 0.14f));
+                    cv.text(ftxt, fr, Font::Caption, color::error, Align::Center);
+                });
+            }
+            flow_text(cv, status, sub, Font::Caption, color::on_surface_variant, rw, 22.0f);
+
+            Flow progress_text{8.0f, 4.0f};
+            flow_text(cv, progress_text, pbuf, Font::Caption, color::outline, rw, 20.0f);
+            flow_text(cv, progress_text, cur, Font::MonoSmall, stopping ? color::amber : color::on_surface_variant, rw, 20.0f, true, Align::Right);
+
+            Flow database{8.0f, 8.0f};
+            flow_text(cv, database, db_info, Font::Caption, color::outline, rw, 32.0f, true);
+            database.add(button_width(cv, L"Open Qdrant Web UI", true, 166.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::open, L"Open Qdrant Web UI", IdOpenQdrantUi);
+            });
+            database.add(button_width(cv, L"Clear Database", true, 130.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::del, L"Clear Database", IdClearDatabase, 0, 2);
+            });
+
+            const float headline_y = y + 16.0f + label_h + 2.0f;
+            const float status_y = headline_y + headline.height(rw) + 8.0f;
+            const float track_y = status_y + status.height(rw) + 12.0f;
+            const float progress_y = track_y + 16.0f;
+            const float database_line_y = progress_y + progress_text.height(rw) + 10.0f;
+            const float database_y = database_line_y + 11.0f;
+            const float h = database_y + database.height(rw) + 11.0f - y;
+            const float next_y = card_begin(cv, x, y, w, h);
+
+            cv.text_wrap(label, rect(lx, y + 16.0f, rw, label_h), Font::Label, color::primary);
+            headline.draw(lx, headline_y, rw);
+            status.draw(lx, status_y, rw);
+
+            const D2D1_RECT_F track = rect(lx, track_y, rw, 8.0f);
+            cv.fill_round(track, 4.0f, color::surface_highest);
             if (pct > 0.0f) {
                 cv.fill_round(rect(track.left, track.top, std::max(8.0f, width(track) * pct), 8.0f), 4.0f, running ? color::amber : color::primary);
             }
+            progress_text.draw(lx, progress_y, rw);
 
-            wchar_t pbuf[32];
-            swprintf_s(pbuf, L"%.1f%% completed", pct * 100.0f);
-            cv.text(pbuf, rect(lx, y + 132.0f, 140.0f, 20.0f), Font::Caption, color::outline);
-            std::wstring cur = stopping ? L"Stopping indexer — finishing current batch…"
-                             : (running && d.current[0] ? (std::wstring{L"Processing: "} + d.current)
-                             : (running && d.message[0] ? std::wstring{d.message} : L"On-demand scanner idle — zero background GPU/RAM usage"));
-            cv.text(cur, rect(lx + 150.0f, y + 132.0f, w - 194.0f, 20.0f), Font::MonoSmall, stopping ? color::amber : color::on_surface_variant, Align::Right);
-
-            // Database management row
-            const float dby = y + 162.0f;
-            cv.hline(lx, rx, dby, with_alpha(color::outline_variant, 0.5f));
-            const std::wstring db_info = L"Qdrant collection: " + to_wide(sh_.settings.model_name) +
-                                         L"  •  127.0.0.1:" + std::to_wstring(sh_.settings.qdrant_http_port);
-            cv.text(db_info, rect(lx, dby + 12.0f, w - 370.0f, 30.0f), Font::Caption, color::outline);
-            draw_button(cv, rect(rx - 304.0f, dby + 11.0f, 166.0f, 32.0f), glyph::open, L"Open Qdrant Web UI", IdOpenQdrantUi);
-            draw_button(cv, rect(rx - 130.0f, dby + 11.0f, 130.0f, 32.0f), glyph::del, L"Clear Database", IdClearDatabase, 0, 2);
+            cv.hline(lx, lx + rw, database_line_y, with_alpha(color::outline_variant, 0.5f));
+            database.draw(lx, database_y, rw);
             y = next_y;
         }
 
         // 1b. Failed files card (shown when decode/embed failures exist)
         if (!sh_.failed_files.empty()) {
+            const float lx = x + 22.0f, rw = w - 44.0f;
             const size_t show_n = std::min<size_t>(sh_.failed_files.size(), 6);
-            const float h = 76.0f + show_n * 36.0f + (sh_.failed_files.size() > show_n ? 24.0f : 0.0f);
-            const float next_y = card_begin(cv, x, y, w, h);
-            const float lx = x + 22.0f, rw = w - 44.0f, rx = lx + rw;
+            const bool stacked = rw < 560.0f;
+            const float path_x = 32.0f;
+            const float path_w = stacked ? rw - 40.0f : rw * 0.64f - path_x - 4.0f;
+            const float reason_x = stacked ? path_x : rw * 0.64f;
+            const float reason_w = stacked ? rw - 40.0f : rw * 0.36f - 10.0f;
 
             const std::wstring title = L"Failed Media Files (" + format_count(sh_.failed_files.size()) + L")";
-            cv.text(title, rect(lx, y + 16.0f, 320.0f, 22.0f), Font::Large, color::error);
-            cv.text(L"Skipped until modified — click a file to reveal in Explorer, or retry all",
-                    rect(lx, y + 38.0f, rw - 280.0f, 18.0f), Font::Small, color::on_surface_variant);
-            draw_button(cv, rect(rx - 266.0f, y + 18.0f, 126.0f, 32.0f), glyph::open, L"Open Log File", IdOpenFailedLog);
-            draw_button(cv, rect(rx - 132.0f, y + 18.0f, 132.0f, 32.0f), glyph::refresh, L"Retry Failed", IdClearFailed);
+            const CardHeader hd = make_header(cv, rw, title, color::error,
+                                              L"Skipped until modified — click a file to reveal in Explorer, or retry all", 266.0f, 32.0f);
 
-            float cy = y + 64.0f;
+            struct FailedRow {
+                std::wstring label;
+                float y;
+                float h;
+                float content_h;
+                float path_h;
+            };
+            std::vector<FailedRow> rows;
+            float cy = y + 16.0f + hd.h + 10.0f;
             for (size_t i = 0; i < show_n; ++i) {
                 const auto& ff = sh_.failed_files[i];
-                const D2D1_RECT_F ir = rect(lx, cy, rw, 32.0f);
+                FailedRow row{ff.path.empty() ? (L"ID " + std::to_wstring(ff.id)) : ff.path, cy, 0.0f, 0.0f, 0.0f};
+                row.path_h = cv.measure_height(row.label, Font::MonoSmall, path_w);
+                const float reason_h = cv.measure_height(ff.reason, Font::Caption, reason_w);
+                row.content_h = stacked ? row.path_h + (reason_h > 0.0f ? 2.0f + reason_h : 0.0f) : std::max(row.path_h, reason_h);
+                row.h = std::max(32.0f, row.content_h + 12.0f);
+                rows.push_back(std::move(row));
+                cy += rows.back().h + 4.0f;
+            }
+            const bool has_more = sh_.failed_files.size() > show_n;
+            const std::wstring more = has_more
+                ? L"+ " + format_count(sh_.failed_files.size() - show_n) + L" more in " + failed_path(sh_.settings.model_name).filename().wstring()
+                : std::wstring{};
+            const float more_h = has_more ? text_height(cv, more, Font::Caption, rw, 20.0f) : 0.0f;
+            const float list_bottom = has_more ? cy + more_h : cy - 4.0f;
+            const float h = list_bottom + 16.0f - y;
+            const float next_y = card_begin(cv, x, y, w, h);
+
+            const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
+            draw_button(cv, rect(side.left, side.top, 126.0f, 32.0f), glyph::open, L"Open Log File", IdOpenFailedLog);
+            draw_button(cv, rect(side.left + 134.0f, side.top, 132.0f, 32.0f), glyph::refresh, L"Retry Failed", IdClearFailed);
+
+            for (size_t i = 0; i < rows.size(); ++i) {
+                const auto& ff = sh_.failed_files[i];
+                const FailedRow& row = rows[i];
+                const D2D1_RECT_F ir = rect(lx, row.y, rw, row.h);
                 const bool hov = hovered(IdFailedRow, static_cast<int>(i));
                 cv.fill_round(ir, 8.0f, hov ? color::surface_high : color::surface_low);
-                cv.icon(glyph::warning, rect(ir.left + 8.0f, ir.top, 20.0f, 32.0f), color::error, Font::IconSmall);
-                const std::wstring label = ff.path.empty() ? (L"ID " + std::to_wstring(ff.id)) : ff.path;
-                cv.text(label, rect(ir.left + 32.0f, ir.top, rw * 0.62f, 32.0f), Font::MonoSmall, color::on_surface);
-                cv.text(ff.reason, rect(ir.left + rw * 0.64f, ir.top, rw * 0.36f - 10.0f, 32.0f), Font::Caption, color::outline, Align::Right);
+                cv.icon(glyph::warning, rect(ir.left + 8.0f, ir.top, 20.0f, row.h), color::error, Font::IconSmall);
+                const float content_top = ir.top + (row.h - row.content_h) * 0.5f;
+                cv.text_wrap(row.label, rect(ir.left + path_x, content_top, path_w, row.path_h), Font::MonoSmall, color::on_surface);
+                const float reason_y = stacked ? content_top + row.path_h + 2.0f : ir.top;
+                const float reason_h = stacked ? row.content_h - row.path_h - 2.0f : row.h;
+                cv.text_wrap(ff.reason, rect(ir.left + reason_x, reason_y, reason_w, reason_h), Font::Caption, color::outline, stacked ? Align::Left : Align::Right);
                 if (!ff.path.empty()) cv.hit(ir, IdFailedRow, static_cast<int>(i));
-                cy += 36.0f;
             }
-            if (sh_.failed_files.size() > show_n) {
-                const std::wstring more = L"+ " + format_count(sh_.failed_files.size() - show_n) + L" more in " + failed_path(sh_.settings.model_name).filename().wstring();
-                cv.text(more, rect(lx, cy, rw, 20.0f), Font::Caption, color::outline);
+            if (has_more) {
+                cv.text_wrap(more, rect(lx, cy, rw, more_h), Font::Caption, color::outline);
             }
             y = next_y;
         }
@@ -589,102 +777,181 @@ private:
         {
             const bool custom = !sh_.settings.whole_pc;
             const size_t inc_n = sh_.settings.include_dirs.size();
-            const float inc_h = custom ? (46.0f + std::max<size_t>(1, inc_n) * 38.0f + 8.0f) : 0.0f;
-            const float h = 238.0f + inc_h;
-            const float next_y = card_begin(cv, x, y, w, h);
             const float lx = x + 22.0f, rw = w - 44.0f;
 
-            cv.text(L"Indexing Scope", rect(lx, y + 16.0f, 300.0f, 22.0f), Font::Large, color::on_surface);
-            cv.text(L"Scan the whole PC with Voidtools Everything, or restrict indexing to specific folders",
-                    rect(lx, y + 38.0f, rw, 18.0f), Font::Small, color::on_surface_variant);
+            const CardHeader hd = make_header(cv, rw, L"Indexing Scope", color::on_surface,
+                                              L"Scan the whole PC with Voidtools Everything, or restrict indexing to specific folders");
 
-            const float half = (rw - 12.0f) * 0.5f;
-            draw_radio(cv, rect(lx, y + 66.0f, half, 56.0f), sh_.settings.whole_pc,
-                       L"Include the whole PC", L"All local fixed drives (minus exclusions)", IdScopeAll);
-            draw_radio(cv, rect(lx + half + 12.0f, y + 66.0f, half, 56.0f), !sh_.settings.whole_pc,
-                       L"Specify directories to include", L"Only scan the folders listed below", IdScopeCustom);
+            struct Radio {
+                bool on;
+                const wchar_t* title;
+                const wchar_t* desc;
+                int id;
+            };
+            const Radio radios[2] = {
+                {sh_.settings.whole_pc, L"Include the whole PC", L"All local fixed drives (minus exclusions)", IdScopeAll},
+                {!sh_.settings.whole_pc, L"Specify directories to include", L"Only scan the folders listed below", IdScopeCustom},
+            };
+            constexpr float radio_min_w = 300.0f;
+            const float radio_h = std::max(radio_height(cv, radio_min_w, radios[0].title, radios[0].desc),
+                                           radio_height(cv, radio_min_w, radios[1].title, radios[1].desc));
+            Flow radio_flow{12.0f, 8.0f};
+            for (const Radio& radio : radios) {
+                radio_flow.add(radio_min_w, radio_h, [&, radio](D2D1_RECT_F r) {
+                    draw_radio(cv, r, radio.on, radio.title, radio.desc, radio.id);
+                }, true);
+            }
 
-            float cy = y + 134.0f;
+            Flow include_head{8.0f, 8.0f};
+            flow_text(cv, include_head, L"INCLUDED FOLDERS", Font::Label, color::primary, rw, 30.0f, true);
+            include_head.add(button_width(cv, L"Add Directory", true, 134.0f), 30.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::add, L"Add Directory", IdAddInclude);
+            });
+
+            const wchar_t* empty_msg = L"No folders added yet — click Add Directory to choose folders to scan";
+            const float empty_h = std::max(34.0f, 14.0f + cv.measure_height(empty_msg, Font::Small, rw - 24.0f));
+            std::vector<std::wstring> include_paths;
+            std::vector<float> include_y, include_h;
+
+            float cy = y + 16.0f + hd.h + 10.0f;
+            const float radios_y = cy;
+            cy += radio_flow.height(rw) + 12.0f;
+            const float include_head_y = cy;
+            float empty_y = 0.0f;
             if (custom) {
-                cv.text(L"INCLUDED FOLDERS", rect(lx, cy + 4.0f, 200.0f, 20.0f), Font::Label, color::primary);
-                draw_button(cv, rect(lx + rw - 134.0f, cy, 134.0f, 30.0f), glyph::add, L"Add Directory", IdAddInclude);
-                cy += 38.0f;
+                cy += include_head.height(rw) + 8.0f;
                 if (inc_n == 0) {
-                    const D2D1_RECT_F er = rect(lx, cy, rw, 34.0f);
-                    cv.fill_round(er, 8.0f, color::surface_low);
-                    cv.text(L"No folders added yet — click Add Directory to choose folders to scan", inset(er, 12.0f, 0.0f), Font::Small, color::outline);
-                    cy += 38.0f;
-                } else {
-                    for (size_t i = 0; i < inc_n; ++i) {
-                        const D2D1_RECT_F ir = rect(lx, cy, rw, 34.0f);
-                        cv.fill_round(ir, 8.0f, color::surface_low);
-                        cv.icon(glyph::folder, rect(ir.left + 8.0f, ir.top, 22.0f, 34.0f), color::primary, Font::IconSmall);
-                        cv.text(to_wide(sh_.settings.include_dirs[i]), rect(ir.left + 34.0f, ir.top, rw - 72.0f, 34.0f), Font::MonoSmall, color::on_surface);
-                        draw_button(cv, rect(ir.right - 32.0f, ir.top + 3.0f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveInclude, static_cast<int>(i), 3);
-                        cy += 38.0f;
-                    }
+                    empty_y = cy;
+                    cy += empty_h + 4.0f;
+                }
+                for (size_t i = 0; i < inc_n; ++i) {
+                    include_paths.push_back(to_wide(sh_.settings.include_dirs[i]));
+                    include_y.push_back(cy);
+                    include_h.push_back(mono_row_height(cv, include_paths.back(), rw - 72.0f, 34.0f));
+                    cy += include_h.back() + 4.0f;
                 }
                 cy += 8.0f;
             }
-
-            // Media types & limits row
-            cv.hline(lx, lx + rw, cy, with_alpha(color::outline_variant, 0.5f));
+            const float line_y = cy;
             cy += 12.0f;
-            draw_button(cv, rect(lx, cy, 108.0f, 32.0f), glyph::photo, L"Images",
-                        IdToggleImages, 0, sh_.settings.index_images ? 1 : 0);
-            draw_button(cv, rect(lx + 116.0f, cy, 108.0f, 32.0f), glyph::video, L"Videos",
-                        IdToggleVideos, 0, sh_.settings.index_videos ? 1 : 0);
 
             const std::wstring min_lbl = L"Min size: " + std::to_wstring(sh_.settings.min_file_kb) + L" KB";
-            draw_button(cv, rect(lx + rw - 136.0f, cy, 136.0f, 32.0f), 0, min_lbl, IdMinKbStep);
+            Flow media{8.0f, 8.0f};
+            media.add(button_width(cv, L"Images", true, 108.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::photo, L"Images", IdToggleImages, 0, sh_.settings.index_images ? 1 : 0);
+            });
+            media.add(button_width(cv, L"Videos", true, 108.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::video, L"Videos", IdToggleVideos, 0, sh_.settings.index_videos ? 1 : 0);
+            });
+            media.add(0.0f, 32.0f, [](D2D1_RECT_F) {}, true);
+            media.add(button_width(cv, min_lbl, false, 136.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, 0, min_lbl, IdMinKbStep);
+            });
+            const float media_y = cy;
+            cy += media.height(rw) + 10.0f;
 
-            cy += 42.0f;
-            cv.text(L"Click Min size to cycle minimum file size threshold. Videos are embedded by averaging keyframes.",
-                    rect(lx, cy, rw, 18.0f), Font::Caption, color::outline);
+            const wchar_t* limits_note = L"Click Min size to cycle minimum file size threshold. Videos are embedded by averaging keyframes.";
+            const float limits_note_h = text_height(cv, limits_note, Font::Caption, rw, 18.0f);
+            const float limits_note_y = cy;
+            const float h = cy + limits_note_h + 16.0f - y;
+            const float next_y = card_begin(cv, x, y, w, h);
+
+            draw_header(cv, lx, y, rw, hd);
+            radio_flow.draw(lx, radios_y, rw);
+
+            if (custom) {
+                include_head.draw(lx, include_head_y, rw);
+                if (inc_n == 0) {
+                    const D2D1_RECT_F er = rect(lx, empty_y, rw, empty_h);
+                    cv.fill_round(er, 8.0f, color::surface_low);
+                    text_middle(cv, empty_msg, inset(er, 12.0f, 0.0f), Font::Small, color::outline);
+                }
+                for (size_t i = 0; i < inc_n; ++i) {
+                    const D2D1_RECT_F ir = rect(lx, include_y[i], rw, include_h[i]);
+                    cv.fill_round(ir, 8.0f, color::surface_low);
+                    cv.icon(glyph::folder, rect(ir.left + 8.0f, ir.top, 22.0f, include_h[i]), color::primary, Font::IconSmall);
+                    text_middle(cv, include_paths[i], rect(ir.left + 34.0f, ir.top, rw - 72.0f, include_h[i]), Font::MonoSmall, color::on_surface);
+                    draw_button(cv, rect(ir.right - 32.0f, ir.top + (include_h[i] - 28.0f) * 0.5f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveInclude, static_cast<int>(i), 3);
+                }
+            }
+
+            cv.hline(lx, lx + rw, line_y, with_alpha(color::outline_variant, 0.5f));
+            media.draw(lx, media_y, rw);
+            cv.text_wrap(limits_note, rect(lx, limits_note_y, rw, limits_note_h), Font::Caption, color::outline);
             y = next_y;
         }
 
         // 3. Excluded Directories Card (always visible)
         {
             const auto locked = locked_excludes();
-            const size_t total_rows = locked.size() + sh_.settings.exclude_dirs.size();
-            const float h = 122.0f + total_rows * 36.0f;
-            const float next_y = card_begin(cv, x, y, w, h);
+            const bool show_exclude_error = !exclude_error_.empty() && exclude_field_.text == exclude_error_for_text_;
             const float lx = x + 22.0f, rw = w - 44.0f;
 
-            cv.text(L"Excluded Directories & Patterns", rect(lx, y + 16.0f, 340.0f, 22.0f), Font::Large, color::on_surface);
-            cv.text(L"Skipped in both Whole PC and Custom Folder modes", rect(lx, y + 38.0f, 380.0f, 18.0f), Font::Small, color::on_surface_variant);
-            draw_button(cv, rect(lx + rw - 142.0f, y + 18.0f, 142.0f, 32.0f), glyph::folder, L"Add Folder…", IdAddExcludeFolder);
+            const CardHeader hd = make_header(cv, rw, L"Excluded Directories & Patterns", color::on_surface,
+                                              L"Skipped in both Whole PC and Custom Folder modes", 142.0f, 32.0f);
 
-            // Pattern input bar
-            float cy = y + 66.0f;
-            const D2D1_RECT_F fr = rect(lx, cy, rw - 108.0f, 34.0f);
-            cv.fill_round(fr, 8.0f, color::surface_low);
-            cv.stroke_round(fr, 8.0f, active_field_ == &exclude_field_ ? color::primary : color::outline_variant);
-            exclude_field_.draw(cv, inset(fr, 10.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
-            cv.hit(fr, IdExcludeField);
-            draw_button(cv, rect(lx + rw - 100.0f, cy, 100.0f, 34.0f), glyph::add, L"Add Rule", IdAddExcludePattern);
-            cy += 44.0f;
+            Flow input{8.0f, 8.0f};
+            input.add(180.0f, 34.0f, [&](D2D1_RECT_F fr) {
+                cv.fill_round(fr, 8.0f, color::surface_low);
+                cv.stroke_round(fr, 8.0f, active_field_ == &exclude_field_ ? color::primary : color::outline_variant);
+                exclude_field_.draw(cv, inset(fr, 10.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                cv.hit(fr, IdExcludeField);
+            }, true);
+            input.add(button_width(cv, L"Add Rule", true, 100.0f), 34.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::add, L"Add Rule", IdAddExcludePattern);
+            });
 
+            struct ExcludeRow {
+                std::wstring text;
+                std::wstring tag;
+                bool locked;
+                int index;
+                float y;
+                float h;
+            };
+            std::vector<ExcludeRow> rows;
             for (const auto& sys : locked) {
-                const D2D1_RECT_F ir = rect(lx, cy, rw, 32.0f);
-                cv.fill_round(ir, 8.0f, with_alpha(color::surface_lowest, 0.7f));
-                cv.icon(glyph::block, rect(ir.left + 8.0f, ir.top, 20.0f, 32.0f), color::outline, Font::IconSmall);
-                cv.text(sys, rect(ir.left + 32.0f, ir.top, rw - 120.0f, 32.0f), Font::MonoSmall, color::outline);
-                cv.text(L"System", rect(ir.right - 92.0f, ir.top, 56.0f, 32.0f), Font::Caption, color::outline, Align::Right);
-                cv.icon(glyph::lock, rect(ir.right - 30.0f, ir.top, 24.0f, 32.0f), color::outline, Font::IconSmall);
-                cy += 36.0f;
+                rows.push_back({sys, L"System", true, 0, 0.0f, 0.0f});
             }
             for (size_t i = 0; i < sh_.settings.exclude_dirs.size(); ++i) {
-                const D2D1_RECT_F ir = rect(lx, cy, rw, 32.0f);
-                cv.fill_round(ir, 8.0f, color::surface_low);
                 const std::wstring wex = to_wide(sh_.settings.exclude_dirs[i]);
                 const bool is_pat = wex.find(L'*') != std::wstring::npos || !(wex.size() >= 2 && wex[1] == L':');
-                cv.icon(glyph::block, rect(ir.left + 8.0f, ir.top, 20.0f, 32.0f), color::error, Font::IconSmall);
-                cv.text(wex, rect(ir.left + 32.0f, ir.top, rw - 120.0f, 32.0f), Font::MonoSmall, color::on_surface);
-                cv.text(is_pat ? L"Pattern" : L"Folder", rect(ir.right - 92.0f, ir.top, 56.0f, 32.0f), Font::Caption, color::on_surface_variant, Align::Right);
-                draw_button(cv, rect(ir.right - 30.0f, ir.top + 2.0f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveExclude, static_cast<int>(i), 3);
-                cy += 36.0f;
+                rows.push_back({wex, is_pat ? L"Pattern" : L"Folder", false, static_cast<int>(i), 0.0f, 0.0f});
+            }
+
+            const float input_y = y + 16.0f + hd.h + 10.0f;
+            const float input_h = input.height(rw);
+            const float error_y = input_y + input_h + 4.0f;
+            const float error_h = show_exclude_error ? text_height(cv, exclude_error_, Font::Caption, rw - 22.0f, 20.0f) : 0.0f;
+            float cy = input_y + input_h + 10.0f + (show_exclude_error ? error_h + 2.0f : 0.0f);
+            for (ExcludeRow& row : rows) {
+                row.y = cy;
+                row.h = mono_row_height(cv, row.text, rw - 120.0f, 32.0f);
+                cy += row.h + 4.0f;
+            }
+            const float h = (rows.empty() ? cy : cy - 4.0f) + 16.0f - y;
+            const float next_y = card_begin(cv, x, y, w, h);
+
+            const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
+            draw_button(cv, side, glyph::folder, L"Add Folder…", IdAddExcludeFolder);
+
+            input.draw(lx, input_y, rw);
+            if (show_exclude_error) {
+                cv.icon(glyph::warning, rect(lx, error_y, 18.0f, 20.0f), color::error, Font::IconSmall);
+                cv.text_wrap(exclude_error_, rect(lx + 22.0f, error_y, rw - 22.0f, error_h), Font::Caption, color::error);
+            }
+
+            for (const ExcludeRow& row : rows) {
+                const D2D1_RECT_F ir = rect(lx, row.y, rw, row.h);
+                cv.fill_round(ir, 8.0f, row.locked ? with_alpha(color::surface_lowest, 0.7f) : color::surface_low);
+                cv.icon(glyph::block, rect(ir.left + 8.0f, ir.top, 20.0f, row.h), row.locked ? color::outline : color::error, Font::IconSmall);
+                text_middle(cv, row.text, rect(ir.left + 32.0f, ir.top, rw - 120.0f, row.h), Font::MonoSmall, row.locked ? color::outline : color::on_surface);
+                cv.text(row.tag, rect(ir.right - 92.0f, ir.top, 56.0f, row.h), Font::Caption, row.locked ? color::outline : color::on_surface_variant, Align::Right);
+                if (row.locked) {
+                    cv.icon(glyph::lock, rect(ir.right - 30.0f, ir.top, 24.0f, row.h), color::outline, Font::IconSmall);
+                } else {
+                    draw_button(cv, rect(ir.right - 30.0f, ir.top + (row.h - 28.0f) * 0.5f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveExclude, row.index, 3);
+                }
             }
             y = next_y;
         }
@@ -710,229 +977,356 @@ private:
     float draw_tab_settings(Canvas& cv, float x, float y, float w) {
         // 1. Keybind & Pill behaviour card
         {
-            const float h = 186.0f;
-            const float next_y = card_begin(cv, x, y, w, h);
             const float lx = x + 22.0f, rw = w - 44.0f;
 
-            cv.text(L"Spotlight Invocation Keybind", rect(lx, y + 16.0f, 340.0f, 22.0f), Font::Large, color::on_surface);
-            cv.text(L"Global desktop shortcut registered by the lightweight tray launcher", rect(lx, y + 38.0f, rw - 80.0f, 18.0f), Font::Small, color::on_surface_variant);
-            draw_switch(cv, lx + rw, y + 30.0f, sh_.settings.hotkey_enabled, IdToggleHotkey);
+            const CardHeader hd = make_header(cv, rw, L"Spotlight Invocation Keybind", color::on_surface,
+                                              L"Global desktop shortcut registered by the lightweight tray launcher", 44.0f, 24.0f);
 
-            // Keybind box
-            const D2D1_RECT_F kr = rect(lx, y + 68.0f, 240.0f, 40.0f);
-            cv.fill_round(kr, 10.0f, color::surface_lowest);
-            cv.stroke_round(kr, 10.0f, recording_hotkey_ ? color::amber : color::outline_variant, recording_hotkey_ ? 1.5f : 1.0f);
             const std::wstring hk = recording_hotkey_ ? L"Press shortcut…" : format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk);
-            cv.text(hk, kr, Font::BodySemi, recording_hotkey_ ? color::amber : color::primary, Align::Center);
+            const wchar_t* record_label = recording_hotkey_ ? L"Cancel Recording" : L"Record Keybind";
+            Flow keys{8.0f, 8.0f};
+            keys.add(240.0f, 40.0f, [&](D2D1_RECT_F kr) {
+                cv.fill_round(kr, 10.0f, color::surface_lowest);
+                cv.stroke_round(kr, 10.0f, recording_hotkey_ ? color::amber : color::outline_variant, recording_hotkey_ ? 1.5f : 1.0f);
+                cv.text(hk, kr, Font::BodySemi, recording_hotkey_ ? color::amber : color::primary, Align::Center);
+            });
+            keys.add(button_width(cv, record_label, true, 160.0f), 40.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::keyboard, record_label, IdRecordHotkey, 0, recording_hotkey_ ? 1 : 0);
+            });
+            keys.add(button_width(cv, L"Reset (Alt+Space)", false, 118.0f), 40.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, 0, L"Reset (Alt+Space)", IdResetHotkey, 0, 3);
+            });
 
-            draw_button(cv, rect(lx + 252.0f, y + 68.0f, 160.0f, 40.0f), glyph::keyboard,
-                        recording_hotkey_ ? L"Cancel Recording" : L"Record Keybind", IdRecordHotkey, 0, recording_hotkey_ ? 1 : 0);
-            draw_button(cv, rect(lx + 420.0f, y + 68.0f, 118.0f, 40.0f), 0, L"Reset (Alt+Space)", IdResetHotkey, 0, 3);
-
-            // Pill & startup options row
-            const float ry = y + 122.0f;
-            cv.hline(lx, lx + rw, ry, with_alpha(color::outline_variant, 0.5f));
-            cv.text(L"Open on PC startup", rect(lx, ry + 14.0f, 150.0f, 22.0f), Font::Body, color::on_surface);
-            draw_switch(cv, lx + 196.0f, ry + 25.0f, sh_.settings.launch_on_startup, IdToggleStartup);
-
-            cv.text(L"Hide pill when clicking outside", rect(lx + 220.0f, ry + 14.0f, 224.0f, 22.0f), Font::Body, color::on_surface);
-            draw_switch(cv, lx + 486.0f, ry + 25.0f, sh_.settings.hide_on_focus_loss, IdToggleHideFocus);
+            Flow startup{12.0f, 0.0f};
+            flow_text(cv, startup, L"Open on PC startup", Font::Body, color::on_surface, rw, 32.0f);
+            startup.add(44.0f, 32.0f, [&](D2D1_RECT_F r) {
+                draw_switch(cv, r.right, (r.top + r.bottom) * 0.5f, sh_.settings.launch_on_startup, IdToggleStartup);
+            });
+            Flow hide_on_blur{12.0f, 0.0f};
+            flow_text(cv, hide_on_blur, L"Hide pill when clicking outside", Font::Body, color::on_surface, rw, 32.0f);
+            hide_on_blur.add(44.0f, 32.0f, [&](D2D1_RECT_F r) {
+                draw_switch(cv, r.right, (r.top + r.bottom) * 0.5f, sh_.settings.hide_on_focus_loss, IdToggleHideFocus);
+            });
 
             const std::wstring idle_lbl = sh_.settings.ui_idle_timeout_s < 0
                 ? L"UI process timeout: Never"
                 : (sh_.settings.ui_idle_timeout_s == 0
                     ? L"UI process timeout: 0s (Immediate)"
                     : L"UI process timeout: " + std::to_wstring(sh_.settings.ui_idle_timeout_s) + L"s");
-            draw_button(cv, rect(lx + rw - 238.0f, ry + 10.0f, 238.0f, 32.0f), glyph::clock, idle_lbl, IdIdleStep);
+            Flow options{24.0f, 10.0f};
+            options.add_group(startup, rw);
+            options.add_group(hide_on_blur, rw);
+            options.add(0.0f, 32.0f, [](D2D1_RECT_F) {}, true);
+            options.add(button_width(cv, idle_lbl, true, 238.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::clock, idle_lbl, IdIdleStep);
+            });
+
+            const bool contain = parse_thumb_fit(sh_.settings.thumb_fit) == ThumbFit::Contain;
+            Flow thumbs{8.0f, 8.0f};
+            flow_text(cv, thumbs, L"Image thumbnails:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
+            thumbs.add(button_width(cv, L"Fill tile (crop)", false, 120.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, 0, L"Fill tile (crop)", IdThumbFit, static_cast<int>(ThumbFit::Crop), !contain ? 1 : 0);
+            });
+            thumbs.add(button_width(cv, L"Whole image (fit)", false, 150.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, 0, L"Whole image (fit)", IdThumbFit, static_cast<int>(ThumbFit::Contain), contain ? 1 : 0);
+            });
+
+            const float keys_y = y + 16.0f + hd.h + 10.0f;
+            const float options_line_y = keys_y + keys.height(rw) + 14.0f;
+            const float options_y = options_line_y + 10.0f;
+            const float thumbs_y = options_y + options.height(rw) + 16.0f;
+            const float h = thumbs_y + thumbs.height(rw) + 16.0f - y;
+            const float next_y = card_begin(cv, x, y, w, h);
+
+            const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
+            draw_switch(cv, side.right, side.top + 12.0f, sh_.settings.hotkey_enabled, IdToggleHotkey);
+            keys.draw(lx, keys_y, rw);
+            cv.hline(lx, lx + rw, options_line_y, with_alpha(color::outline_variant, 0.5f));
+            options.draw(lx, options_y, rw);
+            thumbs.draw(lx, thumbs_y, rw);
             y = next_y;
         }
 
         // 2. Embeddings AI Model & GPU Batching card
         {
-            const float h = 278.0f;
-            const float next_y = card_begin(cv, x, y, w, h);
             const float lx = x + 22.0f, rw = w - 44.0f;
 
-            cv.text(L"Embeddings AI Model & Compute", rect(lx, y + 16.0f, 360.0f, 22.0f), Font::Large, color::on_surface);
-            cv.text(L"Vision weights (.safetensors) and text ONNX / tokenizer directory", rect(lx, y + 38.0f, rw, 18.0f), Font::Small, color::on_surface_variant);
+            const CardHeader hd = make_header(cv, rw, L"Embeddings AI Model & Compute", color::on_surface,
+                                              L"Vision weights (.safetensors) and text ONNX / tokenizer directory");
 
             // Model dir row
-            float cy = y + 66.0f;
-            const D2D1_RECT_F dr = rect(lx, cy, rw - 116.0f, 32.0f);
-            cv.fill_round(dr, 8.0f, color::surface_lowest);
-            cv.text(to_wide(sh_.settings.model_dir), inset(dr, 10.0f, 0.0f), Font::MonoSmall, color::on_surface_variant);
-            draw_button(cv, rect(lx + rw - 108.0f, cy, 108.0f, 32.0f), glyph::folder, L"Browse…", IdBrowseModelDir);
+            const std::wstring model_dir = to_wide(sh_.settings.model_dir);
+            const bool dir_beside = rw - 116.0f >= 220.0f;
+            const float dir_w = dir_beside ? rw - 116.0f : rw;
+            const float dir_h = mono_row_height(cv, model_dir, dir_w - 20.0f, 32.0f);
+            Flow dir_row{8.0f, 8.0f};
+            dir_row.add(dir_w, dir_h, [&](D2D1_RECT_F dr) {
+                cv.fill_round(dr, 8.0f, color::surface_lowest);
+                text_middle(cv, model_dir, inset(dr, 10.0f, 0.0f), Font::MonoSmall, color::on_surface_variant);
+            });
+            dir_row.add(button_width(cv, L"Browse…", true, 108.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::folder, L"Browse…", IdBrowseModelDir);
+            });
 
             // Model name chips + custom field
-            cy += 42.0f;
-            cv.text(L"Model:", rect(lx, cy, 56.0f, 32.0f), Font::SmallSemi, color::on_surface_variant);
-            float mx = lx + 58.0f;
+            Flow chips{8.0f, 8.0f};
+            flow_text(cv, chips, L"Model:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
             for (size_t i = 0; i < models_.size() && i < 3; ++i) {
                 const std::wstring wm = to_wide(models_[i]);
-                const float cw_chip = cv.measure(wm, Font::SmallSemi) + 24.0f;
                 const bool on = models_[i] == sh_.settings.model_name;
-                draw_button(cv, rect(mx, cy, cw_chip, 32.0f), 0, wm, IdModelChip, static_cast<int>(i), on ? 1 : 0);
-                mx += cw_chip + 8.0f;
+                chips.add(button_width(cv, wm, false, 0.0f), 32.0f, [&, wm, i, on](D2D1_RECT_F r) {
+                    draw_button(cv, r, 0, wm, IdModelChip, static_cast<int>(i), on ? 1 : 0);
+                });
             }
-            const D2D1_RECT_F mfr = rect(mx, cy, std::max(140.0f, lx + rw - mx), 32.0f);
-            cv.fill_round(mfr, 8.0f, color::surface_low);
-            cv.stroke_round(mfr, 8.0f, active_field_ == &model_field_ ? color::primary : color::outline_variant);
-            model_field_.draw(cv, inset(mfr, 10.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
-            cv.hit(mfr, IdModelField);
+            chips.add(140.0f, 32.0f, [&](D2D1_RECT_F mfr) {
+                cv.fill_round(mfr, 8.0f, color::surface_low);
+                cv.stroke_round(mfr, 8.0f, active_field_ == &model_field_ ? color::primary : color::outline_variant);
+                model_field_.draw(cv, inset(mfr, 10.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                cv.hit(mfr, IdModelField);
+            }, true);
 
             // Device & VRAM Batch size
-            cy += 44.0f;
-            cv.text(L"Device:", rect(lx, cy, 52.0f, 32.0f), Font::SmallSemi, color::on_surface_variant);
             const bool is_cpu = sh_.settings.device == "cpu";
-            draw_button(cv, rect(lx + 54.0f, cy, 138.0f, 32.0f), glyph::chip, L"GPU (ROCm / CUDA)", IdDeviceAuto, 0, !is_cpu ? 1 : 0);
-            draw_button(cv, rect(lx + 198.0f, cy, 86.0f, 32.0f), 0, L"CPU Only", IdDeviceCpu, 0, is_cpu ? 1 : 0);
+            Flow device{6.0f, 0.0f};
+            flow_text(cv, device, L"Device:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
+            device.add(button_width(cv, L"GPU (ROCm / CUDA)", true, 138.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::chip, L"GPU (ROCm / CUDA)", IdDeviceAuto, 0, !is_cpu ? 1 : 0);
+            });
+            device.add(button_width(cv, L"CPU Only", false, 86.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, 0, L"CPU Only", IdDeviceCpu, 0, is_cpu ? 1 : 0);
+            });
 
-            cv.text(L"Batch size:", rect(lx + 298.0f, cy, 72.0f, 32.0f), Font::SmallSemi, color::on_surface_variant);
+            Flow batch{5.0f, 8.0f};
+            flow_text(cv, batch, L"Batch size:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
             static constexpr uint32_t batches[] = {0, 32, 64, 128, 256};
-            float bx = lx + 372.0f;
-            for (int i = 0; i < 5; ++i) {
-                const std::wstring bl = batches[i] == 0 ? L"Auto (VRAM)" : std::to_wstring(batches[i]);
-                const float bw = batches[i] == 0 ? 92.0f : 44.0f;
-                draw_button(cv, rect(bx, cy, bw, 32.0f), 0, bl, IdBatchPreset, static_cast<int>(batches[i]),
-                            sh_.settings.batch_size == batches[i] ? 1 : 0);
-                bx += bw + 5.0f;
+            for (const uint32_t b : batches) {
+                const std::wstring bl = b == 0 ? L"Auto (VRAM)" : std::to_wstring(b);
+                batch.add(button_width(cv, bl, false, b == 0 ? 92.0f : 44.0f), 32.0f, [&, b, bl](D2D1_RECT_F r) {
+                    draw_button(cv, r, 0, bl, IdBatchPreset, static_cast<int>(b), sh_.settings.batch_size == b ? 1 : 0);
+                });
             }
             const bool custom_batch = sh_.settings.batch_size > 0 &&
                 sh_.settings.batch_size != 32 && sh_.settings.batch_size != 64 &&
                 sh_.settings.batch_size != 128 && sh_.settings.batch_size != 256;
-            const D2D1_RECT_F bfr = rect(bx, cy, std::max(64.0f, lx + rw - bx), 32.0f);
-            cv.fill_round(bfr, 8.0f, color::surface_low);
-            cv.stroke_round(bfr, 8.0f, (active_field_ == &batch_field_ || custom_batch) ? color::primary : color::outline_variant,
-                            (active_field_ == &batch_field_ || custom_batch) ? 1.5f : 1.0f);
-            batch_field_.draw(cv, inset(bfr, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
-            cv.hit(bfr, IdBatchField);
+            batch.add(64.0f, 32.0f, [&](D2D1_RECT_F bfr) {
+                cv.fill_round(bfr, 8.0f, color::surface_low);
+                cv.stroke_round(bfr, 8.0f, (active_field_ == &batch_field_ || custom_batch) ? color::primary : color::outline_variant,
+                                (active_field_ == &batch_field_ || custom_batch) ? 1.5f : 1.0f);
+                batch_field_.draw(cv, inset(bfr, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                cv.hit(bfr, IdBatchField);
+            }, true);
 
-            cy += 38.0f;
-            if (sh_.settings.batch_size >= 128) {
-                cv.icon(glyph::warning, rect(lx, cy, 18.0f, 20.0f), color::amber, Font::IconSmall);
-                cv.text(L"High fixed batch sizes may exceed VRAM and trigger driver resets; OOM automatically halves the batch.",
-                        rect(lx + 22.0f, cy, rw - 22.0f, 20.0f), Font::Caption, color::amber);
+            Flow compute{14.0f, 8.0f};
+            compute.add_group(device, rw);
+            compute.add_group(batch, rw, true);
+
+            const bool batch_warn = sh_.settings.batch_size >= 128;
+            std::wstring batch_note;
+            if (batch_warn) {
+                batch_note = L"High fixed batch sizes may exceed VRAM and trigger driver resets; OOM automatically halves the batch.";
+            } else if (sh_.settings.batch_size == 0) {
+                const std::wstring chosen = sh_.index_state.auto_batch > 0
+                    ? L"Auto chose " + std::to_wstring(sh_.index_state.auto_batch) + L" on the last run."
+                    : L"Auto measures the fastest batch size on first index.";
+                batch_note = chosen + L" Backs off automatically on out-of-memory.";
             } else {
-                cv.text(L"Auto probes free VRAM on startup and backs off automatically on out-of-memory.",
-                        rect(lx, cy, rw, 20.0f), Font::Caption, color::outline);
+                batch_note = L"Auto probes free VRAM on startup and backs off automatically on out-of-memory.";
             }
+            const float note_x = batch_warn ? 22.0f : 0.0f;
+            const float note_h = text_height(cv, batch_note, Font::Caption, rw - note_x, 20.0f);
 
             // Custom vision script override
-            cy += 28.0f;
-            cv.text(L"Vision script:", rect(lx, cy, 90.0f, 30.0f), Font::SmallSemi, color::on_surface_variant);
             const std::wstring scr = sh_.settings.vision_script.empty() ? L"Bundled (python\\usyseek_vision.py)" : to_wide(sh_.settings.vision_script);
-            const D2D1_RECT_F sr = rect(lx + 92.0f, cy, rw - 260.0f, 30.0f);
-            cv.fill_round(sr, 8.0f, color::surface_lowest);
-            cv.text(scr, inset(sr, 10.0f, 0.0f), Font::MonoSmall, color::on_surface_variant);
-            draw_button(cv, rect(lx + rw - 160.0f, cy, 96.0f, 30.0f), glyph::code, L"Custom…", IdBrowseScript);
-            draw_button(cv, rect(lx + rw - 58.0f, cy, 58.0f, 30.0f), 0, L"Reset", IdClearScript, 0, 3);
+            const float script_label_w = cv.measure(L"Vision script:", Font::SmallSemi) + 4.0f;
+            const float custom_w = button_width(cv, L"Custom…", true, 96.0f);
+            const float reset_w = button_width(cv, L"Reset", false, 58.0f);
+            const float beside_box_w = rw - script_label_w - custom_w - reset_w - 24.0f;
+            const bool script_beside = beside_box_w >= 200.0f;
+            const float script_box_w = script_beside ? beside_box_w : rw;
+            const float script_box_h = mono_row_height(cv, scr, script_box_w - 20.0f, 30.0f);
+            Flow script{8.0f, 8.0f};
+            flow_text(cv, script, L"Vision script:", Font::SmallSemi, color::on_surface_variant, rw, 30.0f);
+            script.add(script_box_w, script_box_h, [&](D2D1_RECT_F sr) {
+                cv.fill_round(sr, 8.0f, color::surface_lowest);
+                text_middle(cv, scr, inset(sr, 10.0f, 0.0f), Font::MonoSmall, color::on_surface_variant);
+            });
+            script.add(custom_w, 30.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::code, L"Custom…", IdBrowseScript);
+            });
+            script.add(reset_w, 30.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, 0, L"Reset", IdClearScript, 0, 3);
+            });
+
+            const float dir_y = y + 16.0f + hd.h + 10.0f;
+            const float chips_y = dir_y + dir_row.height(rw) + 10.0f;
+            const float compute_y = chips_y + chips.height(rw) + 12.0f;
+            const float note_y = compute_y + compute.height(rw) + 6.0f;
+            const float script_y = note_y + note_h + 8.0f;
+            const float h = script_y + script.height(rw) + 16.0f - y;
+            const float next_y = card_begin(cv, x, y, w, h);
+
+            draw_header(cv, lx, y, rw, hd);
+            dir_row.draw(lx, dir_y, rw);
+            chips.draw(lx, chips_y, rw);
+            compute.draw(lx, compute_y, rw);
+            if (batch_warn) {
+                cv.icon(glyph::warning, rect(lx, note_y, 18.0f, 20.0f), color::amber, Font::IconSmall);
+            }
+            cv.text_wrap(batch_note, rect(lx + note_x, note_y, rw - note_x, note_h), Font::Caption, batch_warn ? color::amber : color::outline);
+            script.draw(lx, script_y, rw);
             y = next_y;
         }
 
         // 3. Python Environment Card (.venv or portable NuGet Python)
         {
             const bool has_log = !venv_log_.empty();
-            const float h = 368.0f + (has_log ? 84.0f : 0.0f);
-            const float next_y = card_begin(cv, x, y, w, h);
             const float lx = x + 22.0f, rw = w - 44.0f;
 
-            cv.text(L"Python Environment", rect(lx, y + 16.0f, 360.0f, 22.0f), Font::Large, color::on_surface);
-            cv.text(L"Any Python 3.10+ .venv or portable Python folder with PyTorch & open-clip (runs out-of-process)",
-                    rect(lx, y + 38.0f, rw - 140.0f, 18.0f), Font::Small, color::on_surface_variant);
-
-            // Status pill
             std::error_code ec;
             const bool ver_ok = venv_.exists && fs::exists(venv_.python_exe, ec);
             const std::wstring ready_txt = venv_.portable ? L"Portable Ready" : L".venv Ready";
             const std::wstring st_txt = venv_busy_ ? L"Running task…" : (ver_ok ? ready_txt : (venv_.exists ? L"Missing python.exe" : L"Not found"));
             const D2D1_COLOR_F st_col = venv_busy_ ? color::amber : (ver_ok ? color::mint : color::error);
             const float sw = cv.measure(st_txt, Font::Caption) + 26.0f;
-            const D2D1_RECT_F sbr = rect(lx + rw - sw, y + 18.0f, sw, 24.0f);
+
+            const CardHeader hd = make_header(cv, rw, L"Python Environment", color::on_surface,
+                                              L"Any Python 3.10+ .venv or portable Python folder with PyTorch & open-clip (runs out-of-process)", sw, 24.0f);
+
+            // Details box
+            const std::wstring env_path = to_wide(sh_.settings.venv_dir);
+            const std::wstring py_info = venv_.exists
+                ? (L"Python " + venv_.version + (venv_.portable ? L"  (portable: " : L"  (venv of ") + venv_.home + L")")
+                : L"No pyvenv.cfg or python.exe in selected folder";
+            const std::wstring pkgs = venv_pkgs_.empty() ? L"—" : venv_pkgs_;
+            const float value_w = rw - 120.0f;
+            const bool select_beside = value_w - 92.0f >= 150.0f;
+            const float env_w = select_beside ? value_w - 92.0f : value_w;
+            const float env_text_h = text_height(cv, env_path, Font::MonoSmall, env_w, 22.0f);
+            const float env_h = select_beside ? std::max(24.0f, env_text_h) : env_text_h + 4.0f + 24.0f;
+            const float py_h = text_height(cv, py_info, Font::Small, value_w, 22.0f);
+            const float pkgs_h = text_height(cv, pkgs, Font::Caption, value_w, 22.0f);
+            const float box_h = 8.0f + env_h + 2.0f + py_h + 2.0f + pkgs_h + 6.0f;
+
+            // Portable Python (NuGet) row
+            static constexpr const char* versions[4] = {"3.14", "3.13", "3.12", "3.11"};
+            const std::wstring dl_label = dl_total_ > 0 && venv_busy_
+                ? (L"Downloading " + std::to_wstring(dl_done_ * 100 / std::max<ULONG>(1, dl_total_)) + L"%")
+                : L"Download & Use";
+            Flow portable{8.0f, 8.0f};
+            flow_text(cv, portable, L"Portable Python:", Font::SmallSemi, color::on_surface_variant, rw, 30.0f);
+            for (int i = 0; i < 4; ++i) {
+                const bool on = sh_.settings.python_version == versions[i];
+                portable.add(52.0f, 30.0f, [&, i, on](D2D1_RECT_F r) {
+                    draw_button(cv, r, 0, to_wide(versions[i]), IdPyVerChip, i, on ? 1 : 0);
+                });
+            }
+            portable.add(78.0f, 30.0f, [&](D2D1_RECT_F pvr) {
+                cv.fill_round(pvr, 8.0f, color::surface_low);
+                cv.stroke_round(pvr, 8.0f, active_field_ == &py_ver_field_ ? color::primary : color::outline_variant);
+                py_ver_field_.draw(cv, inset(pvr, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                cv.hit(pvr, IdPyVerField);
+            });
+            portable.add(0.0f, 30.0f, [](D2D1_RECT_F) {}, true);
+            portable.add(button_width(cv, dl_label, true, 196.0f), 30.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::download, dl_label, IdDownloadNugetPy, 0, 1);
+            });
+
+            // Torch installer backend row
+            const char* backends[4] = {"rocm", "cuda", "cpu", "manual"};
+            const wchar_t* blabels[4] = {L"AMD ROCm", L"NVIDIA CUDA", L"CPU", L"Manual"};
+            Flow backend{8.0f, 8.0f};
+            flow_text(cv, backend, L"PyTorch stack:", Font::SmallSemi, color::on_surface_variant, rw, 30.0f);
+            for (int i = 0; i < 4; ++i) {
+                const bool on = sh_.settings.torch_backend == backends[i];
+                const wchar_t* blabel = blabels[i];
+                backend.add(button_width(cv, blabel, false, i == 3 ? 78.0f : 98.0f), 30.0f, [&, i, on, blabel](D2D1_RECT_F r) {
+                    draw_button(cv, r, 0, blabel, IdBackendChip, i, on ? 1 : 0);
+                });
+            }
+            if (sh_.settings.torch_backend == "rocm") {
+                Flow arch{4.0f, 0.0f};
+                flow_text(cv, arch, L"Arch:", Font::Small, color::outline, rw, 30.0f);
+                arch.add(86.0f, 30.0f, [&](D2D1_RECT_F ar) {
+                    cv.fill_round(ar, 8.0f, color::surface_low);
+                    cv.stroke_round(ar, 8.0f, active_field_ == &arch_field_ ? color::primary : color::outline_variant);
+                    arch_field_.draw(cv, inset(ar, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                    cv.hit(ar, IdArchField);
+                });
+                backend.add_group(arch, rw);
+            }
+            backend.add(0.0f, 30.0f, [](D2D1_RECT_F) {}, true);
+            backend.add(button_width(cv, L"Open CMD in .venv", true, 196.0f), 30.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::terminal, L"Open CMD in .venv", IdOpenTerminal);
+            });
+
+            // Optional custom Torch pip args row
+            Flow torch{8.0f, 8.0f};
+            flow_text(cv, torch, L"Torch pip args:", Font::SmallSemi, color::on_surface_variant, rw, 30.0f);
+            torch.add(200.0f, 30.0f, [&](D2D1_RECT_F tfr) {
+                cv.fill_round(tfr, 8.0f, color::surface_low);
+                cv.stroke_round(tfr, 8.0f, active_field_ == &torch_field_ ? color::primary : color::outline_variant);
+                torch_field_.draw(cv, inset(tfr, 10.0f, 2.0f), Font::MonoSmall, color::on_surface, color::outline);
+                cv.hit(tfr, IdTorchField);
+            }, true);
+
+            // Action buttons
+            const float action_w = std::max({button_width(cv, L"Install / Update Packages", true, 0.0f),
+                                             button_width(cv, L"Create / Recreate Venv", true, 0.0f),
+                                             button_width(cv, L"Delete Venv", true, 0.0f)});
+            Flow actions{8.0f, 8.0f};
+            actions.add(action_w, 36.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::download, L"Install / Update Packages", IdUpdateVenv);
+            }, true);
+            actions.add(action_w, 36.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::refresh, L"Create / Recreate Venv", IdRecreateVenv);
+            }, true);
+            actions.add(action_w, 36.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::del, L"Delete Venv", IdDeleteVenv, 0, 2);
+            }, true);
+
+            const float log_h = has_log ? mono_row_height(cv, venv_log_, rw - 20.0f, 72.0f) : 0.0f;
+
+            const float box_y = y + 16.0f + hd.h + 10.0f;
+            const float portable_y = box_y + box_h + 12.0f;
+            const float backend_y = portable_y + portable.height(rw) + 8.0f;
+            const float torch_y = backend_y + backend.height(rw) + 8.0f;
+            const float actions_y = torch_y + torch.height(rw) + 12.0f;
+            const float log_y = actions_y + actions.height(rw) + 10.0f;
+            const float h = (has_log ? log_y + log_h : log_y - 10.0f) + 16.0f - y;
+            const float next_y = card_begin(cv, x, y, w, h);
+
+            const D2D1_RECT_F sbr = draw_header(cv, lx, y, rw, hd);
             cv.fill_round(sbr, 12.0f, with_alpha(st_col, 0.16f));
             cv.fill_circle({sbr.left + 11.0f, sbr.top + 12.0f}, 3.5f, st_col);
             cv.text(st_txt, rect(sbr.left + 20.0f, sbr.top, sw - 22.0f, 24.0f), Font::Caption, st_col);
 
-            // Details box
-            float cy = y + 66.0f;
-            const D2D1_RECT_F box = rect(lx, cy, rw, 84.0f);
+            const D2D1_RECT_F box = rect(lx, box_y, rw, box_h);
             cv.fill_round(box, 10.0f, color::surface_lowest);
             cv.stroke_round(box, 10.0f, color::outline_variant);
-            cv.text(L"Env Path:", rect(lx + 14.0f, cy + 8.0f, 100.0f, 22.0f), Font::Caption, color::outline);
-            cv.text(to_wide(sh_.settings.venv_dir), rect(lx + 110.0f, cy + 8.0f, rw - 210.0f, 22.0f), Font::MonoSmall, color::primary);
-            draw_button(cv, rect(lx + rw - 92.0f, cy + 6.0f, 84.0f, 24.0f), glyph::folder, L"Select…", IdBrowseVenv);
+            float ry = box_y + 8.0f;
+            cv.text(L"Env Path:", rect(lx + 14.0f, ry, 96.0f, 22.0f), Font::Caption, color::outline);
+            text_middle(cv, env_path, rect(lx + 110.0f, ry, env_w, env_text_h), Font::MonoSmall, color::primary);
+            const D2D1_RECT_F select_r = select_beside ? rect(lx + rw - 92.0f, ry - 2.0f, 84.0f, 24.0f)
+                                                       : rect(lx + 110.0f, ry + env_text_h + 4.0f, 84.0f, 24.0f);
+            draw_button(cv, select_r, glyph::folder, L"Select…", IdBrowseVenv);
 
-            cv.text(L"Interpreter:", rect(lx + 14.0f, cy + 32.0f, 100.0f, 22.0f), Font::Caption, color::outline);
-            const std::wstring py_info = venv_.exists
-                ? (L"Python " + venv_.version + (venv_.portable ? L"  (portable: " : L"  (venv of ") + venv_.home + L")")
-                : L"No pyvenv.cfg or python.exe in selected folder";
-            cv.text(py_info, rect(lx + 110.0f, cy + 32.0f, rw - 120.0f, 22.0f), Font::Small, color::on_surface);
+            ry += env_h + 2.0f;
+            cv.text(L"Interpreter:", rect(lx + 14.0f, ry, 96.0f, 22.0f), Font::Caption, color::outline);
+            text_middle(cv, py_info, rect(lx + 110.0f, ry, value_w, py_h), Font::Small, color::on_surface);
 
-            cv.text(L"Packages:", rect(lx + 14.0f, cy + 56.0f, 100.0f, 22.0f), Font::Caption, color::outline);
-            cv.text(venv_pkgs_.empty() ? L"—" : venv_pkgs_, rect(lx + 110.0f, cy + 56.0f, rw - 120.0f, 22.0f), Font::Caption, color::on_surface_variant);
+            ry += py_h + 2.0f;
+            cv.text(L"Packages:", rect(lx + 14.0f, ry, 96.0f, 22.0f), Font::Caption, color::outline);
+            text_middle(cv, pkgs, rect(lx + 110.0f, ry, value_w, pkgs_h), Font::Caption, color::on_surface_variant);
 
-            // Portable Python (NuGet) row
-            cy += 96.0f;
-            cv.text(L"Portable Python:", rect(lx, cy, 104.0f, 30.0f), Font::SmallSemi, color::on_surface_variant);
-            static constexpr const char* versions[4] = {"3.14", "3.13", "3.12", "3.11"};
-            float vx = lx + 106.0f;
-            for (int i = 0; i < 4; ++i) {
-                const bool on = sh_.settings.python_version == versions[i];
-                draw_button(cv, rect(vx, cy, 52.0f, 30.0f), 0, to_wide(versions[i]), IdPyVerChip, i, on ? 1 : 0);
-                vx += 58.0f;
-            }
-            const D2D1_RECT_F pvr = rect(vx, cy, 78.0f, 30.0f);
-            cv.fill_round(pvr, 8.0f, color::surface_low);
-            cv.stroke_round(pvr, 8.0f, active_field_ == &py_ver_field_ ? color::primary : color::outline_variant);
-            py_ver_field_.draw(cv, inset(pvr, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
-            cv.hit(pvr, IdPyVerField);
-            const std::wstring dl_label = dl_total_ > 0 && venv_busy_
-                ? (L"Downloading " + std::to_wstring(dl_done_ * 100 / std::max<ULONG>(1, dl_total_)) + L"%")
-                : L"Download & Use";
-            draw_button(cv, rect(lx + rw - 196.0f, cy, 196.0f, 30.0f), glyph::download, dl_label, IdDownloadNugetPy, 0, 1);
-
-            // Torch installer backend row
-            cy += 38.0f;
-            cv.text(L"PyTorch stack:", rect(lx, cy, 94.0f, 30.0f), Font::SmallSemi, color::on_surface_variant);
-            const char* backends[4] = {"rocm", "cuda", "cpu", "manual"};
-            const wchar_t* blabels[4] = {L"AMD ROCm", L"NVIDIA CUDA", L"CPU", L"Manual"};
-            float bx = lx + 96.0f;
-            for (int i = 0; i < 4; ++i) {
-                const bool on = sh_.settings.torch_backend == backends[i];
-                const float w_chip = i == 3 ? 78.0f : 98.0f;
-                draw_button(cv, rect(bx, cy, w_chip, 30.0f), 0, blabels[i], IdBackendChip, i, on ? 1 : 0);
-                bx += w_chip + 6.0f;
-            }
-            if (sh_.settings.torch_backend == "rocm") {
-                cv.text(L"Arch:", rect(bx + 4.0f, cy, 38.0f, 30.0f), Font::Small, color::outline);
-                const D2D1_RECT_F ar = rect(bx + 42.0f, cy, 86.0f, 30.0f);
-                cv.fill_round(ar, 8.0f, color::surface_low);
-                cv.stroke_round(ar, 8.0f, active_field_ == &arch_field_ ? color::primary : color::outline_variant);
-                arch_field_.draw(cv, inset(ar, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
-                cv.hit(ar, IdArchField);
-            }
-            draw_button(cv, rect(lx + rw - 196.0f, cy, 196.0f, 30.0f), glyph::terminal, L"Open CMD in .venv", IdOpenTerminal);
-
-            // Optional custom Torch pip args row
-            cy += 38.0f;
-            cv.text(L"Torch pip args:", rect(lx, cy, 94.0f, 30.0f), Font::SmallSemi, color::on_surface_variant);
-            const D2D1_RECT_F tfr = rect(lx + 96.0f, cy, rw - 96.0f, 30.0f);
-            cv.fill_round(tfr, 8.0f, color::surface_low);
-            cv.stroke_round(tfr, 8.0f, active_field_ == &torch_field_ ? color::primary : color::outline_variant);
-            torch_field_.draw(cv, inset(tfr, 10.0f, 2.0f), Font::MonoSmall, color::on_surface, color::outline);
-            cv.hit(tfr, IdTorchField);
-
-            // Action buttons
-            cy += 42.0f;
-            const float bw3 = (rw - 16.0f) / 3.0f;
-            draw_button(cv, rect(lx, cy, bw3, 36.0f), glyph::download, L"Install / Update Packages", IdUpdateVenv);
-            draw_button(cv, rect(lx + bw3 + 8.0f, cy, bw3, 36.0f), glyph::refresh, L"Create / Recreate Venv", IdRecreateVenv);
-            draw_button(cv, rect(lx + (bw3 + 8.0f) * 2.0f, cy, bw3, 36.0f), glyph::del, L"Delete Venv", IdDeleteVenv, 0, 2);
+            portable.draw(lx, portable_y, rw);
+            backend.draw(lx, backend_y, rw);
+            torch.draw(lx, torch_y, rw);
+            actions.draw(lx, actions_y, rw);
 
             if (has_log) {
-                cy += 46.0f;
-                const D2D1_RECT_F lr = rect(lx, cy, rw, 72.0f);
+                const D2D1_RECT_F lr = rect(lx, log_y, rw, log_h);
                 cv.fill_round(lr, 8.0f, color::surface_lowest);
-                cv.text(venv_log_, inset(lr, 10.0f, 6.0f), Font::MonoSmall, color::on_surface_variant);
+                cv.text_wrap(venv_log_, inset(lr, 10.0f, 6.0f), Font::MonoSmall, color::on_surface_variant);
             }
             y = next_y;
         }
@@ -1213,7 +1607,7 @@ private:
     // ------------------------------------------------------------------------------------------
 
     [[nodiscard]] float view_height() const {
-        return std::max(1.0f, target_.size().height - TABS_H - 1.0f);
+        return std::max(1.0f, target_.size().height - tabs_height(target_.size().width) - 1.0f);
     }
     [[nodiscard]] float max_scroll() const {
         return std::max(0.0f, content_h_ - view_height());
@@ -1284,12 +1678,24 @@ private:
         }
     }
 
+    bool add_exclude(const std::wstring& v) {
+        std::vector<std::wstring> existing = locked_excludes();
+        for (const auto& e : sh_.settings.exclude_dirs) existing.push_back(to_wide(e));
+        if (is_duplicate_exclusion(v, existing)) {
+            exclude_error_ = L"That folder is already excluded";
+            exclude_error_for_text_ = exclude_field_.text;
+            return false;
+        }
+        exclude_error_.clear();
+        sh_.settings.exclude_dirs.push_back(to_utf8(v));
+        sh_.save();
+        return true;
+    }
+
     void add_exclude_from_field() {
         const std::wstring v = trim(exclude_field_.text);
         if (v.empty()) return;
-        sh_.settings.exclude_dirs.push_back(to_utf8(v));
-        exclude_field_.set(L"");
-        sh_.save();
+        if (add_exclude(v)) exclude_field_.set(L"");
         render();
     }
 
@@ -1429,10 +1835,7 @@ private:
                 break;
             }
             case IdAddExcludeFolder:
-                if (auto dir = pick_path(true)) {
-                    sh_.settings.exclude_dirs.push_back(to_utf8(dir->wstring()));
-                    sh_.save();
-                }
+                if (auto dir = pick_path(true)) add_exclude(dir->wstring());
                 break;
             case IdAddExcludePattern: add_exclude_from_field(); break;
             case IdExcludeField: focus_field(exclude_field_); break;
@@ -1470,6 +1873,11 @@ private:
             case IdToggleHideFocus:
                 sh_.settings.hide_on_focus_loss = !sh_.settings.hide_on_focus_loss;
                 sh_.save();
+                break;
+            case IdThumbFit:
+                sh_.settings.thumb_fit = idx == static_cast<int>(ThumbFit::Contain) ? "contain" : "crop";
+                sh_.save();
+                if (sh_.redraw_all) sh_.redraw_all();
                 break;
             case IdIdleStep: {
                 static constexpr int32_t steps[] = {0, 60, 180, 600, 1800, -1};
@@ -1714,7 +2122,7 @@ private:
             case WM_GETMINMAXINFO: {
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
                 const float s = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
-                mmi->ptMinTrackSize = {static_cast<LONG>(760 * s), static_cast<LONG>(520 * s)};
+                mmi->ptMinTrackSize = {static_cast<LONG>(420 * s), static_cast<LONG>(520 * s)};
                 return 0;
             }
             case WM_SETCURSOR:
@@ -1829,6 +2237,8 @@ private:
     D2D1_RECT_F scroll_thumb_{};
 
     TextField exclude_field_;
+    std::wstring exclude_error_;
+    std::wstring exclude_error_for_text_;
     TextField model_field_;
     TextField batch_field_;
     TextField arch_field_;
