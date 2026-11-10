@@ -66,6 +66,7 @@ struct Shared {
         const bool was_running = indexer_running;
         const bool prev_stopping = indexer_stopping;
         const uint64_t prev_embedded = indexer.embedded;
+        const uint64_t prev_found = indexer.found;
         const uint64_t prev_failed = indexer.failed;
         const Phase prev_phase = indexer.phase;
 
@@ -96,7 +97,7 @@ struct Shared {
         }
 
         return force || finished || indexer_running != was_running || indexer_stopping != prev_stopping ||
-               (indexer_running && (indexer.embedded != prev_embedded || indexer.failed != prev_failed || indexer.phase != prev_phase));
+               (indexer_running && (indexer.embedded != prev_embedded || indexer.found != prev_found || indexer.failed != prev_failed || indexer.phase != prev_phase));
     }
 
     bool polled_once_ = false;

@@ -43,6 +43,7 @@ struct Settings {
     std::string vision_script;           // empty = bundled usyseek_vision.py
     std::string torch_backend = "rocm";  // rocm | cuda | cpu | manual
     std::string rocm_arch = "gfx1030";
+    std::string cuda_version = "cu126";  // PyTorch CUDA wheel index, e.g. cu126 | cu130
     std::string torch_pip_args;          // optional custom pip install args for torch/torchvision
 
     // Database
@@ -54,6 +55,7 @@ struct Settings {
 struct IndexState {
     int64_t last_index_unix = 0;
     uint64_t last_index_found = 0;
+    std::optional<uint64_t> last_index_embedded;
     std::string last_error;
     uint32_t auto_batch = 0; // batch size benchmarked for auto_batch_key, 0 = not measured
     std::string auto_batch_key;

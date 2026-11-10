@@ -23,6 +23,62 @@ class CandidateSizesTest(unittest.TestCase):
         self.assertEqual(v.candidate_sizes(4), [4])
 
 
+def timings(values):
+    remaining = iter(values)
+    calls = []
+
+    def run_once():
+        calls.append(1)
+        return next(remaining)
+
+    return run_once, calls
+
+
+class WarmUpTest(unittest.TestCase):
+    def test_stops_once_consecutive_runs_agree(self):
+        run_once, calls = timings([1.0, 0.5, 0.31, 0.30, 0.30, 0.30])
+        v.warm_up(run_once)
+        self.assertEqual(len(calls), 4)
+
+    def test_runs_the_minimum_even_when_already_steady(self):
+        run_once, calls = timings([0.3] * 10)
+        v.warm_up(run_once)
+        self.assertEqual(len(calls), v._BENCH_WARMUP_MIN_RUNS)
+
+    def test_stops_at_the_maximum_when_times_never_settle(self):
+        run_once, calls = timings([1.0 / (2 ** n) for n in range(20)])
+        v.warm_up(run_once)
+        self.assertEqual(len(calls), v._BENCH_WARMUP_MAX_RUNS)
+
+
+class TimedRateTest(unittest.TestCase):
+    def test_runs_until_the_minimum_duration(self):
+        run_once, calls = timings([0.1] * 20)
+        v.timed_rate(run_once, 8)
+        self.assertEqual(len(calls), 3)
+        run_once, calls = timings([0.05] * 20)
+        v.timed_rate(run_once, 8)
+        self.assertEqual(len(calls), 6)
+
+    def test_runs_the_minimum_count_for_slow_runs(self):
+        run_once, calls = timings([2.0] * 20)
+        v.timed_rate(run_once, 8)
+        self.assertEqual(len(calls), v._BENCH_TIMED_MIN_RUNS)
+
+    def test_stops_at_the_maximum_run_count(self):
+        run_once, calls = timings([0.0001] * 100)
+        v.timed_rate(run_once, 8)
+        self.assertEqual(len(calls), v._BENCH_TIMED_MAX_RUNS)
+
+    def test_rate_is_images_per_second_at_the_median_run(self):
+        run_once, _ = timings([0.1, 0.1, 5.0])
+        self.assertEqual(v.timed_rate(run_once, 32), 320)
+
+    def test_even_run_count_averages_the_middle_pair(self):
+        run_once, _ = timings([0.05, 0.05, 0.1, 0.15])
+        self.assertAlmostEqual(v.timed_rate(run_once, 3), 40)
+
+
 class SearchBatchTest(unittest.TestCase):
     def test_picks_fastest(self):
         measure, _ = measuring({8: 100, 16: 150, 32: 200, 64: 190})

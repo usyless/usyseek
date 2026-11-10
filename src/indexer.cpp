@@ -880,12 +880,13 @@ int run_indexer(Settings& settings) {
     pr.d.todo = todo.size();
     if (todo.empty() || stopping()) {
         failures.save();
-        pr.phase(stopping() ? Phase::Stopped : Phase::Done);
         IndexState st = load_json_file<IndexState>(state_path());
         st.last_index_unix = unix_now();
         st.last_index_found = files.size();
+        st.last_index_embedded = pr.d.embedded;
         st.last_error.clear();
         save_json_file(state_path(), st);
+        pr.phase(stopping() ? Phase::Stopped : Phase::Done);
         return 0;
     }
 
@@ -1063,6 +1064,7 @@ int run_indexer(Settings& settings) {
     IndexState st = load_json_file<IndexState>(state_path());
     st.last_index_unix = unix_now();
     st.last_index_found = files.size();
+    st.last_index_embedded = pr.d.embedded;
     st.last_error.clear();
     if (auto_batch && batch < st.auto_batch) st.auto_batch = batch;
     save_json_file(state_path(), st);

@@ -137,7 +137,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 - **Python**: **Not required!** System-wide Python is no longer a dependency. The application can automatically download and manage a portable Python runtime directly from the Settings UI (or you can optionally point it to an existing virtualenv / local install).
 - **GPU (Optional but recommended for indexing)**:
   - **AMD**: ROCm for Windows (default target: `gfx1030` / RDNA2+)
-  - **NVIDIA**: CUDA 11.8+ / 12.x
+  - **NVIDIA**: CUDA 12.6+ (wheel variant `cu126`, `cu130`, `cu132` or `cu134`, pickable in Settings)
   - **CPU**: Supported for both indexing and search fallback
 
 ---

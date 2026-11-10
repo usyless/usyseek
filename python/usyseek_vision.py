@@ -30,7 +30,12 @@ _size = 0
 _hint = 0
 
 _BENCH_FIRST_SIZE = 8
-_BENCH_TIMED_RUNS = 3
+_BENCH_WARMUP_MIN_RUNS = 2
+_BENCH_WARMUP_MAX_RUNS = 8
+_BENCH_WARMUP_TOLERANCE = 0.10
+_BENCH_TIMED_MIN_SECONDS = 0.3
+_BENCH_TIMED_MIN_RUNS = 3
+_BENCH_TIMED_MAX_RUNS = 40
 _BENCH_DROP_RATIO = 0.75
 _BENCH_GAIN_RATIO = 1.03
 
@@ -216,6 +221,31 @@ def candidate_sizes(cap):
     return sizes
 
 
+def warm_up(run_once):
+    """Calls run_once (returning elapsed seconds) until two consecutive runs agree within
+    _BENCH_WARMUP_TOLERANCE, after at least _BENCH_WARMUP_MIN_RUNS and at most _BENCH_WARMUP_MAX_RUNS runs."""
+    previous = None
+    for runs in range(1, _BENCH_WARMUP_MAX_RUNS + 1):
+        elapsed = run_once()
+        settled = previous is not None and abs(elapsed - previous) <= _BENCH_WARMUP_TOLERANCE * max(elapsed, previous)
+        if settled and runs >= _BENCH_WARMUP_MIN_RUNS:
+            return
+        previous = elapsed
+
+
+def timed_rate(run_once, size):
+    """Calls run_once (returning elapsed seconds) until _BENCH_TIMED_MIN_SECONDS have been spent and at least
+    _BENCH_TIMED_MIN_RUNS have run, never more than _BENCH_TIMED_MAX_RUNS. Returns images per second at the
+    median run time, which a single stalled or unusually fast run cannot move."""
+    times = []
+    while len(times) < _BENCH_TIMED_MAX_RUNS and (len(times) < _BENCH_TIMED_MIN_RUNS or sum(times) < _BENCH_TIMED_MIN_SECONDS):
+        times.append(run_once())
+    times.sort()
+    middle = len(times) // 2
+    median = times[middle] if len(times) % 2 else (times[middle - 1] + times[middle]) / 2
+    return size / median
+
+
 def search_batch(sizes, measure):
     """Walks sizes in ascending order and returns the fastest. measure(size) gives images per second,
     or None when the size ran out of memory. Stops at the first out-of-memory size or once throughput
@@ -245,17 +275,19 @@ def benchmark_batch(limit=128):
 
     def measure(size):
         frames = np.zeros((size, _size, _size, 3), dtype=np.uint8)
-        try:
-            _run(frames)
+
+        def run_once():
             start = time.perf_counter()
-            for _ in range(_BENCH_TIMED_RUNS):
-                _run(frames)
-            elapsed = time.perf_counter() - start
+            _run(frames)
+            return time.perf_counter() - start
+
+        try:
+            warm_up(run_once)
+            return timed_rate(run_once, size)
         except Exception as e:  # torch.OutOfMemoryError, HIP/CUDA OOM RuntimeError
             if "out of memory" not in str(e).lower():
                 raise
             return None
-        return size * _BENCH_TIMED_RUNS / elapsed
 
     try:
         return search_batch(candidate_sizes(cap), measure)

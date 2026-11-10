@@ -8,7 +8,7 @@
 
 namespace usyseek {
 
-inline std::wstring normalize_exclusion(std::wstring_view raw) {
+inline std::wstring normalize_path_rule(std::wstring_view raw) {
     const auto is_space = [](wchar_t c) { return std::iswspace(static_cast<wint_t>(c)) != 0; };
     size_t b = 0, e = raw.size();
     while (b < e && is_space(raw[b])) ++b;
@@ -27,9 +27,9 @@ inline std::wstring normalize_exclusion(std::wstring_view raw) {
     return out;
 }
 
-inline bool is_duplicate_exclusion(std::wstring_view candidate, const std::vector<std::wstring>& existing) {
-    const std::wstring wanted = normalize_exclusion(candidate);
-    return std::any_of(existing.begin(), existing.end(), [&](const std::wstring& e) { return normalize_exclusion(e) == wanted; });
+inline bool is_duplicate_path_rule(std::wstring_view candidate, const std::vector<std::wstring>& existing) {
+    const std::wstring wanted = normalize_path_rule(candidate);
+    return std::any_of(existing.begin(), existing.end(), [&](const std::wstring& e) { return normalize_path_rule(e) == wanted; });
 }
 
 } // namespace usyseek

@@ -3,7 +3,8 @@
 #include "shared.hpp"
 #include "flow.hpp"
 #include "textfield.hpp"
-#include "../exclusions.hpp"
+#include "../path_rules.hpp"
+#include "../torch_index.hpp"
 
 #include <shobjidl.h>
 #include <urlmon.h>
@@ -134,6 +135,7 @@ public:
         batch_field_.placeholder = L"Custom";
         py_ver_field_.placeholder = L"3.14";
         arch_field_.placeholder = L"gfx1030";
+        cuda_field_.placeholder = L"cu126";
         torch_field_.placeholder = L"Optional custom pip args (e.g. --index-url ... torch==2.7.1 torchvision==0.22.1)";
         sync_fields();
         probe_venv();
@@ -254,6 +256,8 @@ private:
         IdDownloadNugetPy,
         IdBackendChip,
         IdArchField,
+        IdCudaPreset,
+        IdCudaField,
         IdTorchField,
         IdOpenTerminal,
         IdUpdateVenv,
@@ -268,6 +272,7 @@ private:
         batch_field_.set(sh_.settings.batch_size > 0 ? std::to_wstring(sh_.settings.batch_size) : L"");
         py_ver_field_.set(to_wide(sh_.settings.python_version.empty() ? "3.14" : sh_.settings.python_version));
         arch_field_.set(to_wide(sh_.settings.rocm_arch));
+        cuda_field_.set(to_wide(sh_.settings.cuda_version));
         torch_field_.set(to_wide(sh_.settings.torch_pip_args));
     }
 
@@ -398,6 +403,15 @@ private:
 
     float text_height(Canvas& cv, std::wstring_view s, Font f, float w, float min_h) {
         return std::max(min_h, cv.measure_height(s, f, w));
+    }
+
+    float error_row_height(Canvas& cv, std::wstring_view message, float row_w) {
+        return text_height(cv, message, Font::Caption, row_w - 22.0f, 20.0f);
+    }
+
+    void draw_error_row(Canvas& cv, std::wstring_view message, float x, float y, float row_w, float h) {
+        cv.icon(glyph::warning, rect(x, y, 18.0f, 20.0f), color::error, Font::IconSmall);
+        cv.text_wrap(message, rect(x + 22.0f, y, row_w - 22.0f, h), Font::Caption, color::error);
     }
 
     float mono_row_height(Canvas& cv, std::wstring_view s, float text_w, float min_h) {
@@ -580,8 +594,10 @@ private:
             const bool running = sh_.indexer_running;
             const bool stopping = running && sh_.indexer_stopping;
             const auto& d = sh_.indexer;
-            const uint64_t embedded = running ? d.embedded : sh_.db_count.value_or(sh_.index_state.last_index_found);
-            const uint64_t total = running && d.found ? d.found : std::max(embedded, sh_.index_state.last_index_found);
+            const DisplayedProgress shown = displayed_progress(running, d.embedded, d.found, sh_.index_state.last_index_embedded,
+                                                               sh_.index_state.last_index_found, sh_.db_count);
+            const uint64_t embedded = shown.embedded;
+            const uint64_t total = shown.total;
 
             const std::wstring num_a = format_count(embedded);
             const std::wstring num_b = L" / " + format_count(total);
@@ -818,8 +834,15 @@ private:
             cy += radio_flow.height(rw) + 12.0f;
             const float include_head_y = cy;
             float empty_y = 0.0f;
+            float include_error_y = 0.0f;
+            float include_error_h = 0.0f;
             if (custom) {
                 cy += include_head.height(rw) + 8.0f;
+                if (!include_error_.empty()) {
+                    include_error_y = cy;
+                    include_error_h = error_row_height(cv, include_error_, rw);
+                    cy += include_error_h + 8.0f;
+                }
                 if (inc_n == 0) {
                     empty_y = cy;
                     cy += empty_h + 4.0f;
@@ -861,6 +884,9 @@ private:
 
             if (custom) {
                 include_head.draw(lx, include_head_y, rw);
+                if (!include_error_.empty()) {
+                    draw_error_row(cv, include_error_, lx, include_error_y, rw, include_error_h);
+                }
                 if (inc_n == 0) {
                     const D2D1_RECT_F er = rect(lx, empty_y, rw, empty_h);
                     cv.fill_round(er, 8.0f, color::surface_low);
@@ -922,7 +948,7 @@ private:
             const float input_y = y + 16.0f + hd.h + 10.0f;
             const float input_h = input.height(rw);
             const float error_y = input_y + input_h + 4.0f;
-            const float error_h = show_exclude_error ? text_height(cv, exclude_error_, Font::Caption, rw - 22.0f, 20.0f) : 0.0f;
+            const float error_h = show_exclude_error ? error_row_height(cv, exclude_error_, rw) : 0.0f;
             float cy = input_y + input_h + 10.0f + (show_exclude_error ? error_h + 2.0f : 0.0f);
             for (ExcludeRow& row : rows) {
                 row.y = cy;
@@ -937,8 +963,7 @@ private:
 
             input.draw(lx, input_y, rw);
             if (show_exclude_error) {
-                cv.icon(glyph::warning, rect(lx, error_y, 18.0f, 20.0f), color::error, Font::IconSmall);
-                cv.text_wrap(exclude_error_, rect(lx + 22.0f, error_y, rw - 22.0f, error_h), Font::Caption, color::error);
+                draw_error_row(cv, exclude_error_, lx, error_y, rw, error_h);
             }
 
             for (const ExcludeRow& row : rows) {
@@ -1253,6 +1278,25 @@ private:
                     cv.hit(ar, IdArchField);
                 });
                 backend.add_group(arch, rw);
+            } else if (sh_.settings.torch_backend == "cuda") {
+                Flow cuda{4.0f, 0.0f};
+                flow_text(cv, cuda, L"CUDA:", Font::Small, color::outline, rw, 30.0f);
+                for (size_t i = 0; i < cuda_versions.size(); ++i) {
+                    const std::wstring vl = to_wide(std::string{cuda_versions[i]});
+                    const bool on = sh_.settings.cuda_version == cuda_versions[i];
+                    cuda.add(button_width(cv, vl, false, 56.0f), 30.0f, [&, i, vl, on](D2D1_RECT_F r) {
+                        draw_button(cv, r, 0, vl, IdCudaPreset, static_cast<int>(i), on ? 1 : 0);
+                    });
+                }
+                const bool custom_cuda = std::ranges::find(cuda_versions, sh_.settings.cuda_version) == cuda_versions.end();
+                cuda.add(72.0f, 30.0f, [&, custom_cuda](D2D1_RECT_F cr) {
+                    cv.fill_round(cr, 8.0f, color::surface_low);
+                    cv.stroke_round(cr, 8.0f, (active_field_ == &cuda_field_ || custom_cuda) ? color::primary : color::outline_variant);
+                    cuda_field_.draw(cv, inset(cr, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                    cv.hit(cr, IdCudaField);
+                });
+                flow_text(cv, cuda, L"Pick the newest version your NVIDIA driver supports.", Font::Caption, color::outline, rw, 30.0f);
+                backend.add_group(cuda, rw);
             }
             backend.add(0.0f, 30.0f, [](D2D1_RECT_F) {}, true);
             backend.add(button_width(cv, L"Open CMD in .venv", true, 196.0f), 30.0f, [&](D2D1_RECT_F r) {
@@ -1584,10 +1628,10 @@ private:
             exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", L"https://stable.repo.amd.com/rocm/whl-next/",
                              L"torch[device-" + arch + L"]", L"torchvision[device-" + arch + L"]", L"rocm[libraries,device-" + arch + L"]"});
         } else if (sh_.settings.torch_backend == "cuda") {
-            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", L"https://download.pytorch.org/whl/cu126",
+            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cuda", sh_.settings.cuda_version)),
                              L"torch", L"torchvision"});
         } else {
-            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", L"https://download.pytorch.org/whl/cpu",
+            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cpu", "")),
                              L"torch", L"torchvision"});
         }
         fs::path req = exe_dir() / L"python" / L"requirements.txt";
@@ -1647,6 +1691,11 @@ private:
             sh_.settings.rocm_arch = a;
             changed = true;
         }
+        const std::string cu = to_utf8(trim(cuda_field_.text));
+        if (!cu.empty() && cu != sh_.settings.cuda_version) {
+            sh_.settings.cuda_version = cu;
+            changed = true;
+        }
         const std::string tp = to_utf8(trim(torch_field_.text));
         if (tp != sh_.settings.torch_pip_args) {
             sh_.settings.torch_pip_args = tp;
@@ -1681,7 +1730,7 @@ private:
     bool add_exclude(const std::wstring& v) {
         std::vector<std::wstring> existing = locked_excludes();
         for (const auto& e : sh_.settings.exclude_dirs) existing.push_back(to_wide(e));
-        if (is_duplicate_exclusion(v, existing)) {
+        if (is_duplicate_path_rule(v, existing)) {
             exclude_error_ = L"That folder is already excluded";
             exclude_error_for_text_ = exclude_field_.text;
             return false;
@@ -1712,7 +1761,7 @@ private:
         const int idx = h ? h->index : 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;
 
-        if (active_field_ && id != IdExcludeField && id != IdModelField && id != IdBatchField && id != IdArchField && id != IdTorchField) {
+        if (active_field_ && id != IdExcludeField && id != IdModelField && id != IdBatchField && id != IdArchField && id != IdCudaField && id != IdTorchField) {
             commit_fields();
             active_field_->focused = false;
             active_field_ = nullptr;
@@ -1801,6 +1850,13 @@ private:
                 break;
             case IdAddInclude:
                 if (auto dir = pick_path(true)) {
+                    std::vector<std::wstring> existing;
+                    for (const auto& d : sh_.settings.include_dirs) existing.push_back(to_wide(d));
+                    if (is_duplicate_path_rule(dir->wstring(), existing)) {
+                        include_error_ = L"That folder is already included";
+                        break;
+                    }
+                    include_error_.clear();
                     sh_.settings.include_dirs.push_back(to_utf8(dir->wstring()));
                     sh_.save();
                 }
@@ -1808,6 +1864,7 @@ private:
             case IdRemoveInclude:
                 if (idx >= 0 && idx < static_cast<int>(sh_.settings.include_dirs.size())) {
                     sh_.settings.include_dirs.erase(sh_.settings.include_dirs.begin() + idx);
+                    include_error_.clear();
                     sh_.save();
                 }
                 break;
@@ -1947,6 +2004,12 @@ private:
                 break;
             }
             case IdArchField: focus_field(arch_field_); break;
+            case IdCudaPreset:
+                sh_.settings.cuda_version = std::string{cuda_versions[static_cast<size_t>(std::clamp(idx, 0, static_cast<int>(cuda_versions.size()) - 1))]};
+                cuda_field_.set(to_wide(sh_.settings.cuda_version));
+                sh_.save();
+                break;
+            case IdCudaField: focus_field(cuda_field_); break;
             case IdTorchField: focus_field(torch_field_); break;
             case IdPyVerField: focus_field(py_ver_field_); break;
             case IdPyVerChip: {
@@ -2132,7 +2195,7 @@ private:
                     ScreenToClient(hwnd_, &pt);
                     const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
                     const int id = h ? h->id : 0;
-                    const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdBatchField || id == IdArchField || id == IdTorchField || id == IdPyVerField;
+                    const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdBatchField || id == IdArchField || id == IdCudaField || id == IdTorchField || id == IdPyVerField;
                     SetCursor(ibeam ? cursor_ibeam_ : (id ? cursor_hand_ : cursor_arrow_));
                     return TRUE;
                 }
@@ -2237,11 +2300,13 @@ private:
     D2D1_RECT_F scroll_thumb_{};
 
     TextField exclude_field_;
+    std::wstring include_error_;
     std::wstring exclude_error_;
     std::wstring exclude_error_for_text_;
     TextField model_field_;
     TextField batch_field_;
     TextField arch_field_;
+    TextField cuda_field_;
     TextField torch_field_;
     TextField py_ver_field_;
     TextField* active_field_ = nullptr;
