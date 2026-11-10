@@ -554,6 +554,12 @@ struct PyVision {
             throw std::runtime_error("Failed to start Python vision worker");
         }
         if (job) AssignProcessToJobObject(job.get(), proc.hProcess);
+        PROCESS_POWER_THROTTLING_STATE throttling{};
+        throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        throttling.StateMask = 0; // Disable Windows EcoQoS / Efficiency Mode on worker
+        SetProcessInformation(proc.hProcess, ProcessPowerThrottling, &throttling, sizeof(throttling));
+        SetPriorityClass(proc.hProcess, ABOVE_NORMAL_PRIORITY_CLASS);
         ResumeThread(proc.hThread);
 
         OVERLAPPED ov{};
@@ -1065,6 +1071,12 @@ int wmain(int argc, wchar_t** argv) {
         return export_text_only(load_settings());
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    PROCESS_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    throttling.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+    SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
     ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
 
