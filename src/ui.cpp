@@ -206,8 +206,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     const UINT m_toggle = msg_toggle_search();
     const UINT m_settings = msg_open_settings();
     const UINT m_idx = msg_indexer_changed();
+    const UINT m_quit = msg_quit_ui();
 
     pill.extra_handler = [&](UINT msg, WPARAM wp, LPARAM lp, bool& done) -> LRESULT {
+        if (msg == m_quit && m_quit) {
+            done = true;
+            PostQuitMessage(0);
+            return 0;
+        }
         if (msg == m_toggle && m_toggle) {
             done = true;
             pill.toggle();

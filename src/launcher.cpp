@@ -19,10 +19,12 @@ constexpr UINT WM_TRAY = WM_APP + 1;
 constexpr UINT TRAY_ID = 1;
 constexpr int HOTKEY_ID = 1;
 constexpr UINT_PTR TIMER_STOP_INDEX = 1;
+constexpr UINT_PTR TIMER_TRAY_PROGRESS = 2;
 
 enum MenuId : UINT {
     IdSearch = 100,
     IdSettings,
+    IdCloseUi,
     IdToggleIndex,
     IdQuit,
 };
@@ -128,6 +130,9 @@ private:
                 if (wp == TIMER_STOP_INDEX) {
                     KillTimer(hwnd, TIMER_STOP_INDEX);
                     if (indexer_.hProcess) TerminateProcess(indexer_.hProcess, 1);
+                } else if (wp == TIMER_TRAY_PROGRESS) {
+                    if (indexer_.hProcess) update_tip();
+                    else KillTimer(hwnd, TIMER_TRAY_PROGRESS);
                 }
                 return 0;
             case WM_DESTROY:
@@ -214,7 +219,7 @@ private:
     }
 
     void maybe_stop_qdrant() {
-        if (!ui_.hProcess && !indexer_.hProcess && qdrant_.hProcess) {
+        if (!is_ui_running() && !indexer_.hProcess && qdrant_.hProcess) {
             TerminateProcess(qdrant_.hProcess, 0);
             WaitForSingleObject(qdrant_.hProcess, 2000);
             qdrant_.reset();
@@ -244,6 +249,37 @@ private:
         } else if (!ui_.hProcess) {
             spawn_ui(L"--settings");
         }
+    }
+
+    bool is_ui_running() const {
+        if (ui_.hProcess && WaitForSingleObject(ui_.hProcess, 0) == WAIT_TIMEOUT) return true;
+        if (ui_hwnd_ && IsWindow(ui_hwnd_)) return true;
+        return FindWindowW(PILL_CLASS, nullptr) != nullptr;
+    }
+
+    void close_ui() {
+        HWND h = (ui_hwnd_ && IsWindow(ui_hwnd_)) ? ui_hwnd_ : FindWindowW(PILL_CLASS, nullptr);
+        DWORD ext_pid = 0;
+        if (h) {
+            GetWindowThreadProcessId(h, &ext_pid);
+            PostMessageW(h, msg_quit_ui(), 0, 0);
+        }
+        if (ui_.hProcess) {
+            if (WaitForSingleObject(ui_.hProcess, 400) != WAIT_OBJECT_0) {
+                TerminateProcess(ui_.hProcess, 0);
+                WaitForSingleObject(ui_.hProcess, 1000);
+            }
+            ui_.reset();
+        } else if (ext_pid != 0 && ext_pid != GetCurrentProcessId()) {
+            wil::unique_handle proc{OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, ext_pid)};
+            if (proc) {
+                if (WaitForSingleObject(proc.get(), 400) != WAIT_OBJECT_0) {
+                    TerminateProcess(proc.get(), 0);
+                }
+            }
+        }
+        ui_hwnd_ = nullptr;
+        maybe_stop_qdrant();
     }
 
     void start_index() {
@@ -276,6 +312,7 @@ private:
 
         indexer_ = spawn(exe_dir() / L"usyseek-indexer.exe", L"", true, L"indexer.log", &env);
         stopping_index_ = false;
+        if (indexer_.hProcess) SetTimer(hwnd_, TIMER_TRAY_PROGRESS, 1000, nullptr);
         notify_ui();
         update_tip();
     }
@@ -304,6 +341,7 @@ private:
             maybe_stop_qdrant();
         } else if (h == indexer_.hProcess) {
             KillTimer(hwnd_, TIMER_STOP_INDEX);
+            KillTimer(hwnd_, TIMER_TRAY_PROGRESS);
             indexer_.reset();
             stopping_index_ = false;
             close_everything_instance();
@@ -345,6 +383,7 @@ private:
     }
 
     void add_tray() {
+        last_tip_.clear();
         NOTIFYICONDATAW nid = tray_data();
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         nid.uCallbackMessage = WM_TRAY;
@@ -354,6 +393,7 @@ private:
         Shell_NotifyIconW(NIM_ADD, &nid);
         nid.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        update_tip();
     }
 
     void remove_tray() {
@@ -361,24 +401,62 @@ private:
         Shell_NotifyIconW(NIM_DELETE, &nid);
     }
 
-    std::wstring status_line() const {
-        if (!indexer_.hProcess) return std::wstring{APP_NAME} + L"  v" + APP_VERSION;
-        if (stopping_index_) return L"Stopping indexer…";
-        std::wstring line = L"Indexing";
+    std::wstring format_index_progress(bool multiline) const {
+        if (!indexer_.hProcess) return {};
         if (auto block = StatusBlock::open()) {
             const StatusData d = block->read();
-            if (d.phase == Phase::Embedding) line += L" (" + format_count(d.embedded) + L" / " + format_count(d.found) + L")";
-            else line = phase_label(d.phase);
+            if (stopping_index_) {
+                if (d.found > 0) {
+                    wchar_t pbuf[32];
+                    const double pct = std::clamp(100.0 * static_cast<double>(d.embedded) / static_cast<double>(d.found), 0.0, 100.0);
+                    swprintf_s(pbuf, L"%.1f%%", pct);
+                    return std::wstring{L"Stopping indexer… ("} + format_count(d.embedded) + L" / " + format_count(d.found) + L" • " + pbuf + L")";
+                }
+                return L"Stopping indexer…";
+            }
+            if (d.phase == Phase::Embedding || d.found > 0) {
+                wchar_t pbuf[32];
+                const double pct = d.found > 0
+                    ? std::clamp(100.0 * static_cast<double>(d.embedded) / static_cast<double>(d.found), 0.0, 100.0)
+                    : 0.0;
+                swprintf_s(pbuf, L"%.1f%%", pct);
+                std::wstring line = std::wstring{L"Indexing "} + pbuf + (multiline ? L"\n" : L"  •  ") +
+                                    format_count(d.embedded) + L" / " + format_count(d.found);
+                if (d.rate > 0.05f) {
+                    wchar_t rbuf[32];
+                    swprintf_s(rbuf, L"%.1f/s", d.rate);
+                    line += std::wstring{L" • "} + rbuf;
+                    if (d.todo > d.processed) {
+                        const uint64_t rem_ms = static_cast<uint64_t>((d.todo - d.processed) / d.rate * 1000.0f);
+                        line += L" • ETA " + format_duration_ms(rem_ms);
+                    }
+                }
+                return line;
+            }
+            std::wstring line = phase_label(d.phase);
+            if (d.message[0]) line += std::wstring{L" — "} + d.message;
+            return line;
         }
-        return line;
+        return stopping_index_ ? L"Stopping indexer…" : L"Indexing…";
+    }
+
+    std::wstring status_line() const {
+        if (!indexer_.hProcess) return std::wstring{APP_NAME} + L"  v" + APP_VERSION;
+        return format_index_progress(false);
     }
 
     void update_tip() {
+        std::wstring tip = APP_NAME;
+        if (indexer_.hProcess) {
+            const std::wstring prog = format_index_progress(true);
+            if (!prog.empty()) tip += L" — " + prog;
+        }
+        if (tip.size() >= 127) tip.resize(127);
+        if (tip == last_tip_) return;
+        last_tip_ = tip;
+
         NOTIFYICONDATAW nid = tray_data();
         nid.uFlags = NIF_TIP | NIF_SHOWTIP;
-        const std::wstring tip = indexer_.hProcess
-            ? (std::wstring{APP_NAME} + (stopping_index_ ? L" - stopping indexer" : L" - indexing"))
-            : std::wstring{APP_NAME};
         wcscpy_s(nid.szTip, tip.c_str());
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
@@ -397,6 +475,7 @@ private:
     }
 
     void show_menu() {
+        update_tip();
         wil::unique_hmenu menu{CreatePopupMenu()};
         const std::wstring header = status_line();
         AppendMenuW(menu.get(), MF_STRING | MF_DISABLED, 0, header.c_str());
@@ -405,6 +484,9 @@ private:
         if (settings_.hotkey_enabled) search += L"\t" + hotkey_text(settings_);
         AppendMenuW(menu.get(), MF_STRING, IdSearch, search.c_str());
         AppendMenuW(menu.get(), MF_STRING, IdSettings, L"Open Settings");
+        const bool ui_alive = is_ui_running();
+        AppendMenuW(menu.get(), MF_STRING | (ui_alive ? 0 : (MF_DISABLED | MF_GRAYED)), IdCloseUi,
+                    ui_alive ? L"Close UI Process" : L"Close UI Process (Not Running)");
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu.get(), MF_STRING, IdToggleIndex,
                     indexer_.hProcess ? (stopping_index_ ? L"Stopping Indexing…" : L"Stop Indexing") : L"Start Indexing");
@@ -420,6 +502,7 @@ private:
         switch (cmd) {
             case IdSearch: toggle_search(); break;
             case IdSettings: open_settings(); break;
+            case IdCloseUi: close_ui(); break;
             case IdToggleIndex: indexer_.hProcess ? stop_index() : start_index(); break;
             case IdQuit: DestroyWindow(hwnd_); break;
             default: break;
@@ -438,6 +521,7 @@ private:
     wil::unique_process_information indexer_;
     wil::unique_process_information qdrant_;
     bool stopping_index_ = false;
+    std::wstring last_tip_;
 };
 
 } // namespace

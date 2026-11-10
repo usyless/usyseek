@@ -57,6 +57,10 @@ inline UINT msg_indexer_changed() noexcept {
     static const UINT m = RegisterWindowMessageW(L"usyseek.indexer_changed");
     return m;
 }
+inline UINT msg_quit_ui() noexcept {
+    static const UINT m = RegisterWindowMessageW(L"usyseek.quit_ui");
+    return m;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Strings
