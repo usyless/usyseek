@@ -183,6 +183,9 @@ private:
         IdMenuField,
         IdDrop,
         IdDropItem,
+        IdHelpBtn,
+        IdHelp,
+        IdHelpItem,
         IdGrid,
     };
     enum MenuAction { ActOpen, ActReveal, ActSimilar, ActCopy };
@@ -248,6 +251,18 @@ private:
         SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
     }
 
+    static constexpr float HELP_W = 420.0f;
+    static constexpr float HELP_H = 240.0f;
+
+    [[nodiscard]] bool show_help() const noexcept {
+        return help_pinned_ || hover_id_ == IdHelpBtn || hover_id_ == IdHelp || hover_id_ == IdHelpItem;
+    }
+
+    [[nodiscard]] float help_height_dip() const noexcept {
+        if (!show_help()) return 0.0f;
+        return (HEADER_H - 4.0f) + HELP_H + 12.0f;
+    }
+
     [[nodiscard]] float dropdown_height_dip() const noexcept {
         if (!drop_open_) return 0.0f;
         const float row = 32.0f;
@@ -256,7 +271,7 @@ private:
     }
 
     [[nodiscard]] float current_height_dip() const {
-        if (!expanded()) return std::max(HEADER_H + STATUS_H, dropdown_height_dip());
+        if (!expanded()) return std::max({HEADER_H + STATUS_H, dropdown_height_dip(), help_height_dip()});
         return sh_.settings.pill_h > 0 ? static_cast<float>(sh_.settings.pill_h) : DEFAULT_H;
     }
 
@@ -512,6 +527,7 @@ private:
         draw_status(cv, sz);
         if (expanded()) draw_grid(cv);
         if (drop_open_) draw_dropdown(cv);
+        if (show_help()) draw_help(cv, sz);
         if (menu_open_) draw_menu(cv);
     }
 
@@ -544,6 +560,8 @@ private:
         x -= 8;
         cv.vline(x, cy - 12, cy + 12, color::outline_variant);
         x -= 4;
+        btn(glyph::help, IdHelpBtn, show_help());
+        help_btn_x_ = x;
         btn(glyph::tag, IdTagBtn, drop_open_ && drop_from_button_);
         x -= 8;
 
@@ -863,6 +881,64 @@ private:
         }
     }
 
+    struct HelpRow {
+        const wchar_t* syntax;
+        const wchar_t* desc;
+        const wchar_t* insert;
+    };
+    static constexpr HelpRow HELP_ROWS[] = {
+        {L"free text", L"Semantic search by meaning (CLIP)", L""},
+        {L"name:cat", L"File name contains prefix tokens", L"name:"},
+        {L"tag:fav", L"Require tag (\"quotes\" for spaces)", L"tag:"},
+        {L"-tag:wip", L"Exclude tag (or !tag:wip)", L"-tag:"},
+        {L"dir:C:\\Photos", L"Search inside folder (or in:, bare path)", L"dir:"},
+        {L"similar:path", L"Visually similar to an indexed file", L"similar:"},
+        {L"type:image", L"Filter media type (image or video)", L"type:image "},
+    };
+
+    void draw_help(Canvas& cv, D2D1_SIZE_F sz) {
+        const float x = std::clamp(help_btn_x_ + 36.0f - HELP_W, 14.0f, std::max(14.0f, sz.width - HELP_W - 14.0f));
+        const float y = HEADER_H - 4.0f;
+        const D2D1_RECT_F r = rect(x, y, HELP_W, HELP_H);
+        cv.shadow(r, 12, 12, 0.35f);
+        cv.fill_round(r, 12, color::surface_high);
+        cv.stroke_round(r, 12, color::outline_variant);
+        cv.hit(rect(x, HEADER_H - 18.0f, HELP_W, HELP_H + 14.0f), IdHelp);
+
+        cv.text(L"SEARCH SYNTAX  ·  CLICK TO INSERT", rect(x + 14.0f, y + 8.0f, HELP_W - 28.0f, 22.0f), Font::Label, color::primary);
+        float ry = y + 34.0f;
+        for (int i = 0; i < static_cast<int>(std::size(HELP_ROWS)); ++i) {
+            const D2D1_RECT_F rr = rect(x + 6.0f, ry, HELP_W - 12.0f, 28.0f);
+            if (hover_id_ == IdHelpItem && hover_index_ == i && HELP_ROWS[i].insert[0] != 0) {
+                cv.fill_round(rr, 8.0f, with_alpha(color::primary, 0.12f));
+            }
+            const D2D1_RECT_F badge = rect(rr.left + 6.0f, rr.top + 3.0f, 114.0f, 22.0f);
+            cv.fill_round(badge, 6.0f, with_alpha(color::surface_highest, 0.9f));
+            cv.text(HELP_ROWS[i].syntax, inset(badge, 8.0f, 0.0f), Font::MonoSmall, color::primary);
+            cv.text(HELP_ROWS[i].desc, D2D1::RectF(rr.left + 130.0f, rr.top, rr.right - 8.0f, rr.bottom), Font::Small, color::on_surface_variant);
+            if (HELP_ROWS[i].insert[0] != 0) cv.hit(rr, IdHelpItem, i);
+            ry += 28.0f;
+        }
+    }
+
+    void insert_help_syntax(int index) {
+        if (index < 0 || index >= static_cast<int>(std::size(HELP_ROWS))) return;
+        const std::wstring_view ins = HELP_ROWS[index].insert;
+        if (ins.empty()) return;
+        std::wstring t = trim(field_.text);
+        if (!t.empty()) t += L' ';
+        t += ins;
+        field_.set(t);
+        field_.focused = true;
+        help_pinned_ = false;
+        hover_id_ = IdNone;
+        caret_reset();
+        update_dropdown();
+        if (ins.ends_with(L' ')) run_search(0);
+        else apply_height();
+        render();
+    }
+
     // ------------------------------------------------------------------------------------------
     // Context menu (actions + tag editor)
     // ------------------------------------------------------------------------------------------
@@ -899,6 +975,7 @@ private:
         menu_open_ = false;
         drop_open_ = false;
         drop_from_button_ = false;
+        help_pinned_ = false;
         field_.focused = true;
         apply_height();
     }
@@ -1096,8 +1173,10 @@ private:
         const int id = h ? h->id : IdNone;
         const int idx = h ? h->index : 0;
         if (id != hover_id_ || idx != hover_index_) {
+            const bool was_help = show_help();
             hover_id_ = id;
             hover_index_ = idx;
+            if (show_help() != was_help) apply_height();
             render();
         }
     }
@@ -1121,6 +1200,10 @@ private:
             drop_from_button_ = false;
             apply_height();
         }
+        if (help_pinned_ && id != IdHelp && id != IdHelpItem && id != IdHelpBtn) {
+            help_pinned_ = false;
+            apply_height();
+        }
         switch (id) {
             case IdField: {
                 field_.focused = true;
@@ -1137,7 +1220,17 @@ private:
                 chip_ = idx - 1;
                 if (!trim(field_.text).empty()) run_search(0);
                 break;
+            case IdHelpBtn:
+                help_pinned_ = !help_pinned_;
+                drop_open_ = false;
+                drop_from_button_ = false;
+                apply_height();
+                break;
+            case IdHelpItem:
+                insert_help_syntax(idx);
+                return;
             case IdTagBtn:
+                help_pinned_ = false;
                 drop_from_button_ = !(drop_open_ && drop_from_button_);
                 if (drop_from_button_) {
                     sh_.refresh_tags();
@@ -1241,7 +1334,7 @@ private:
     void on_key(UINT vk) {
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
         if (vk == VK_ESCAPE) {
-            if (menu_open_ || drop_open_) close_popups();
+            if (menu_open_ || drop_open_ || help_pinned_) close_popups();
             else if (fullscreen_) toggle_fullscreen();
             else if (!selected_.empty() && !field_.focused) {
                 selected_.clear();
@@ -1365,7 +1458,7 @@ private:
         if (t && vert) return HTTOP;
         if (btm && vert) return HTBOTTOM;
         const D2D1_POINT_2F p{pt.x / target_.scale(), pt.y / target_.scale()};
-        if (p.y < HEADER_H + STATUS_H && !menu_open_ && !drop_open_) {
+        if (p.y < HEADER_H + STATUS_H && !menu_open_ && !drop_open_ && !show_help()) {
             const Hit* h = hit_test(hits_, p);
             if (!h) return HTCAPTION;
         }
@@ -1463,7 +1556,7 @@ private:
                     ScreenToClient(hwnd_, &pt);
                     const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
                     const int id = h ? h->id : 0;
-                    SetCursor(id == IdField || id == IdMenuField ? cursor_ibeam_ : (id == IdNone || id == IdGrid || id == IdMenu || id == IdDrop || id == IdCard) ? cursor_arrow_ : cursor_hand_);
+                    SetCursor(id == IdField || id == IdMenuField ? cursor_ibeam_ : (id == IdNone || id == IdGrid || id == IdMenu || id == IdDrop || id == IdHelp || id == IdCard) ? cursor_arrow_ : cursor_hand_);
                     return TRUE;
                 }
                 break;
@@ -1471,7 +1564,9 @@ private:
             case WM_MOUSELEAVE:
                 tracking_ = false;
                 if (hover_id_) {
+                    const bool was_help = show_help();
                     hover_id_ = IdNone;
+                    if (show_help() != was_help) apply_height();
                     render();
                 }
                 return 0;
@@ -1582,6 +1677,9 @@ private:
     bool drop_from_button_ = false;
     std::vector<TagCount> drop_items_;
     int drop_sel_ = 0;
+
+    bool help_pinned_ = false;
+    float help_btn_x_ = 0.0f;
 };
 
 } // namespace usyseek::ui

@@ -76,6 +76,7 @@ inline constexpr wchar_t warning = 0xE7BA;
 inline constexpr wchar_t download = 0xE896;
 inline constexpr wchar_t block = 0xF140;
 inline constexpr wchar_t chevron_down = 0xE70D;
+inline constexpr wchar_t help = 0xE897;
 } // namespace glyph
 
 enum class Font : uint8_t {
