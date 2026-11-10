@@ -4,8 +4,51 @@
 #include "textfield.hpp"
 
 #include <shobjidl.h>
+#include <urlmon.h>
+
+namespace usyseek {
+
+struct NugetVersionIndex {
+    std::vector<std::string> versions;
+};
+
+} // namespace usyseek
 
 namespace usyseek::ui {
+
+class DownloadProgressCallback final : public IBindStatusCallback {
+public:
+    explicit DownloadProgressCallback(std::function<void(ULONG, ULONG)> on_progress)
+        : on_progress_{std::move(on_progress)} {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IBindStatusCallback) {
+            *ppv = static_cast<IBindStatusCallback*>(this);
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    HRESULT STDMETHODCALLTYPE OnStartBinding(DWORD, IBinding*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPriority(LONG*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE OnLowResource(DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnProgress(ULONG progress, ULONG progress_max, ULONG status_code, LPCWSTR) override {
+        if ((status_code == BINDSTATUS_DOWNLOADINGDATA || status_code == BINDSTATUS_ENDDOWNLOADDATA) && on_progress_) {
+            on_progress_(progress, progress_max);
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnStopBinding(HRESULT, LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetBindInfo(DWORD*, BINDINFO*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE OnDataAvailable(DWORD, DWORD, FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE OnObjectAvailable(REFIID, IUnknown*) override { return E_NOTIMPL; }
+
+private:
+    std::function<void(ULONG, ULONG)> on_progress_;
+};
 
 class SettingsWindow {
 public:
@@ -46,6 +89,7 @@ public:
         exclude_field_.placeholder = L"Pattern or path (e.g. *\\cache or D:\\Temp)";
         model_field_.placeholder = L"PE-Core-L-14-336";
         batch_field_.placeholder = L"Custom";
+        py_ver_field_.placeholder = L"3.14";
         arch_field_.placeholder = L"gfx1030";
         torch_field_.placeholder = L"Optional custom pip args (e.g. --index-url ... torch==2.7.1 torchvision==0.22.1)";
         sync_fields();
@@ -161,6 +205,9 @@ private:
         IdClearScript,
         IdBrowseVenv,
         IdBrowseBasePy,
+        IdPyVerChip,
+        IdPyVerField,
+        IdDownloadNugetPy,
         IdBackendChip,
         IdArchField,
         IdTorchField,
@@ -175,6 +222,7 @@ private:
         sh_.settings.launch_on_startup = is_startup_enabled();
         model_field_.set(to_wide(sh_.settings.model_name));
         batch_field_.set(sh_.settings.batch_size > 0 ? std::to_wstring(sh_.settings.batch_size) : L"");
+        py_ver_field_.set(to_wide(sh_.settings.python_version.empty() ? "3.14" : sh_.settings.python_version));
         arch_field_.set(to_wide(sh_.settings.rocm_arch));
         torch_field_.set(to_wide(sh_.settings.torch_pip_args));
     }
@@ -201,7 +249,7 @@ private:
         venv_pkgs_.clear();
         if (!venv_.exists) return;
         std::error_code ec;
-        const fs::path sp = vdir / L"Lib" / L"site-packages";
+        const fs::path sp = venv_.site_packages.empty() ? (vdir / L"Lib" / L"site-packages") : fs::path{venv_.site_packages};
         if (!fs::exists(sp, ec)) return;
         std::vector<std::wstring> found;
         for (const auto& e : fs::directory_iterator(sp, ec)) {
@@ -781,21 +829,22 @@ private:
             y = next_y;
         }
 
-        // 3. Python Virtual Environment (.venv) Card
+        // 3. Python Environment Card (.venv or portable NuGet Python)
         {
             const bool has_log = !venv_log_.empty();
-            const float h = 330.0f + (has_log ? 84.0f : 0.0f);
+            const float h = 368.0f + (has_log ? 84.0f : 0.0f);
             const float next_y = card_begin(cv, x, y, w, h);
             const float lx = x + 22.0f, rw = w - 44.0f;
 
-            cv.text(L"Python Virtual Environment (.venv)", rect(lx, y + 16.0f, 360.0f, 22.0f), Font::Large, color::on_surface);
-            cv.text(L"Connected via shared memory (supports any Python 3.10+ .venv with PyTorch & open-clip)",
+            cv.text(L"Python Environment", rect(lx, y + 16.0f, 360.0f, 22.0f), Font::Large, color::on_surface);
+            cv.text(L"Any Python 3.10+ .venv or portable Python folder with PyTorch & open-clip (runs out-of-process)",
                     rect(lx, y + 38.0f, rw - 140.0f, 18.0f), Font::Small, color::on_surface_variant);
 
             // Status pill
             std::error_code ec;
             const bool ver_ok = venv_.exists && fs::exists(venv_.python_exe, ec);
-            const std::wstring st_txt = venv_busy_ ? L"Running task…" : (ver_ok ? L".venv Ready" : (venv_.exists ? L"Missing python.exe" : L"Not found"));
+            const std::wstring ready_txt = venv_.portable ? L"Portable Ready" : L".venv Ready";
+            const std::wstring st_txt = venv_busy_ ? L"Running task…" : (ver_ok ? ready_txt : (venv_.exists ? L"Missing python.exe" : L"Not found"));
             const D2D1_COLOR_F st_col = venv_busy_ ? color::amber : (ver_ok ? color::mint : color::error);
             const float sw = cv.measure(st_txt, Font::Caption) + 26.0f;
             const D2D1_RECT_F sbr = rect(lx + rw - sw, y + 18.0f, sw, 24.0f);
@@ -808,19 +857,41 @@ private:
             const D2D1_RECT_F box = rect(lx, cy, rw, 84.0f);
             cv.fill_round(box, 10.0f, color::surface_lowest);
             cv.stroke_round(box, 10.0f, color::outline_variant);
-            cv.text(L"Venv Path:", rect(lx + 14.0f, cy + 8.0f, 100.0f, 22.0f), Font::Caption, color::outline);
+            cv.text(L"Env Path:", rect(lx + 14.0f, cy + 8.0f, 100.0f, 22.0f), Font::Caption, color::outline);
             cv.text(to_wide(sh_.settings.venv_dir), rect(lx + 110.0f, cy + 8.0f, rw - 210.0f, 22.0f), Font::MonoSmall, color::primary);
             draw_button(cv, rect(lx + rw - 92.0f, cy + 6.0f, 84.0f, 24.0f), glyph::folder, L"Select…", IdBrowseVenv);
 
             cv.text(L"Interpreter:", rect(lx + 14.0f, cy + 32.0f, 100.0f, 22.0f), Font::Caption, color::outline);
-            const std::wstring py_info = venv_.exists ? (L"Python " + venv_.version + L"  (" + venv_.home + L")") : L"No pyvenv.cfg in selected folder";
+            const std::wstring py_info = venv_.exists
+                ? (L"Python " + venv_.version + (venv_.portable ? L"  (portable: " : L"  (venv of ") + venv_.home + L")")
+                : L"No pyvenv.cfg or python.exe in selected folder";
             cv.text(py_info, rect(lx + 110.0f, cy + 32.0f, rw - 120.0f, 22.0f), Font::Small, color::on_surface);
 
             cv.text(L"Packages:", rect(lx + 14.0f, cy + 56.0f, 100.0f, 22.0f), Font::Caption, color::outline);
             cv.text(venv_pkgs_.empty() ? L"—" : venv_pkgs_, rect(lx + 110.0f, cy + 56.0f, rw - 120.0f, 22.0f), Font::Caption, color::on_surface_variant);
 
-            // Torch installer backend row
+            // Portable Python (NuGet) row
             cy += 96.0f;
+            cv.text(L"Portable Python:", rect(lx, cy, 104.0f, 30.0f), Font::SmallSemi, color::on_surface_variant);
+            static constexpr const char* versions[4] = {"3.14", "3.13", "3.12", "3.11"};
+            float vx = lx + 106.0f;
+            for (int i = 0; i < 4; ++i) {
+                const bool on = sh_.settings.python_version == versions[i];
+                draw_button(cv, rect(vx, cy, 52.0f, 30.0f), 0, to_wide(versions[i]), IdPyVerChip, i, on ? 1 : 0);
+                vx += 58.0f;
+            }
+            const D2D1_RECT_F pvr = rect(vx, cy, 78.0f, 30.0f);
+            cv.fill_round(pvr, 8.0f, color::surface_low);
+            cv.stroke_round(pvr, 8.0f, active_field_ == &py_ver_field_ ? color::primary : color::outline_variant);
+            py_ver_field_.draw(cv, inset(pvr, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+            cv.hit(pvr, IdPyVerField);
+            const std::wstring dl_label = dl_total_ > 0 && venv_busy_
+                ? (L"Downloading " + std::to_wstring(dl_done_ * 100 / std::max<ULONG>(1, dl_total_)) + L"%")
+                : L"Download & Use";
+            draw_button(cv, rect(lx + rw - 196.0f, cy, 196.0f, 30.0f), glyph::download, dl_label, IdDownloadNugetPy, 0, 1);
+
+            // Torch installer backend row
+            cy += 38.0f;
             cv.text(L"PyTorch stack:", rect(lx, cy, 94.0f, 30.0f), Font::SmallSemi, color::on_surface_variant);
             const char* backends[4] = {"rocm", "cuda", "cpu", "manual"};
             const wchar_t* blabels[4] = {L"AMD ROCm", L"NVIDIA CUDA", L"CPU", L"Manual"};
@@ -894,7 +965,13 @@ private:
     void open_venv_terminal() {
         const fs::path vdir = to_wide(sh_.settings.venv_dir);
         const fs::path act = vdir / L"Scripts" / L"activate.bat";
-        std::wstring args = fs::exists(act) ? (L"/k \"\"" + act.wstring() + L"\"\"") : L"";
+        std::wstring args;
+        if (fs::exists(act)) {
+            args = L"/k \"\"" + act.wstring() + L"\"\"";
+        } else if (venv_.portable) {
+            // Portable Python: put the interpreter and its Scripts folder first on PATH
+            args = L"/k \"set \"PATH=" + venv_.home + L";" + venv_.home + L"\\Scripts;%PATH%\"\"";
+        }
         SHELLEXECUTEINFOW sei{sizeof(sei)};
         sei.lpVerb = L"open";
         sei.lpFile = L"cmd.exe";
@@ -950,6 +1027,7 @@ private:
         if (!sh_.settings.base_python.empty() && fs::exists(to_wide(sh_.settings.base_python))) {
             return to_wide(sh_.settings.base_python);
         }
+        if (venv_.portable && fs::exists(venv_.python_exe)) return venv_.python_exe;
         if (!venv_.home.empty() && fs::exists(fs::path{venv_.home} / L"python.exe")) {
             return fs::path{venv_.home} / L"python.exe";
         }
@@ -961,12 +1039,141 @@ private:
         return L"python.exe";
     }
 
+    // ------------------------------------------------------------------------------------------
+    // Portable Python from NuGet (python package = full CPython with pip/venv, no installer)
+    // ------------------------------------------------------------------------------------------
+
+    static std::optional<std::string> http_get_to_memory(const wchar_t* url) {
+        wil::com_ptr<IStream> stream;
+        if (FAILED(URLOpenBlockingStreamW(nullptr, url, &stream, 0, nullptr)) || !stream) return std::nullopt;
+        std::string out;
+        char buf[16384];
+        for (;;) {
+            ULONG got = 0;
+            const HRESULT hr = stream->Read(buf, sizeof(buf), &got);
+            if (got) out.append(buf, got);
+            if (FAILED(hr) || hr == S_FALSE || got == 0) break;
+        }
+        return out;
+    }
+
+    static std::vector<int> parse_ver(std::string_view v) {
+        std::vector<int> out;
+        int cur = 0;
+        bool any = false;
+        for (char c : v) {
+            if (c >= '0' && c <= '9') {
+                cur = cur * 10 + (c - '0');
+                any = true;
+            } else if (c == '.') {
+                out.push_back(cur);
+                cur = 0;
+                any = false;
+            } else {
+                break;
+            }
+        }
+        if (any) out.push_back(cur);
+        return out;
+    }
+
+    /// Resolves "3.14" to the newest stable 3.14.x on NuGet; exact versions ("3.12.2") pass through if listed.
+    std::optional<std::string> resolve_nuget_python(const std::string& want) {
+        append_venv_log(L"Querying NuGet for Python " + to_wide(want) + L"…");
+        const auto body = http_get_to_memory(L"https://api.nuget.org/v3-flatcontainer/python/index.json");
+        if (!body) {
+            append_venv_log(L"Could not reach api.nuget.org");
+            return std::nullopt;
+        }
+        NugetVersionIndex idx;
+        if (glz::read<JSON_READ>(idx, *body)) {
+            append_venv_log(L"Unexpected response from NuGet");
+            return std::nullopt;
+        }
+        const bool exact = std::count(want.begin(), want.end(), '.') >= 2 || want.find('-') != std::string::npos;
+        if (exact) {
+            if (std::find(idx.versions.begin(), idx.versions.end(), want) != idx.versions.end()) return want;
+            append_venv_log(L"Python " + to_wide(want) + L" is not published on NuGet");
+            return std::nullopt;
+        }
+        const std::string prefix = want + ".";
+        std::optional<std::string> best;
+        for (const auto& v : idx.versions) {
+            if (!v.starts_with(prefix) || v.find('-') != std::string::npos) continue; // stable only
+            if (!best || parse_ver(v) > parse_ver(*best)) best = v;
+        }
+        if (!best) append_venv_log(L"No stable Python " + to_wide(want) + L".x release on NuGet");
+        return best;
+    }
+
+    void download_portable_python() {
+        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        auto uninit = wil::scope_exit([co] { if (SUCCEEDED(co)) CoUninitialize(); });
+
+        const std::string want = sh_.settings.python_version.empty() ? "3.14" : sh_.settings.python_version;
+        const auto ver = resolve_nuget_python(want);
+        if (!ver) return;
+
+        const fs::path root = data_dir() / (L"python-" + to_wide(*ver));
+        const fs::path pkg = data_dir() / (L"python." + to_wide(*ver) + L".nupkg");
+        std::error_code ec;
+
+        if (!fs::exists(root / L"tools" / L"python.exe", ec)) {
+            const std::wstring url = L"https://api.nuget.org/v3-flatcontainer/python/" + to_wide(*ver) + L"/python." + to_wide(*ver) + L".nupkg";
+            append_venv_log(L"Downloading Python " + to_wide(*ver) + L" from NuGet…");
+            DownloadProgressCallback cb{[this](ULONG done, ULONG total) {
+                sh_.call([this, done, total] {
+                    dl_done_ = done;
+                    dl_total_ = total;
+                    render();
+                });
+            }};
+            const HRESULT hr = URLDownloadToFileW(nullptr, url.c_str(), pkg.c_str(), 0, &cb);
+            sh_.call([this] { dl_total_ = 0; });
+            if (FAILED(hr)) {
+                append_venv_log(L"Download failed (HRESULT 0x" + std::format(L"{:08X}", static_cast<uint32_t>(hr)) + L")");
+                fs::remove(pkg, ec);
+                return;
+            }
+
+            // .nupkg is a zip; Windows 10+ ships bsdtar which extracts zips natively
+            append_venv_log(L"Extracting…");
+            fs::remove_all(root, ec);
+            fs::create_directories(root, ec);
+            wchar_t sys_dir[MAX_PATH]{};
+            GetSystemDirectoryW(sys_dir, MAX_PATH);
+            exec_logged(fs::path{sys_dir} / L"tar.exe", {L"-xf", pkg.wstring(), L"-C", root.wstring(), L"tools"});
+            fs::remove(pkg, ec);
+            if (!fs::exists(root / L"tools" / L"python.exe", ec)) {
+                append_venv_log(L"Extraction failed: tools\\python.exe missing");
+                return;
+            }
+        } else {
+            append_venv_log(L"Python " + to_wide(*ver) + L" already downloaded, reusing it.");
+        }
+
+        // Packages install straight into the portable interpreter (no venv)
+        const fs::path py = root / L"tools" / L"python.exe";
+        exec_logged(py, {L"-m", L"ensurepip", L"--upgrade"});
+        sh_.call([this, root] {
+            sh_.settings.venv_dir = to_utf8(root.wstring());
+            sh_.save();
+            probe_venv();
+            render();
+        });
+        install_packages_into(py);
+    }
+
     void install_packages_in_worker() {
-        const fs::path py = fs::path{to_wide(sh_.settings.venv_dir)} / L"Scripts" / L"python.exe";
-        if (!fs::exists(py)) {
-            append_venv_log(L"python.exe not found in venv — click Create / Recreate Venv first.");
+        const VenvInfo info = read_venv(to_wide(sh_.settings.venv_dir));
+        if (!info.exists || !fs::exists(info.python_exe)) {
+            append_venv_log(L"python.exe not found — create a venv or download a portable Python first.");
             return;
         }
+        install_packages_into(info.python_exe);
+    }
+
+    void install_packages_into(const fs::path& py) {
         exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"pip"});
         const std::wstring custom_args = trim(to_wide(sh_.settings.torch_pip_args));
         if (!custom_args.empty()) {
@@ -1049,6 +1256,11 @@ private:
         const std::string tp = to_utf8(trim(torch_field_.text));
         if (tp != sh_.settings.torch_pip_args) {
             sh_.settings.torch_pip_args = tp;
+            changed = true;
+        }
+        const std::string pv = to_utf8(trim(py_ver_field_.text));
+        if (!pv.empty() && pv != sh_.settings.python_version) {
+            sh_.settings.python_version = pv;
             changed = true;
         }
         const std::wstring bs_txt = trim(batch_field_.text);
@@ -1328,11 +1540,32 @@ private:
             }
             case IdArchField: focus_field(arch_field_); break;
             case IdTorchField: focus_field(torch_field_); break;
+            case IdPyVerField: focus_field(py_ver_field_); break;
+            case IdPyVerChip: {
+                static constexpr const char* v[4] = {"3.14", "3.13", "3.12", "3.11"};
+                sh_.settings.python_version = v[std::clamp(idx, 0, 3)];
+                py_ver_field_.set(to_wide(sh_.settings.python_version));
+                sh_.save();
+                break;
+            }
+            case IdDownloadNugetPy:
+                commit_fields();
+                run_venv_task([this] { download_portable_python(); });
+                return;
             case IdOpenTerminal: open_venv_terminal(); break;
             case IdUpdateVenv:
                 run_venv_task([this] { install_packages_in_worker(); });
                 return;
             case IdRecreateVenv:
+                if (venv_.portable) {
+                    // Portable interpreters are not venvs: re-download the selected version instead
+                    run_venv_task([this] {
+                        std::error_code ec;
+                        fs::remove_all(to_wide(sh_.settings.venv_dir), ec);
+                        download_portable_python();
+                    });
+                    return;
+                }
                 run_venv_task([this] {
                     const fs::path base = find_base_python();
                     const fs::path vdir = to_wide(sh_.settings.venv_dir);
@@ -1491,7 +1724,7 @@ private:
                     ScreenToClient(hwnd_, &pt);
                     const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
                     const int id = h ? h->id : 0;
-                    const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdBatchField || id == IdArchField || id == IdTorchField;
+                    const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdBatchField || id == IdArchField || id == IdTorchField || id == IdPyVerField;
                     SetCursor(ibeam ? cursor_ibeam_ : (id ? cursor_hand_ : cursor_arrow_));
                     return TRUE;
                 }
@@ -1600,6 +1833,7 @@ private:
     TextField batch_field_;
     TextField arch_field_;
     TextField torch_field_;
+    TextField py_ver_field_;
     TextField* active_field_ = nullptr;
     bool recording_hotkey_ = false;
 
@@ -1608,6 +1842,7 @@ private:
     std::wstring venv_pkgs_;
     std::wstring venv_log_;
     bool venv_busy_ = false;
+    ULONG dl_done_ = 0, dl_total_ = 0;
     std::jthread task_;
 };
 

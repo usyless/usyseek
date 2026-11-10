@@ -38,10 +38,11 @@ struct Settings {
     // Python environment
     std::string venv_dir;
     std::string base_python;
-    std::string vision_script;          // empty = bundled usyseek_vision.py
-    std::string torch_backend = "rocm"; // rocm | cuda | cpu | manual
+    std::string python_version = "3.14"; // NuGet portable Python version (e.g. 3.14, 3.13, 3.12.2)
+    std::string vision_script;           // empty = bundled usyseek_vision.py
+    std::string torch_backend = "rocm";  // rocm | cuda | cpu | manual
     std::string rocm_arch = "gfx1030";
-    std::string torch_pip_args;         // optional custom pip install args for torch/torchvision
+    std::string torch_pip_args;          // optional custom pip install args for torch/torchvision
 
     // Database
     uint16_t qdrant_http_port = 6389;
@@ -228,37 +229,73 @@ inline std::vector<FailedFile> load_failed_files(std::string_view coll) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Python virtual environment inspection (pyvenv.cfg)
+// Python environment inspection (.venv or standalone / NuGet portable Python)
 // ---------------------------------------------------------------------------------------------
 
 struct VenvInfo {
     bool exists = false;
-    std::wstring home;        // base interpreter directory
-    std::wstring version;     // e.g. 3.12.10
-    std::wstring python_exe;  // venv\Scripts\python.exe
+    bool portable = false;      // true when python.exe lives directly in the directory (e.g. NuGet portable)
+    std::wstring home;          // base interpreter directory
+    std::wstring version;       // e.g. 3.14.0
+    std::wstring python_exe;    // venv\Scripts\python.exe or portable\python.exe
+    std::wstring site_packages; // Lib\site-packages
 };
+
+inline std::wstring read_pe_version(const fs::path& exe) {
+    DWORD dummy = 0;
+    const DWORD sz = GetFileVersionInfoSizeW(exe.c_str(), &dummy);
+    if (sz == 0) return {};
+    std::vector<uint8_t> buf(sz);
+    if (!GetFileVersionInfoW(exe.c_str(), 0, sz, buf.data())) return {};
+    VS_FIXEDFILEINFO* ffi = nullptr;
+    UINT len = 0;
+    if (!VerQueryValueW(buf.data(), L"\\", reinterpret_cast<void**>(&ffi), &len) || !ffi) return {};
+    return std::to_wstring(HIWORD(ffi->dwFileVersionMS)) + L"." +
+           std::to_wstring(LOWORD(ffi->dwFileVersionMS)) + L"." +
+           std::to_wstring(HIWORD(ffi->dwFileVersionLS));
+}
 
 inline VenvInfo read_venv(const fs::path& venv) {
     VenvInfo info;
-    const auto cfg = ulp::fs::read_as_bytes(venv / L"pyvenv.cfg");
-    if (!cfg) return info;
-    info.exists = true;
-    info.python_exe = (venv / L"Scripts" / L"python.exe").wstring();
-    std::string_view rest{*cfg};
-    while (!rest.empty()) {
-        const auto nl = rest.find('\n');
-        std::string_view line = rest.substr(0, nl);
-        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
-        const auto eq = line.find('=');
-        if (eq == std::string_view::npos) continue;
-        auto key = to_wide(line.substr(0, eq));
-        auto val = to_wide(line.substr(eq + 1));
-        key = trim(key);
-        val = trim(val);
-        if (key == L"home") info.home = val;
-        else if (key == L"version" || key == L"version_info") {
-            if (info.version.empty() || key == L"version") info.version = val;
+    if (const auto cfg = ulp::fs::read_as_bytes(venv / L"pyvenv.cfg")) {
+        info.exists = true;
+        info.portable = false;
+        info.python_exe = (venv / L"Scripts" / L"python.exe").wstring();
+        info.site_packages = (venv / L"Lib" / L"site-packages").wstring();
+        std::string_view rest{*cfg};
+        while (!rest.empty()) {
+            const auto nl = rest.find('\n');
+            std::string_view line = rest.substr(0, nl);
+            rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+            const auto eq = line.find('=');
+            if (eq == std::string_view::npos) continue;
+            auto key = to_wide(line.substr(0, eq));
+            auto val = to_wide(line.substr(eq + 1));
+            key = trim(key);
+            val = trim(val);
+            if (key == L"home") info.home = val;
+            else if (key == L"version" || key == L"version_info") {
+                if (info.version.empty() || key == L"version") info.version = val;
+            }
         }
+        return info;
+    }
+
+    // Portable / standalone Python directory (e.g. NuGet python package or WinPython)
+    std::error_code ec;
+    fs::path root = venv;
+    if (!fs::exists(root / L"python.exe", ec) && fs::exists(root / L"tools" / L"python.exe", ec)) {
+        root = root / L"tools";
+    }
+    const fs::path py_exe = root / L"python.exe";
+    if (fs::exists(py_exe, ec)) {
+        info.exists = true;
+        info.portable = true;
+        info.home = root.wstring();
+        info.python_exe = py_exe.wstring();
+        info.site_packages = (root / L"Lib" / L"site-packages").wstring();
+        info.version = read_pe_version(py_exe);
+        if (info.version.empty()) info.version = L"3.x";
     }
     return info;
 }

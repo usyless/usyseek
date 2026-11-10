@@ -168,7 +168,7 @@ target_include_directories(usyseek_common INTERFACE
     "${PROJECT_SOURCE_DIR}/resources"
 )
 target_include_directories(usyseek_common SYSTEM INTERFACE "${PROJECT_SOURCE_DIR}/3rdparty")
-target_link_libraries(usyseek_common INTERFACE usylibpp::usylibpp glaze::glaze)
+target_link_libraries(usyseek_common INTERFACE usylibpp::usylibpp glaze::glaze version)
 target_compile_definitions(usyseek_common INTERFACE
     WINVER=0x0A00
     _WIN32_WINNT=0x0A00
@@ -249,7 +249,7 @@ target_link_libraries(usyseek-ui PRIVATE
     usyseek_rust
     "${ORT_ROOT}/lib/onnxruntime.lib"
     d2d1 dwrite d3d11 dxgi dxguid dcomp dwmapi windowscodecs
-    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys
+    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys urlmon version
 )
 add_custom_command(TARGET usyseek-ui POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${ORT_ROOT}/lib/onnxruntime.dll" "$<TARGET_FILE_DIR:usyseek-ui>/onnxruntime.dll"
