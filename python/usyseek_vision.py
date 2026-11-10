@@ -323,15 +323,26 @@ def _run_worker(pipe_name, custom_script=""):
                     frames = int(msg["frames"])
                     if req_shm != shm_name or req_bytes != shm_bytes or shm_map is None:
                         if shm_map is not None:
-                            shm_map.close()
+                            try:
+                                shm_map.close()
+                            except BufferError:
+                                pass
                         shm_map = mmap.mmap(-1, req_bytes, tagname=req_shm, access=mmap.ACCESS_WRITE)
                         shm_name = req_shm
                         shm_bytes = req_bytes
                     in_count = frames * size * size * 3
-                    arr = np.frombuffer(shm_map, dtype=np.uint8, count=in_count).reshape((frames, size, size, 3))
-                    emb = np.ascontiguousarray(target.embed(arr), dtype=np.float32)
                     out_count = frames * dim
-                    np.frombuffer(shm_map, dtype=np.float32, count=out_count)[:] = emb.ravel()[:out_count]
+                    arr = np.frombuffer(shm_map, dtype=np.uint8, count=in_count).reshape((frames, size, size, 3))
+                    try:
+                        emb = np.ascontiguousarray(target.embed(arr), dtype=np.float32)
+                    finally:
+                        del arr
+                    out_arr = np.frombuffer(shm_map, dtype=np.float32, count=out_count)
+                    try:
+                        out_arr[:] = emb.ravel()[:out_count]
+                    finally:
+                        del out_arr
+                        del emb
                     hint = int(target.batch_hint()) if hasattr(target, "batch_hint") else 0
                     send_msg({"ok": True, "hint": hint})
                 else:
@@ -340,7 +351,10 @@ def _run_worker(pipe_name, custom_script=""):
                 send_msg({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
     if shm_map is not None:
-        shm_map.close()
+        try:
+            shm_map.close()
+        except BufferError:
+            pass
 
 
 if __name__ == "__main__":
