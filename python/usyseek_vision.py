@@ -94,6 +94,9 @@ def load(cfg):
             parent_name, _, attr = name.rpartition(".")
             parent = model.get_submodule(parent_name) if parent_name else model
             setattr(parent, attr, torch.zeros(buf.shape, dtype=buf.dtype, device=_device))
+    for mod in model.visual.modules():
+        if hasattr(mod, "init_non_persistent_buffers"):
+            mod.init_non_persistent_buffers()
     model.eval()
     _model = model
 
@@ -223,6 +226,9 @@ def export_text(model_dir, model_name):
                 setattr(parent, attr, parent.build_causal_mask().to("cpu"))
             else:
                 setattr(parent, attr, torch.zeros(buf.shape, dtype=buf.dtype, device="cpu"))
+    for mod in m.modules():
+        if hasattr(mod, "init_non_persistent_buffers"):
+            mod.init_non_persistent_buffers()
     m.eval()
 
     class TextWrapper(torch.nn.Module):

@@ -118,11 +118,6 @@ inline ParsedQuery parse_query(std::wstring_view q) {
         if (w) out.text += L' ';
         out.text += words[w];
     }
-    // A single token that reads like a file name searches names instead of meaning
-    if (words.size() == 1 && (words[0].find(L'.') != std::wstring::npos || words[0].find(L'_') != std::wstring::npos)) {
-        out.names.push_back(to_utf8(words[0]));
-        out.text.clear();
-    }
     return out;
 }
 
