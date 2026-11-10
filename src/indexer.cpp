@@ -589,7 +589,8 @@ struct PyVision {
         const size_t needed = std::max<size_t>(65536, std::max(in_bytes, out_bytes));
         if (needed > shm_bytes || !shm_view) {
             unmap_shm();
-            const size_t alloc = std::max(needed, shm_bytes * 2);
+            const size_t min_alloc = static_cast<size_t>(std::max<size_t>(frames, 128)) * size * size * 3;
+            const size_t alloc = std::max(needed, std::max(min_alloc, shm_bytes * 2));
             shm_name = "Local\\usyseek.vision.shm." + std::to_string(GetCurrentProcessId()) + "." + std::to_string(++shm_gen);
             shm.reset(CreateFileMappingA(
                 INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
