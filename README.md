@@ -84,6 +84,11 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 ## Features
 
 ### 🔍 Spotlight Search Pill & Media Grid
+
+<p align="center">
+  <img src="assets/pill-ui.png" alt="Spotlight Search Pill" />
+</p>
+
 - **Movable & Draggable**: Freely drag the search pill anywhere on your desktop; screen positions are preserved across launches.
 - **Live Edge Resizing**: Drag left and right pill edges to adjust width with real-time pixel tooltips, or double-click to snap back to default.
 - **Fullscreen Mode**: Expand instantly from the pill into an immersive edge-to-edge media exploration view.
@@ -106,6 +111,11 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 - **Robust Exclusion Rules**: Pre-configured system rules (`C:\Windows`, `$Recycle.Bin`, `Program Files`, `AppData`) plus custom glob/path exclusions.
 
 ### ⚙️ Settings & Environment Management
+
+<p align="center">
+  <img src="assets/settings.png" alt="Settings & Indexing" />
+</p>
+
 - **Interactive Global Hotkey Recorder**: Easily rebind the spotlight shortcut (e.g. `Alt + Space`, `Ctrl + Shift + Space`) or disable it entirely.
 - **AI Model Selection**: Supports OpenCLIP and Perception Engine vision models (default: `PE-Core-L-14-336`). Automatically exports ONNX text towers for CPU search.
 - **One-Click Model Download**: Settings fetches the weights and tokenizer from Hugging Face (default repository `timm/<model name>`) and stores them as `<model>.safetensors` and `<model>-tokenizer.json` in the model folder. Downloads resume after an interruption, and a model added while the app is running is picked up without a restart.
