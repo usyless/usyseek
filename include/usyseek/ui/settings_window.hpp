@@ -1551,6 +1551,28 @@ private:
         });
     }
 
+    struct VenvJobInputs {
+        std::string python_version;
+        std::string venv_dir;
+        std::string torch_pip_args;
+        std::string torch_backend;
+        std::string rocm_arch;
+        std::string cuda_version;
+        fs::path base_python;
+    };
+
+    VenvJobInputs venv_job_inputs() const {
+        return {
+            .python_version = sh_.settings.python_version,
+            .venv_dir = sh_.settings.venv_dir,
+            .torch_pip_args = sh_.settings.torch_pip_args,
+            .torch_backend = sh_.settings.torch_backend,
+            .rocm_arch = sh_.settings.rocm_arch,
+            .cuda_version = sh_.settings.cuda_version,
+            .base_python = find_base_python(),
+        };
+    }
+
     void run_venv_task(std::function<void(const std::stop_token&)> work) {
         run_job(venv_job_, std::move(work), [this] {
             probe_venv();
@@ -1727,8 +1749,8 @@ private:
         return best;
     }
 
-    void download_portable_python(const std::stop_token& stop) {
-        const std::string want = sh_.settings.python_version.empty() ? "3.14" : sh_.settings.python_version;
+    void download_portable_python(const VenvJobInputs& in, const std::stop_token& stop) {
+        const std::string want = in.python_version.empty() ? "3.14" : in.python_version;
         const auto ver = resolve_nuget_python(want);
         if (!ver) return;
 
@@ -1771,21 +1793,21 @@ private:
             probe_venv();
             invalidate();
         });
-        install_packages_into(py);
+        install_packages_into(in, py);
     }
 
-    void install_packages_in_worker() {
-        const VenvInfo info = read_venv(to_wide(sh_.settings.venv_dir));
+    void install_packages_in_worker(const VenvJobInputs& in) {
+        const VenvInfo info = read_venv(to_wide(in.venv_dir));
         if (!info.exists || !fs::exists(info.python_exe)) {
             append_venv_log(L"python.exe not found — create a venv or download a portable Python first.");
             return;
         }
-        install_packages_into(info.python_exe);
+        install_packages_into(in, info.python_exe);
     }
 
-    void install_packages_into(const fs::path& py) {
+    void install_packages_into(const VenvJobInputs& in, const fs::path& py) {
         exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"pip"});
-        const std::wstring custom_args = trim(to_wide(sh_.settings.torch_pip_args));
+        const std::wstring custom_args = trim(to_wide(in.torch_pip_args));
         if (!custom_args.empty()) {
             int argc = 0;
             LPWSTR* argv = CommandLineToArgvW(custom_args.c_str(), &argc);
@@ -1793,14 +1815,14 @@ private:
             for (int i = 0; i < argc; ++i) args.emplace_back(argv[i]);
             if (argv) LocalFree(argv);
             exec_logged(py, args);
-        } else if (sh_.settings.torch_backend == "manual") {
+        } else if (in.torch_backend == "manual") {
             append_venv_log(L"Manual PyTorch mode: skipping Torch install, installing requirements.txt…");
-        } else if (sh_.settings.torch_backend == "rocm") {
-            const std::wstring arch = to_wide(sh_.settings.rocm_arch.empty() ? "gfx1030" : sh_.settings.rocm_arch);
+        } else if (in.torch_backend == "rocm") {
+            const std::wstring arch = to_wide(in.rocm_arch.empty() ? "gfx1030" : in.rocm_arch);
             exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", L"https://stable.repo.amd.com/rocm/whl-next/",
                              L"torch[device-" + arch + L"]", L"torchvision[device-" + arch + L"]", L"rocm[libraries,device-" + arch + L"]"});
-        } else if (sh_.settings.torch_backend == "cuda") {
-            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cuda", sh_.settings.cuda_version)),
+        } else if (in.torch_backend == "cuda") {
+            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cuda", in.cuda_version)),
                              L"torch", L"torchvision"});
         } else {
             exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cpu", "")),
@@ -2226,37 +2248,36 @@ private:
             }
             case IdDownloadNugetPy:
                 commit_fields();
-                run_venv_task([this](const std::stop_token& stop) { download_portable_python(stop); });
+                run_venv_task([this, in = venv_job_inputs()](const std::stop_token& stop) { download_portable_python(in, stop); });
                 return;
             case IdOpenTerminal: open_venv_terminal(); break;
             case IdUpdateVenv:
-                run_venv_task([this](const std::stop_token&) { install_packages_in_worker(); });
+                run_venv_task([this, in = venv_job_inputs()](const std::stop_token&) { install_packages_in_worker(in); });
                 return;
             case IdRecreateVenv:
                 if (venv_.portable) {
                     // Portable interpreters are not venvs: re-download the selected version instead
-                    run_venv_task([this](const std::stop_token& stop) {
+                    run_venv_task([this, in = venv_job_inputs()](const std::stop_token& stop) {
                         std::error_code ec;
-                        fs::remove_all(to_wide(sh_.settings.venv_dir), ec);
-                        download_portable_python(stop);
+                        fs::remove_all(to_wide(in.venv_dir), ec);
+                        download_portable_python(in, stop);
                     });
                     return;
                 }
-                run_venv_task([this](const std::stop_token&) {
-                    const fs::path base = find_base_python();
-                    const fs::path vdir = to_wide(sh_.settings.venv_dir);
+                run_venv_task([this, in = venv_job_inputs()](const std::stop_token&) {
+                    const fs::path vdir = to_wide(in.venv_dir);
                     std::error_code ec;
                     if (fs::exists(vdir, ec)) {
                         append_venv_log(L"Removing old environment…");
                         fs::remove_all(vdir, ec);
                     }
-                    exec_logged(base, {L"-m", L"venv", vdir.wstring()});
-                    install_packages_in_worker();
+                    exec_logged(in.base_python, {L"-m", L"venv", vdir.wstring()});
+                    install_packages_in_worker(in);
                 });
                 return;
             case IdDeleteVenv:
-                run_venv_task([this](const std::stop_token&) {
-                    const fs::path vdir = to_wide(sh_.settings.venv_dir);
+                run_venv_task([this, in = venv_job_inputs()](const std::stop_token&) {
+                    const fs::path vdir = to_wide(in.venv_dir);
                     std::error_code ec;
                     fs::remove_all(vdir, ec);
                     append_venv_log(L"Virtual environment deleted.");
