@@ -314,6 +314,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.thumbs.stop();
     sh.previews.stop();
     sh.engine.stop();
+    pill.release_com_objects();
     if (SUCCEEDED(ole)) OleUninitialize();
     return code;
 }

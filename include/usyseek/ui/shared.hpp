@@ -12,8 +12,6 @@
 #include <shldisp.h>
 #include <windowsx.h>
 
-#include <atomic>
-
 namespace usyseek::ui {
 
 inline constexpr UINT WM_APP_THUMBS = WM_APP + 10;
@@ -188,76 +186,6 @@ inline bool set_data_bytes(IDataObject* obj, CLIPFORMAT cf, const void* data, si
     return false;
 }
 
-/// Wraps a shell IDataObject and implements IDataObjectAsyncCapability (formerly IAsyncOperation)
-/// returning VARIANT_TRUE for async mode. This signals Windows Explorer that drops can be completed
-/// asynchronously on an Explorer worker thread, preventing modal dialogs (such as "file already exists")
-/// from blocking the drag source's thread inside IDropTarget::Drop().
-class AsyncDataObject final : public IDataObject, public IDataObjectAsyncCapability {
-public:
-    explicit AsyncDataObject(wil::com_ptr<IDataObject> inner) : inner_{std::move(inner)} {}
-
-    // IUnknown
-    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-        if (!ppv) return E_POINTER;
-        if (riid == IID_IUnknown || riid == IID_IDataObject) {
-            *ppv = static_cast<IDataObject*>(this);
-        } else if (riid == IID_IDataObjectAsyncCapability) {
-            *ppv = static_cast<IDataObjectAsyncCapability*>(this);
-        } else {
-            return inner_ ? inner_->QueryInterface(riid, ppv) : E_NOINTERFACE;
-        }
-        AddRef();
-        return S_OK;
-    }
-    IFACEMETHODIMP_(ULONG) AddRef() override { return ++ref_; }
-    IFACEMETHODIMP_(ULONG) Release() override {
-        const ULONG r = --ref_;
-        if (!r) delete this;
-        return r;
-    }
-
-    // IDataObjectAsyncCapability
-    IFACEMETHODIMP SetAsyncMode(BOOL fDoOpAsync) override {
-        async_mode_ = fDoOpAsync;
-        return S_OK;
-    }
-    IFACEMETHODIMP GetAsyncMode(BOOL* pfIsOpAsync) override {
-        if (!pfIsOpAsync) return E_POINTER;
-        *pfIsOpAsync = async_mode_;
-        return S_OK;
-    }
-    IFACEMETHODIMP StartOperation(IBindCtx*) override {
-        in_async_ = TRUE;
-        return S_OK;
-    }
-    IFACEMETHODIMP InOperation(BOOL* pfInAsyncOp) override {
-        if (!pfInAsyncOp) return E_POINTER;
-        *pfInAsyncOp = in_async_;
-        return S_OK;
-    }
-    IFACEMETHODIMP EndOperation(HRESULT, IBindCtx*, DWORD) override {
-        in_async_ = FALSE;
-        return S_OK;
-    }
-
-    // IDataObject
-    IFACEMETHODIMP GetData(FORMATETC* pfe, STGMEDIUM* psm) override { return inner_->GetData(pfe, psm); }
-    IFACEMETHODIMP GetDataHere(FORMATETC* pfe, STGMEDIUM* psm) override { return inner_->GetDataHere(pfe, psm); }
-    IFACEMETHODIMP QueryGetData(FORMATETC* pfe) override { return inner_->QueryGetData(pfe); }
-    IFACEMETHODIMP GetCanonicalFormatEtc(FORMATETC* in, FORMATETC* out) override { return inner_->GetCanonicalFormatEtc(in, out); }
-    IFACEMETHODIMP SetData(FORMATETC* pfe, STGMEDIUM* psm, BOOL rel) override { return inner_->SetData(pfe, psm, rel); }
-    IFACEMETHODIMP EnumFormatEtc(DWORD dir, IEnumFORMATETC** e) override { return inner_->EnumFormatEtc(dir, e); }
-    IFACEMETHODIMP DAdvise(FORMATETC* pfe, DWORD advf, IAdviseSink* sink, DWORD* conn) override { return inner_->DAdvise(pfe, advf, sink, conn); }
-    IFACEMETHODIMP DUnadvise(DWORD conn) override { return inner_->DUnadvise(conn); }
-    IFACEMETHODIMP EnumDAdvise(IEnumSTATDATA** e) override { return inner_->EnumDAdvise(e); }
-
-private:
-    std::atomic<ULONG> ref_{1};
-    wil::com_ptr<IDataObject> inner_;
-    BOOL async_mode_ = VARIANT_TRUE;
-    BOOL in_async_ = FALSE;
-};
-
 /// A shell data object for files, as Explorer makes it: shell ID lists + CF_HDROP, so drops and pastes into
 /// Explorer, browsers, chat apps and editors receive the files themselves. Pastes default to copying.
 inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring> paths) {
@@ -310,29 +238,39 @@ inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring>
 
     const DWORD effect = DROPEFFECT_COPY;
     set_data_bytes(obj.get(), static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT)), &effect, sizeof(effect));
-
-    wil::com_ptr<IDataObject> wrapped;
-    wrapped.attach(new AsyncDataObject(std::move(obj)));
-    return wrapped;
+    return obj;
 }
 
 /// Drags files out to other applications (copy or link only: a drop never moves the user's files away).
-inline DWORD drag_media(HWND hwnd, std::span<const std::wstring> paths) {
+/// The target is asked to finish the drop on its own thread, so its dialogs (such as "file already exists")
+/// never block this one inside the drag loop. Returns the data object's async state when the target is still
+/// working on the drop afterwards, null otherwise.
+inline wil::com_ptr<IDataObjectAsyncCapability> drag_media(HWND hwnd, std::span<const std::wstring> paths) {
     const auto obj = media_data_object(paths);
+    if (!obj) return nullptr;
+    auto async = obj.try_query<IDataObjectAsyncCapability>();
+    if (async) async->SetAsyncMode(VARIANT_TRUE);
     DWORD effect = DROPEFFECT_NONE;
-    if (obj) SHDoDragDrop(hwnd, obj.get(), nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
-    return effect;
+    SHDoDragDrop(hwnd, obj.get(), nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
+    BOOL in_operation = FALSE;
+    if (async && SUCCEEDED(async->InOperation(&in_operation)) && in_operation) return async;
+    return nullptr;
 }
 
-/// Puts files on the clipboard. `image` (unpremultiplied BGRA) adds a bitmap for apps that paste pixels
-/// (Paint, Office, image editors); `png_file` adds that file's bytes as "PNG" so alpha survives.
-inline bool copy_media_to_clipboard(std::span<const std::wstring> paths, const Raster* image, const std::wstring* png_file) {
-    const auto obj = media_data_object(paths);
-    if (!obj) return false;
+/// What a copy puts on the clipboard besides the files themselves, prepared away from the UI thread.
+struct ClipboardPayload {
+    std::vector<std::wstring> paths;
+    std::vector<uint8_t> dib; // bitmap for apps that paste pixels (Paint, Office, image editors)
+    std::vector<uint8_t> png; // the file's own bytes as "PNG" so alpha survives
+};
+
+/// Any thread: copies `image` (unpremultiplied BGRA) into a DIB and reads `png_file`.
+inline ClipboardPayload build_clipboard_payload(std::vector<std::wstring> paths, const Raster* image, const std::wstring* png_file) {
+    ClipboardPayload payload{std::move(paths)};
     if (image && image->w && image->h) {
         const size_t stride = static_cast<size_t>(image->w) * 4;
-        std::vector<uint8_t> dib(sizeof(BITMAPINFOHEADER) + stride * image->h);
-        auto* bih = reinterpret_cast<BITMAPINFOHEADER*>(dib.data());
+        payload.dib.resize(sizeof(BITMAPINFOHEADER) + stride * image->h);
+        auto* bih = reinterpret_cast<BITMAPINFOHEADER*>(payload.dib.data());
         bih->biSize = sizeof(BITMAPINFOHEADER);
         bih->biWidth = static_cast<LONG>(image->w);
         bih->biHeight = static_cast<LONG>(image->h); // bottom-up: the form every consumer reads correctly
@@ -341,31 +279,28 @@ inline bool copy_media_to_clipboard(std::span<const std::wstring> paths, const R
         bih->biCompression = BI_RGB;
         bih->biSizeImage = static_cast<DWORD>(stride * image->h);
         for (UINT y = 0; y < image->h; ++y) {
-            std::memcpy(dib.data() + sizeof(BITMAPINFOHEADER) + stride * (image->h - 1 - y), image->pixels.data() + stride * y, stride);
+            std::memcpy(payload.dib.data() + sizeof(BITMAPINFOHEADER) + stride * (image->h - 1 - y), image->pixels.data() + stride * y, stride);
         }
-        set_data_bytes(obj.get(), CF_DIB, dib.data(), dib.size());
     }
     if (png_file) {
-        std::vector<uint8_t> bytes;
         wil::unique_hfile f{CreateFileW(png_file->c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr)};
         LARGE_INTEGER size{};
         if (f && GetFileSizeEx(f.get(), &size) && size.QuadPart > 0 && size.QuadPart < (256ll << 20)) {
-            bytes.resize(static_cast<size_t>(size.QuadPart));
+            payload.png.resize(static_cast<size_t>(size.QuadPart));
             DWORD read = 0;
-            if (ReadFile(f.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size()) {
-                set_data_bytes(obj.get(), static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"PNG")), bytes.data(), bytes.size());
-            }
+            if (!ReadFile(f.get(), payload.png.data(), static_cast<DWORD>(payload.png.size()), &read, nullptr) || read != payload.png.size()) payload.png.clear();
         }
     }
-    HRESULT hr = OleSetClipboard(obj.get());
-    for (int retry = 0; FAILED(hr) && retry < 10; ++retry) {
-        Sleep(20);
-        hr = OleSetClipboard(obj.get());
-    }
-    if (FAILED(hr)) return false;
-    // Render now: this process exits when idle and the clipboard must outlive it
-    OleFlushClipboard();
-    return true;
+    return payload;
+}
+
+/// UI thread: the data object to hand to OleSetClipboard.
+inline wil::com_ptr<IDataObject> clipboard_data_object(const ClipboardPayload& payload) {
+    auto obj = media_data_object(payload.paths);
+    if (!obj) return nullptr;
+    if (!payload.dib.empty()) set_data_bytes(obj.get(), CF_DIB, payload.dib.data(), payload.dib.size());
+    if (!payload.png.empty()) set_data_bytes(obj.get(), static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"PNG")), payload.png.data(), payload.png.size());
+    return obj;
 }
 
 inline std::wstring format_date(int64_t unix) {

@@ -5,6 +5,7 @@
 
 #include <shellscalingapi.h>
 
+#include <map>
 #include <set>
 #include <unordered_set>
 
@@ -108,6 +109,12 @@ public:
         SetTimer(hwnd_, TIMER_FADE, 15, nullptr);
     }
 
+    /// COM objects this window still holds; released before OLE is uninitialised.
+    void release_com_objects() {
+        async_drops_.clear();
+        pending_clipboard_.reset();
+    }
+
     void toggle() {
         if (visible() && !fading_out_ && GetForegroundWindow() == hwnd_) hide();
         else show();
@@ -181,7 +188,9 @@ private:
     static constexpr float DEFAULT_W = 880.0f;
     static constexpr float DEFAULT_H = 640.0f;
     static constexpr float MENU_W = 256.0f;
-    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_DEBOUNCE = 2, TIMER_STATUS = 4, TIMER_DEVICE = 5, TIMER_FADE = 6;
+    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_DEBOUNCE = 2, TIMER_STATUS = 4, TIMER_DEVICE = 5, TIMER_FADE = 6, TIMER_DROP = 7, TIMER_COPY = 8;
+    static constexpr uint64_t COPY_MAX_PIXELS = 40'000'000;
+    static constexpr int CLIPBOARD_ATTEMPTS = 10;
 
     enum Id {
         IdNone = 0,
@@ -1199,40 +1208,67 @@ private:
     }
 
     /// Copies the files themselves; a single still image also goes on as pixels so editors can paste it.
-    /// Done on a worker thread with OleInitialize so decoding, file I/O, and OleFlushClipboard never block the UI.
+    /// Only the decode runs on a worker; the newest copy wins and reaches the clipboard from the UI thread.
     void copy_media(const std::vector<const Item*>& sel) {
         if (sel.empty()) return;
-        struct Job {
-            std::vector<std::wstring> paths;
-            bool is_single_image = false;
-            uint32_t w = 0, h = 0;
-        };
-        Job job;
-        job.paths.reserve(sel.size());
-        for (const auto* it : sel) job.paths.push_back(item_path(*it));
+        std::vector<std::wstring> paths;
+        for (const auto* it : sel) paths.push_back(item_path(*it));
         const Item& one = *sel.front();
-        job.is_single_image = (sel.size() == 1 && one.pt.p.k == 0 && !svg::is_svg(job.paths[0]));
-        job.w = one.pt.p.w;
-        job.h = one.pt.p.h;
+        const bool decode = sel.size() == 1 && one.pt.p.k == 0 && !svg::is_svg(paths[0]) && static_cast<uint64_t>(one.pt.p.w) * one.pt.p.h <= COPY_MAX_PIXELS;
 
+        if (pending_clipboard_) {
+            KillTimer(hwnd_, TIMER_COPY);
+            pending_clipboard_.reset();
+            end_copy();
+        }
+        for (auto& [id, worker] : copy_workers_) worker.request_stop();
+        const uint64_t id = ++copy_generation_;
+        copy_decoding_ = decode;
         ++sh_.background_jobs;
-        std::thread([job = std::move(job), &sh = sh_] {
-            const auto done = wil::scope_exit([&sh] {
-                --sh.background_jobs;
-            });
-            if (FAILED(OleInitialize(nullptr))) return;
-            const auto ole = wil::scope_exit([] { OleUninitialize(); });
-
-            constexpr uint64_t MAX_PIXELS = 40'000'000;
-            std::optional<Raster> image;
-            std::optional<std::wstring> png;
-            if (job.is_single_image && static_cast<uint64_t>(job.w) * job.h <= MAX_PIXELS) {
-                image = decode_image(job.paths[0], 0, false);
-                if (image && static_cast<uint64_t>(image->w) * image->h > MAX_PIXELS) image.reset();
-                if (lower(fs::path{job.paths[0]}.extension().wstring()) == L".png") png = job.paths[0];
+        copy_workers_[id] = std::jthread([this, id, decode, paths = std::move(paths)](const std::stop_token& stop) mutable {
+            ulp::win::COMWrapper<false> com{COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE};
+            auto payload = std::make_shared<ClipboardPayload>();
+            if (!stop.stop_requested()) {
+                std::optional<Raster> image;
+                std::optional<std::wstring> png;
+                if (decode) {
+                    image = decode_image(paths[0], 0, false);
+                    if (image && static_cast<uint64_t>(image->w) * image->h > COPY_MAX_PIXELS) image.reset();
+                    if (lower(fs::path{paths[0]}.extension().wstring()) == L".png") png = paths[0];
+                }
+                *payload = build_clipboard_payload(std::move(paths), image ? &*image : nullptr, png ? &*png : nullptr);
             }
-            copy_media_to_clipboard(job.paths, image ? &*image : nullptr, png ? &*png : nullptr);
-        }).detach();
+            sh_.call([this, id, payload] {
+                copy_workers_.erase(id);
+                if (id != copy_generation_) {
+                    end_copy();
+                    return;
+                }
+                copy_decoding_ = false;
+                pending_clipboard_ = clipboard_data_object(*payload);
+                clipboard_attempts_ = 0;
+                set_clipboard();
+            });
+        });
+    }
+
+    /// The clipboard can be held open by another process for a moment: try again shortly instead of waiting here.
+    void set_clipboard() {
+        KillTimer(hwnd_, TIMER_COPY);
+        const HRESULT hr = pending_clipboard_ ? OleSetClipboard(pending_clipboard_.get()) : E_FAIL;
+        if (hr == CLIPBRD_E_CANT_OPEN && ++clipboard_attempts_ < CLIPBOARD_ATTEMPTS) {
+            SetTimer(hwnd_, TIMER_COPY, 30, nullptr);
+            return;
+        }
+        // Render now: this process exits when idle and the clipboard must outlive it
+        if (SUCCEEDED(hr)) OleFlushClipboard();
+        pending_clipboard_.reset();
+        end_copy();
+    }
+
+    void end_copy() {
+        --sh_.background_jobs;
+        if (sh_.visibility_changed) sh_.visibility_changed();
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1500,15 +1536,18 @@ private:
         hover_id_ = IdNone;
         render();
         dragging_out_ = true;
-        // Relinquish topmost status so targets and OS dialogs (e.g. file conflict prompts) show on top
+        // Not topmost while the target works, so its dialogs (e.g. file conflict prompts) are not hidden behind this window
         SetWindowPos(hwnd_, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        drag_media(hwnd_, paths);
+        auto async_drop = drag_media(hwnd_, paths);
         dragging_out_ = false;
-        if (sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && GetForegroundWindow() != hwnd_) {
-            hide();
-        } else if (GetForegroundWindow() == hwnd_) {
+        if (async_drop) {
+            async_drops_.push_back(std::move(async_drop));
+            ++sh_.background_jobs;
+            SetTimer(hwnd_, TIMER_DROP, 250, nullptr);
+        } else {
             SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
+        if (sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && GetForegroundWindow() != hwnd_) hide();
         invalidate();
     }
 
@@ -2011,12 +2050,8 @@ private:
                 return 0;
             }
             case WM_ACTIVATE:
-                if (LOWORD(wp) == WA_INACTIVE) {
-                    if (sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && !dragging_out_) {
-                        if (GetTickCount64() - shown_tick_ > 250) hide();
-                    }
-                } else {
-                    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if (LOWORD(wp) == WA_INACTIVE && sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && !dragging_out_) {
+                    if (GetTickCount64() - shown_tick_ > 250) hide();
                 }
                 return 0;
             case WM_CAPTURECHANGED:
@@ -2026,6 +2061,10 @@ private:
                 return 0;
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) {
+                    if (copy_decoding_) {
+                        SetCursor(LoadCursorW(nullptr, IDC_APPSTARTING));
+                        return TRUE;
+                    }
                     POINT pt;
                     GetCursorPos(&pt);
                     ScreenToClient(hwnd_, &pt);
@@ -2083,6 +2122,21 @@ private:
                     case TIMER_FADE:
                         on_fade_timer();
                         return 0;
+                    case TIMER_DROP: {
+                        const size_t before = async_drops_.size();
+                        std::erase_if(async_drops_, [](const auto& drop) {
+                            BOOL in_operation = FALSE;
+                            return FAILED(drop->InOperation(&in_operation)) || !in_operation;
+                        });
+                        sh_.background_jobs -= static_cast<int>(before - async_drops_.size());
+                        if (async_drops_.empty()) {
+                            KillTimer(hwnd_, TIMER_DROP);
+                            SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            if (sh_.visibility_changed) sh_.visibility_changed();
+                        }
+                        return 0;
+                    }
+                    case TIMER_COPY: set_clipboard(); return 0;
                 }
                 return 0;
             case WM_APP_THUMBS: on_thumbs(); return 0;
@@ -2171,6 +2225,13 @@ private:
     int drag_index_ = -1;
     POINT drag_origin_{};
     std::optional<uint64_t> deferred_select_;
+    std::vector<wil::com_ptr<IDataObjectAsyncCapability>> async_drops_; // drops the target is still completing
+
+    uint64_t copy_generation_ = 0;
+    bool copy_decoding_ = false;
+    wil::com_ptr<IDataObject> pending_clipboard_;
+    int clipboard_attempts_ = 0;
+    std::map<uint64_t, std::jthread> copy_workers_; // last member: joined before the state they report to goes away
 };
 
 } // namespace usyseek::ui
