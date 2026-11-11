@@ -7,6 +7,7 @@
 #include <usyseek/progress.hpp>
 #include <usyseek/status.hpp>
 
+#include <atomic>
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <shldisp.h>
@@ -241,19 +242,130 @@ inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring>
     return obj;
 }
 
+/// Wraps a shell data object to properly advertise and handle IDataObjectAsyncCapability (IAsyncOperation).
+/// SHCreateDataObject's built-in implementation of IDataObjectAsyncCapability ignores SetAsyncMode and
+/// reports FALSE from GetAsyncMode for local file system items, which causes Windows Explorer to run the
+/// drop and its conflict resolution dialogs synchronously inside IDropTarget::Drop() on our UI thread.
+class AsyncDataObject final : public IDataObject, public IDataObjectAsyncCapability {
+public:
+    explicit AsyncDataObject(wil::com_ptr<IDataObject> inner) : inner_(std::move(inner)) {}
+    virtual ~AsyncDataObject() = default;
+
+    // IUnknown
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IDataObject)) {
+            *ppv = static_cast<IDataObject*>(this);
+        } else if (riid == __uuidof(IDataObjectAsyncCapability)) {
+            *ppv = static_cast<IDataObjectAsyncCapability*>(this);
+        }
+        if (*ppv) {
+            AddRef();
+            return S_OK;
+        }
+        return inner_ ? inner_->QueryInterface(riid, ppv) : E_NOINTERFACE;
+    }
+
+    IFACEMETHODIMP_(ULONG) AddRef() override {
+        return ++ref_count_;
+    }
+
+    IFACEMETHODIMP_(ULONG) Release() override {
+        const ULONG count = --ref_count_;
+        if (count == 0) delete this;
+        return count;
+    }
+
+    // IDataObjectAsyncCapability
+    IFACEMETHODIMP SetAsyncMode(BOOL fDoOpAsync) override {
+        async_mode_ = fDoOpAsync;
+        return S_OK;
+    }
+
+    IFACEMETHODIMP GetAsyncMode(BOOL* pfIsOpAsync) override {
+        if (!pfIsOpAsync) return E_POINTER;
+        *pfIsOpAsync = async_mode_;
+        return S_OK;
+    }
+
+    IFACEMETHODIMP StartOperation(IBindCtx* /*pbcReserved*/) override {
+        in_operation_ = TRUE;
+        return S_OK;
+    }
+
+    IFACEMETHODIMP InOperation(BOOL* pfInAsyncOp) override {
+        if (!pfInAsyncOp) return E_POINTER;
+        *pfInAsyncOp = in_operation_;
+        return S_OK;
+    }
+
+    IFACEMETHODIMP EndOperation(HRESULT /*hResult*/, IBindCtx* /*pbcReserved*/, DWORD /*dwEffects*/) override {
+        in_operation_ = FALSE;
+        return S_OK;
+    }
+
+    // IDataObject
+    IFACEMETHODIMP GetData(FORMATETC* pformatetcIn, STGMEDIUM* pmedium) override {
+        return inner_ ? inner_->GetData(pformatetcIn, pmedium) : E_UNEXPECTED;
+    }
+
+    IFACEMETHODIMP GetDataHere(FORMATETC* pformatetc, STGMEDIUM* pmedium) override {
+        return inner_ ? inner_->GetDataHere(pformatetc, pmedium) : E_UNEXPECTED;
+    }
+
+    IFACEMETHODIMP QueryGetData(FORMATETC* pformatetc) override {
+        return inner_ ? inner_->QueryGetData(pformatetc) : E_UNEXPECTED;
+    }
+
+    IFACEMETHODIMP GetCanonicalFormatEtc(FORMATETC* pformatetcIn, FORMATETC* pformatetcOut) override {
+        return inner_ ? inner_->GetCanonicalFormatEtc(pformatetcIn, pformatetcOut) : E_UNEXPECTED;
+    }
+
+    IFACEMETHODIMP SetData(FORMATETC* pformatetc, STGMEDIUM* pmedium, BOOL fRelease) override {
+        return inner_ ? inner_->SetData(pformatetc, pmedium, fRelease) : E_UNEXPECTED;
+    }
+
+    IFACEMETHODIMP EnumFormatEtc(DWORD dwDirection, IEnumFORMATETC** ppenumFormatEtc) override {
+        return inner_ ? inner_->EnumFormatEtc(dwDirection, ppenumFormatEtc) : E_UNEXPECTED;
+    }
+
+    IFACEMETHODIMP DAdvise(FORMATETC* pformatetc, DWORD advf, IAdviseSink* pAdvSink, DWORD* pdwConnection) override {
+        return inner_ ? inner_->DAdvise(pformatetc, advf, pAdvSink, pdwConnection) : E_UNEXPECTED;
+    }
+
+    IFACEMETHODIMP DUnadvise(DWORD dwConnection) override {
+        return inner_ ? inner_->DUnadvise(dwConnection) : E_UNEXPECTED;
+    }
+
+    IFACEMETHODIMP EnumDAdvise(IEnumSTATDATA** ppenumAdvise) override {
+        return inner_ ? inner_->EnumDAdvise(ppenumAdvise) : E_UNEXPECTED;
+    }
+
+private:
+    wil::com_ptr<IDataObject> inner_;
+    std::atomic<ULONG> ref_count_{1};
+    std::atomic<BOOL> async_mode_{VARIANT_TRUE};
+    std::atomic<BOOL> in_operation_{FALSE};
+};
+
 /// Drags files out to other applications (copy or link only: a drop never moves the user's files away).
 /// The target is asked to finish the drop on its own thread, so its dialogs (such as "file already exists")
 /// never block this one inside the drag loop. Returns the data object's async state when the target is still
 /// working on the drop afterwards, null otherwise.
 inline wil::com_ptr<IDataObjectAsyncCapability> drag_media(HWND hwnd, std::span<const std::wstring> paths) {
-    const auto obj = media_data_object(paths);
-    if (!obj) return nullptr;
+    auto inner = media_data_object(paths);
+    if (!inner) return nullptr;
+    auto* wrapper = new (std::nothrow) AsyncDataObject(std::move(inner));
+    if (!wrapper) return nullptr;
+    wil::com_ptr<IDataObject> obj;
+    obj.attach(static_cast<IDataObject*>(wrapper));
     auto async = obj.try_query<IDataObjectAsyncCapability>();
-    if (async) async->SetAsyncMode(VARIANT_TRUE);
+    if (!async) return nullptr;
     DWORD effect = DROPEFFECT_NONE;
     SHDoDragDrop(hwnd, obj.get(), nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
     BOOL in_operation = FALSE;
-    if (async && SUCCEEDED(async->InOperation(&in_operation)) && in_operation) return async;
+    if (SUCCEEDED(async->InOperation(&in_operation)) && in_operation) return async;
     return nullptr;
 }
 
