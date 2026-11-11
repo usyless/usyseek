@@ -115,7 +115,7 @@ usyseek_fetch_archive(qdrant-web-ui-${USYSEEK_QDRANT_WEB_UI_VERSION}
     "https://github.com/qdrant/qdrant-web-ui/releases/download/${USYSEEK_QDRANT_WEB_UI_VERSION}/dist-qdrant.zip"
     QDRANT_WEB_UI_DIR)
 
-##### Rust staticlib (qdrant gRPC client + tokenizers)
+##### Rust staticlib (qdrant gRPC client + tokenizers + resvg)
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
 set(RUST_DIR "${PROJECT_SOURCE_DIR}/rust")
 set(RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/rust_target")
@@ -123,9 +123,9 @@ set(RUST_STATIC_LIB "${RUST_TARGET_DIR}/release/usyseek_rust.lib")
 add_custom_command(
     OUTPUT "${RUST_STATIC_LIB}"
     COMMAND "${CARGO_EXECUTABLE}" build --release --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
-    DEPENDS "${RUST_DIR}/Cargo.toml" "${RUST_DIR}/src/lib.rs"
+    DEPENDS "${RUST_DIR}/Cargo.toml" "${RUST_DIR}/Cargo.lock" "${RUST_DIR}/src/lib.rs" "${RUST_DIR}/src/svg.rs"
     WORKING_DIRECTORY "${RUST_DIR}"
-    COMMENT "Building usyseek_rust staticlib (qdrant-client + tokenizers)..."
+    COMMENT "Building usyseek_rust staticlib (qdrant-client + tokenizers + resvg)..."
     VERBATIM
 )
 add_custom_target(usyseek_rust_build DEPENDS "${RUST_STATIC_LIB}")
@@ -249,7 +249,7 @@ target_link_libraries(usyseek-ui PRIVATE
     usyseek_rust
     "${ORT_ROOT}/lib/onnxruntime.lib"
     d2d1 dwrite d3d11 dxgi dxguid dcomp dwmapi windowscodecs
-    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys urlmon version
+    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys winhttp version
 )
 add_custom_command(TARGET usyseek-ui POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${ORT_ROOT}/lib/onnxruntime.dll" "$<TARGET_FILE_DIR:usyseek-ui>/onnxruntime.dll"

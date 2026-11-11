@@ -1,5 +1,7 @@
-//! usyseek native bridge: qdrant gRPC client + HuggingFace tokenizer, exposed over a small C ABI.
-//! All structured data crosses the boundary as UTF-8 JSON; bulk numeric data (vectors, ids) as raw slices.
+//! usyseek native bridge: qdrant gRPC client + HuggingFace tokenizer + resvg, exposed over a small C ABI.
+//! All structured data crosses the boundary as UTF-8 JSON; bulk numeric data (vectors, ids, pixels) as raw slices.
+
+mod svg;
 
 use std::collections::HashMap;
 use std::ptr;
@@ -52,7 +54,9 @@ impl UsyBuf {
         Self { ptr: ptr::null_mut(), len: 0, cap: 0 }
     }
     fn from_string(s: String) -> Self {
-        let mut v = s.into_bytes();
+        Self::from_bytes(s.into_bytes())
+    }
+    fn from_bytes(mut v: Vec<u8>) -> Self {
         let out = Self { ptr: v.as_mut_ptr(), len: v.len(), cap: v.capacity() };
         std::mem::forget(v);
         out
@@ -69,6 +73,12 @@ pub unsafe extern "C" fn usy_buf_free(b: UsyBuf) {
 unsafe fn write_out(out: *mut UsyBuf, s: String) {
     if !out.is_null() {
         unsafe { *out = UsyBuf::from_string(s) };
+    }
+}
+
+unsafe fn write_bytes(out: *mut UsyBuf, v: Vec<u8>) {
+    if !out.is_null() {
+        unsafe { *out = UsyBuf::from_bytes(v) };
     }
 }
 

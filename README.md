@@ -70,13 +70,13 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 3. **`usyseek-indexer.exe` (Scanner & Embedding Pipeline)**:
    - On-demand worker process that exists only while indexing is active.
    - Embeds an isolated instance of **Voidtools Everything** (`uk.usyless.usyseek`) for instant NTFS file discovery across local drives.
-   - Utilizes **Windows Imaging Component (WIC)** for high-throughput image decoding and **Media Foundation (MF)** for multi-threaded video keyframe extraction.
+   - Utilizes **Windows Imaging Component (WIC)** for high-throughput image decoding, **resvg** for SVG / SVGZ rasterisation and **Media Foundation (MF)** for multi-threaded video keyframe extraction.
    - **Zero C++ Python Dependency**: Completely decoupled from CPython at compile and link time (no `pybind11` or `python3XY.dll` link requirement). Communicates with an out-of-process Python worker (`usyseek_vision.py`) via zero-copy **named shared memory**, executing the vision tower on AMD (ROCm), NVIDIA (CUDA), or CPU.
    - Reports live progress, throughput, and status through shared memory (`Local\usyseek.indexer.status`).
 
 4. **`qdrant.exe` (Embedded Vector Engine)**:
    - Bundled Windows x64 Qdrant vector database running locally over gRPC and HTTP.
-   - Communicates with C++ through a specialized static library written in Rust (`usyseek_rust`) wrapping `qdrant-client` and `tokio`.
+   - Communicates with C++ through a specialized static library written in Rust (`usyseek_rust`) wrapping `qdrant-client` and `tokio` (the same library hosts the tokenizer and the `resvg` SVG renderer).
    - Includes the bundled static **Qdrant Web UI** for browsing collections and vector payloads.
 
 ---
@@ -101,12 +101,14 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 ### ⚡ Blazing Fast Indexing
 - **Voidtools Everything Integration**: Near-instantaneous filesystem crawling across whole PC drives (`C:\`, `D:\`, etc.) or selected directories.
 - **Multi-Threaded Hardware Decoding**: Concurrent WIC image decoding and Media Foundation video frame sampling.
+- **Vector Images**: SVG and SVGZ files are rendered with resvg (on white) for both embedding and thumbnails.
 - **Configurable Video Keyframes**: Extracts configurable representative frames across videos (default: 8 frames) for semantic video retrieval.
 - **Robust Exclusion Rules**: Pre-configured system rules (`C:\Windows`, `$Recycle.Bin`, `Program Files`, `AppData`) plus custom glob/path exclusions.
 
 ### ⚙️ Settings & Environment Management
 - **Interactive Global Hotkey Recorder**: Easily rebind the spotlight shortcut (e.g. `Alt + Space`, `Ctrl + Shift + Space`) or disable it entirely.
 - **AI Model Selection**: Supports OpenCLIP and Perception Engine vision models (default: `PE-Core-L-14-336`). Automatically exports ONNX text towers for CPU search.
+- **One-Click Model Download**: Settings fetches the weights and tokenizer from Hugging Face (default repository `timm/<model name>`) and stores them as `<model>.safetensors` and `<model>-tokenizer.json` in the model folder. Downloads resume after an interruption, and a model added while the app is running is picked up without a restart.
 - **Zero-Setup Portable Python**: System-wide Python is **not required**. `usyseek` can download and bootstrap a self-contained portable Python runtime (via NuGet, supporting 3.14, 3.13, 3.12, 3.11) with one click from Settings, or use an existing `.venv`.
 - **Thumbnail Fit**: Show image thumbnails cropped to fill the tile (default) or as the whole image, letterboxed.
 - **Hardware Acceleration**: Configure hardware acceleration (ROCm / CUDA / CPU) with custom PyTorch arguments directly within the UI.
@@ -133,7 +135,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 - **C++ Compiler**: MSVC from Visual Studio 2022 (v143+) supporting C++23 (`/std:c++latest`)
 - **CMake**: `3.31+`
 - **Build System**: [Ninja](https://github.com/ninja-build/ninja)
-- **Rust Toolchain**: `cargo` / `rustc` (used to compile the `usyseek_rust` static library)
+- **Rust Toolchain**: `cargo` / `rustc` 1.85+ (used to compile the `usyseek_rust` static library)
 - **Python**: **Not required!** System-wide Python is no longer a dependency. The application can automatically download and manage a portable Python runtime directly from the Settings UI (or you can optionally point it to an existing virtualenv / local install).
 - **GPU (Optional but recommended for indexing)**:
   - **AMD**: ROCm for Windows (default target: `gfx1030` / RDNA2+)

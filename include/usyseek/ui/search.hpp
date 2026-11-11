@@ -4,7 +4,9 @@
 
 #include <onnxruntime_cxx_api.h>
 
+#include <array>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <list>
 #include <mutex>
@@ -130,143 +132,107 @@ public:
     enum class State { Idle, Exporting, Loading, Ready, Failed };
     std::function<void()> on_state_changed;
 
-    ~TextEncoder() {
-        if (tok_) usy_tok_free(tok_);
-    }
-
+    /// Loads the text tower in the background. A request made while another load is running replaces it
+    /// as soon as that one finishes; asking again for a model that failed retries it.
     void load_async(fs::path model_dir, std::string model_name) {
         {
-            std::lock_guard lk{m_};
-            if (state_ == State::Loading || state_ == State::Exporting ||
-                (state_ == State::Ready && model_name == name_ && model_dir == dir_)) return;
+            const std::lock_guard lk{m_};
+            const bool same = model_name == name_ && model_dir == dir_;
+            if (same && (busy_ || state_ == State::Ready)) return;
+            name_ = std::move(model_name);
+            dir_ = std::move(model_dir);
+            ++wanted_;
+            if (busy_) return; // the running loader picks the new request up
+            busy_ = true;
             state_ = State::Loading;
-            name_ = model_name;
-            dir_ = model_dir;
         }
-        if (on_state_changed) on_state_changed();
-        loader_ = std::jthread([this, model_dir = std::move(model_dir), model_name = std::move(model_name)] {
-            try {
-                const fs::path weights = model_dir / (to_wide(model_name) + L".safetensors");
-                const fs::path onnx = model_dir / (to_wide(model_name) + L"-text.onnx");
-                fs::path tok = model_dir / (to_wide(model_name) + L"-tokenizer.json");
-                std::error_code ec;
-                if (!fs::exists(tok, ec)) {
-                    const fs::path alt = model_dir / L"tokenizer.json";
-                    if (fs::exists(alt, ec)) tok = alt;
-                }
-                if (!fs::exists(onnx, ec)) {
-                    if (!fs::exists(weights, ec)) {
-                        throw std::runtime_error("Model weights missing (" + to_utf8(weights.filename().wstring()) + ")");
-                    }
-                    {
-                        std::lock_guard lk{m_};
-                        state_ = State::Exporting;
-                    }
-                    if (on_state_changed) on_state_changed();
-
-                    const fs::path idx_exe = exe_dir() / L"usyseek-indexer.exe";
-                    std::wstring cmd = L"\"" + idx_exe.wstring() + L"\" --export-text";
-                    STARTUPINFOW si{sizeof(si)};
-                    wil::unique_process_information pi;
-                    if (CreateProcessW(idx_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, exe_dir().c_str(), &si, &pi)) {
-                        WaitForSingleObject(pi.hProcess, 180'000);
-                    }
-                    {
-                        std::lock_guard lk{m_};
-                        state_ = State::Loading;
-                    }
-                    if (on_state_changed) on_state_changed();
-                    if (!fs::exists(onnx, ec)) {
-                        throw std::runtime_error("Text ONNX export failed - check Python .venv in Settings");
-                    }
-                }
-                if (!fs::exists(tok, ec)) throw std::runtime_error("Tokenizer missing (" + to_utf8(tok.filename().wstring()) + ")");
-
-                if (!env_) env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_ERROR, "usyseek");
-                Ort::SessionOptions so;
-                so.SetIntraOpNumThreads(static_cast<int>(std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u)));
-                so.SetInterOpNumThreads(1);
-                so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-                so.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
-                so.DisableCpuMemArena();
-                auto session = std::make_unique<Ort::Session>(*env_, onnx.c_str(), so);
-
-                const auto in_shape = session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
-                const auto out_shape = session->GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
-                const size_t ctx = in_shape.size() >= 2 && in_shape[1] > 0 ? static_cast<size_t>(in_shape[1]) : 77;
-                const size_t dim = out_shape.empty() ? 0 : static_cast<size_t>(out_shape.back());
-                Ort::AllocatorWithDefaultOptions alloc;
-                const std::string in_name = session->GetInputNameAllocated(0, alloc).get();
-                const std::string out_name = session->GetOutputNameAllocated(0, alloc).get();
-
-                RustBuf terr;
-                const std::string tok_path = to_utf8(tok.wstring());
-                UsyTokenizer* t = usy_tok_load(ustr(tok_path), ctx, &terr.b);
-                if (!t) throw std::runtime_error("Tokenizer failed to load: " + terr.str());
-
-                std::lock_guard lk{m_};
-                if (tok_) usy_tok_free(tok_);
-                tok_ = t;
-                session_ = std::move(session);
-                ctx_ = ctx;
-                dim_ = dim;
-                in_name_ = in_name;
-                out_name_ = out_name;
-                cache_.clear();
-                error_.clear();
-                state_ = State::Ready;
-            } catch (const std::exception& e) {
-                std::lock_guard lk{m_};
-                error_ = to_wide(e.what());
-                state_ = State::Failed;
-            }
-            cv_.notify_all();
-            if (on_state_changed) on_state_changed();
-            SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
-        });
+        notify();
+        loader_ = std::jthread([this] { load_loop(); });
     }
 
-    [[nodiscard]] State state() const {
-        std::lock_guard lk{m_};
-        return state_;
+    /// Tries a failed load again (after an index run, a model download or a Python install).
+    void retry() {
+        fs::path dir;
+        std::string name;
+        {
+            const std::lock_guard lk{m_};
+            if (busy_ || state_ != State::Failed) return;
+            dir = dir_;
+            name = name_;
+        }
+        load_async(std::move(dir), std::move(name));
     }
+
+    /// Cheap enough to poll: retries a failed load once the model files on disk differ from the failed
+    /// attempt and have stopped changing (so a file that is still being copied is left alone).
+    void retry_if_files_changed() {
+        fs::path dir;
+        std::string name;
+        {
+            const std::lock_guard lk{m_};
+            if (busy_ || state_ != State::Failed) return;
+            dir = dir_;
+            name = name_;
+        }
+        const FileSignature now = file_signature(dir, name);
+        {
+            const std::lock_guard lk{m_};
+            const bool settled = now == seen_files_;
+            seen_files_ = now;
+            if (!settled || now == failed_files_) return;
+        }
+        load_async(std::move(dir), std::move(name));
+    }
+
+    /// Lock-free: drawn every frame by the UI thread.
+    [[nodiscard]] State state() const noexcept { return state_.load(); }
     [[nodiscard]] std::wstring error() const {
-        std::lock_guard lk{m_};
+        const std::lock_guard lk{m_};
         return error_;
     }
 
-    /// Blocks until the model is ready (or failed).
+    /// Blocks until a pending load has finished, then runs the model. The lock is only held around the
+    /// bookkeeping, never around inference, so `state()` / `error()` stay responsive while a query is encoded.
     std::optional<std::vector<float>> encode(const std::wstring& text, std::wstring* err = nullptr) {
-        std::unique_lock lk{m_};
-        cv_.wait(lk, [&] { return state_ == State::Ready || state_ == State::Failed || state_ == State::Idle; });
-        if (state_ != State::Ready) {
-            if (err) *err = error_.empty() ? L"Text model not loaded" : error_;
-            return std::nullopt;
-        }
-        for (auto it = cache_.begin(); it != cache_.end(); ++it) {
-            if (it->first == text) {
-                cache_.splice(cache_.begin(), cache_, it);
-                return cache_.front().second;
+        std::shared_ptr<const Model> model;
+        {
+            std::unique_lock lk{m_};
+            cv_.wait(lk, [&] { return !busy_; });
+            if (state_ != State::Ready || !model_) {
+                if (err) *err = error_.empty() ? L"Text model not loaded" : error_;
+                return std::nullopt;
             }
+            for (auto it = cache_.begin(); it != cache_.end(); ++it) {
+                if (it->first == text) {
+                    cache_.splice(cache_.begin(), cache_, it);
+                    return cache_.front().second;
+                }
+            }
+            model = model_;
         }
-        std::vector<int64_t> ids(ctx_, 0);
+
+        std::vector<int64_t> ids(model->ctx, 0);
         const std::string u = to_utf8(lower(text));
-        if (usy_tok_encode(tok_, ustr(u), ids.data()) == 0) {
+        if (usy_tok_encode(model->tok, ustr(u), ids.data()) == 0) {
             if (err) *err = L"Tokenizer failed";
             return std::nullopt;
         }
         try {
             const auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-            const int64_t shape[2] = {1, static_cast<int64_t>(ctx_)};
-            Ort::Value input = Ort::Value::CreateTensor<int64_t>(mem, ids.data(), ids.size(), shape, 2);
-            const char* in_names[] = {in_name_.c_str()};
-            const char* out_names[] = {out_name_.c_str()};
-            auto out = session_->Run(Ort::RunOptions{nullptr}, in_names, &input, 1, out_names, 1);
+            const std::array<int64_t, 2> shape = {1, static_cast<int64_t>(model->ctx)};
+            Ort::Value input = Ort::Value::CreateTensor<int64_t>(mem, ids.data(), ids.size(), shape.data(), shape.size());
+            const char* in_names[] = {model->in_name.c_str()};
+            const char* out_names[] = {model->out_name.c_str()};
+            auto out = model->session->Run(Ort::RunOptions{nullptr}, in_names, &input, 1, out_names, 1);
             const float* p = out[0].GetTensorData<float>();
             const size_t n = out[0].GetTensorTypeAndShapeInfo().GetElementCount();
             std::vector<float> v(p, p + n);
-            cache_.emplace_front(text, v);
-            if (cache_.size() > 64) cache_.pop_back();
+
+            const std::lock_guard lk{m_};
+            if (model == model_) { // not replaced by another model in the meantime
+                cache_.emplace_front(text, v);
+                if (cache_.size() > 64) cache_.pop_back();
+            }
             return v;
         } catch (const std::exception& e) {
             if (err) *err = to_wide(e.what());
@@ -275,17 +241,152 @@ public:
     }
 
 private:
+    struct Model {
+        std::unique_ptr<Ort::Session> session;
+        UsyTokenizer* tok = nullptr;
+        size_t ctx = 0;
+        std::string in_name, out_name;
+
+        Model() = default;
+        Model(const Model&) = delete;
+        Model& operator=(const Model&) = delete;
+        ~Model() {
+            if (tok) usy_tok_free(tok);
+        }
+    };
+
+    struct ModelPaths {
+        fs::path weights, onnx, tokenizer, shared_tokenizer;
+    };
+    static ModelPaths model_paths(const fs::path& dir, const std::string& name) {
+        const std::wstring w = to_wide(name);
+        return {dir / (w + L".safetensors"), dir / (w + L"-text.onnx"), dir / (w + L"-tokenizer.json"), dir / L"tokenizer.json"};
+    }
+
+    /// Size and modification time of every file a load depends on (0 = missing).
+    using FileSignature = std::array<uint64_t, 8>;
+    static FileSignature file_signature(const fs::path& dir, const std::string& name) {
+        const ModelPaths p = model_paths(dir, name);
+        FileSignature sig{};
+        size_t i = 0;
+        for (const fs::path* f : {&p.weights, &p.onnx, &p.tokenizer, &p.shared_tokenizer}) {
+            WIN32_FILE_ATTRIBUTE_DATA d{};
+            if (GetFileAttributesExW(f->c_str(), GetFileExInfoStandard, &d)) {
+                sig[i] = (static_cast<uint64_t>(d.nFileSizeHigh) << 32) | d.nFileSizeLow;
+                sig[i + 1] = (static_cast<uint64_t>(d.ftLastWriteTime.dwHighDateTime) << 32) | d.ftLastWriteTime.dwLowDateTime;
+            }
+            i += 2;
+        }
+        return sig;
+    }
+
+    void notify() const {
+        if (on_state_changed) on_state_changed();
+    }
+
+    void load_loop() {
+        for (;;) {
+            fs::path dir;
+            std::string name;
+            uint64_t generation = 0;
+            {
+                const std::lock_guard lk{m_};
+                dir = dir_;
+                name = name_;
+                generation = wanted_;
+                state_ = State::Loading;
+            }
+            notify();
+            const FileSignature files = file_signature(dir, name);
+
+            std::shared_ptr<const Model> model;
+            std::wstring error;
+            try {
+                model = load_model(dir, name);
+            } catch (const std::exception& e) {
+                error = to_wide(e.what());
+            }
+
+            std::shared_ptr<const Model> previous; // released after the lock
+            {
+                const std::lock_guard lk{m_};
+                if (generation != wanted_) continue; // another model was requested while this one loaded
+                previous = std::exchange(model_, std::move(model));
+                cache_.clear();
+                error_ = std::move(error);
+                failed_files_ = seen_files_ = files;
+                state_ = model_ ? State::Ready : State::Failed;
+                busy_ = false;
+            }
+            break;
+        }
+        cv_.notify_all();
+        notify();
+        SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
+    }
+
+    std::shared_ptr<const Model> load_model(const fs::path& model_dir, const std::string& model_name) {
+        const ModelPaths paths = model_paths(model_dir, model_name);
+        std::error_code ec;
+        const fs::path& tok = !fs::exists(paths.tokenizer, ec) && fs::exists(paths.shared_tokenizer, ec) ? paths.shared_tokenizer : paths.tokenizer;
+        if (!fs::exists(paths.onnx, ec)) {
+            if (!fs::exists(paths.weights, ec)) {
+                throw std::runtime_error("Model weights missing (" + to_utf8(paths.weights.filename().wstring()) + ") - download the model in Settings");
+            }
+            state_ = State::Exporting;
+            notify();
+
+            const fs::path idx_exe = exe_dir() / L"usyseek-indexer.exe";
+            std::wstring cmd = L"\"" + idx_exe.wstring() + L"\" --export-text";
+            STARTUPINFOW si{sizeof(si)};
+            wil::unique_process_information pi;
+            if (CreateProcessW(idx_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, exe_dir().c_str(), &si, &pi)) {
+                WaitForSingleObject(pi.hProcess, 180'000);
+            }
+            state_ = State::Loading;
+            notify();
+            if (!fs::exists(paths.onnx, ec)) {
+                throw std::runtime_error("Text ONNX export failed - check the Python environment in Settings");
+            }
+        }
+        if (!fs::exists(tok, ec)) {
+            throw std::runtime_error("Tokenizer missing (" + to_utf8(tok.filename().wstring()) + ") - download the model in Settings");
+        }
+
+        if (!env_) env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_ERROR, "usyseek");
+        Ort::SessionOptions so;
+        so.SetIntraOpNumThreads(static_cast<int>(std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u)));
+        so.SetInterOpNumThreads(1);
+        so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        so.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+        so.DisableCpuMemArena();
+
+        auto model = std::make_shared<Model>();
+        model->session = std::make_unique<Ort::Session>(*env_, paths.onnx.c_str(), so);
+        const auto in_shape = model->session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
+        model->ctx = in_shape.size() >= 2 && in_shape[1] > 0 ? static_cast<size_t>(in_shape[1]) : 77;
+        Ort::AllocatorWithDefaultOptions alloc;
+        model->in_name = model->session->GetInputNameAllocated(0, alloc).get();
+        model->out_name = model->session->GetOutputNameAllocated(0, alloc).get();
+
+        RustBuf terr;
+        const std::string tok_path = to_utf8(tok.wstring());
+        model->tok = usy_tok_load(ustr(tok_path), model->ctx, &terr.b);
+        if (!model->tok) throw std::runtime_error("Tokenizer failed to load: " + terr.str());
+        return model;
+    }
+
     mutable std::mutex m_;
     std::condition_variable cv_;
-    State state_ = State::Idle;
+    std::atomic<State> state_{State::Idle};
+    bool busy_ = false;   // a loader thread is running
+    uint64_t wanted_ = 0; // bumped by every request, so a loader can tell it was superseded
     std::wstring error_;
     std::string name_;
     fs::path dir_;
-    std::unique_ptr<Ort::Env> env_;
-    std::unique_ptr<Ort::Session> session_;
-    UsyTokenizer* tok_ = nullptr;
-    size_t ctx_ = 0, dim_ = 0;
-    std::string in_name_, out_name_;
+    FileSignature failed_files_{}, seen_files_{};
+    std::unique_ptr<Ort::Env> env_; // loader thread only
+    std::shared_ptr<const Model> model_;
     std::list<std::pair<std::wstring, std::vector<float>>> cache_;
     std::jthread loader_;
 };
@@ -322,7 +423,7 @@ public:
 
     void start(const Settings& s) {
         settings_ = s;
-        thread_ = std::jthread([this](std::stop_token st) { run(st); });
+        thread_ = std::jthread([this] { run(); });
     }
 
     void stop() {
@@ -364,7 +465,7 @@ public:
     }
 
 private:
-    void run(std::stop_token) {
+    void run() {
         ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
         Settings s;
         {
@@ -435,7 +536,7 @@ private:
             uint64_t self_id = 0;
             if (q.similar) {
                 self_id = path_id(*q.similar);
-                if (!db_.retrieve(coll, std::span{&self_id, 1}, {"k"}).value_or(DbPoints{}).points.size()) {
+                if (db_.retrieve(coll, std::span{&self_id, 1}, {"k"}).value_or(DbPoints{}).points.empty()) {
                     res->error = L"Not indexed yet";
                     return res;
                 }

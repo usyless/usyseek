@@ -2,6 +2,8 @@
 
 #include "gfx.hpp"
 
+#include <usyseek/svg.hpp>
+
 #include <shobjidl.h>
 
 #include <condition_variable>
@@ -22,7 +24,7 @@ public:
     void start(HWND notify, UINT msg, unsigned threads = 3) {
         notify_ = notify;
         msg_ = msg;
-        for (unsigned i = 0; i < threads; ++i) workers_.emplace_back([this](std::stop_token st) { worker(st); });
+        for (unsigned i = 0; i < threads; ++i) workers_.emplace_back([this](const std::stop_token& st) { worker(st); });
     }
 
     void stop() {
@@ -95,12 +97,12 @@ private:
     static constexpr size_t MAX_BITMAPS = 240;
 
     struct Req {
-        uint64_t id;
+        uint64_t id = 0;
         std::wstring path;
-        UINT px;
+        UINT px = 0;
     };
     struct Done {
-        uint64_t id;
+        uint64_t id = 0;
         UINT w = 0, h = 0;
         std::vector<uint8_t> pixels;
     };
@@ -109,7 +111,7 @@ private:
         std::list<uint64_t>::iterator lru;
     };
 
-    void worker(std::stop_token st) {
+    void worker(const std::stop_token& st) {
         ulp::win::COMWrapper<false> com{COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE};
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         while (!st.stop_requested()) {
@@ -132,7 +134,28 @@ private:
         }
     }
 
+    /// The shell has no SVG thumbnailer of its own, so those are rasterised with resvg.
+    static void load_svg(const Req& r, Done& d) {
+        const auto raster = svg::render(r.path, r.px, r.px, svg::Fit::Contain);
+        if (!raster) return;
+        const std::span<const uint8_t> src = raster->rgba();
+        d.pixels.resize(src.size());
+        // Opaque RGBA -> BGRA
+        for (size_t i = 0; i + 3 < src.size(); i += 4) {
+            d.pixels[i] = src[i + 2];
+            d.pixels[i + 1] = src[i + 1];
+            d.pixels[i + 2] = src[i];
+            d.pixels[i + 3] = src[i + 3];
+        }
+        d.w = raster->width;
+        d.h = raster->height;
+    }
+
     static void load(const Req& r, Done& d) {
+        if (svg::is_svg(r.path)) {
+            load_svg(r, d);
+            return;
+        }
         wil::com_ptr<IShellItemImageFactory> factory;
         if (FAILED(SHCreateItemFromParsingName(r.path.c_str(), nullptr, IID_PPV_ARGS(&factory)))) return;
         HBITMAP raw = nullptr;

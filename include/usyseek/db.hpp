@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rust_bridge.hpp"
 #include "settings.hpp"
 
 #include <glaze/glaze.hpp>
@@ -9,19 +10,9 @@
 #include <thread>
 
 extern "C" {
-struct UsyStr {
-    const char* ptr;
-    size_t len;
-};
-struct UsyBuf {
-    char* ptr;
-    size_t len;
-    size_t cap;
-};
 struct UsyQdrant;
 struct UsyTokenizer;
 
-void usy_buf_free(UsyBuf b);
 UsyQdrant* usy_qd_connect(UsyStr url, UsyBuf* out);
 void usy_qd_free(UsyQdrant* q);
 int32_t usy_qd_health(UsyQdrant* q, UsyBuf* out);
@@ -42,21 +33,6 @@ size_t usy_tok_encode(UsyTokenizer* t, UsyStr text, int64_t* ids);
 }
 
 namespace usyseek {
-
-inline UsyStr ustr(std::string_view s) noexcept { return UsyStr{s.data(), s.size()}; }
-
-/// RAII owner of a Rust-allocated buffer.
-struct RustBuf {
-    UsyBuf b{nullptr, 0, 0};
-    RustBuf() = default;
-    RustBuf(const RustBuf&) = delete;
-    RustBuf& operator=(const RustBuf&) = delete;
-    ~RustBuf() {
-        if (b.ptr) usy_buf_free(b);
-    }
-    [[nodiscard]] std::string_view view() const noexcept { return {b.ptr ? b.ptr : "", b.len}; }
-    [[nodiscard]] std::string str() const { return std::string{view()}; }
-};
 
 struct MediaPayload {
     std::string p;                 // full path

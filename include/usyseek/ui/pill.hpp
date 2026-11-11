@@ -63,6 +63,7 @@ public:
         caret_reset();
         sh_.refresh_tags();
         sh_.poll_indexer(true);
+        sh_.refresh_hotkey_state();
         SetTimer(hwnd_, TIMER_STATUS, 1000, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
         render();
@@ -112,10 +113,19 @@ public:
         else show();
     }
 
+    /// Asks for a repaint. Any number of calls before the next WM_PAINT collapse into a single frame, and
+    /// WM_PAINT is only delivered once pending input has been handled, so typing never waits on drawing.
+    void invalidate() {
+        dirty_ = true;
+        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    /// Draws a frame right now. Prefer `invalidate()`: presenting waits for the display's refresh.
     void render() {
         if (rendering_ || (!visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         rendering_ = true;
+        dirty_ = false;
         const bool anim = step_anim();
         auto* dc = target_.dc();
         hits_.clear();
@@ -370,7 +380,7 @@ private:
                 searching_ = false;
                 scroll_ = target_scroll_ = 0.0f;
                 apply_height();
-                render();
+                invalidate();
                 return;
             }
             last_query_ = q;
@@ -384,7 +394,7 @@ private:
         r.offset = offset;
         loading_more_ = offset > 0;
         sh_.engine.search(std::move(r));
-        render();
+        invalidate();
     }
 
 public:
@@ -404,22 +414,30 @@ public:
         }
         for (auto& p : r->points) items_.push_back(make_item(std::move(p)));
         apply_height();
-        render();
+        invalidate();
     }
 
     void on_thumbs() {
-        if (target_.ready() && sh_.thumbs.process(target_.dc())) render();
+        if (target_.ready() && sh_.thumbs.process(target_.dc())) invalidate();
     }
 
     void on_indexer_changed() {
         sh_.poll_indexer(true);
         sh_.refresh_tags();
-        if (visible()) render();
+        if (visible()) invalidate();
+    }
+
+    /// The text model finished (re)loading: a query that failed for the lack of one is run again.
+    void on_encoder_changed() {
+        if (sh_.engine.encoder().state() == TextEncoder::State::Ready && !error_.empty() && !searching_ && !trim(field_.text).empty()) {
+            run_search(0);
+        }
+        invalidate();
     }
 
     void on_tags_refreshed() {
         if (drop_open_) update_dropdown();
-        if (visible()) render();
+        if (visible()) invalidate();
     }
 
 private:
@@ -639,11 +657,14 @@ private:
         } else if (enc == TextEncoder::State::Loading) {
             sep();
             piece(L"Loading model…", color::primary);
-        } else if (enc == TextEncoder::State::Failed) {
-            sep();
-            piece(sh_.engine.encoder().error(), color::error);
         }
-        if (!error_.empty()) {
+        // A search fails with the model's own error while there is no model: show it once
+        const std::wstring model_error = enc == TextEncoder::State::Failed ? sh_.engine.encoder().error() : std::wstring{};
+        if (!model_error.empty()) {
+            sep();
+            piece(model_error, color::error);
+        }
+        if (!error_.empty() && error_ != model_error) {
             sep();
             piece(error_, color::error);
         } else if (last_ms_ > 0 && expanded()) {
@@ -654,6 +675,10 @@ private:
         }
         sep();
         piece(to_wide(sh_.settings.model_name), color::outline);
+        if (sh_.hotkey_unavailable()) {
+            sep();
+            piece(format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk) + L" is taken by another app", color::amber);
+        }
 
         if (expanded() && !items_.empty()) {
             std::wstring right = format_count(items_.size()) + (has_more_ ? L"+" : L"") + L" results";
@@ -938,7 +963,7 @@ private:
         update_dropdown();
         if (ins.ends_with(L' ')) run_search(0);
         else apply_height();
-        render();
+        invalidate();
     }
 
     // ------------------------------------------------------------------------------------------
@@ -970,7 +995,7 @@ private:
             if (seen.insert(t.v).second) menu_tags_.push_back(t.v);
         }
         caret_reset();
-        render();
+        invalidate();
     }
 
     void close_popups() {
@@ -1018,7 +1043,7 @@ private:
             for (const auto& c : changes) db.set_tags(coll, std::span{&c.id, 1}, c.tags);
             sh_.refresh_tags();
         });
-        render();
+        invalidate();
     }
 
     [[nodiscard]] D2D1_RECT_F menu_rect() const {
@@ -1116,7 +1141,7 @@ private:
                 break;
             }
         }
-        render();
+        invalidate();
     }
 
     void find_similar(const Item& it) {
@@ -1156,7 +1181,7 @@ private:
                 if (track > 0) {
                     scroll_ = target_scroll_ = std::clamp(drag_scroll_start_ + (p.y - drag_y_) / track * max_scroll(), 0.0f, max_scroll());
                 }
-                render();
+                invalidate();
                 return;
             }
         }
@@ -1167,7 +1192,7 @@ private:
             } else {
                 Canvas cv{target_.dc(), sh_.fonts, hits_};
                 field_.click(cv, p.x, true);
-                render();
+                invalidate();
                 return;
             }
         }
@@ -1179,11 +1204,17 @@ private:
             hover_id_ = id;
             hover_index_ = idx;
             if (show_help() != was_help) apply_height();
-            render();
+            invalidate();
         }
     }
 
+    /// Hit regions are recorded while drawing, so a pending repaint is done before a mouse position is resolved.
+    void flush() {
+        if (dirty_) render();
+    }
+
     void on_lbutton_down(D2D1_POINT_2F p, bool dbl) {
+        flush();
         selecting_text_ = false;
         dragging_scroll_ = false;
         SetFocus(hwnd_);
@@ -1194,7 +1225,7 @@ private:
 
         if (menu_open_ && id != IdMenu && id != IdMenuItem && id != IdMenuTag && id != IdMenuField) {
             close_popups();
-            render();
+            invalidate();
             return;
         }
         if (drop_open_ && id != IdDrop && id != IdDropItem && id != IdTagBtn && id != IdField) {
@@ -1297,15 +1328,16 @@ private:
                 break;
             default: break;
         }
-        render();
+        invalidate();
     }
 
     void on_rbutton_down(D2D1_POINT_2F p) {
+        flush();
         const Hit* h = hit_test(hits_, p);
         if (!h || (h->id != IdCard && h->id != IdTagChip && h->id != IdSimilar)) {
             if (menu_open_) {
                 close_popups();
-                render();
+                invalidate();
             }
             return;
         }
@@ -1330,7 +1362,7 @@ private:
         else selected_ = {items_[f].pt.id};
         field_.focused = false;
         scroll_to(f);
-        render();
+        invalidate();
     }
 
     void on_key(UINT vk) {
@@ -1342,7 +1374,7 @@ private:
                 selected_.clear();
                 field_.focused = true;
             } else hide();
-            render();
+            invalidate();
             return;
         }
         if (vk == VK_F11) {
@@ -1363,13 +1395,13 @@ private:
                 menu_field_.on_key(hwnd_, vk, handled);
             }
             caret_reset();
-            render();
+            invalidate();
             return;
         }
         if (drop_open_ && !drop_items_.empty()) {
             if (vk == VK_DOWN || vk == VK_UP) {
                 drop_sel_ = (drop_sel_ + (vk == VK_DOWN ? 1 : -1) + static_cast<int>(drop_items_.size())) % static_cast<int>(drop_items_.size());
-                render();
+                invalidate();
                 return;
             }
             if (vk == VK_RETURN || vk == VK_TAB) {
@@ -1383,14 +1415,14 @@ private:
             if (vk == 'C' && !field_.focused) return menu_action_selected(ActCopy);
             if (vk == 'A' && !field_.focused) {
                 for (const auto& it : items_) selected_.insert(it.pt.id);
-                render();
+                invalidate();
                 return;
             }
         }
         if (ctrl && vk == 'F') {
             field_.focused = true;
             field_.select_all();
-            render();
+            invalidate();
             return;
         }
         if (vk == VK_RETURN) {
@@ -1403,7 +1435,7 @@ private:
                 field_.focused = true;
                 focus_ = -1;
                 selected_.clear();
-                render();
+                invalidate();
                 return;
             }
             move_focus(vk == VK_LEFT ? -1 : vk == VK_RIGHT ? 1 : 0, vk == VK_DOWN ? 1 : vk == VK_UP ? -1 : 0);
@@ -1417,7 +1449,7 @@ private:
         if (field_.on_key(hwnd_, vk, handled)) schedule_search();
         else update_dropdown();
         caret_reset();
-        render();
+        invalidate();
     }
 
     void menu_action_selected(int a) {
@@ -1430,7 +1462,7 @@ private:
         if (menu_open_) {
             menu_field_.on_char(c);
             caret_reset();
-            render();
+            invalidate();
             return;
         }
         if (!field_.focused) {
@@ -1439,10 +1471,11 @@ private:
         }
         if (field_.on_char(c)) schedule_search();
         caret_reset();
-        render();
+        invalidate();
     }
 
     LRESULT hit_test_nc(LPARAM lp) {
+        flush();
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd_, &pt);
         RECT rc;
@@ -1569,7 +1602,7 @@ private:
                     const bool was_help = show_help();
                     hover_id_ = IdNone;
                     if (show_help() != was_help) apply_height();
-                    render();
+                    invalidate();
                 }
                 return 0;
             case WM_LBUTTONDOWN: on_lbutton_down(to_dip(lp), false); return 0;
@@ -1596,11 +1629,11 @@ private:
                     case TIMER_CARET:
                         field_.caret_on = !field_.caret_on;
                         menu_field_.caret_on = field_.caret_on;
-                        if (field_.focused || menu_open_) render();
+                        if (field_.focused || menu_open_) invalidate();
                         return 0;
                     case TIMER_DEBOUNCE: run_search(0); return 0;
                     case TIMER_STATUS:
-                        if (sh_.poll_indexer()) render();
+                        if (sh_.poll_indexer()) invalidate();
                         return 0;
                     case TIMER_DEVICE:
                         KillTimer(hwnd_, TIMER_DEVICE);
@@ -1616,7 +1649,7 @@ private:
                 if (wp == 1) {
                     run_search(items_.size());
                 } else if (wp == 2) {
-                    render();
+                    invalidate();
                 } else if (lp) {
                     std::unique_ptr<std::function<void()>> fn{reinterpret_cast<std::function<void()>*>(lp)};
                     (*fn)();
@@ -1633,6 +1666,7 @@ private:
     std::vector<Hit> hits_;
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
     bool rendering_ = false;
+    bool dirty_ = false; // state changed since the last frame
     ULONGLONG shown_tick_ = 0;
 
     TextField field_;

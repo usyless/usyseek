@@ -96,8 +96,8 @@ struct Scope {
                 abs_excludes.push_back(normalise_dir(raw));
             } else {
                 std::wstring n = lower(raw);
-                while (n.starts_with(L"*") || n.starts_with(L"\\")) n.erase(0, 1);
-                while (n.ends_with(L"*") || n.ends_with(L"\\")) n.pop_back();
+                while (n.starts_with(L'*') || n.starts_with(L'\\')) n.erase(0, 1);
+                while (n.ends_with(L'*') || n.ends_with(L'\\')) n.pop_back();
                 if (!n.empty()) name_excludes.push_back(L"\\" + n + L"\\");
             }
         };
@@ -922,6 +922,7 @@ int run_indexer(Settings& settings) {
     std::atomic<size_t> next{0};
     std::atomic<uint32_t> alive{workers};
     std::vector<std::jthread> pool;
+    pool.reserve(workers);
     for (uint32_t w = 0; w < workers; ++w) {
         pool.emplace_back([&] {
             ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
@@ -935,6 +936,7 @@ int run_indexer(Settings& settings) {
                 try {
                     item.data = f.kind == 0 ? dec.image(f.path) : dec.video(f.path, settings.video_frames);
                 } catch (...) {
+                    // Leaves item.data empty: the file is counted as failed and remembered so it is not retried
                 }
                 if (!queue.push(std::move(item))) break;
             }

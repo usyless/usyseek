@@ -38,7 +38,7 @@ void wait_search(Pill& pill, DWORD timeout_ms = 15000) {
     pump_messages(180);
 }
 
-bool capture_window(WindowTarget& wt, std::function<void()> render_fn, const fs::path& png) {
+bool capture_window(WindowTarget& wt, const std::function<void()>& render_fn, const fs::path& png) {
     wt.request_capture(png);
     render_fn();
     return wt.capture_ok();
@@ -170,7 +170,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         PostMessageW(pill.hwnd(), WM_APP_RESULT, 0, reinterpret_cast<LPARAM>(r.release()));
     };
     sh.engine.encoder().on_state_changed = [&] {
-        sh.call([&] { sh.redraw_all(); });
+        sh.call([&] {
+            pill.on_encoder_changed();
+            settings_win.invalidate();
+        });
     };
     sh.engine.start(sh.settings);
     sh.engine.encoder().load_async(to_wide(sh.settings.model_dir), sh.settings.model_name);
@@ -181,8 +184,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     };
     sh.tags_refreshed = [&] { pill.on_tags_refreshed(); };
     sh.redraw_all = [&] {
-        if (pill.visible()) pill.render();
-        if (settings_win.visible()) settings_win.render();
+        pill.invalidate();
+        settings_win.invalidate();
     };
     sh.settings_changed = [&] {
         sh.engine.encoder().load_async(to_wide(sh.settings.model_dir), sh.settings.model_name);
@@ -192,7 +195,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     const auto arm_idle_timer = [&] {
         KillTimer(pill.hwnd(), TIMER_IDLE_EXIT);
-        if (!pill.visible() && !settings_win.visible() && !sh.test_mode) {
+        // A download or package install keeps the process alive even with both windows closed
+        if (!pill.visible() && !settings_win.visible() && !sh.test_mode && sh.background_jobs == 0) {
             SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
             if (sh.settings.ui_idle_timeout_s == 0) {
                 PostQuitMessage(0);
@@ -228,7 +232,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         if (msg == m_idx && m_idx) {
             done = true;
             pill.on_indexer_changed();
-            if (settings_win.visible()) settings_win.render();
+            settings_win.invalidate();
             return 0;
         }
         if (msg == WM_APP_RESULT) {
@@ -240,7 +244,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         if (msg == WM_TIMER && wp == TIMER_IDLE_EXIT) {
             done = true;
             KillTimer(pill.hwnd(), TIMER_IDLE_EXIT);
-            if (!pill.visible() && !settings_win.visible()) PostQuitMessage(0);
+            if (!pill.visible() && !settings_win.visible() && sh.background_jobs == 0) PostQuitMessage(0);
             return 0;
         }
         return 0;
@@ -261,6 +265,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     if (HWND launcher = find_launcher()) {
         send_cmd_value(launcher, Cmd::UiHello, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pill.hwnd())));
+        sh.refresh_hotkey_state();
     }
 
     wil::unique_handle own_job;

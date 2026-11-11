@@ -42,6 +42,15 @@ enum class Cmd : ULONG_PTR {
     SuspendHotkey,           // payload: uint32 (1 = suspend, 0 = resume)
     NeedQdrant,
     Quit,
+    HotkeyStatus,            // query: the reply is a HotkeyState
+};
+
+/// Whether the launcher currently holds the global search shortcut.
+enum class HotkeyState : uint32_t {
+    Unknown = 0, // no launcher to ask
+    Registered,
+    Disabled,    // switched off in settings
+    Unavailable, // another application owns the combination
 };
 
 // Registered window messages (cross-process)
@@ -192,7 +201,7 @@ inline fs::path state_path() { return data_dir() / L"state.json"; }
 inline std::optional<fs::path> find_upwards(const fs::path& relative) {
     std::error_code ec;
     for (fs::path d = exe_dir(); !d.empty(); d = d.parent_path()) {
-        const fs::path c = d / relative;
+        fs::path c = d / relative;
         if (fs::exists(c, ec)) return c;
         if (d == d.parent_path()) break;
     }
@@ -223,6 +232,16 @@ inline bool send_cmd(HWND target, Cmd cmd, std::span<const std::byte> payload = 
     cds.lpData = payload.empty() ? nullptr : const_cast<std::byte*>(payload.data());
     DWORD_PTR result = 0;
     return SendMessageTimeoutW(target, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds), SMTO_ABORTIFHUNG, 2000, &result) != 0;
+}
+
+/// Sends a command and returns the launcher's reply, or nothing when it could not be reached.
+inline std::optional<DWORD_PTR> query_cmd(HWND target, Cmd cmd) noexcept {
+    if (!target) return std::nullopt;
+    COPYDATASTRUCT cds{};
+    cds.dwData = static_cast<ULONG_PTR>(cmd);
+    DWORD_PTR result = 0;
+    if (SendMessageTimeoutW(target, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&cds), SMTO_ABORTIFHUNG, 2000, &result) == 0) return std::nullopt;
+    return result;
 }
 
 template <typename T>

@@ -16,6 +16,19 @@ namespace usyseek::ui {
 inline constexpr UINT WM_APP_THUMBS = WM_APP + 10;
 inline constexpr UINT WM_APP_RESULT = WM_APP + 11;
 inline constexpr UINT WM_APP_CALL = WM_APP + 12;
+inline constexpr UINT WM_APP_REDRAW = WM_APP + 13; // coalesced "something changed" from a worker thread
+
+inline std::wstring format_hotkey(uint32_t mods, uint32_t vk) {
+    std::wstring t;
+    if (mods & MOD_CONTROL) t += L"Ctrl + ";
+    if (mods & MOD_ALT) t += L"Alt + ";
+    if (mods & MOD_SHIFT) t += L"Shift + ";
+    if (mods & MOD_WIN) t += L"Win + ";
+    wchar_t name[64]{};
+    if (vk == VK_SPACE) wcscpy_s(name, L"Space");
+    else GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16), name, 64);
+    return t + (name[0] ? name : L"Key");
+}
 
 /// State and services shared by the pill and the settings window (UI thread only unless noted).
 struct Shared {
@@ -36,6 +49,8 @@ struct Shared {
 
     HWND call_hwnd = nullptr;        // window that runs marshalled callbacks
     bool test_mode = false;
+    HotkeyState hotkey_state = HotkeyState::Unknown;
+    int background_jobs = 0;         // downloads / installs in flight: the process must not idle-exit under them
 
     std::function<void()> open_settings;
     std::function<void()> visibility_changed;
@@ -62,7 +77,22 @@ struct Shared {
         });
     }
 
+    /// Asks the launcher whether it holds the global shortcut. Returns true when the answer changed.
+    bool refresh_hotkey_state() {
+        const HotkeyState before = hotkey_state;
+        const auto reply = query_cmd(find_launcher(), Cmd::HotkeyStatus);
+        hotkey_state = reply && *reply <= static_cast<DWORD_PTR>(HotkeyState::Unavailable) ? static_cast<HotkeyState>(*reply) : HotkeyState::Unknown;
+        return hotkey_state != before;
+    }
+
+    /// True while the configured shortcut cannot open search because another application owns it.
+    [[nodiscard]] bool hotkey_unavailable() const noexcept {
+        return settings.hotkey_enabled && hotkey_state == HotkeyState::Unavailable;
+    }
+
     bool poll_indexer(bool force = false) {
+        // Model files dropped into the folder (or exported by another process) are picked up without a restart
+        engine.encoder().retry_if_files_changed();
         const bool was_running = indexer_running;
         const bool prev_stopping = indexer_stopping;
         const uint64_t prev_embedded = indexer.embedded;
@@ -89,6 +119,7 @@ struct Shared {
         }
 
         const bool finished = was_running && !indexer_running;
+        if (finished) engine.encoder().retry(); // the indexer exports the text model when it was missing
         const bool failed_changed = indexer_running && indexer.failed != prev_failed;
         if (force || finished || failed_changed || !polled_once_) {
             polled_once_ = true;

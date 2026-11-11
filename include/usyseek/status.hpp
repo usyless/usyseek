@@ -95,7 +95,7 @@ public:
                 YieldProcessor();
                 continue;
             }
-            std::memcpy(&out, const_cast<const StatusData*>(&s->data), sizeof(StatusData));
+            std::memcpy(&out, &s->data, sizeof(StatusData));
             std::atomic_thread_fence(std::memory_order_acquire);
             if (s->seq.load(std::memory_order_acquire) == a) break;
         }

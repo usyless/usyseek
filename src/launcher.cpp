@@ -167,9 +167,12 @@ private:
                 register_hotkey();
                 return TRUE;
             case Cmd::SuspendHotkey:
+                // The UI is recording a new shortcut: release the key but keep reporting the real state
                 if (payload(uint32_t{0})) UnregisterHotKey(hwnd_, HOTKEY_ID);
                 else register_hotkey();
                 return TRUE;
+            case Cmd::HotkeyStatus:
+                return static_cast<LRESULT>(hotkey_state_);
             case Cmd::NeedQdrant:
                 ensure_qdrant();
                 return TRUE;
@@ -184,7 +187,7 @@ private:
     // Processes
     // ------------------------------------------------------------------------------------------
 
-    wil::unique_process_information spawn(const fs::path& exe, std::wstring args, bool no_window) {
+    wil::unique_process_information spawn(const fs::path& exe, const std::wstring& args, bool no_window) {
         wil::unique_process_information pi;
         std::wstring cmd = L"\"" + exe.wstring() + L"\" " + args;
         STARTUPINFOW si{sizeof(si)};
@@ -329,12 +332,25 @@ private:
 
     void register_hotkey() {
         UnregisterHotKey(hwnd_, HOTKEY_ID);
-        if (!settings_.hotkey_enabled || settings_.hotkey_vk == 0) return;
-        if (!RegisterHotKey(hwnd_, HOTKEY_ID, settings_.hotkey_mods | MOD_NOREPEAT, settings_.hotkey_vk)) {
+        if (!settings_.hotkey_enabled || settings_.hotkey_vk == 0) {
+            hotkey_state_ = HotkeyState::Disabled;
+            return;
+        }
+        if (RegisterHotKey(hwnd_, HOTKEY_ID, settings_.hotkey_mods | MOD_NOREPEAT, settings_.hotkey_vk)) {
+            hotkey_state_ = HotkeyState::Registered;
+            return;
+        }
+        // Tell the user once per combination; the UI shows the state for as long as it lasts
+        const bool already_reported = hotkey_state_ == HotkeyState::Unavailable &&
+                                      failed_mods_ == settings_.hotkey_mods && failed_vk_ == settings_.hotkey_vk;
+        hotkey_state_ = HotkeyState::Unavailable;
+        failed_mods_ = settings_.hotkey_mods;
+        failed_vk_ = settings_.hotkey_vk;
+        if (!already_reported) {
             NOTIFYICONDATAW nid = tray_data();
             nid.uFlags = NIF_INFO;
             wcscpy_s(nid.szInfoTitle, APP_NAME);
-            wcscpy_s(nid.szInfo, L"The search shortcut is already used by another app.");
+            wcscpy_s(nid.szInfo, L"The search shortcut is already used by another app. Pick a different one in Settings.");
             nid.dwInfoFlags = NIIF_WARNING;
             Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
@@ -446,7 +462,7 @@ private:
         AppendMenuW(menu.get(), MF_STRING | MF_DISABLED, 0, header.c_str());
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         std::wstring search = L"Open Search";
-        if (settings_.hotkey_enabled) search += L"\t" + hotkey_text(settings_);
+        if (settings_.hotkey_enabled && hotkey_state_ == HotkeyState::Registered) search += L"\t" + hotkey_text(settings_);
         AppendMenuW(menu.get(), MF_STRING, IdSearch, search.c_str());
         AppendMenuW(menu.get(), MF_STRING, IdSettings, L"Open Settings");
         const bool ui_alive = is_ui_running();
@@ -480,6 +496,8 @@ private:
     HWND ui_hwnd_ = nullptr;
     UINT taskbar_created_ = 0;
     Settings settings_;
+    HotkeyState hotkey_state_ = HotkeyState::Disabled;
+    uint32_t failed_mods_ = 0, failed_vk_ = 0;
     wil::unique_handle job_;
     wil::unique_event_nothrow stop_event_;
     wil::unique_process_information ui_;

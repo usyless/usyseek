@@ -3,11 +3,11 @@
 #include "shared.hpp"
 #include "flow.hpp"
 #include "textfield.hpp"
+#include "../http.hpp"
 #include "../path_rules.hpp"
 #include "../torch_index.hpp"
 
 #include <shobjidl.h>
-#include <urlmon.h>
 
 namespace usyseek {
 
@@ -18,40 +18,6 @@ struct NugetVersionIndex {
 } // namespace usyseek
 
 namespace usyseek::ui {
-
-class DownloadProgressCallback final : public IBindStatusCallback {
-public:
-    explicit DownloadProgressCallback(std::function<void(ULONG, ULONG)> on_progress)
-        : on_progress_{std::move(on_progress)} {}
-
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
-        if (!ppv) return E_POINTER;
-        if (riid == IID_IUnknown || riid == IID_IBindStatusCallback) {
-            *ppv = static_cast<IBindStatusCallback*>(this);
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
-    ULONG STDMETHODCALLTYPE Release() override { return 1; }
-    HRESULT STDMETHODCALLTYPE OnStartBinding(DWORD, IBinding*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetPriority(LONG*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE OnLowResource(DWORD) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE OnProgress(ULONG progress, ULONG progress_max, ULONG status_code, LPCWSTR) override {
-        if ((status_code == BINDSTATUS_DOWNLOADINGDATA || status_code == BINDSTATUS_ENDDOWNLOADDATA) && on_progress_) {
-            on_progress_(progress, progress_max);
-        }
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE OnStopBinding(HRESULT, LPCWSTR) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetBindInfo(DWORD*, BINDINFO*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE OnDataAvailable(DWORD, DWORD, FORMATETC*, STGMEDIUM*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE OnObjectAvailable(REFIID, IUnknown*) override { return E_NOTIMPL; }
-
-private:
-    std::function<void(ULONG, ULONG)> on_progress_;
-};
 
 class Flow {
 public:
@@ -97,10 +63,6 @@ private:
 class SettingsWindow {
 public:
     explicit SettingsWindow(Shared& s) : sh_{s} {}
-
-    ~SettingsWindow() {
-        if (task_.joinable()) task_.join();
-    }
 
     bool create(HINSTANCE inst) {
         WNDCLASSEXW wc{sizeof(wc)};
@@ -157,6 +119,7 @@ public:
         scan_models();
         sh_.poll_indexer(true);
         sh_.refresh_tags();
+        sh_.refresh_hotkey_state();
         ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
@@ -184,13 +147,20 @@ public:
         tab_ = t;
         scroll_ = target_scroll_ = 0.0f;
         active_field_ = nullptr;
-        render();
+        invalidate();
+    }
+
+    /// Asks for a repaint; calls made before the next WM_PAINT collapse into one frame, and input is handled first.
+    void invalidate() {
+        dirty_ = true;
+        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     void render() {
         if (rendering_ || (!visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         rendering_ = true;
+        dirty_ = false;
         const bool anim = step_anim();
         auto* dc = target_.dc();
         hits_.clear();
@@ -243,10 +213,13 @@ private:
         IdBrowseModelDir,
         IdModelChip,
         IdModelField,
+        IdRepoField,
+        IdDownloadModel,
         IdDeviceAuto,
         IdDeviceCpu,
         IdBatchPreset,
         IdBatchField,
+        IdResetAutoBatch,
         IdBrowseScript,
         IdClearScript,
         IdBrowseVenv,
@@ -290,6 +263,23 @@ private:
         if (std::find(models_.begin(), models_.end(), sh_.settings.model_name) == models_.end()) {
             models_.insert(models_.begin(), sh_.settings.model_name);
         }
+        refresh_model_files();
+    }
+
+    /// Which files of the selected model are on disk. Returns true when that changed.
+    bool refresh_model_files() {
+        const fs::path dir = to_wide(sh_.settings.model_dir);
+        const std::wstring name = to_wide(sh_.settings.model_name);
+        std::error_code ec;
+        ModelFiles now;
+        now.weights = fs::exists(dir / (name + L".safetensors"), ec);
+        now.weights_bytes = now.weights ? fs::file_size(dir / (name + L".safetensors"), ec) : 0;
+        if (ec) now.weights_bytes = 0;
+        now.tokenizer = fs::exists(dir / (name + L"-tokenizer.json"), ec) || fs::exists(dir / L"tokenizer.json", ec);
+        now.onnx = fs::exists(dir / (name + L"-text.onnx"), ec);
+        const bool changed = now != model_files_;
+        model_files_ = now;
+        return changed;
     }
 
     void probe_venv() {
@@ -577,7 +567,7 @@ private:
             const D2D1_COLOR_F fg = on ? color::on_primary_container : color::on_surface_variant;
             cv.icon(tabs[i].g, rect(x + 12.0f, r.top, 18.0f, height(r)), fg, Font::IconSmall);
             cv.text(tabs[i].label, rect(x + 34.0f, r.top, tw + 4.0f, height(r)), Font::BodySemi, fg);
-            cv.hit(r, tabs[i].id, i);
+            cv.hit(r, tabs[i].id);
         }
         cv.hline(0, sz.width, strip_h, with_alpha(color::outline_variant, 0.65f));
     }
@@ -909,7 +899,7 @@ private:
 
         // 3. Excluded Directories Card (always visible)
         {
-            const auto locked = locked_excludes();
+            const auto& locked = locked_excludes();
             const bool show_exclude_error = !exclude_error_.empty() && exclude_field_.text == exclude_error_for_text_;
             const float lx = x + 22.0f, rw = w - 44.0f;
 
@@ -936,6 +926,7 @@ private:
                 float h;
             };
             std::vector<ExcludeRow> rows;
+            rows.reserve(locked.size() + sh_.settings.exclude_dirs.size());
             for (const auto& sys : locked) {
                 rows.push_back({sys, L"System", true, 0, 0.0f, 0.0f});
             }
@@ -986,18 +977,6 @@ private:
     // ------------------------------------------------------------------------------------------
     // Tab 2: Application & Venv Settings
     // ------------------------------------------------------------------------------------------
-
-    static std::wstring format_hotkey(uint32_t mods, uint32_t vk) {
-        std::wstring t;
-        if (mods & MOD_CONTROL) t += L"Ctrl + ";
-        if (mods & MOD_ALT) t += L"Alt + ";
-        if (mods & MOD_SHIFT) t += L"Shift + ";
-        if (mods & MOD_WIN) t += L"Win + ";
-        wchar_t name[64]{};
-        if (vk == VK_SPACE) wcscpy_s(name, L"Space");
-        else GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16), name, 64);
-        return t + (name[0] ? name : L"Key");
-    }
 
     float draw_tab_settings(Canvas& cv, float x, float y, float w) {
         // 1. Keybind & Pill behaviour card
@@ -1056,8 +1035,15 @@ private:
                 draw_button(cv, r, 0, L"Whole image (fit)", IdThumbFit, static_cast<int>(ThumbFit::Contain), contain ? 1 : 0);
             });
 
+            // The launcher could not register the shortcut: say so here instead of leaving a dead key
+            const bool hotkey_warn = sh_.hotkey_unavailable() && !recording_hotkey_;
+            const std::wstring hotkey_msg = format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk) +
+                L" is already registered by another app, so it cannot open search. Record a different shortcut or close the app that uses it.";
+            const float hotkey_msg_h = hotkey_warn ? error_row_height(cv, hotkey_msg, rw) : 0.0f;
+
             const float keys_y = y + 16.0f + hd.h + 10.0f;
-            const float options_line_y = keys_y + keys.height(rw) + 14.0f;
+            const float hotkey_msg_y = keys_y + keys.height(rw) + 8.0f;
+            const float options_line_y = keys_y + keys.height(rw) + (hotkey_warn ? 8.0f + hotkey_msg_h : 0.0f) + 14.0f;
             const float options_y = options_line_y + 10.0f;
             const float thumbs_y = options_y + options.height(rw) + 16.0f;
             const float h = thumbs_y + thumbs.height(rw) + 16.0f - y;
@@ -1066,6 +1052,7 @@ private:
             const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
             draw_switch(cv, side.right, side.top + 12.0f, sh_.settings.hotkey_enabled, IdToggleHotkey);
             keys.draw(lx, keys_y, rw);
+            if (hotkey_warn) draw_error_row(cv, hotkey_msg, lx, hotkey_msg_y, rw, hotkey_msg_h);
             cv.hline(lx, lx + rw, options_line_y, with_alpha(color::outline_variant, 0.5f));
             options.draw(lx, options_y, rw);
             thumbs.draw(lx, thumbs_y, rw);
@@ -1109,6 +1096,49 @@ private:
                 model_field_.draw(cv, inset(mfr, 10.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
                 cv.hit(mfr, IdModelField);
             }, true);
+
+            // What is on disk for the selected model, and a way to fetch what is missing
+            const ModelFiles& mf = model_files_;
+            const JobView fetch_view = view(model_job_);
+            const auto badge = [&cv](Flow& flow, std::wstring text, D2D1_COLOR_F col) {
+                const float bw = cv.measure(text, Font::Caption) + 28.0f;
+                flow.add(bw, 22.0f, [&cv, text = std::move(text), col, bw](D2D1_RECT_F br) {
+                    cv.fill_round(br, 11.0f, with_alpha(col, 0.15f));
+                    cv.fill_circle({br.left + 11.0f, br.top + 11.0f}, 3.5f, col);
+                    cv.text(text, rect(br.left + 20.0f, br.top, bw - 22.0f, 22.0f), Font::Caption, col);
+                });
+            };
+            Flow files{8.0f, 6.0f};
+            badge(files, mf.weights ? L"Weights  " + format_size(mf.weights_bytes) : L"Weights missing", mf.weights ? color::mint : color::error);
+            badge(files, mf.tokenizer ? L"Tokenizer" : L"Tokenizer missing", mf.tokenizer ? color::mint : color::error);
+            badge(files, mf.onnx ? L"Text ONNX" : L"Text ONNX not exported yet", mf.onnx ? color::mint : color::amber);
+            const auto enc_state = sh_.engine.encoder().state();
+            if (enc_state == TextEncoder::State::Ready) badge(files, L"Search model loaded", color::mint);
+            else if (enc_state == TextEncoder::State::Exporting) badge(files, L"Exporting text ONNX…", color::primary);
+            else if (enc_state == TextEncoder::State::Loading) badge(files, L"Loading search model…", color::primary);
+            const std::wstring enc_error = enc_state == TextEncoder::State::Failed ? sh_.engine.encoder().error() : std::wstring{};
+            const float enc_error_h = enc_error.empty() ? 0.0f : error_row_height(cv, enc_error, rw);
+
+            const bool show_fetch = !mf.weights || !mf.tokenizer || model_job_.busy;
+            repo_field_.placeholder = to_wide(default_repo());
+            const std::wstring fetch_label = !model_job_.busy ? L"Download Model"
+                : (fetch_view.total > 0 ? L"Cancel  •  " + std::to_wstring(fetch_view.done * 100 / fetch_view.total) + L"%" : L"Cancel");
+            Flow fetch{8.0f, 8.0f};
+            flow_text(cv, fetch, L"Hugging Face repo:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
+            fetch.add(200.0f, 32.0f, [&](D2D1_RECT_F fr) {
+                cv.fill_round(fr, 8.0f, color::surface_low);
+                cv.stroke_round(fr, 8.0f, active_field_ == &repo_field_ ? color::primary : color::outline_variant);
+                repo_field_.draw(cv, inset(fr, 10.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                cv.hit(fr, IdRepoField);
+            }, true);
+            fetch.add(button_width(cv, fetch_label, true, 170.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, model_job_.busy ? glyph::close : glyph::download, fetch_label, IdDownloadModel, 0, model_job_.busy ? 2 : 1);
+            });
+            std::wstring fetch_note = fetch_view.log;
+            if (model_job_.busy && fetch_view.total > 0) {
+                fetch_note += L"  " + format_size(fetch_view.done) + L" / " + format_size(fetch_view.total);
+            }
+            const float fetch_note_h = fetch_note.empty() ? 0.0f : text_height(cv, fetch_note, Font::Caption, rw, 18.0f);
 
             // Device & VRAM Batch size
             const bool is_cpu = sh_.settings.device == "cpu";
@@ -1157,8 +1187,17 @@ private:
             } else {
                 batch_note = L"Auto probes free VRAM on startup and backs off automatically on out-of-memory.";
             }
+            // The measured size is kept until the model or GPU changes; this forgets it so the next run measures again
+            const bool can_reset_batch = sh_.settings.batch_size == 0 && sh_.index_state.auto_batch > 0;
             const float note_x = batch_warn ? 22.0f : 0.0f;
-            const float note_h = text_height(cv, batch_note, Font::Caption, rw - note_x, 20.0f);
+            Flow note{10.0f, 4.0f};
+            flow_text(cv, note, batch_note, Font::Caption, batch_warn ? color::amber : color::outline, rw - note_x, 24.0f, true);
+            if (can_reset_batch) {
+                note.add(button_width(cv, L"Reset learnt size", false, 0.0f), 24.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, r, 0, L"Reset learnt size", IdResetAutoBatch);
+                });
+            }
+            const float note_h = note.height(rw - note_x);
 
             // Custom vision script override
             const std::wstring scr = sh_.settings.vision_script.empty() ? L"Bundled (python\\usyseek_vision.py)" : to_wide(sh_.settings.vision_script);
@@ -1184,7 +1223,11 @@ private:
 
             const float dir_y = y + 16.0f + hd.h + 10.0f;
             const float chips_y = dir_y + dir_row.height(rw) + 10.0f;
-            const float compute_y = chips_y + chips.height(rw) + 12.0f;
+            const float files_y = chips_y + chips.height(rw) + 10.0f;
+            const float enc_error_y = files_y + files.height(rw) + 6.0f;
+            const float fetch_y = enc_error_y + (enc_error.empty() ? 0.0f : enc_error_h + 6.0f) + 2.0f;
+            const float fetch_note_y = fetch_y + (show_fetch ? fetch.height(rw) + 6.0f : 0.0f);
+            const float compute_y = fetch_note_y + (fetch_note.empty() ? 0.0f : fetch_note_h + 6.0f) + 6.0f;
             const float note_y = compute_y + compute.height(rw) + 6.0f;
             const float script_y = note_y + note_h + 8.0f;
             const float h = script_y + script.height(rw) + 16.0f - y;
@@ -1193,25 +1236,34 @@ private:
             draw_header(cv, lx, y, rw, hd);
             dir_row.draw(lx, dir_y, rw);
             chips.draw(lx, chips_y, rw);
+            files.draw(lx, files_y, rw);
+            if (!enc_error.empty()) draw_error_row(cv, enc_error, lx, enc_error_y, rw, enc_error_h);
+            if (show_fetch) fetch.draw(lx, fetch_y, rw);
+            if (!fetch_note.empty()) {
+                cv.text_wrap(fetch_note, rect(lx, fetch_note_y, rw, fetch_note_h), Font::Caption, fetch_view.failed ? color::error : color::outline);
+            }
             compute.draw(lx, compute_y, rw);
             if (batch_warn) {
-                cv.icon(glyph::warning, rect(lx, note_y, 18.0f, 20.0f), color::amber, Font::IconSmall);
+                cv.icon(glyph::warning, rect(lx, note_y + 2.0f, 18.0f, 20.0f), color::amber, Font::IconSmall);
             }
-            cv.text_wrap(batch_note, rect(lx + note_x, note_y, rw - note_x, note_h), Font::Caption, batch_warn ? color::amber : color::outline);
+            note.draw(lx + note_x, note_y, rw - note_x);
             script.draw(lx, script_y, rw);
             y = next_y;
         }
 
         // 3. Python Environment Card (.venv or portable NuGet Python)
         {
-            const bool has_log = !venv_log_.empty();
+            const JobView venv_view = view(venv_job_);
+            const std::wstring& venv_log = venv_view.log;
+            const bool venv_busy = venv_job_.busy;
+            const bool has_log = !venv_log.empty();
             const float lx = x + 22.0f, rw = w - 44.0f;
 
             std::error_code ec;
             const bool ver_ok = venv_.exists && fs::exists(venv_.python_exe, ec);
             const std::wstring ready_txt = venv_.portable ? L"Portable Ready" : L".venv Ready";
-            const std::wstring st_txt = venv_busy_ ? L"Running task…" : (ver_ok ? ready_txt : (venv_.exists ? L"Missing python.exe" : L"Not found"));
-            const D2D1_COLOR_F st_col = venv_busy_ ? color::amber : (ver_ok ? color::mint : color::error);
+            const std::wstring st_txt = venv_busy ? L"Running task…" : (ver_ok ? ready_txt : (venv_.exists ? L"Missing python.exe" : L"Not found"));
+            const D2D1_COLOR_F st_col = venv_busy ? color::amber : (ver_ok ? color::mint : color::error);
             const float sw = cv.measure(st_txt, Font::Caption) + 26.0f;
 
             const CardHeader hd = make_header(cv, rw, L"Python Environment", color::on_surface,
@@ -1234,8 +1286,8 @@ private:
 
             // Portable Python (NuGet) row
             static constexpr const char* versions[4] = {"3.14", "3.13", "3.12", "3.11"};
-            const std::wstring dl_label = dl_total_ > 0 && venv_busy_
-                ? (L"Downloading " + std::to_wstring(dl_done_ * 100 / std::max<ULONG>(1, dl_total_)) + L"%")
+            const std::wstring dl_label = venv_view.total > 0 && venv_busy
+                ? (L"Downloading " + std::to_wstring(venv_view.done * 100 / venv_view.total) + L"%")
                 : L"Download & Use";
             Flow portable{8.0f, 8.0f};
             flow_text(cv, portable, L"Portable Python:", Font::SmallSemi, color::on_surface_variant, rw, 30.0f);
@@ -1282,7 +1334,7 @@ private:
                 Flow cuda{4.0f, 0.0f};
                 flow_text(cv, cuda, L"CUDA:", Font::Small, color::outline, rw, 30.0f);
                 for (size_t i = 0; i < cuda_versions.size(); ++i) {
-                    const std::wstring vl = to_wide(std::string{cuda_versions[i]});
+                    const std::wstring vl = to_wide(cuda_versions[i]);
                     const bool on = sh_.settings.cuda_version == cuda_versions[i];
                     cuda.add(button_width(cv, vl, false, 56.0f), 30.0f, [&, i, vl, on](D2D1_RECT_F r) {
                         draw_button(cv, r, 0, vl, IdCudaPreset, static_cast<int>(i), on ? 1 : 0);
@@ -1328,7 +1380,7 @@ private:
                 draw_button(cv, r, glyph::del, L"Delete Venv", IdDeleteVenv, 0, 2);
             }, true);
 
-            const float log_h = has_log ? mono_row_height(cv, venv_log_, rw - 20.0f, 72.0f) : 0.0f;
+            const float log_h = has_log ? mono_row_height(cv, venv_log, rw - 20.0f, 72.0f) : 0.0f;
 
             const float box_y = y + 16.0f + hd.h + 10.0f;
             const float portable_y = box_y + box_h + 12.0f;
@@ -1370,7 +1422,7 @@ private:
             if (has_log) {
                 const D2D1_RECT_F lr = rect(lx, log_y, rw, log_h);
                 cv.fill_round(lr, 8.0f, color::surface_lowest);
-                cv.text_wrap(venv_log_, inset(lr, 10.0f, 6.0f), Font::MonoSmall, color::on_surface_variant);
+                cv.text_wrap(venv_log, inset(lr, 10.0f, 6.0f), Font::MonoSmall, color::on_surface_variant);
             }
             y = next_y;
         }
@@ -1419,29 +1471,174 @@ private:
         ShellExecuteExW(&sei);
     }
 
-    void run_venv_task(std::function<void()> fn) {
-        if (venv_busy_) return;
-        if (task_.joinable()) task_.join();
-        venv_busy_ = true;
-        venv_log_ = L"Starting…";
-        render();
-        task_ = std::jthread([this, fn = std::move(fn)] {
-            fn();
-            sh_.call([this] {
-                venv_busy_ = false;
-                probe_venv();
-                render();
+    // ------------------------------------------------------------------------------------------
+    // Background jobs (downloads, package installs)
+    // ------------------------------------------------------------------------------------------
+
+    /// One background task and what it reports. Workers write through `report*`, which also asks for a
+    /// repaint; the UI thread draws a snapshot. Nothing a worker does ever posts more than one pending message,
+    /// so a chatty download cannot bury mouse and keyboard input the way one message per progress tick did.
+    struct Job {
+        bool busy = false; // UI thread only
+        std::mutex m;
+        std::wstring log;  // latest line
+        bool failed = false;
+        uint64_t done = 0, total = 0; // download progress, total 0 = nothing to show
+        std::jthread thread;          // last member: joined before the state it writes to goes away
+    };
+    struct JobView {
+        std::wstring log;
+        bool failed = false;
+        uint64_t done = 0, total = 0;
+    };
+
+    static JobView view(Job& job) {
+        const std::lock_guard lk{job.m};
+        return {job.log, job.failed, job.done, job.total};
+    }
+
+    /// Any thread.
+    void request_redraw() {
+        if (!redraw_posted_.exchange(true)) PostMessageW(hwnd_, WM_APP_REDRAW, 0, 0);
+    }
+
+    void report(Job& job, std::wstring_view line, bool failed = false) {
+        std::wstring clean = trim(line);
+        if (clean.empty()) return;
+        {
+            const std::lock_guard lk{job.m};
+            job.log = std::move(clean);
+            job.failed = failed;
+        }
+        request_redraw();
+    }
+
+    void report_progress(Job& job, uint64_t done, uint64_t total) {
+        {
+            const std::lock_guard lk{job.m};
+            job.done = done;
+            job.total = total;
+        }
+        request_redraw();
+    }
+
+    /// Runs `work` on the job's thread, then `finished` back on the UI thread.
+    void run_job(Job& job, std::function<void(const std::stop_token&)> work, std::function<void()> finished) {
+        if (job.busy) return;
+        if (job.thread.joinable()) job.thread.join();
+        job.busy = true;
+        ++sh_.background_jobs;
+        {
+            const std::lock_guard lk{job.m};
+            job.log = L"Starting…";
+            job.failed = false;
+            job.done = job.total = 0;
+        }
+        invalidate();
+        job.thread = std::jthread([this, &job, work = std::move(work), finished = std::move(finished)](const std::stop_token& stop) {
+            work(stop);
+            sh_.call([this, &job, finished] {
+                job.busy = false;
+                --sh_.background_jobs;
+                {
+                    const std::lock_guard lk{job.m};
+                    job.done = job.total = 0;
+                }
+                finished();
+                if (sh_.visibility_changed) sh_.visibility_changed();
+                invalidate();
             });
         });
     }
 
-    void append_venv_log(std::wstring_view line) {
-        const std::wstring clean = trim(line);
-        if (clean.empty()) return;
-        sh_.call([this, clean] {
-            venv_log_ = clean;
-            render();
+    void run_venv_task(std::function<void(const std::stop_token&)> work) {
+        run_job(venv_job_, std::move(work), [this] {
+            probe_venv();
+            sh_.engine.encoder().retry(); // the text model export needs this environment
         });
+    }
+
+    void append_venv_log(std::wstring_view line) { report(venv_job_, line); }
+
+    // ------------------------------------------------------------------------------------------
+    // Model download (Hugging Face)
+    // ------------------------------------------------------------------------------------------
+
+    /// open_clip weights for the PE models live under timm/<model name>.
+    [[nodiscard]] std::string default_repo() const { return "timm/" + sh_.settings.model_name; }
+
+    /// "owner/name", nothing that could change the URL it is pasted into.
+    static bool valid_repo(std::string_view repo) {
+        const auto slash = repo.find('/');
+        if (slash == std::string_view::npos || slash == 0 || slash + 1 >= repo.size() || repo.find('/', slash + 1) != std::string_view::npos) return false;
+        if (repo.find("..") != std::string_view::npos) return false;
+        return std::ranges::all_of(repo, [](unsigned char c) { return std::isalnum(c) != 0 || c == '/' || c == '-' || c == '_' || c == '.'; });
+    }
+
+    /// Fetches whatever the selected model is missing and stores it under the names the app looks for:
+    /// open_clip_model.safetensors -> <model>.safetensors, tokenizer.json -> <model>-tokenizer.json.
+    void download_model(const std::stop_token& stop, const std::string& repo, const fs::path& dir, const std::string& name) {
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        const std::wstring base = L"https://huggingface.co/" + to_wide(repo) + L"/resolve/main/";
+        const std::wstring wname = to_wide(name);
+        struct Item {
+            std::wstring remote;
+            fs::path local;
+            bool present;
+        };
+        const Item items[] = {
+            {L"tokenizer.json", dir / (wname + L"-tokenizer.json"),
+             fs::exists(dir / (wname + L"-tokenizer.json"), ec) || fs::exists(dir / L"tokenizer.json", ec)},
+            {L"open_clip_model.safetensors", dir / (wname + L".safetensors"), fs::exists(dir / (wname + L".safetensors"), ec)},
+        };
+        for (const Item& item : items) {
+            if (item.present) continue;
+            report(model_job_, L"Downloading " + item.remote + L" from " + to_wide(repo) + L"…");
+            const http::Result r = http::download(base + item.remote, item.local,
+                                                  [this](uint64_t done, uint64_t total) { report_progress(model_job_, done, total); }, stop);
+            report_progress(model_job_, 0, 0);
+            if (r.cancelled) {
+                report(model_job_, L"Download cancelled — it continues from where it stopped next time.");
+                return;
+            }
+            if (!r.ok) {
+                report(model_job_, item.remote + L" from " + to_wide(repo) + L": " + r.error, true);
+                return;
+            }
+        }
+        report(model_job_, L"Saved as " + wname + L".safetensors and " + wname + L"-tokenizer.json in " + dir.wstring());
+    }
+
+    void start_model_download() {
+        if (model_job_.busy) {
+            model_job_.thread.request_stop();
+            return;
+        }
+        std::string repo = to_utf8(trim(repo_field_.text));
+        // A pasted model page URL works too
+        for (const std::string_view prefix : {"https://huggingface.co/", "http://huggingface.co/", "huggingface.co/"}) {
+            if (repo.starts_with(prefix)) repo.erase(0, prefix.size());
+        }
+        while (repo.ends_with('/')) repo.pop_back();
+        if (repo.empty()) repo = default_repo();
+        if (!valid_repo(repo)) {
+            {
+                const std::lock_guard lk{model_job_.m};
+                model_job_.log = L"Enter the repository as owner/name, for example timm/PE-Core-L-14-336";
+                model_job_.failed = true;
+            }
+            invalidate();
+            return;
+        }
+        run_job(model_job_,
+                [this, repo, dir = fs::path{to_wide(sh_.settings.model_dir)}, name = sh_.settings.model_name](const std::stop_token& stop) {
+                    download_model(stop, repo, dir, name);
+                },
+                [this] {
+                    scan_models();
+                    sh_.engine.encoder().retry();
+                });
     }
 
     void exec_logged(const fs::path& exe, const std::vector<std::wstring>& args) {
@@ -1481,20 +1678,6 @@ private:
     // Portable Python from NuGet (python package = full CPython with pip/venv, no installer)
     // ------------------------------------------------------------------------------------------
 
-    static std::optional<std::string> http_get_to_memory(const wchar_t* url) {
-        wil::com_ptr<IStream> stream;
-        if (FAILED(URLOpenBlockingStreamW(nullptr, url, &stream, 0, nullptr)) || !stream) return std::nullopt;
-        std::string out;
-        char buf[16384];
-        for (;;) {
-            ULONG got = 0;
-            const HRESULT hr = stream->Read(buf, sizeof(buf), &got);
-            if (got) out.append(buf, got);
-            if (FAILED(hr) || hr == S_FALSE || got == 0) break;
-        }
-        return out;
-    }
-
     static std::vector<int> parse_ver(std::string_view v) {
         std::vector<int> out;
         int cur = 0;
@@ -1518,7 +1701,7 @@ private:
     /// Resolves "3.14" to the newest stable 3.14.x on NuGet; exact versions ("3.12.2") pass through if listed.
     std::optional<std::string> resolve_nuget_python(const std::string& want) {
         append_venv_log(L"Querying NuGet for Python " + to_wide(want) + L"…");
-        const auto body = http_get_to_memory(L"https://api.nuget.org/v3-flatcontainer/python/index.json");
+        const auto body = http::get(L"https://api.nuget.org/v3-flatcontainer/python/index.json");
         if (!body) {
             append_venv_log(L"Could not reach api.nuget.org");
             return std::nullopt;
@@ -1544,10 +1727,7 @@ private:
         return best;
     }
 
-    void download_portable_python() {
-        HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        auto uninit = wil::scope_exit([co] { if (SUCCEEDED(co)) CoUninitialize(); });
-
+    void download_portable_python(const std::stop_token& stop) {
         const std::string want = sh_.settings.python_version.empty() ? "3.14" : sh_.settings.python_version;
         const auto ver = resolve_nuget_python(want);
         if (!ver) return;
@@ -1559,18 +1739,10 @@ private:
         if (!fs::exists(root / L"tools" / L"python.exe", ec)) {
             const std::wstring url = L"https://api.nuget.org/v3-flatcontainer/python/" + to_wide(*ver) + L"/python." + to_wide(*ver) + L".nupkg";
             append_venv_log(L"Downloading Python " + to_wide(*ver) + L" from NuGet…");
-            DownloadProgressCallback cb{[this](ULONG done, ULONG total) {
-                sh_.call([this, done, total] {
-                    dl_done_ = done;
-                    dl_total_ = total;
-                    render();
-                });
-            }};
-            const HRESULT hr = URLDownloadToFileW(nullptr, url.c_str(), pkg.c_str(), 0, &cb);
-            sh_.call([this] { dl_total_ = 0; });
-            if (FAILED(hr)) {
-                append_venv_log(L"Download failed (HRESULT 0x" + std::format(L"{:08X}", static_cast<uint32_t>(hr)) + L")");
-                fs::remove(pkg, ec);
+            const http::Result dl = http::download(url, pkg, [this](uint64_t done, uint64_t total) { report_progress(venv_job_, done, total); }, stop);
+            report_progress(venv_job_, 0, 0);
+            if (!dl.ok) {
+                append_venv_log(dl.cancelled ? L"Download cancelled." : L"Download failed: " + dl.error);
                 return;
             }
 
@@ -1597,7 +1769,7 @@ private:
             sh_.settings.venv_dir = to_utf8(root.wstring());
             sh_.save();
             probe_venv();
-            render();
+            invalidate();
         });
         install_packages_into(py);
     }
@@ -1684,6 +1856,8 @@ private:
         const std::string m = to_utf8(trim(model_field_.text));
         if (!m.empty() && m != sh_.settings.model_name) {
             sh_.settings.model_name = m;
+            repo_field_.set(L""); // the repository belonged to the previous model
+            scan_models();
             changed = true;
         }
         const std::string a = to_utf8(trim(arch_field_.text));
@@ -1745,23 +1919,37 @@ private:
         const std::wstring v = trim(exclude_field_.text);
         if (v.empty()) return;
         if (add_exclude(v)) exclude_field_.set(L"");
-        render();
+        invalidate();
     }
 
     void stop_recording() {
         if (!recording_hotkey_) return;
         recording_hotkey_ = false;
         send_cmd_value(find_launcher(), Cmd::SuspendHotkey, uint32_t{0});
+        sh_.refresh_hotkey_state();
+    }
+
+    /// Hands the saved shortcut to the launcher and learns whether it could be registered.
+    void reload_launcher_hotkey() {
+        send_to_launcher(Cmd::ReloadSettings);
+        sh_.refresh_hotkey_state();
+        if (sh_.redraw_all) sh_.redraw_all();
+    }
+
+    /// Hit regions are recorded while drawing, so a pending repaint is done before a mouse position is resolved.
+    void flush() {
+        if (dirty_) render();
     }
 
     void on_lbutton_down(D2D1_POINT_2F p, bool dbl) {
+        flush();
         SetFocus(hwnd_);
         const Hit* h = hit_test(hits_, p);
         const int id = h ? h->id : IdNone;
         const int idx = h ? h->index : 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;
 
-        if (active_field_ && id != IdExcludeField && id != IdModelField && id != IdBatchField && id != IdArchField && id != IdCudaField && id != IdTorchField) {
+        if (active_field_ && id != IdExcludeField && id != IdModelField && id != IdRepoField && id != IdBatchField && id != IdArchField && id != IdCudaField && id != IdTorchField && id != IdPyVerField) {
             commit_fields();
             active_field_->focused = false;
             active_field_ = nullptr;
@@ -1851,6 +2039,7 @@ private:
             case IdAddInclude:
                 if (auto dir = pick_path(true)) {
                     std::vector<std::wstring> existing;
+                    existing.reserve(sh_.settings.include_dirs.size());
                     for (const auto& d : sh_.settings.include_dirs) existing.push_back(to_wide(d));
                     if (is_duplicate_path_rule(dir->wstring(), existing)) {
                         include_error_ = L"That folder is already included";
@@ -1905,7 +2094,7 @@ private:
             case IdToggleHotkey:
                 sh_.settings.hotkey_enabled = !sh_.settings.hotkey_enabled;
                 sh_.save();
-                send_to_launcher(Cmd::ReloadSettings);
+                reload_launcher_hotkey();
                 break;
             case IdRecordHotkey:
                 if (recording_hotkey_) {
@@ -1920,7 +2109,7 @@ private:
                 sh_.settings.hotkey_vk = VK_SPACE;
                 sh_.settings.hotkey_enabled = true;
                 sh_.save();
-                send_to_launcher(Cmd::ReloadSettings);
+                reload_launcher_hotkey();
                 break;
             case IdToggleStartup:
                 sh_.settings.launch_on_startup = !sh_.settings.launch_on_startup;
@@ -1961,11 +2150,18 @@ private:
                 if (idx >= 0 && idx < static_cast<int>(models_.size())) {
                     sh_.settings.model_name = models_[idx];
                     model_field_.set(to_wide(sh_.settings.model_name));
+                    repo_field_.set(L"");
+                    refresh_model_files();
                     sh_.save();
                     if (sh_.settings_changed) sh_.settings_changed();
                 }
                 break;
             case IdModelField: focus_field(model_field_); break;
+            case IdRepoField: focus_field(repo_field_); break;
+            case IdDownloadModel:
+                commit_fields();
+                start_model_download();
+                break;
             case IdDeviceAuto:
                 sh_.settings.device = "auto";
                 sh_.save();
@@ -1980,6 +2176,15 @@ private:
                 sh_.save();
                 break;
             case IdBatchField: focus_field(batch_field_); break;
+            case IdResetAutoBatch: {
+                // Re-read first: the indexer owns the rest of this file and may have written to it since
+                IndexState st = load_json_file<IndexState>(state_path());
+                st.auto_batch = 0;
+                st.auto_batch_key.clear();
+                save_json_file(state_path(), st);
+                sh_.index_state = std::move(st);
+                break;
+            }
             case IdBrowseScript:
                 if (auto f = pick_path(false, L"Python Script", L"*.py")) {
                     sh_.settings.vision_script = to_utf8(f->wstring());
@@ -2021,23 +2226,23 @@ private:
             }
             case IdDownloadNugetPy:
                 commit_fields();
-                run_venv_task([this] { download_portable_python(); });
+                run_venv_task([this](const std::stop_token& stop) { download_portable_python(stop); });
                 return;
             case IdOpenTerminal: open_venv_terminal(); break;
             case IdUpdateVenv:
-                run_venv_task([this] { install_packages_in_worker(); });
+                run_venv_task([this](const std::stop_token&) { install_packages_in_worker(); });
                 return;
             case IdRecreateVenv:
                 if (venv_.portable) {
                     // Portable interpreters are not venvs: re-download the selected version instead
-                    run_venv_task([this] {
+                    run_venv_task([this](const std::stop_token& stop) {
                         std::error_code ec;
                         fs::remove_all(to_wide(sh_.settings.venv_dir), ec);
-                        download_portable_python();
+                        download_portable_python(stop);
                     });
                     return;
                 }
-                run_venv_task([this] {
+                run_venv_task([this](const std::stop_token&) {
                     const fs::path base = find_base_python();
                     const fs::path vdir = to_wide(sh_.settings.venv_dir);
                     std::error_code ec;
@@ -2050,7 +2255,7 @@ private:
                 });
                 return;
             case IdDeleteVenv:
-                run_venv_task([this] {
+                run_venv_task([this](const std::stop_token&) {
                     const fs::path vdir = to_wide(sh_.settings.venv_dir);
                     std::error_code ec;
                     fs::remove_all(vdir, ec);
@@ -2067,14 +2272,14 @@ private:
                 break;
             default: break;
         }
-        render();
+        invalidate();
     }
 
     void on_key(UINT vk) {
         if (recording_hotkey_) {
             if (vk == VK_ESCAPE) {
                 stop_recording();
-                render();
+                invalidate();
                 return;
             }
             if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN) return;
@@ -2089,8 +2294,8 @@ private:
             sh_.settings.hotkey_enabled = true;
             sh_.save();
             stop_recording();
-            send_to_launcher(Cmd::ReloadSettings);
-            render();
+            reload_launcher_hotkey();
+            invalidate();
             return;
         }
         if (active_field_) {
@@ -2099,20 +2304,20 @@ private:
                 else commit_fields();
                 active_field_->focused = false;
                 active_field_ = nullptr;
-                render();
+                invalidate();
                 return;
             }
             if (vk == VK_ESCAPE) {
                 sync_fields();
                 active_field_->focused = false;
                 active_field_ = nullptr;
-                render();
+                invalidate();
                 return;
             }
             bool handled = false;
             active_field_->on_key(hwnd_, vk, handled);
             active_field_->caret_on = true;
-            render();
+            invalidate();
             return;
         }
         if (vk == VK_ESCAPE) hide();
@@ -2123,7 +2328,7 @@ private:
         if (active_field_ == &batch_field_ && (c < L'0' || c > L'9')) return;
         if (active_field_->on_char(c)) {
             active_field_->caret_on = true;
-            render();
+            invalidate();
         }
     }
 
@@ -2195,7 +2400,7 @@ private:
                     ScreenToClient(hwnd_, &pt);
                     const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
                     const int id = h ? h->id : 0;
-                    const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdBatchField || id == IdArchField || id == IdCudaField || id == IdTorchField || id == IdPyVerField;
+                    const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdRepoField || id == IdBatchField || id == IdArchField || id == IdCudaField || id == IdTorchField || id == IdPyVerField;
                     SetCursor(ibeam ? cursor_ibeam_ : (id ? cursor_hand_ : cursor_arrow_));
                     return TRUE;
                 }
@@ -2206,6 +2411,7 @@ private:
                     TrackMouseEvent(&tme);
                     tracking_ = true;
                 }
+                flush();
                 const D2D1_POINT_2F p = to_dip(lp);
                 if (dragging_scroll_) {
                     if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
@@ -2216,7 +2422,7 @@ private:
                         if (track > 0.0f) {
                             scroll_ = target_scroll_ = std::clamp(drag_scroll_start_ + (p.y - drag_y_) / track * max_scroll(), 0.0f, max_scroll());
                         }
-                        render();
+                        invalidate();
                         return 0;
                     }
                 }
@@ -2226,7 +2432,7 @@ private:
                 if (id != hover_id_ || idx != hover_index_) {
                     hover_id_ = id;
                     hover_index_ = idx;
-                    render();
+                    invalidate();
                 }
                 return 0;
             }
@@ -2234,7 +2440,7 @@ private:
                 tracking_ = false;
                 if (hover_id_) {
                     hover_id_ = IdNone;
-                    render();
+                    invalidate();
                 }
                 return 0;
             case WM_LBUTTONDOWN: on_lbutton_down(to_dip(lp), false); return 0;
@@ -2261,17 +2467,27 @@ private:
                     case TIMER_CARET:
                         if (active_field_) {
                             active_field_->caret_on = !active_field_->caret_on;
-                            render();
+                            invalidate();
                         }
                         return 0;
-                    case TIMER_POLL:
-                        if (sh_.poll_indexer()) render();
+                    case TIMER_POLL: {
+                        bool changed = sh_.poll_indexer();
+                        if (refresh_model_files()) {
+                            scan_models(); // a model was added to or removed from the folder
+                            changed = true;
+                        }
+                        if (changed) invalidate();
                         return 0;
+                    }
                     case TIMER_DEVICE:
                         KillTimer(hwnd_, TIMER_DEVICE);
                         render();
                         return 0;
                 }
+                return 0;
+            case WM_APP_REDRAW:
+                redraw_posted_ = false;
+                invalidate();
                 return 0;
             case WM_CLOSE:
                 hide();
@@ -2286,6 +2502,8 @@ private:
     std::vector<Hit> hits_;
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
     bool rendering_ = false;
+    bool dirty_ = false; // state changed since the last frame
+    std::atomic<bool> redraw_posted_{false};
 
     int tab_ = 0;
     int hover_id_ = IdNone;
@@ -2304,6 +2522,7 @@ private:
     std::wstring exclude_error_;
     std::wstring exclude_error_for_text_;
     TextField model_field_;
+    TextField repo_field_;
     TextField batch_field_;
     TextField arch_field_;
     TextField cuda_field_;
@@ -2312,13 +2531,20 @@ private:
     TextField* active_field_ = nullptr;
     bool recording_hotkey_ = false;
 
+    struct ModelFiles {
+        bool weights = false, tokenizer = false, onnx = false;
+        uint64_t weights_bytes = 0;
+        bool operator==(const ModelFiles&) const = default;
+    };
+
     std::vector<std::string> models_;
+    ModelFiles model_files_;
     VenvInfo venv_;
     std::wstring venv_pkgs_;
-    std::wstring venv_log_;
-    bool venv_busy_ = false;
-    ULONG dl_done_ = 0, dl_total_ = 0;
-    std::jthread task_;
+
+    // Last: their threads are joined before anything above is destroyed
+    Job venv_job_;
+    Job model_job_;
 };
 
 } // namespace usyseek::ui

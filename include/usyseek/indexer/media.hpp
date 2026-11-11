@@ -1,6 +1,7 @@
 #pragma once
 
 #include <usyseek/common.hpp>
+#include <usyseek/svg.hpp>
 
 #include <mfapi.h>
 #include <mfidl.h>
@@ -23,6 +24,7 @@ inline ResizeMode parse_resize_mode(std::string_view s) {
 
 inline constexpr std::wstring_view IMAGE_EXTS[] = {
     L"jpg", L"jpeg", L"jpe", L"jfif", L"png", L"bmp", L"gif", L"tif", L"tiff", L"webp", L"heic", L"heif", L"avif", L"jxl", L"dng",
+    L"svg", L"svgz",
 };
 inline constexpr std::wstring_view VIDEO_EXTS[] = {
     L"mp4", L"m4v", L"mov", L"mkv", L"webm", L"avi", L"wmv", L"mpg", L"mpeg", L"ts", L"m2ts", L"3gp",
@@ -57,6 +59,7 @@ public:
     }
 
     std::optional<Decoded> image(const std::wstring& path) {
+        if (svg::is_svg(path)) return vector_image(path);
         if (!wic_) return std::nullopt;
         wil::com_ptr<IWICBitmapDecoder> dec;
         if (FAILED(wic_->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) return std::nullopt;
@@ -132,7 +135,7 @@ public:
         for (uint32_t k = 0; k < n; ++k) {
             if (duration > 0) {
                 PROPVARIANT pos;
-                InitPropVariantFromInt64(static_cast<LONGLONG>(duration * (2 * k + 1) / (2 * n)), &pos);
+                InitPropVariantFromInt64(static_cast<LONGLONG>(duration * (2ull * k + 1) / (2ull * n)), &pos);
                 const HRESULT hr = reader->SetCurrentPosition(GUID_NULL, pos);
                 PropVariantClear(&pos);
                 if (FAILED(hr)) break;
@@ -158,6 +161,34 @@ public:
     }
 
 private:
+    /// SVG has no pixels of its own, so resvg rasterises it straight at the network input size.
+    [[nodiscard]] std::optional<Decoded> vector_image(const std::wstring& path) const {
+        const svg::Fit fit = mode_ == ResizeMode::Squash ? svg::Fit::Stretch
+                           : mode_ == ResizeMode::Shortest ? svg::Fit::Cover : svg::Fit::Contain;
+        const auto raster = svg::render(path, size_, size_, fit);
+        if (!raster || raster->width > size_ || raster->height > size_) return std::nullopt;
+
+        Decoded out;
+        out.width = raster->src_width;
+        out.height = raster->src_height;
+        Frame f;
+        f.rgb.assign(static_cast<size_t>(size_) * size_ * 3, 0);
+        // Contain leaves the bitmap smaller than the input: centre it, like raster images in Longest mode
+        const size_t x0 = (size_ - raster->width) / 2, y0 = (size_ - raster->height) / 2;
+        const std::span<const uint8_t> src = raster->rgba();
+        for (size_t y = 0; y < raster->height; ++y) {
+            const uint8_t* s = src.data() + y * raster->width * 4;
+            uint8_t* d = f.rgb.data() + ((y0 + y) * size_ + x0) * 3;
+            for (size_t x = 0; x < raster->width; ++x, s += 4, d += 3) {
+                d[0] = s[0];
+                d[1] = s[1];
+                d[2] = s[2];
+            }
+        }
+        out.frames.push_back(std::move(f));
+        return out;
+    }
+
     static bool copy_sample(IMFSample* sample, UINT32 w, UINT32 h, std::vector<uint8_t>& dst) {
         wil::com_ptr<IMFMediaBuffer> buf;
         if (FAILED(sample->ConvertToContiguousBuffer(&buf))) return false;
@@ -183,9 +214,10 @@ private:
     }
 
     static double mean_luma(const std::vector<uint8_t>& rgb) {
+        constexpr size_t step = 21; // every 7th RGB pixel is plenty
         uint64_t sum = 0;
-        for (size_t i = 0; i + 2 < rgb.size(); i += 3 * 7) sum += (rgb[i] * 77u + rgb[i + 1] * 150u + rgb[i + 2] * 29u) >> 8;
-        const size_t n = rgb.size() / (3 * 7);
+        for (size_t i = 0; i + 2 < rgb.size(); i += step) sum += (rgb[i] * 77u + rgb[i + 1] * 150u + rgb[i + 2] * 29u) >> 8;
+        const size_t n = rgb.size() / step;
         return n ? static_cast<double>(sum) / static_cast<double>(n) : 0.0;
     }
 
@@ -255,10 +287,11 @@ private:
         out.rgb.assign(static_cast<size_t>(S) * S * 3, 0);
         const UINT stride = S * 3;
         if (mode_ == ResizeMode::Longest) {
-            const UINT x0 = (S - sw) / 2, y0 = (S - sh) / 2;
-            std::vector<uint8_t> tmp(static_cast<size_t>(sw) * sh * 3);
+            const size_t x0 = (S - sw) / 2, y0 = (S - sh) / 2;
+            const size_t row = static_cast<size_t>(sw) * 3;
+            std::vector<uint8_t> tmp(row * sh);
             if (FAILED(final_src->CopyPixels(nullptr, sw * 3, static_cast<UINT>(tmp.size()), tmp.data()))) return false;
-            for (UINT y = 0; y < sh; ++y) std::memcpy(out.rgb.data() + (y0 + y) * stride + x0 * 3, tmp.data() + y * sw * 3, sw * 3);
+            for (size_t y = 0; y < sh; ++y) std::memcpy(out.rgb.data() + (y0 + y) * stride + x0 * 3, tmp.data() + y * row, row);
             return true;
         }
         const WICRect rc{static_cast<INT>((sw - S) / 2), static_cast<INT>((sh - S) / 2), static_cast<INT>(S), static_cast<INT>(S)};
