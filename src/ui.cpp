@@ -81,6 +81,20 @@ int run_automated_test(Shared& sh, Pill& pill, SettingsWindow& settings_win, con
         pump_messages(250);
         SendMessageW(pill.hwnd(), WM_KEYDOWN, VK_ESCAPE, 0);
         pump_messages(60);
+
+        // Full-size viewer, then the next result
+        pill.test_preview(0);
+        for (int i = 0; i < 100 && pill.preview_loading(); ++i) pump_messages(50);
+        pump_messages(80);
+        capture_window(pill.target(), [&] { pill.render(); }, out_dir / L"03b_pill_preview.png");
+        if (pill.result_count() > 1) {
+            SendMessageW(pill.hwnd(), WM_KEYDOWN, VK_RIGHT, 0);
+            for (int i = 0; i < 100 && pill.preview_loading(); ++i) pump_messages(50);
+            pump_messages(80);
+            capture_window(pill.target(), [&] { pill.render(); }, out_dir / L"03c_pill_preview_next.png");
+        }
+        SendMessageW(pill.hwnd(), WM_KEYDOWN, VK_ESCAPE, 0);
+        pump_messages(60);
     }
 
     // Tag autocomplete dropdown
@@ -123,6 +137,8 @@ int run_automated_test(Shared& sh, Pill& pill, SettingsWindow& settings_win, con
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ulp::win::COMWrapper<false> com{COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE};
+    // OLE proper (not just COM) for dragging media out and putting it on the clipboard
+    const HRESULT ole = OleInitialize(nullptr);
     ulp::win::dark::init_dark_mode();
 
     int argc = 0;
@@ -163,8 +179,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     if (!settings_win.create(inst)) return 1;
 
     sh.call_hwnd = pill.hwnd();
-    sh.gfx.on_device_changed = [&] { sh.thumbs.reset_gpu(); };
+    sh.gfx.on_device_changed = [&] {
+        sh.thumbs.reset_gpu();
+        sh.previews.reset_gpu();
+    };
     sh.thumbs.start(pill.hwnd(), WM_APP_THUMBS);
+    sh.previews.start(pill.hwnd(), WM_APP_THUMBS, 1);
 
     sh.engine.on_result = [&](std::unique_ptr<SearchResult> r) {
         PostMessageW(pill.hwnd(), WM_APP_RESULT, 0, reinterpret_cast<LPARAM>(r.release()));
@@ -292,6 +312,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     }
 
     sh.thumbs.stop();
+    sh.previews.stop();
     sh.engine.stop();
+    if (SUCCEEDED(ole)) OleUninitialize();
     return code;
 }

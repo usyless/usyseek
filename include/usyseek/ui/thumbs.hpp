@@ -15,10 +15,79 @@
 
 namespace usyseek::ui {
 
+/// A decoded 32bpp BGRA raster.
+struct Raster {
+    UINT w = 0, h = 0;
+    std::vector<uint8_t> pixels;
+};
+
+/// Decodes the first frame of an image with WIC, upright (EXIF orientation applied) and scaled down to fit
+/// `max_px` on its longer side (0 = native size). Any thread with COM initialised.
+inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px, bool premultiplied) {
+    wil::com_ptr<IWICImagingFactory> wic;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) return std::nullopt;
+    wil::com_ptr<IWICBitmapDecoder> dec;
+    if (FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) return std::nullopt;
+    wil::com_ptr<IWICBitmapFrameDecode> frame;
+    if (FAILED(dec->GetFrame(0, &frame))) return std::nullopt;
+    UINT w = 0, h = 0;
+    if (FAILED(frame->GetSize(&w, &h)) || !w || !h) return std::nullopt;
+
+    USHORT orientation = 1;
+    wil::com_ptr<IWICMetadataQueryReader> meta;
+    if (SUCCEEDED(frame->GetMetadataQueryReader(&meta))) {
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        if (SUCCEEDED(meta->GetMetadataByName(L"System.Photo.Orientation", &v)) && v.vt == VT_UI2) orientation = v.uiVal;
+        PropVariantClear(&v);
+    }
+    wil::com_ptr<IWICBitmapSource> src = frame;
+    const UINT longest = std::max(w, h);
+    if (max_px && longest > max_px) {
+        const double s = static_cast<double>(max_px) / longest;
+        const UINT sw = std::max(1u, static_cast<UINT>(std::lround(w * s))), shh = std::max(1u, static_cast<UINT>(std::lround(h * s)));
+        wil::com_ptr<IWICBitmapScaler> scaler;
+        if (FAILED(wic->CreateBitmapScaler(&scaler)) || FAILED(scaler->Initialize(src.get(), sw, shh, WICBitmapInterpolationModeHighQualityCubic))) return std::nullopt;
+        src = scaler;
+    }
+    // EXIF orientation as a rotation followed by an optional horizontal mirror
+    WICBitmapTransformOptions rot = WICBitmapTransformRotate0;
+    bool mirror = false;
+    switch (orientation) {
+        case 2: mirror = true; break;
+        case 3: rot = WICBitmapTransformRotate180; break;
+        case 4: rot = WICBitmapTransformRotate180; mirror = true; break;
+        case 5: rot = WICBitmapTransformRotate90; mirror = true; break;
+        case 6: rot = WICBitmapTransformRotate90; break;
+        case 7: rot = WICBitmapTransformRotate270; mirror = true; break;
+        case 8: rot = WICBitmapTransformRotate270; break;
+        default: break;
+    }
+    for (const auto opt : {rot, mirror ? WICBitmapTransformFlipHorizontal : WICBitmapTransformRotate0}) {
+        if (opt == WICBitmapTransformRotate0) continue;
+        wil::com_ptr<IWICBitmapFlipRotator> fr;
+        if (FAILED(wic->CreateBitmapFlipRotator(&fr)) || FAILED(fr->Initialize(src.get(), opt))) return std::nullopt;
+        src = fr;
+    }
+    wil::com_ptr<IWICFormatConverter> conv;
+    if (FAILED(wic->CreateFormatConverter(&conv))) return std::nullopt;
+    const WICPixelFormatGUID fmt = premultiplied ? GUID_WICPixelFormat32bppPBGRA : GUID_WICPixelFormat32bppBGRA;
+    if (FAILED(conv->Initialize(src.get(), fmt, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) return std::nullopt;
+    Raster r;
+    if (FAILED(conv->GetSize(&r.w, &r.h)) || !r.w || !r.h) return std::nullopt;
+    const size_t stride = static_cast<size_t>(r.w) * 4;
+    if (stride * r.h > (1ull << 31)) return std::nullopt;
+    r.pixels.resize(stride * r.h);
+    if (FAILED(conv->CopyPixels(nullptr, static_cast<UINT>(stride), static_cast<UINT>(r.pixels.size()), r.pixels.data()))) return std::nullopt;
+    return r;
+}
+
 /// Shell thumbnails (Windows thumbnail cache / extractors) decoded on worker threads.
 /// Device bitmaps are created on the UI thread and dropped when the graphics device changes.
 class Thumbs {
 public:
+    /// `full` decodes the image itself (WIC) at up to `px` before falling back to the shell thumbnail: used for previews.
+    explicit Thumbs(size_t max_bitmaps = 240, bool full = false) : max_bitmaps_{max_bitmaps}, full_{full} {}
     ~Thumbs() { stop(); }
 
     void start(HWND notify, UINT msg, unsigned threads = 3) {
@@ -43,7 +112,7 @@ public:
             std::lock_guard lk{m_};
             if (!pending_.insert(id).second) return;
             queue_.push_front({id, path, px});
-            while (queue_.size() > 64) {
+            while (queue_.size() > (full_ ? 6u : 64u)) {
                 pending_.erase(queue_.back().id);
                 queue_.pop_back();
             }
@@ -77,7 +146,7 @@ public:
             if (FAILED(dc->CreateBitmap(D2D1::SizeU(d.w, d.h), d.pixels.data(), d.w * 4, &props, &bmp))) continue;
             lru_.push_front(d.id);
             bitmaps_[d.id] = {std::move(bmp), lru_.begin()};
-            while (bitmaps_.size() > MAX_BITMAPS) {
+            while (bitmaps_.size() > max_bitmaps_) {
                 bitmaps_.erase(lru_.back());
                 lru_.pop_back();
             }
@@ -91,10 +160,22 @@ public:
         lru_.clear();
     }
 
+    /// Drops every bitmap, queued request and failure (frees preview memory once the viewer closes).
+    void clear() {
+        {
+            std::lock_guard lk{m_};
+            for (const auto& q : queue_) pending_.erase(q.id);
+            queue_.clear();
+        }
+        reset_gpu();
+        failed_.clear();
+    }
+
     void clear_failed() { failed_.clear(); }
 
 private:
-    static constexpr size_t MAX_BITMAPS = 240;
+    size_t max_bitmaps_;
+    bool full_;
 
     struct Req {
         uint64_t id = 0;
@@ -124,7 +205,7 @@ private:
                 queue_.pop_front();
             }
             Done d{r.id};
-            load(r, d);
+            if (!full_ || !load_full(r, d)) load(r, d);
             {
                 std::lock_guard lk{m_};
                 pending_.erase(r.id);
@@ -149,6 +230,16 @@ private:
         }
         d.w = raster->width;
         d.h = raster->height;
+    }
+
+    static bool load_full(const Req& r, Done& d) {
+        if (svg::is_svg(r.path)) return false;
+        auto img = decode_image(r.path, r.px, true);
+        if (!img) return false;
+        d.w = img->w;
+        d.h = img->h;
+        d.pixels = std::move(img->pixels);
+        return true;
     }
 
     static void load(const Req& r, Done& d) {

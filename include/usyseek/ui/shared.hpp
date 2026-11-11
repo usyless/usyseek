@@ -37,6 +37,7 @@ struct Shared {
     Settings settings;
     Engine engine;
     Thumbs thumbs;
+    Thumbs previews{4, true}; // full-size viewer images: the shown one and its neighbours
 
     std::vector<TagCount> tags;      // facet counts
     std::optional<uint64_t> db_count;
@@ -165,6 +166,125 @@ inline void reveal_in_explorer(const std::wstring& path) {
         SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
         ILFree(pidl);
     }
+}
+
+/// Hands `n` bytes to `obj` as an HGLOBAL of format `cf` (the data object takes ownership).
+inline bool set_data_bytes(IDataObject* obj, CLIPFORMAT cf, const void* data, size_t n) {
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, n);
+    if (!h) return false;
+    if (void* p = GlobalLock(h)) {
+        std::memcpy(p, data, n);
+        GlobalUnlock(h);
+    }
+    FORMATETC fe{cf, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM sm{};
+    sm.tymed = TYMED_HGLOBAL;
+    sm.hGlobal = h;
+    if (SUCCEEDED(obj->SetData(&fe, &sm, TRUE))) return true;
+    GlobalFree(h);
+    return false;
+}
+
+/// A shell data object for files, as Explorer makes it: shell ID lists + CF_HDROP, so drops and pastes into
+/// Explorer, browsers, chat apps and editors receive the files themselves. Pastes default to copying.
+inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring> paths) {
+    std::vector<PIDLIST_ABSOLUTE> pidls;
+    std::vector<std::wstring> found;
+    for (const auto& p : paths) {
+        if (PIDLIST_ABSOLUTE id = ILCreateFromPathW(p.c_str())) {
+            pidls.push_back(id);
+            found.push_back(p);
+        }
+    }
+    const auto free_pidls = wil::scope_exit([&] {
+        for (auto* id : pidls) ILFree(id);
+    });
+    if (pidls.empty()) return nullptr;
+
+    // Shell ID lists relative to the shared folder (Explorer's own shape), or absolute under the desktop
+    PIDLIST_ABSOLUTE parent = ILCloneFull(pidls.front());
+    if (!parent) return nullptr;
+    const auto free_parent = wil::scope_exit([&] { ILFree(parent); });
+    ILRemoveLastID(reinterpret_cast<PUIDLIST_RELATIVE>(parent));
+    bool same_parent = true;
+    for (auto* id : pidls) {
+        PIDLIST_ABSOLUTE pp = ILCloneFull(id);
+        if (!pp) return nullptr;
+        ILRemoveLastID(reinterpret_cast<PUIDLIST_RELATIVE>(pp));
+        const bool eq = ILIsEqual(pp, parent) != FALSE;
+        ILFree(pp);
+        if (!eq) {
+            same_parent = false;
+            break;
+        }
+    }
+    std::vector<PCUITEMID_CHILD> children;
+    for (auto* id : pidls) children.push_back(same_parent ? ILFindLastID(id) : reinterpret_cast<PCUITEMID_CHILD>(id));
+    wil::com_ptr<IDataObject> obj;
+    if (FAILED(SHCreateDataObject(same_parent ? parent : nullptr, static_cast<UINT>(children.size()), children.data(), nullptr, IID_PPV_ARGS(&obj)))) return nullptr;
+
+    // Plain file list too: what most non-shell drop targets read, and what survives a clipboard flush
+    std::vector<uint8_t> buf(sizeof(DROPFILES));
+    for (const auto& p : found) {
+        const auto* b = reinterpret_cast<const uint8_t*>(p.c_str());
+        buf.insert(buf.end(), b, b + (p.size() + 1) * sizeof(wchar_t));
+    }
+    buf.insert(buf.end(), sizeof(wchar_t), 0);
+    auto* df = reinterpret_cast<DROPFILES*>(buf.data());
+    df->pFiles = sizeof(DROPFILES);
+    df->fWide = TRUE;
+    set_data_bytes(obj.get(), CF_HDROP, buf.data(), buf.size());
+
+    const DWORD effect = DROPEFFECT_COPY;
+    set_data_bytes(obj.get(), static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT)), &effect, sizeof(effect));
+    return obj;
+}
+
+/// Drags files out to other applications (copy or link only: a drop never moves the user's files away).
+inline DWORD drag_media(HWND hwnd, std::span<const std::wstring> paths) {
+    const auto obj = media_data_object(paths);
+    DWORD effect = DROPEFFECT_NONE;
+    if (obj) SHDoDragDrop(hwnd, obj.get(), nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
+    return effect;
+}
+
+/// Puts files on the clipboard. `image` (unpremultiplied BGRA) adds a bitmap for apps that paste pixels
+/// (Paint, Office, image editors); `png_file` adds that file's bytes as "PNG" so alpha survives.
+inline bool copy_media_to_clipboard(std::span<const std::wstring> paths, const Raster* image, const std::wstring* png_file) {
+    const auto obj = media_data_object(paths);
+    if (!obj) return false;
+    if (image && image->w && image->h) {
+        const size_t stride = static_cast<size_t>(image->w) * 4;
+        std::vector<uint8_t> dib(sizeof(BITMAPINFOHEADER) + stride * image->h);
+        auto* bih = reinterpret_cast<BITMAPINFOHEADER*>(dib.data());
+        bih->biSize = sizeof(BITMAPINFOHEADER);
+        bih->biWidth = static_cast<LONG>(image->w);
+        bih->biHeight = static_cast<LONG>(image->h); // bottom-up: the form every consumer reads correctly
+        bih->biPlanes = 1;
+        bih->biBitCount = 32;
+        bih->biCompression = BI_RGB;
+        bih->biSizeImage = static_cast<DWORD>(stride * image->h);
+        for (UINT y = 0; y < image->h; ++y) {
+            std::memcpy(dib.data() + sizeof(BITMAPINFOHEADER) + stride * (image->h - 1 - y), image->pixels.data() + stride * y, stride);
+        }
+        set_data_bytes(obj.get(), CF_DIB, dib.data(), dib.size());
+    }
+    if (png_file) {
+        std::vector<uint8_t> bytes;
+        wil::unique_hfile f{CreateFileW(png_file->c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr)};
+        LARGE_INTEGER size{};
+        if (f && GetFileSizeEx(f.get(), &size) && size.QuadPart > 0 && size.QuadPart < (256ll << 20)) {
+            bytes.resize(static_cast<size_t>(size.QuadPart));
+            DWORD read = 0;
+            if (ReadFile(f.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) && read == bytes.size()) {
+                set_data_bytes(obj.get(), static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"PNG")), bytes.data(), bytes.size());
+            }
+        }
+    }
+    if (FAILED(OleSetClipboard(obj.get()))) return false;
+    // Render now: this process exits when idle and the clipboard must outlive it
+    OleFlushClipboard();
+    return true;
 }
 
 inline std::wstring format_date(int64_t unix) {

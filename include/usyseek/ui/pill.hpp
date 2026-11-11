@@ -157,6 +157,14 @@ public:
     void set_fullscreen(bool on) {
         if (on != fullscreen_) toggle_fullscreen();
     }
+    /// Test hook: opens the viewer on a result (-1 closes it).
+    void test_preview(int index) {
+        if (index < 0) close_preview();
+        else open_preview(index);
+    }
+    [[nodiscard]] bool preview_loading() const {
+        return preview_valid() && !sh_.previews.failed(items_[preview_].pt.id) && !sh_.previews.get(items_[preview_].pt.id);
+    }
     [[nodiscard]] size_t result_count() const noexcept { return items_.size(); }
     [[nodiscard]] bool searching() const noexcept { return searching_; }
 
@@ -185,6 +193,7 @@ private:
         IdClose,
         IdCard,
         IdSimilar,
+        IdCardPreview,
         IdTagChip,
         IdScrollbar,
         IdMenu,
@@ -197,8 +206,17 @@ private:
         IdHelp,
         IdHelpItem,
         IdGrid,
+        IdPreview,      // viewer backdrop
+        IdPvImage,
+        IdPvPrev,
+        IdPvNext,
+        IdPvPlay,
+        IdPvOpen,
+        IdPvReveal,
+        IdPvCopy,
+        IdPvClose,
     };
-    enum MenuAction { ActOpen, ActReveal, ActSimilar, ActCopy };
+    enum MenuAction { ActOpen, ActPreview, ActReveal, ActSimilar, ActCopy, ActCopyPath, ActCount };
 
     struct Item {
         DbPoint pt;
@@ -348,6 +366,7 @@ private:
         // Present failed: device removed/reset or adapter gone. Rebuild everything on the next frame.
         sh_.gfx.recover(hwnd_);
         sh_.thumbs.reset_gpu();
+        sh_.previews.reset_gpu();
         target_.release();
         SetTimer(hwnd_, TIMER_DEVICE, 100, nullptr);
     }
@@ -407,6 +426,7 @@ public:
         has_more_ = r->has_more;
         semantic_ = r->semantic;
         if (!r->append) {
+            if (preview_ >= 0) close_preview(false);
             items_.clear();
             selected_.clear();
             focus_ = -1;
@@ -418,7 +438,12 @@ public:
     }
 
     void on_thumbs() {
-        if (target_.ready() && sh_.thumbs.process(target_.dc())) invalidate();
+        if (!target_.ready()) return;
+        const bool thumbs = sh_.thumbs.process(target_.dc());
+        const bool previews = sh_.previews.process(target_.dc());
+        // A full-size decode that lands after the viewer closed is not kept around
+        if (preview_ < 0 && previews) sh_.previews.clear();
+        if (thumbs || (previews && preview_ >= 0)) invalidate();
     }
 
     void on_indexer_changed() {
@@ -541,6 +566,11 @@ private:
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(color::bg, 0.80f));
+        if (preview_ >= 0) {
+            draw_preview(cv, sz);
+            if (menu_open_) draw_menu(cv);
+            return;
+        }
         draw_header(cv, sz);
         draw_status(cv, sz);
         if (expanded()) draw_grid(cv);
@@ -702,6 +732,7 @@ private:
         const int first_row = std::max(0, static_cast<int>((scroll_ - PAD) / (g.card_h + GAP)));
         const int last_row = static_cast<int>((scroll_ + height(g.view)) / (g.card_h + GAP)) + 1;
         const UINT px = static_cast<UINT>(std::max(g.card_w, g.thumb_h * 1.6f) * target_.scale());
+        thumb_px_ = px;
         // Prefetch one row beyond the viewport in both directions
         for (int i = std::max(0, (first_row - 1) * g.cols); i < std::min<int>(static_cast<int>(items_.size()), (last_row + 2) * g.cols); ++i) {
             const bool visible = i >= first_row * g.cols && i < (last_row + 1) * g.cols;
@@ -780,11 +811,15 @@ private:
             cv.text(dur, rect(b.left + 21, b.top, dw + 2, 22), Font::Caption, hex(0xffffff));
         }
         if (hov) {
-            const D2D1_RECT_F sb = rect(tr.right - 36, tr.top + 8, 28, 28);
-            const bool on = hover_id_ == IdSimilar;
-            cv.fill_circle({sb.left + 14, sb.top + 14}, 14, hex(on ? 0x2b2930 : 0x000000, on ? 0.95f : 0.55f));
-            cv.icon(glyph::similar, sb, on ? color::primary : hex(0xffffff), Font::IconSmall);
-            cv.hit(sb, IdSimilar, i);
+            auto overlay_btn = [&](float x, wchar_t g, int id) {
+                const D2D1_RECT_F sb = rect(x, tr.top + 8, 28, 28);
+                const bool on = hover_id_ == id;
+                cv.fill_circle({sb.left + 14, sb.top + 14}, 14, hex(on ? 0x2b2930 : 0x000000, on ? 0.95f : 0.55f));
+                cv.icon(g, sb, on ? color::primary : hex(0xffffff), Font::IconSmall);
+                cv.hit(sb, id, i);
+            };
+            overlay_btn(tr.right - 36, glyph::similar, IdSimilar);
+            overlay_btn(tr.right - 70, glyph::zoom, IdCardPreview);
         }
 
         float y = tr.bottom + 10.0f;
@@ -1048,7 +1083,7 @@ private:
 
     [[nodiscard]] D2D1_RECT_F menu_rect() const {
         const D2D1_SIZE_F sz = target_.size();
-        const float h = 4 * 36.0f + 16 + 30 + std::min<size_t>(menu_tags_.size(), 10) * 32.0f + 48;
+        const float h = static_cast<float>(ActCount) * 36.0f + 16 + 30 + std::min<size_t>(menu_tags_.size(), 10) * 32.0f + 48;
         float x = std::min(menu_at_.x, sz.width - MENU_W - 8);
         float y = menu_at_.y;
         if (y + h > sz.height - 8) y = std::max(8.0f, sz.height - 8 - h);
@@ -1067,19 +1102,21 @@ private:
             const wchar_t* label;
             const wchar_t* key;
         };
-        static constexpr Act acts[] = {
+        static constexpr Act acts[ActCount] = {
             {glyph::open, L"Open", L"Enter"},
+            {glyph::zoom, L"Preview", L"Space"},
             {glyph::folder, L"Show in Explorer", L"Ctrl+E"},
             {glyph::similar, L"Find similar", L"Ctrl+S"},
-            {glyph::copy, L"Copy path", L"Ctrl+C"},
+            {glyph::copy, L"Copy media", L"Ctrl+C"},
+            {glyph::link, L"Copy path", L"Ctrl+Shift+C"},
         };
         float y = r.top + 6;
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < ActCount; ++i) {
             const D2D1_RECT_F rr = rect(r.left + 6, y, MENU_W - 12, 36);
             if (hover_id_ == IdMenuItem && hover_index_ == i) cv.fill_round(rr, 8, with_alpha(color::on_surface, 0.08f));
             cv.icon(acts[i].g, rect(rr.left + 8, rr.top, 20, 36), color::on_surface_variant);
-            cv.text(acts[i].label, D2D1::RectF(rr.left + 38, rr.top, rr.right - 60, rr.bottom), Font::Body, color::on_surface);
-            cv.text(acts[i].key, D2D1::RectF(rr.right - 70, rr.top, rr.right - 10, rr.bottom), Font::Caption, color::outline, Align::Right);
+            cv.text(acts[i].label, D2D1::RectF(rr.left + 38, rr.top, rr.right - 86, rr.bottom), Font::Body, color::on_surface);
+            cv.text(acts[i].key, D2D1::RectF(rr.right - 96, rr.top, rr.right - 10, rr.bottom), Font::Caption, color::outline, Align::Right);
             cv.hit(rr, IdMenuItem, i);
             y += 36;
         }
@@ -1122,16 +1159,26 @@ private:
         for (const auto& it : items_) {
             if (selected_.contains(it.pt.id)) sel.push_back(&it);
         }
-        if (sel.empty() && menu_index_ >= 0 && menu_index_ < static_cast<int>(items_.size())) sel.push_back(&items_[menu_index_]);
+        const bool have_index = menu_index_ >= 0 && menu_index_ < static_cast<int>(items_.size());
+        if (sel.empty() && have_index) sel.push_back(&items_[menu_index_]);
         if (sel.empty()) return;
+        // Single-item actions follow the item the menu was opened on (or the keyboard focus)
+        const Item& primary = have_index && selected_.contains(items_[menu_index_].pt.id) ? items_[menu_index_] : *sel.front();
         close_popups();
         switch (a) {
             case ActOpen:
                 for (size_t i = 0; i < sel.size() && i < 8; ++i) open_file(item_path(*sel[i]));
                 break;
-            case ActReveal: reveal_in_explorer(item_path(*sel.front())); break;
-            case ActSimilar: find_similar(*sel.front()); break;
-            case ActCopy: {
+            case ActPreview: open_preview(static_cast<int>(&primary - items_.data())); return;
+            case ActReveal: reveal_in_explorer(item_path(primary)); break;
+            case ActSimilar: {
+                const Item copy = primary;
+                if (preview_ >= 0) close_preview(false);
+                find_similar(copy);
+                break;
+            }
+            case ActCopy: copy_media(sel); break;
+            case ActCopyPath: {
                 std::wstring all;
                 for (const auto* it : sel) {
                     if (!all.empty()) all += L"\r\n";
@@ -1148,6 +1195,289 @@ private:
         field_.set(L"similar:" + item_path(it));
         field_.focused = true;
         run_search(0);
+    }
+
+    /// Copies the files themselves; a single still image also goes on as pixels so editors can paste it.
+    void copy_media(const std::vector<const Item*>& sel) {
+        if (sel.empty()) return;
+        std::vector<std::wstring> paths;
+        for (const auto* it : sel) paths.push_back(item_path(*it));
+        std::optional<Raster> image;
+        std::optional<std::wstring> png;
+        constexpr uint64_t MAX_PIXELS = 40'000'000;
+        const Item& one = *sel.front();
+        if (sel.size() == 1 && one.pt.p.k == 0 && !svg::is_svg(paths[0]) && static_cast<uint64_t>(one.pt.p.w) * one.pt.p.h <= MAX_PIXELS) {
+            const HCURSOR prev = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+            image = decode_image(paths[0], 0, false);
+            if (image && static_cast<uint64_t>(image->w) * image->h > MAX_PIXELS) image.reset();
+            if (lower(fs::path{paths[0]}.extension().wstring()) == L".png") png = paths[0];
+            SetCursor(prev);
+        }
+        copy_media_to_clipboard(paths, image ? &*image : nullptr, png ? &*png : nullptr);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Full-size viewer
+    // ------------------------------------------------------------------------------------------
+
+    static constexpr float PV_TOP = 56.0f;
+    static constexpr float PV_BOTTOM = 44.0f;
+
+    [[nodiscard]] bool preview_valid() const noexcept { return preview_ >= 0 && preview_ < static_cast<int>(items_.size()); }
+
+    void open_preview(int index) {
+        if (index < 0 || index >= static_cast<int>(items_.size())) return;
+        close_popups();
+        hover_id_ = IdNone;
+        preview_wheel_ = 0;
+        preview_go(index);
+    }
+
+    void close_preview(bool restore_focus = true) {
+        if (preview_ < 0) return;
+        const int last = preview_;
+        preview_ = -1;
+        sh_.previews.clear();
+        hover_id_ = IdNone;
+        if (restore_focus && last < static_cast<int>(items_.size())) {
+            focus_ = last;
+            field_.focused = false;
+            scroll_to(last);
+        }
+        invalidate();
+    }
+
+    void preview_go(int index) {
+        if (items_.empty()) return close_preview(false);
+        index = std::clamp(index, 0, static_cast<int>(items_.size()) - 1);
+        preview_ = index;
+        focus_ = index;
+        selected_ = {items_[index].pt.id};
+        field_.focused = false;
+        // Browsing towards the end pulls in the next page, as scrolling the grid would
+        if (index >= static_cast<int>(items_.size()) - 3 && has_more_ && !loading_more_ && !searching_) run_search(items_.size());
+        request_preview();
+        invalidate();
+    }
+
+    void preview_step(int d) {
+        if (!preview_valid()) return;
+        const int n = std::clamp(preview_ + d, 0, static_cast<int>(items_.size()) - 1);
+        if (n != preview_) preview_go(n);
+    }
+
+    /// Decodes are bounded by the monitor, so the image is sharp even when the window goes fullscreen.
+    [[nodiscard]] UINT preview_px() const {
+        MONITORINFO mi{sizeof(mi)};
+        GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi);
+        return static_cast<UINT>(std::max({mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, 256L}));
+    }
+
+    void request_preview() {
+        if (!preview_valid()) return;
+        const UINT px = preview_px();
+        auto want = [&](int k) {
+            if (k >= 0 && k < static_cast<int>(items_.size())) sh_.previews.request(items_[k].pt.id, item_path(items_[k]), px);
+        };
+        // Newest requests are served first: neighbours, then the shown one
+        want(preview_ + 1);
+        want(preview_ - 1);
+        want(preview_);
+        const Item& it = items_[preview_];
+        if (thumb_px_ && !sh_.thumbs.get(it.pt.id)) sh_.thumbs.request(it.pt.id, item_path(it), thumb_px_);
+    }
+
+    /// Where the image goes: fitted to `area`, never enlarged past its own pixel size.
+    [[nodiscard]] D2D1_RECT_F preview_dest(const Item& it, ID2D1Bitmap* bmp, D2D1_RECT_F area) const {
+        const D2D1_SIZE_U ps = bmp->GetPixelSize();
+        const float bw = static_cast<float>(std::max(1u, ps.width)), bh = static_cast<float>(std::max(1u, ps.height));
+        // A thumbnail stands in at the original's size so nothing jumps when the full decode lands
+        const float native = it.pt.p.w && it.pt.p.h ? static_cast<float>(std::max(it.pt.p.w, it.pt.p.h)) : std::max(bw, bh);
+        const float k = std::max(native, std::max(bw, bh)) / std::max(bw, bh) / target_.scale();
+        const float nw = bw * k, nh = bh * k;
+        const float s = std::min({1.0f, width(area) / nw, height(area) / nh});
+        const float w = std::round(nw * s), h = std::round(nh * s);
+        const float x = std::round((area.left + area.right - w) / 2), y = std::round((area.top + area.bottom - h) / 2);
+        return rect(x, y, w, h);
+    }
+
+    void draw_preview(Canvas& cv, D2D1_SIZE_F sz) {
+        if (!preview_valid()) {
+            preview_ = -1;
+            return;
+        }
+        const Item& it = items_[preview_];
+        const int count = static_cast<int>(items_.size());
+        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(color::surface_lowest, 0.94f));
+        // Backdrop below the title bar closes the viewer; the bar itself still drags the window
+        cv.hit(D2D1::RectF(0, PV_TOP, sz.width, sz.height), IdPreview);
+
+        // Image
+        const D2D1_RECT_F area = D2D1::RectF(16, PV_TOP, sz.width - 16, sz.height - PV_BOTTOM);
+        ID2D1Bitmap1* full = sh_.previews.get(it.pt.id);
+        ID2D1Bitmap1* bmp = full ? full : sh_.thumbs.get(it.pt.id);
+        const bool loading = !full && !sh_.previews.failed(it.pt.id);
+        D2D1_RECT_F dest = inset(area, width(area) * 0.3f, height(area) * 0.3f);
+        if (bmp) {
+            dest = preview_dest(it, bmp, area);
+            cv.shadow(dest, 4, 14, 0.35f);
+            cv.bitmap(bmp, dest);
+            cv.hit(dest, IdPvImage);
+            if (loading) draw_spinner(cv, {dest.right - 20, dest.bottom - 20});
+        } else if (loading) {
+            draw_spinner(cv, {(area.left + area.right) / 2, (area.top + area.bottom) / 2});
+        } else {
+            cv.icon(it.pt.p.k == 1 ? glyph::video : glyph::photo, rect(area.left, (area.top + area.bottom) / 2 - 40, width(area), 40), color::outline, Font::IconLarge);
+            cv.text(L"No preview available", rect(area.left, (area.top + area.bottom) / 2, width(area), 24), Font::Body, color::outline, Align::Center);
+        }
+        if (it.pt.p.k == 1) {
+            const D2D1_POINT_2F c{(dest.left + dest.right) / 2, (dest.top + dest.bottom) / 2};
+            const bool on = hover_id_ == IdPvPlay;
+            cv.fill_circle(c, 30, hex(0x000000, on ? 0.75f : 0.55f));
+            cv.icon(glyph::play, rect(c.x - 28, c.y - 30, 60, 60), on ? color::primary : hex(0xffffff), Font::IconLarge);
+            cv.hit(rect(c.x - 30, c.y - 30, 60, 60), IdPvPlay);
+        }
+
+        // Previous / next
+        auto arrow = [&](bool next) {
+            const bool can = next ? preview_ + 1 < count : preview_ > 0;
+            if (!can) return;
+            const float cx = next ? area.right - 28 : area.left + 28, cy = (area.top + area.bottom) / 2;
+            const int id = next ? IdPvNext : IdPvPrev;
+            const bool on = hover_id_ == id;
+            cv.fill_circle({cx, cy}, 22, on ? with_alpha(color::surface_highest, 0.96f) : hex(0x000000, 0.45f));
+            cv.icon(next ? glyph::chevron_right : glyph::chevron_left, rect(cx - 22, cy - 22, 44, 44), on ? color::on_surface : hex(0xffffff, 0.9f));
+            cv.hit(rect(cx - 28, cy - 44, 56, 88), id);
+        };
+        arrow(false);
+        arrow(true);
+
+        // Title bar: name and folder, position, actions
+        float x = sz.width - 12;
+        const float cy = PV_TOP / 2;
+        auto btn = [&](wchar_t g, int id) {
+            x -= 36;
+            icon_button(cv, rect(x, cy - 18, 36, 36), g, id);
+        };
+        btn(glyph::close, IdPvClose);
+        x -= 8;
+        cv.vline(x, cy - 12, cy + 12, color::outline_variant);
+        x -= 4;
+        btn(glyph::copy, IdPvCopy);
+        btn(glyph::folder, IdPvReveal);
+        btn(glyph::open, IdPvOpen);
+        const std::wstring pos = format_count(static_cast<uint64_t>(preview_) + 1) + L" / " + format_count(items_.size()) + (has_more_ ? L"+" : L"");
+        const float pw = cv.measure(pos, Font::SmallSemi) + 24;
+        x -= pw + 6;
+        const D2D1_RECT_F pr = rect(x, cy - 13, pw, 26);
+        cv.fill_round(pr, 13, with_alpha(color::surface_highest, 0.85f));
+        cv.text(pos, pr, Font::SmallSemi, color::on_surface_variant, Align::Center);
+        cv.text(it.name, D2D1::RectF(18, 9, x - 16, 29), Font::BodySemi, color::on_surface);
+        cv.text(it.dir, D2D1::RectF(18, 29, x - 16, 46), Font::MonoSmall, color::outline);
+
+        // Footer: size, date, duration
+        std::wstring meta = it.meta;
+        if (it.pt.p.k == 1 && it.pt.p.d) meta = format_duration_ms(it.pt.p.d) + L"  •  " + meta;
+        if (!it.date.empty()) meta += L"  •  " + it.date;
+        cv.text(meta, D2D1::RectF(18, sz.height - PV_BOTTOM, sz.width - 18, sz.height), Font::Caption, color::outline, Align::Center);
+    }
+
+    void preview_click(int id, bool dbl) {
+        const std::wstring path = item_path(items_[preview_]);
+        switch (id) {
+            case IdPvClose: close_preview(); return;
+            case IdPvPrev: preview_step(-1); return;
+            case IdPvNext: preview_step(1); return;
+            case IdPvOpen:
+            case IdPvPlay: open_file(path); return;
+            case IdPvReveal: reveal_in_explorer(path); return;
+            case IdPvCopy: copy_media({&items_[preview_]}); return;
+            case IdPvImage:
+                if (dbl) open_file(path);
+                else begin_drag_detect(preview_);
+                return;
+            case IdPreview:
+                if (!dbl) {
+                    close_preview();
+                    // The second half of a double-click must not land on the card underneath
+                    swallow_dbl_ = true;
+                }
+                return;
+            default: return;
+        }
+    }
+
+    bool preview_key(UINT vk) {
+        const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+        const Item& it = items_[preview_];
+        switch (vk) {
+            case VK_LEFT:
+            case VK_UP:
+            case VK_PRIOR: preview_step(-1); return true;
+            case VK_RIGHT:
+            case VK_DOWN:
+            case VK_NEXT: preview_step(1); return true;
+            case VK_HOME: preview_go(0); return true;
+            case VK_END: preview_go(static_cast<int>(items_.size()) - 1); return true;
+            case VK_SPACE:
+                swallow_space_ = true;
+                close_preview();
+                return true;
+            case VK_RETURN: open_file(item_path(it)); return true;
+            default: break;
+        }
+        if (ctrl && vk == 'C') {
+            if (shift) set_clipboard_text(hwnd_, item_path(it));
+            else copy_media({&it});
+        } else if (ctrl && vk == 'E') {
+            reveal_in_explorer(item_path(it));
+        } else if (ctrl && vk == 'S') {
+            const Item copy = it;
+            close_preview(false);
+            find_similar(copy);
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Dragging media out to other applications
+    // ------------------------------------------------------------------------------------------
+
+    void begin_drag_detect(int index) {
+        drag_pending_ = true;
+        drag_index_ = index;
+        GetCursorPos(&drag_origin_);
+        SetCapture(hwnd_);
+    }
+
+    /// Mouse released without dragging: a click on one of several selected cards narrows to it now.
+    void end_drag_detect() {
+        if (!drag_pending_) return;
+        drag_pending_ = false;
+        if (deferred_select_) {
+            selected_ = {*deferred_select_};
+            deferred_select_.reset();
+            invalidate();
+        }
+    }
+
+    void start_drag() {
+        drag_pending_ = false;
+        deferred_select_.reset();
+        ReleaseCapture();
+        if (drag_index_ < 0 || drag_index_ >= static_cast<int>(items_.size())) return;
+        const uint64_t id = items_[drag_index_].pt.id;
+        if (!selected_.contains(id)) selected_ = {id};
+        std::vector<std::wstring> paths;
+        for (const auto& it : items_) {
+            if (selected_.contains(it.pt.id)) paths.push_back(item_path(it));
+        }
+        hover_id_ = IdNone;
+        render();
+        dragging_out_ = true;
+        drag_media(hwnd_, paths);
+        dragging_out_ = false;
+        invalidate();
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1170,6 +1500,19 @@ private:
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
             TrackMouseEvent(&tme);
             tracking_ = true;
+        }
+        if (drag_pending_) {
+            if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+                end_drag_detect();
+                ReleaseCapture();
+            } else {
+                POINT c;
+                GetCursorPos(&c);
+                if (std::abs(c.x - drag_origin_.x) > GetSystemMetrics(SM_CXDRAG) || std::abs(c.y - drag_origin_.y) > GetSystemMetrics(SM_CYDRAG)) {
+                    start_drag();
+                    return;
+                }
+            }
         }
         if (dragging_scroll_) {
             if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
@@ -1217,14 +1560,26 @@ private:
         flush();
         selecting_text_ = false;
         dragging_scroll_ = false;
+        drag_pending_ = false;
+        deferred_select_.reset();
         SetFocus(hwnd_);
         const Hit* h = hit_test(hits_, p);
         const int id = h ? h->id : IdNone;
         const int idx = h ? h->index : 0;
         const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+        if (dbl && swallow_dbl_) {
+            swallow_dbl_ = false;
+            return;
+        }
+        swallow_dbl_ = false;
 
         if (menu_open_ && id != IdMenu && id != IdMenuItem && id != IdMenuTag && id != IdMenuField) {
             close_popups();
+            invalidate();
+            return;
+        }
+        if (preview_valid() && !menu_open_) {
+            preview_click(id, dbl);
             invalidate();
             return;
         }
@@ -1280,6 +1635,7 @@ private:
             case IdFullscreen: toggle_fullscreen(); return;
             case IdClose: hide(); return;
             case IdSimilar: find_similar(items_[idx]); return;
+            case IdCardPreview: open_preview(idx); return;
             case IdCard:
             case IdTagChip: {
                 const uint64_t cid = items_[idx].pt.id;
@@ -1292,10 +1648,14 @@ private:
                 } else if (shift && focus_ >= 0) {
                     selected_.clear();
                     for (int k = std::min(focus_, idx); k <= std::max(focus_, idx); ++k) selected_.insert(items_[k].pt.id);
+                } else if (selected_.contains(cid) && selected_.size() > 1) {
+                    deferred_select_ = cid; // keep the selection in case this press starts a drag
                 } else {
                     selected_ = {cid};
                 }
                 if (!shift) focus_ = idx;
+                field_.focused = false; // keys now act on the cards (Space, Ctrl+C, Ctrl+A)
+                begin_drag_detect(idx);
                 break;
             }
             case IdScrollbar:
@@ -1334,7 +1694,17 @@ private:
     void on_rbutton_down(D2D1_POINT_2F p) {
         flush();
         const Hit* h = hit_test(hits_, p);
-        if (!h || (h->id != IdCard && h->id != IdTagChip && h->id != IdSimilar)) {
+        if (preview_valid()) {
+            if (h && (h->id == IdPvImage || h->id == IdPvPlay)) {
+                selected_ = {items_[preview_].pt.id};
+                open_menu(preview_, p);
+            } else if (menu_open_) {
+                close_popups();
+                invalidate();
+            }
+            return;
+        }
+        if (!h || (h->id != IdCard && h->id != IdTagChip && h->id != IdSimilar && h->id != IdCardPreview)) {
             if (menu_open_) {
                 close_popups();
                 invalidate();
@@ -1347,7 +1717,21 @@ private:
     }
 
     void on_wheel(int delta) {
-        if (!expanded() || menu_open_) return;
+        if (menu_open_) return;
+        if (preview_valid()) {
+            // One notch per image, whatever the device's resolution
+            preview_wheel_ += delta;
+            while (preview_wheel_ >= WHEEL_DELTA) {
+                preview_wheel_ -= WHEEL_DELTA;
+                preview_step(-1);
+            }
+            while (preview_wheel_ <= -WHEEL_DELTA) {
+                preview_wheel_ += WHEEL_DELTA;
+                preview_step(1);
+            }
+            return;
+        }
+        if (!expanded()) return;
         target_scroll_ = std::clamp(target_scroll_ - delta * 0.9f, 0.0f, max_scroll());
         start_anim();
     }
@@ -1367,8 +1751,12 @@ private:
 
     void on_key(UINT vk) {
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+        const bool shift = GetKeyState(VK_SHIFT) < 0;
+        // A bare modifier press must not pull focus back to the search field before the chord's key arrives
+        if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN || vk == VK_CAPITAL) return;
         if (vk == VK_ESCAPE) {
             if (menu_open_ || drop_open_ || help_pinned_) close_popups();
+            else if (preview_ >= 0) close_preview();
             else if (fullscreen_) toggle_fullscreen();
             else if (!selected_.empty() && !field_.focused) {
                 selected_.clear();
@@ -1398,6 +1786,11 @@ private:
             invalidate();
             return;
         }
+        if (preview_valid()) {
+            preview_key(vk);
+            invalidate();
+            return;
+        }
         if (drop_open_ && !drop_items_.empty()) {
             if (vk == VK_DOWN || vk == VK_UP) {
                 drop_sel_ = (drop_sel_ + (vk == VK_DOWN ? 1 : -1) + static_cast<int>(drop_items_.size())) % static_cast<int>(drop_items_.size());
@@ -1412,7 +1805,7 @@ private:
         if (ctrl && !selected_.empty()) {
             if (vk == 'E') return menu_action_selected(ActReveal);
             if (vk == 'S') return menu_action_selected(ActSimilar);
-            if (vk == 'C' && !field_.focused) return menu_action_selected(ActCopy);
+            if (vk == 'C' && !field_.focused) return menu_action_selected(shift ? ActCopyPath : ActCopy);
             if (vk == 'A' && !field_.focused) {
                 for (const auto& it : items_) selected_.insert(it.pt.id);
                 invalidate();
@@ -1423,6 +1816,11 @@ private:
             field_.focused = true;
             field_.select_all();
             invalidate();
+            return;
+        }
+        if (vk == VK_SPACE && !field_.focused && focus_ >= 0 && focus_ < static_cast<int>(items_.size())) {
+            swallow_space_ = true;
+            open_preview(focus_);
             return;
         }
         if (vk == VK_RETURN) {
@@ -1458,6 +1856,10 @@ private:
     }
 
     void on_char(wchar_t c) {
+        if (swallow_space_) {
+            swallow_space_ = false;
+            if (c == L' ') return;
+        }
         if (c == L'\r' || c == 27 || c == L'\t') return;
         if (menu_open_) {
             menu_field_.on_char(c);
@@ -1465,6 +1867,7 @@ private:
             invalidate();
             return;
         }
+        if (preview_valid()) return;
         if (!field_.focused) {
             field_.focused = true;
             focus_ = -1;
@@ -1576,13 +1979,14 @@ private:
                 return 0;
             }
             case WM_ACTIVATE:
-                if (LOWORD(wp) == WA_INACTIVE && sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode) {
+                if (LOWORD(wp) == WA_INACTIVE && sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && !dragging_out_) {
                     if (GetTickCount64() - shown_tick_ > 250) hide();
                 }
                 return 0;
             case WM_CAPTURECHANGED:
                 selecting_text_ = false;
                 dragging_scroll_ = false;
+                end_drag_detect();
                 return 0;
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) {
@@ -1591,7 +1995,7 @@ private:
                     ScreenToClient(hwnd_, &pt);
                     const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
                     const int id = h ? h->id : 0;
-                    SetCursor(id == IdField || id == IdMenuField ? cursor_ibeam_ : (id == IdNone || id == IdGrid || id == IdMenu || id == IdDrop || id == IdHelp || id == IdCard) ? cursor_arrow_ : cursor_hand_);
+                    SetCursor(id == IdField || id == IdMenuField ? cursor_ibeam_ : (id == IdNone || id == IdGrid || id == IdMenu || id == IdDrop || id == IdHelp || id == IdCard || id == IdPreview || id == IdPvImage) ? cursor_arrow_ : cursor_hand_);
                     return TRUE;
                 }
                 break;
@@ -1610,6 +2014,7 @@ private:
             case WM_LBUTTONUP:
                 selecting_text_ = false;
                 if (dragging_scroll_) dragging_scroll_ = false;
+                end_drag_detect();
                 ReleaseCapture();
                 return 0;
             case WM_RBUTTONDOWN: on_rbutton_down(to_dip(lp)); return 0;
@@ -1716,6 +2121,18 @@ private:
 
     bool help_pinned_ = false;
     float help_btn_x_ = 0.0f;
+
+    int preview_ = -1;       // item shown full size, -1 when the viewer is closed
+    int preview_wheel_ = 0;  // wheel delta not yet turned into a step
+    UINT thumb_px_ = 0;      // card thumbnail size last requested by the grid
+    bool swallow_space_ = false;
+    bool swallow_dbl_ = false;
+
+    bool drag_pending_ = false; // left button down on media, not yet past the drag threshold
+    bool dragging_out_ = false;
+    int drag_index_ = -1;
+    POINT drag_origin_{};
+    std::optional<uint64_t> deferred_select_;
 };
 
 } // namespace usyseek::ui

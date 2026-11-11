@@ -78,6 +78,10 @@ inline constexpr wchar_t download = 0xE896;
 inline constexpr wchar_t block = 0xF140;
 inline constexpr wchar_t chevron_down = 0xE70D;
 inline constexpr wchar_t help = 0xE897;
+inline constexpr wchar_t zoom = 0xE8A3;
+inline constexpr wchar_t link = 0xE71B;
+inline constexpr wchar_t chevron_left = 0xE76B;
+inline constexpr wchar_t chevron_right = 0xE76C;
 } // namespace glyph
 
 enum class Font : uint8_t {
@@ -284,6 +288,11 @@ public:
             bmp_brush_->SetTransform(D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(dest.left, dest.top));
             dc_->FillRoundedRectangle(D2D1::RoundedRect(drawn, radius, radius), bmp_brush_.get());
         }
+    }
+
+    /// Plain (unclipped, square) bitmap draw with high-quality resampling.
+    void bitmap(ID2D1Bitmap* bmp, D2D1_RECT_F dest) {
+        dc_->DrawBitmap(bmp, &dest, opacity_, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
     }
 
     /// Height of wrapped text in `w` DIPs.
