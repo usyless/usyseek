@@ -503,14 +503,15 @@ private:
         return rect(x, y, g.card_w, g.card_h);
     }
 
-    void scroll_to(int i) {
+    void scroll_to(int i, bool animate = true) {
         if (i < 0) return;
         const Grid g = grid();
         const D2D1_RECT_F r = card_rect(g, i);
         if (r.top < g.view.top + 4) target_scroll_ = scroll_ + (r.top - g.view.top - PAD);
         else if (r.bottom > g.view.bottom - 4) target_scroll_ = scroll_ + (r.bottom - g.view.bottom + PAD);
         target_scroll_ = std::clamp(target_scroll_, 0.0f, max_scroll());
-        start_anim();
+        if (animate) start_anim();
+        else scroll_ = target_scroll_;
     }
 
     void apply_fade() {
@@ -1248,6 +1249,8 @@ private:
         close_popups();
         hover_id_ = IdNone;
         preview_wheel_ = 0;
+        preview_initial_index_ = index;
+        preview_initial_scroll_ = scroll_;
         preview_go(index);
     }
 
@@ -1260,7 +1263,11 @@ private:
         if (restore_focus && last < static_cast<int>(items_.size())) {
             focus_ = last;
             field_.focused = false;
-            scroll_to(last);
+            if (last != preview_initial_index_) {
+                scroll_to(last, false);
+            } else {
+                scroll_ = target_scroll_ = preview_initial_scroll_;
+            }
         }
         invalidate();
     }
@@ -2152,6 +2159,8 @@ private:
     float help_btn_x_ = 0.0f;
 
     int preview_ = -1;       // item shown full size, -1 when the viewer is closed
+    int preview_initial_index_ = -1;
+    float preview_initial_scroll_ = 0.0f;
     int preview_wheel_ = 0;  // wheel delta not yet turned into a step
     UINT thumb_px_ = 0;      // card thumbnail size last requested by the grid
     bool swallow_space_ = false;
