@@ -9,7 +9,10 @@
 
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shldisp.h>
 #include <windowsx.h>
+
+#include <atomic>
 
 namespace usyseek::ui {
 
@@ -185,6 +188,76 @@ inline bool set_data_bytes(IDataObject* obj, CLIPFORMAT cf, const void* data, si
     return false;
 }
 
+/// Wraps a shell IDataObject and implements IDataObjectAsyncCapability (formerly IAsyncOperation)
+/// returning VARIANT_TRUE for async mode. This signals Windows Explorer that drops can be completed
+/// asynchronously on an Explorer worker thread, preventing modal dialogs (such as "file already exists")
+/// from blocking the drag source's thread inside IDropTarget::Drop().
+class AsyncDataObject final : public IDataObject, public IDataObjectAsyncCapability {
+public:
+    explicit AsyncDataObject(wil::com_ptr<IDataObject> inner) : inner_{std::move(inner)} {}
+
+    // IUnknown
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IDataObject) {
+            *ppv = static_cast<IDataObject*>(this);
+        } else if (riid == IID_IDataObjectAsyncCapability) {
+            *ppv = static_cast<IDataObjectAsyncCapability*>(this);
+        } else {
+            return inner_ ? inner_->QueryInterface(riid, ppv) : E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+    IFACEMETHODIMP_(ULONG) AddRef() override { return ++ref_; }
+    IFACEMETHODIMP_(ULONG) Release() override {
+        const ULONG r = --ref_;
+        if (!r) delete this;
+        return r;
+    }
+
+    // IDataObjectAsyncCapability
+    IFACEMETHODIMP SetAsyncMode(BOOL fDoOpAsync) override {
+        async_mode_ = fDoOpAsync;
+        return S_OK;
+    }
+    IFACEMETHODIMP GetAsyncMode(BOOL* pfIsOpAsync) override {
+        if (!pfIsOpAsync) return E_POINTER;
+        *pfIsOpAsync = async_mode_;
+        return S_OK;
+    }
+    IFACEMETHODIMP StartOperation(IBindCtx*) override {
+        in_async_ = TRUE;
+        return S_OK;
+    }
+    IFACEMETHODIMP InOperation(BOOL* pfInAsyncOp) override {
+        if (!pfInAsyncOp) return E_POINTER;
+        *pfInAsyncOp = in_async_;
+        return S_OK;
+    }
+    IFACEMETHODIMP EndOperation(HRESULT, IBindCtx*, DWORD) override {
+        in_async_ = FALSE;
+        return S_OK;
+    }
+
+    // IDataObject
+    IFACEMETHODIMP GetData(FORMATETC* pfe, STGMEDIUM* psm) override { return inner_->GetData(pfe, psm); }
+    IFACEMETHODIMP GetDataHere(FORMATETC* pfe, STGMEDIUM* psm) override { return inner_->GetDataHere(pfe, psm); }
+    IFACEMETHODIMP QueryGetData(FORMATETC* pfe) override { return inner_->QueryGetData(pfe); }
+    IFACEMETHODIMP GetCanonicalFormatEtc(FORMATETC* in, FORMATETC* out) override { return inner_->GetCanonicalFormatEtc(in, out); }
+    IFACEMETHODIMP SetData(FORMATETC* pfe, STGMEDIUM* psm, BOOL rel) override { return inner_->SetData(pfe, psm, rel); }
+    IFACEMETHODIMP EnumFormatEtc(DWORD dir, IEnumFORMATETC** e) override { return inner_->EnumFormatEtc(dir, e); }
+    IFACEMETHODIMP DAdvise(FORMATETC* pfe, DWORD advf, IAdviseSink* sink, DWORD* conn) override { return inner_->DAdvise(pfe, advf, sink, conn); }
+    IFACEMETHODIMP DUnadvise(DWORD conn) override { return inner_->DUnadvise(conn); }
+    IFACEMETHODIMP EnumDAdvise(IEnumSTATDATA** e) override { return inner_->EnumDAdvise(e); }
+
+private:
+    std::atomic<ULONG> ref_{1};
+    wil::com_ptr<IDataObject> inner_;
+    BOOL async_mode_ = VARIANT_TRUE;
+    BOOL in_async_ = FALSE;
+};
+
 /// A shell data object for files, as Explorer makes it: shell ID lists + CF_HDROP, so drops and pastes into
 /// Explorer, browsers, chat apps and editors receive the files themselves. Pastes default to copying.
 inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring> paths) {
@@ -237,7 +310,10 @@ inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring>
 
     const DWORD effect = DROPEFFECT_COPY;
     set_data_bytes(obj.get(), static_cast<CLIPFORMAT>(RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT)), &effect, sizeof(effect));
-    return obj;
+
+    wil::com_ptr<IDataObject> wrapped;
+    wrapped.attach(new AsyncDataObject(std::move(obj)));
+    return wrapped;
 }
 
 /// Drags files out to other applications (copy or link only: a drop never moves the user's files away).
@@ -281,7 +357,12 @@ inline bool copy_media_to_clipboard(std::span<const std::wstring> paths, const R
             }
         }
     }
-    if (FAILED(OleSetClipboard(obj.get()))) return false;
+    HRESULT hr = OleSetClipboard(obj.get());
+    for (int retry = 0; FAILED(hr) && retry < 10; ++retry) {
+        Sleep(20);
+        hr = OleSetClipboard(obj.get());
+    }
+    if (FAILED(hr)) return false;
     // Render now: this process exits when idle and the clipboard must outlive it
     OleFlushClipboard();
     return true;

@@ -1198,22 +1198,40 @@ private:
     }
 
     /// Copies the files themselves; a single still image also goes on as pixels so editors can paste it.
+    /// Done on a worker thread with OleInitialize so decoding, file I/O, and OleFlushClipboard never block the UI.
     void copy_media(const std::vector<const Item*>& sel) {
         if (sel.empty()) return;
-        std::vector<std::wstring> paths;
-        for (const auto* it : sel) paths.push_back(item_path(*it));
-        std::optional<Raster> image;
-        std::optional<std::wstring> png;
-        constexpr uint64_t MAX_PIXELS = 40'000'000;
+        struct Job {
+            std::vector<std::wstring> paths;
+            bool is_single_image = false;
+            uint32_t w = 0, h = 0;
+        };
+        Job job;
+        job.paths.reserve(sel.size());
+        for (const auto* it : sel) job.paths.push_back(item_path(*it));
         const Item& one = *sel.front();
-        if (sel.size() == 1 && one.pt.p.k == 0 && !svg::is_svg(paths[0]) && static_cast<uint64_t>(one.pt.p.w) * one.pt.p.h <= MAX_PIXELS) {
-            const HCURSOR prev = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-            image = decode_image(paths[0], 0, false);
-            if (image && static_cast<uint64_t>(image->w) * image->h > MAX_PIXELS) image.reset();
-            if (lower(fs::path{paths[0]}.extension().wstring()) == L".png") png = paths[0];
-            SetCursor(prev);
-        }
-        copy_media_to_clipboard(paths, image ? &*image : nullptr, png ? &*png : nullptr);
+        job.is_single_image = (sel.size() == 1 && one.pt.p.k == 0 && !svg::is_svg(job.paths[0]));
+        job.w = one.pt.p.w;
+        job.h = one.pt.p.h;
+
+        ++sh_.background_jobs;
+        std::thread([job = std::move(job), &sh = sh_] {
+            const auto done = wil::scope_exit([&sh] {
+                --sh.background_jobs;
+            });
+            if (FAILED(OleInitialize(nullptr))) return;
+            const auto ole = wil::scope_exit([] { OleUninitialize(); });
+
+            constexpr uint64_t MAX_PIXELS = 40'000'000;
+            std::optional<Raster> image;
+            std::optional<std::wstring> png;
+            if (job.is_single_image && static_cast<uint64_t>(job.w) * job.h <= MAX_PIXELS) {
+                image = decode_image(job.paths[0], 0, false);
+                if (image && static_cast<uint64_t>(image->w) * image->h > MAX_PIXELS) image.reset();
+                if (lower(fs::path{job.paths[0]}.extension().wstring()) == L".png") png = job.paths[0];
+            }
+            copy_media_to_clipboard(job.paths, image ? &*image : nullptr, png ? &*png : nullptr);
+        }).detach();
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1475,8 +1493,15 @@ private:
         hover_id_ = IdNone;
         render();
         dragging_out_ = true;
+        // Relinquish topmost status so targets and OS dialogs (e.g. file conflict prompts) show on top
+        SetWindowPos(hwnd_, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         drag_media(hwnd_, paths);
         dragging_out_ = false;
+        if (sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && GetForegroundWindow() != hwnd_) {
+            hide();
+        } else if (GetForegroundWindow() == hwnd_) {
+            SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
         invalidate();
     }
 
@@ -1979,8 +2004,12 @@ private:
                 return 0;
             }
             case WM_ACTIVATE:
-                if (LOWORD(wp) == WA_INACTIVE && sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && !dragging_out_) {
-                    if (GetTickCount64() - shown_tick_ > 250) hide();
+                if (LOWORD(wp) == WA_INACTIVE) {
+                    if (sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && !dragging_out_) {
+                        if (GetTickCount64() - shown_tick_ > 250) hide();
+                    }
+                } else {
+                    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
                 return 0;
             case WM_CAPTURECHANGED:
