@@ -8,3 +8,4 @@ build/
 open-vscode.bat
 build.bat
 rust/target
+compile_commands.json

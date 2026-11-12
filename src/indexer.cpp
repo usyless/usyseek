@@ -206,7 +206,7 @@ public:
             return false;
         }
         owned_.reset(new ulp::Everything(EVERYTHING_INSTANCE, exe.wstring()));
-        switch (owned_->try_load(L"-safe-mode -no-db -no-auto-index -volumes \"\"")) {
+        switch (owned_->try_load(L"-safe-mode -no-auto-index -volumes \"\"")) {
             case ulp::Everything::LoadStatus::Success: break;
             case ulp::Everything::LoadStatus::UACRejected:
                 error = L"Everything needs administrator access to read the drive index";
@@ -222,7 +222,7 @@ public:
             vols += d;
             vols += L':';
         }
-        std::wstring cmd = L"\"" + exe.wstring() + L"\" -safe-mode -no-db -startup -no-auto-index -volumes \"" + vols + L"\" -instance \"" + EVERYTHING_INSTANCE + L"\"";
+        std::wstring cmd = L"\"" + exe.wstring() + L"\" -safe-mode -startup -no-auto-index -volumes \"" + vols + L"\" -instance \"" + EVERYTHING_INSTANCE + L"\"";
         STARTUPINFOW si{sizeof(si)};
         wil::unique_process_information pi;
         if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
