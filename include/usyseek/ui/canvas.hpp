@@ -226,6 +226,19 @@ public:
     [[nodiscard]] ID2D1DeviceContext6* dc() const noexcept { return dc_; }
     [[nodiscard]] Fonts& fonts() const noexcept { return fonts_; }
 
+    struct ScopedOpacity {
+        Canvas& cv;
+        float prev;
+        ScopedOpacity(Canvas& c, float factor) noexcept : cv{c}, prev{c.opacity_} {
+            cv.opacity_ *= std::clamp(factor, 0.0f, 1.0f);
+        }
+        ~ScopedOpacity() { cv.opacity_ = prev; }
+        ScopedOpacity(const ScopedOpacity&) = delete;
+        ScopedOpacity& operator=(const ScopedOpacity&) = delete;
+        ScopedOpacity(ScopedOpacity&&) = delete;
+        ScopedOpacity& operator=(ScopedOpacity&&) = delete;
+    };
+
     ID2D1SolidColorBrush* brush(D2D1_COLOR_F c) {
         c.a *= opacity_;
         brush_->SetColor(c);
@@ -432,35 +445,99 @@ inline std::wstring middle_truncate_dir(Canvas& cv, std::wstring_view path, Font
     return out;
 }
 
-/// Shared delayed-hover tooltip state for Direct2D windows.
-struct HoverTooltip {
-    static constexpr UINT DELAY_MS = 380;
-    D2D1_RECT_F anchor{};
-    bool visible = false;
+/// Tracks current and outgoing hover state with smooth exponential fades and zero idle repaints.
+struct HoverTracker {
+    int id = 0;
+    int index = 0;
+    int prev_id = 0;
+    int prev_index = 0;
+    AnimFloat in_anim;
+    AnimFloat out_anim;
 
-    void on_hover_changed(HWND hwnd, UINT_PTR timer_id, const Hit* h, bool eligible) noexcept {
-        visible = false;
-        if (hwnd) KillTimer(hwnd, timer_id);
-        anchor = h ? h->r : D2D1_RECT_F{};
-        if (eligible && hwnd) SetTimer(hwnd, timer_id, DELAY_MS, nullptr);
-    }
-
-    bool on_timer(HWND hwnd, UINT_PTR timer_id, bool allow) noexcept {
-        if (hwnd) KillTimer(hwnd, timer_id);
-        if (!allow) return false;
-        visible = true;
+    bool set(int new_id, int new_index, bool animate) noexcept {
+        if (new_id == id && new_index == index) return false;
+        if (id != 0 && in_anim.value > 0.002f) {
+            prev_id = id;
+            prev_index = index;
+            out_anim.snap(in_anim.value);
+            out_anim.set(0.0f, animate);
+        }
+        id = new_id;
+        index = new_index;
+        in_anim.snap(0.0f);
+        in_anim.set(new_id != 0 ? 1.0f : 0.0f, animate);
+        if (!animate) {
+            prev_id = 0;
+            out_anim.snap(0.0f);
+        }
         return true;
     }
 
-    void clear(HWND hwnd, UINT_PTR timer_id) noexcept {
-        visible = false;
+    bool step(float dt) noexcept {
+        bool moving = false;
+        if (in_anim.step(dt, 34.0f, 0.008f)) moving = true;
+        if (out_anim.step(dt, 28.0f, 0.008f)) moving = true;
+        if (out_anim.value <= 0.008f) prev_id = 0;
+        return moving;
+    }
+
+    [[nodiscard]] float alpha(int q_id, int q_index = 0) const noexcept {
+        if (id == q_id && index == q_index) return in_anim.value;
+        if (prev_id == q_id && prev_index == q_index) return out_anim.value;
+        return 0.0f;
+    }
+};
+
+/// Shared delayed-hover tooltip state with smooth fade-in/out and zero idle repaints.
+struct HoverTooltip {
+    static constexpr UINT DELAY_MS = 380;
+    D2D1_RECT_F anchor{};
+    D2D1_RECT_F pending_anchor{};
+    std::wstring title;
+    std::wstring subtitle;
+    bool shown = false;
+    AnimFloat alpha;
+
+    void on_hover_changed(HWND hwnd, UINT_PTR timer_id, const Hit* h, bool eligible, bool animate) noexcept {
         if (hwnd) KillTimer(hwnd, timer_id);
+        if (shown) {
+            shown = false;
+            alpha.set(0.0f, animate);
+        } else if (!animate) {
+            alpha.snap(0.0f);
+        }
+        pending_anchor = h ? h->r : D2D1_RECT_F{};
+        if (eligible && hwnd) SetTimer(hwnd, timer_id, DELAY_MS, nullptr);
+    }
+
+    bool on_timer(HWND hwnd, UINT_PTR timer_id, bool allow, std::wstring new_title, std::wstring new_subtitle, bool animate) {
+        if (hwnd) KillTimer(hwnd, timer_id);
+        if (!allow || (new_title.empty() && new_subtitle.empty())) return false;
+        anchor = pending_anchor;
+        title = std::move(new_title);
+        subtitle = std::move(new_subtitle);
+        shown = true;
+        alpha.snap(0.0f);
+        alpha.set(1.0f, animate);
+        return true;
+    }
+
+    void clear(HWND hwnd, UINT_PTR timer_id, bool animate = false) noexcept {
+        if (hwnd) KillTimer(hwnd, timer_id);
+        shown = false;
+        alpha.set(0.0f, animate);
+    }
+
+    bool step(float dt) noexcept {
+        return alpha.step(dt, shown ? 32.0f : 36.0f, 0.008f);
     }
 };
 
 /// Draws a floating wrapped tooltip anchored near `anchor`, clamped within `win_sz`.
-inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std::wstring_view title, std::wstring_view subtitle = {}) {
-    if (title.empty() && subtitle.empty()) return;
+inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std::wstring_view title,
+                         std::wstring_view subtitle = {}, float opacity = 1.0f) {
+    if (opacity <= 0.008f || (title.empty() && subtitle.empty())) return;
+    const Canvas::ScopedOpacity op{cv, opacity};
     constexpr float pad_x = 10.0f;
     constexpr float pad_y = 6.0f;
     constexpr float gap = 2.0f;

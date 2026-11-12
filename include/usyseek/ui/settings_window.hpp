@@ -130,6 +130,7 @@ public:
         SetTimer(hwnd_, TIMER_POLL, 500, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
         render();
+        ValidateRect(hwnd_, nullptr);
     }
 
     void hide() {
@@ -140,6 +141,11 @@ public:
             active_field_ = nullptr;
         }
         snap_anims();
+        anim_active_ = false;
+        raw_hover_id_ = IdNone;
+        raw_hover_index_ = 0;
+        hover_.set(IdNone, 0, false);
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_POLL);
         KillTimer(hwnd_, TIMER_DEVICE);
@@ -179,7 +185,7 @@ public:
         draw(cv);
         if (!target_.present(!in_sizemove_)) recover();
         rendering_ = false;
-        if (visible() && anim) InvalidateRect(hwnd_, nullptr, FALSE);
+        anim_active_ = visible() && anim;
     }
 
 private:
@@ -350,30 +356,28 @@ private:
     // Drawing primitives
     // ------------------------------------------------------------------------------------------
 
-    bool hovered(int id, int idx = 0) const noexcept {
-        return hover_id_ == id && hover_index_ == idx;
+    [[nodiscard]] float hover_alpha(int id, int idx = 0) const noexcept {
+        return hover_.alpha(id, idx);
     }
 
     void draw_button(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, int id, int idx = 0,
                      int style = 0 /* 0=secondary, 1=primary, 2=danger, 3=ghost */) {
-        const bool hov = hovered(id, idx);
-        D2D1_COLOR_F bg = color::surface_high;
+        const float ha = hover_alpha(id, idx);
+        D2D1_COLOR_F bg = lerp_color(color::surface_high, color::surface_highest, ha);
         D2D1_COLOR_F fg = color::on_surface;
         D2D1_COLOR_F border = color::outline_variant;
         if (style == 1) {
-            bg = hov ? hex(0xb8d4ff) : color::primary;
+            bg = lerp_color(color::primary, hex(0xb8d4ff), ha);
             fg = color::on_primary;
             border = bg;
         } else if (style == 2) {
-            bg = hov ? with_alpha(color::error, 0.22f) : with_alpha(color::error_container, 0.45f);
+            bg = lerp_color(with_alpha(color::error_container, 0.45f), with_alpha(color::error, 0.22f), ha);
             fg = color::error;
             border = with_alpha(color::error, 0.45f);
         } else if (style == 3) {
-            bg = hov ? with_alpha(color::on_surface, 0.08f) : hex(0, 0.0f);
-            fg = color::on_surface_variant;
+            bg = with_alpha(color::on_surface, 0.08f * ha);
+            fg = lerp_color(color::on_surface_variant, color::on_surface, ha);
             border = hex(0, 0.0f);
-        } else if (hov) {
-            bg = color::surface_highest;
         }
         const float rad = std::min(10.0f, height(r) * 0.5f);
         if (bg.a > 0.0f) cv.fill_round(r, rad, bg);
@@ -392,9 +396,9 @@ private:
 
     void draw_switch(Canvas& cv, float right_x, float cy, bool on, int id, int idx = 0) {
         const D2D1_RECT_F r = rect(right_x - 44.0f, cy - 12.0f, 44.0f, 24.0f);
-        const bool hov = hovered(id, idx);
+        const float ha = hover_alpha(id, idx);
         const float t = switch_anim_value(id, on);
-        const D2D1_COLOR_F off_track = hov ? color::surface_highest : color::surface_high;
+        const D2D1_COLOR_F off_track = lerp_color(color::surface_high, color::surface_highest, ha);
         cv.fill_round(r, 12.0f, lerp_color(off_track, color::primary, t));
         if (t < 1.0f) cv.stroke_round(r, 12.0f, with_alpha(color::outline, 1.0f - t));
         const float kx = lerp(r.left + 12.0f, r.right - 12.0f, t);
@@ -477,8 +481,8 @@ private:
     }
 
     void draw_radio(Canvas& cv, D2D1_RECT_F r, bool on, std::wstring_view title, std::wstring_view desc, int id) {
-        const bool hov = hovered(id);
-        cv.fill_round(r, 12.0f, on ? with_alpha(color::primary_container, 0.32f) : (hov ? color::surface_high : color::surface_low));
+        const float ha = hover_alpha(id);
+        cv.fill_round(r, 12.0f, on ? with_alpha(color::primary_container, 0.32f) : lerp_color(color::surface_low, color::surface_high, ha));
         cv.stroke_round(r, 12.0f, on ? color::primary : color::outline_variant, on ? 1.5f : 1.0f);
         const D2D1_POINT_2F c{r.left + 22.0f, (r.top + r.bottom) * 0.5f};
         cv.stroke_circle(c, 8.0f, on ? color::primary : color::outline, 1.8f);
@@ -555,18 +559,14 @@ private:
             const float track_h = height(view) - 8.0f;
             const float thumb_h = std::max(28.0f, track_h * height(view) / content_h_);
             const float ty = view.top + 4.0f + (track_h - thumb_h) * (scroll_ / ms);
-            const bool active = hovered(IdScrollbar) || dragging_scroll_;
-            const D2D1_RECT_F tr = D2D1::RectF(view.right - (active ? 9.0f : 7.0f), ty, view.right - 3.0f, ty + thumb_h);
-            cv.fill_round(tr, 3.0f, with_alpha(color::on_surface_variant, active ? 0.55f : 0.28f));
+            const float ha = dragging_scroll_ ? 1.0f : hover_alpha(IdScrollbar);
+            const D2D1_RECT_F tr = D2D1::RectF(view.right - lerp(7.0f, 9.0f, ha), ty, view.right - 3.0f, ty + thumb_h);
+            cv.fill_round(tr, 3.0f, with_alpha(color::on_surface_variant, lerp(0.28f, 0.55f, ha)));
             cv.hit(D2D1::RectF(view.right - 12.0f, view.top, view.right, view.bottom), IdScrollbar);
             scroll_thumb_ = tr;
         }
 
-        if (tooltip_.visible) {
-            if (const wchar_t* tip = tooltip_text(hover_id_)) {
-                draw_tooltip(cv, sz, tooltip_.anchor, tip);
-            }
-        }
+        draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
     }
 
     static const wchar_t* tooltip_text(int id) noexcept {
@@ -591,8 +591,8 @@ private:
         const float t = std::clamp(tab_anim_.value, 0.0f, 1.0f);
         for (int i = 0; i < 2; ++i) {
             const float act = i == 0 ? 1.0f - t : t;
-            if (act < 0.5f && hovered(tabs[i].id)) {
-                cv.fill_round(rects[i], 10.0f, with_alpha(color::on_surface, 0.07f));
+            if (const float ha = hover_alpha(tabs[i].id); act < 0.5f && ha > 0.002f) {
+                cv.fill_round(rects[i], 10.0f, with_alpha(color::on_surface, 0.07f * ha));
             }
         }
         cv.fill_round(lerp_rect(rects[0], rects[1], t), 10.0f, color::primary_container);
@@ -799,8 +799,8 @@ private:
                 const auto& ff = sh_.failed_files[i];
                 const FailedRow& row = rows[i];
                 const D2D1_RECT_F ir = rect(lx, row.y, rw, row.h);
-                const bool hov = hovered(IdFailedRow, static_cast<int>(i));
-                cv.fill_round(ir, 8.0f, hov ? color::surface_high : color::surface_low);
+                const float ha = hover_alpha(IdFailedRow, static_cast<int>(i));
+                cv.fill_round(ir, 8.0f, lerp_color(color::surface_low, color::surface_high, ha));
                 cv.icon(glyph::warning, rect(ir.left + 8.0f, ir.top, 20.0f, row.h), color::error, Font::IconSmall);
                 const float content_top = ir.top + (row.h - row.content_h) * 0.5f;
                 cv.text_wrap(row.label, rect(ir.left + path_x, content_top, path_w, row.path_h), Font::MonoSmall, color::on_surface);
@@ -1889,9 +1889,26 @@ private:
         return std::max(0.0f, content_h_ - view_height());
     }
 
+    [[nodiscard]] static std::pair<int, int> visual_hover(int id, int idx) noexcept {
+        switch (id) {
+            case IdExcludeField:
+            case IdLockedExclude:
+            case IdModelField:
+            case IdRepoField:
+            case IdBatchField:
+            case IdArchField:
+            case IdCudaField:
+            case IdTorchField:
+            case IdPyVerField: return {IdNone, 0};
+            default: return {id, idx};
+        }
+    }
+
     void start_anim() {
-        last_anim_ = std::chrono::steady_clock::now();
-        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+        if (!visible()) return;
+        if (!anim_active_) last_anim_ = std::chrono::steady_clock::now();
+        anim_active_ = true;
+        InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     bool step_anim() {
@@ -1911,6 +1928,8 @@ private:
         if (sw_hotkey_.step(dt)) moving = true;
         if (sw_startup_.step(dt)) moving = true;
         if (sw_hide_focus_.step(dt)) moving = true;
+        if (hover_.step(dt)) moving = true;
+        if (tooltip_.step(dt)) moving = true;
         return moving;
     }
 
@@ -2455,8 +2474,13 @@ private:
                 BeginPaint(hwnd_, &ps);
                 if (visible() || sh_.test_mode) render();
                 EndPaint(hwnd_, &ps);
-                if (visible() && std::abs(target_scroll_ - scroll_) >= 0.5f) {
-                    InvalidateRect(hwnd_, nullptr, FALSE);
+                if (visible() && anim_active_) {
+                    // Drain any due timers while QS_PAINT is clear so VSync frames don't starve timers.
+                    MSG m;
+                    while (PeekMessageW(&m, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE)) {
+                        DispatchMessageW(&m);
+                    }
+                    if (visible() && anim_active_) InvalidateRect(hwnd_, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -2524,22 +2548,34 @@ private:
                 const Hit* h = hit_test(hits_, p);
                 const int id = h ? h->id : IdNone;
                 const int idx = h ? h->index : 0;
-                if (id != hover_id_ || idx != hover_index_) {
-                    hover_id_ = id;
-                    hover_index_ = idx;
-                    tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, tooltip_text(id) != nullptr);
-                    invalidate();
+                if (id != raw_hover_id_ || idx != raw_hover_index_) {
+                    raw_hover_id_ = id;
+                    raw_hover_index_ = idx;
+                    const bool animate = visible() && !sh_.test_mode;
+                    const auto [vid, vidx] = visual_hover(id, idx);
+                    const bool vis_changed = hover_.set(vid, vidx, animate);
+                    tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, tooltip_text(id) != nullptr, animate);
+                    const bool tip_fading = animate && tooltip_.alpha.active();
+                    if ((vis_changed && animate) || tip_fading) start_anim();
+                    else if (vis_changed) invalidate();
                 }
                 return 0;
             }
-            case WM_MOUSELEAVE:
+            case WM_MOUSELEAVE: {
                 tracking_ = false;
-                tooltip_.clear(hwnd_, TIMER_TOOLTIP);
-                if (hover_id_) {
-                    hover_id_ = IdNone;
-                    invalidate();
+                const bool animate = visible() && !sh_.test_mode;
+                tooltip_.clear(hwnd_, TIMER_TOOLTIP, animate);
+                if (raw_hover_id_ != IdNone || hover_.id != IdNone) {
+                    raw_hover_id_ = IdNone;
+                    raw_hover_index_ = 0;
+                    hover_.set(IdNone, 0, animate);
+                    if (animate) start_anim();
+                    else invalidate();
+                } else if (animate && tooltip_.alpha.active()) {
+                    start_anim();
                 }
                 return 0;
+            }
             case WM_LBUTTONDOWN:
                 tooltip_.clear(hwnd_, TIMER_TOOLTIP);
                 on_lbutton_down(to_dip(lp), false);
@@ -2588,9 +2624,15 @@ private:
                         KillTimer(hwnd_, TIMER_DEVICE);
                         render();
                         return 0;
-                    case TIMER_TOOLTIP:
-                        if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, hover_id_ != IdNone)) invalidate();
+                    case TIMER_TOOLTIP: {
+                        const wchar_t* tip = tooltip_text(raw_hover_id_);
+                        const bool animate = visible() && !sh_.test_mode;
+                        if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, raw_hover_id_ != IdNone && tip != nullptr, tip ? tip : L"", {}, animate)) {
+                            if (animate) start_anim();
+                            else invalidate();
+                        }
                         return 0;
+                    }
                 }
                 return 0;
             case WM_APP_REDRAW:
@@ -2618,10 +2660,12 @@ private:
     AnimFloat sw_hotkey_;
     AnimFloat sw_startup_;
     AnimFloat sw_hide_focus_;
-    int hover_id_ = IdNone;
-    int hover_index_ = 0;
+    int raw_hover_id_ = IdNone;
+    int raw_hover_index_ = 0;
+    HoverTracker hover_;
     HoverTooltip tooltip_;
     bool tracking_ = false;
+    bool anim_active_ = false;
     bool in_sizemove_ = false;
 
     float scroll_ = 0.0f, target_scroll_ = 0.0f, content_h_ = 0.0f;

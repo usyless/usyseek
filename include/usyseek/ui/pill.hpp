@@ -68,6 +68,7 @@ public:
         SetTimer(hwnd_, TIMER_STATUS, 1000, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
         render();
+        ValidateRect(hwnd_, nullptr);
         if (!sh_.test_mode && fade_ < 1.0f) {
             last_fade_ = std::chrono::steady_clock::now();
             SetTimer(hwnd_, TIMER_FADE, 15, nullptr);
@@ -86,6 +87,11 @@ public:
         KillTimer(hwnd_, TIMER_STATUS);
         KillTimer(hwnd_, TIMER_DEVICE);
         KillTimer(hwnd_, TIMER_FADE);
+        anim_active_ = false;
+        raw_hover_id_ = IdNone;
+        raw_hover_index_ = 0;
+        hover_.set(IdNone, 0, false);
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         ShowWindow(hwnd_, SW_HIDE);
         ValidateRect(hwnd_, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
@@ -144,7 +150,7 @@ public:
         draw(cv);
         if (!target_.present(!in_sizemove_)) recover();
         rendering_ = false;
-        if (visible() && (anim || searching_ || loading_more_)) InvalidateRect(hwnd_, nullptr, FALSE);
+        anim_active_ = visible() && (anim || searching_ || loading_more_);
     }
 
     /// Test hook: puts the pill into a given state without going through input.
@@ -297,7 +303,32 @@ private:
     static constexpr float HELP_H = 240.0f;
 
     [[nodiscard]] bool show_help() const noexcept {
-        return help_pinned_ || hover_id_ == IdHelpBtn || hover_id_ == IdHelp || hover_id_ == IdHelpItem;
+        return help_pinned_ || raw_hover_id_ == IdHelpBtn || raw_hover_id_ == IdHelp || raw_hover_id_ == IdHelpItem;
+    }
+
+    [[nodiscard]] static std::pair<int, int> visual_hover(int id, int idx) noexcept {
+        switch (id) {
+            case IdCardName:
+            case IdCardDir:
+            case IdCardMoreTags:
+            case IdTagChip: return {IdCard, idx};
+            case IdField:
+            case IdGrid:
+            case IdPreview:
+            case IdPvImage:
+            case IdPvPath:
+            case IdMenu:
+            case IdMenuField:
+            case IdDrop:
+            case IdHelp: return {IdNone, 0};
+            default: return {id, idx};
+        }
+    }
+
+    void clear_hover(bool animate = false) noexcept {
+        raw_hover_id_ = IdNone;
+        raw_hover_index_ = 0;
+        hover_.set(IdNone, 0, animate);
     }
 
     [[nodiscard]] float help_height_dip() const noexcept {
@@ -538,7 +569,9 @@ private:
 
     void on_fade_timer() {
         const auto now = std::chrono::steady_clock::now();
-        const float dt = std::clamp(std::chrono::duration<float>(now - last_fade_).count(), 0.001f, 0.05f);
+        const float raw_dt = std::chrono::duration<float>(now - last_fade_).count();
+        if (raw_dt <= 0.0f) return;
+        const float dt = std::min(raw_dt, 0.05f);
         last_fade_ = now;
         const float step = dt / 0.11f;
         if (target_fade_ > fade_) fade_ = std::min(target_fade_, fade_ + step);
@@ -553,8 +586,10 @@ private:
     }
 
     void start_anim() {
-        last_anim_ = std::chrono::steady_clock::now();
-        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+        if (!visible()) return;
+        if (!anim_active_) last_anim_ = std::chrono::steady_clock::now();
+        anim_active_ = true;
+        InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     bool step_anim() {
@@ -571,6 +606,8 @@ private:
             else moving = true;
         }
         if (chip_anim_.step(dt)) moving = true;
+        if (hover_.step(dt)) moving = true;
+        if (tooltip_.step(dt)) moving = true;
         return moving;
     }
 
@@ -625,11 +662,8 @@ private:
     }
 
     void draw_active_tooltip(Canvas& cv, D2D1_SIZE_F sz) const {
-        if (!tooltip_.visible || menu_open_ || drop_open_) return;
-        std::wstring title, sub;
-        if (tooltip_for(hover_id_, hover_index_, title, sub)) {
-            draw_tooltip(cv, sz, tooltip_.anchor, title, sub);
-        }
+        if (menu_open_ || drop_open_) return;
+        draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
     }
 
     void draw(Canvas& cv) {
@@ -651,10 +685,10 @@ private:
     }
 
     void icon_button(Canvas& cv, D2D1_RECT_F r, wchar_t g, int id, bool active = false) {
-        const bool hov = hover_id_ == id;
+        const float ha = hover_.alpha(id);
         if (active) cv.fill_round(r, height(r) / 2, with_alpha(color::primary, 0.16f));
-        else if (hov) cv.fill_round(r, height(r) / 2, with_alpha(color::on_surface, 0.08f));
-        cv.icon(g, r, active ? color::primary : hov ? color::on_surface : color::on_surface_variant);
+        else if (ha > 0.002f) cv.fill_round(r, height(r) / 2, with_alpha(color::on_surface, 0.08f * ha));
+        cv.icon(g, r, active ? color::primary : lerp_color(color::on_surface_variant, color::on_surface, ha));
         cv.hit(r, id);
     }
 
@@ -704,8 +738,9 @@ private:
         const float ct = std::clamp(chip_anim_.value, 0.0f, 2.0f);
         for (int i = 0; i < 3; ++i) {
             const float act = std::max(0.0f, 1.0f - std::abs(ct - static_cast<float>(i)));
-            if (act < 0.5f && hover_id_ == IdChip && hover_index_ == i) {
-                cv.fill_round(chip_rects[i], 14, with_alpha(color::on_surface, 0.07f));
+            const float ha = hover_.alpha(IdChip, i);
+            if (act < 0.5f && ha > 0.002f) {
+                cv.fill_round(chip_rects[i], 14, with_alpha(color::on_surface, 0.07f * ha));
             }
         }
         const int lo = std::clamp(static_cast<int>(std::floor(ct)), 0, 1);
@@ -843,9 +878,9 @@ private:
             const float track_h = height(g.view) - 8;
             const float thumb_h = std::max(28.0f, track_h * height(g.view) / g.content_h);
             const float ty = g.view.top + 4 + (track_h - thumb_h) * (scroll_ / ms);
-            const bool active = hover_id_ == IdScrollbar || dragging_scroll_;
-            const D2D1_RECT_F tr = D2D1::RectF(g.view.right - (active ? 9 : 7), ty, g.view.right - 3, ty + thumb_h);
-            cv.fill_round(tr, 3, with_alpha(color::on_surface_variant, active ? 0.55f : 0.28f));
+            const float ha = dragging_scroll_ ? 1.0f : hover_.alpha(IdScrollbar);
+            const D2D1_RECT_F tr = D2D1::RectF(g.view.right - lerp(7.0f, 9.0f, ha), ty, g.view.right - 3, ty + thumb_h);
+            cv.fill_round(tr, 3, with_alpha(color::on_surface_variant, lerp(0.28f, 0.55f, ha)));
             cv.hit(D2D1::RectF(g.view.right - 12, g.view.top, g.view.right, g.view.bottom), IdScrollbar);
             scroll_thumb_ = tr;
         }
@@ -861,17 +896,23 @@ private:
         start_anim();
     }
 
+    [[nodiscard]] float card_hover_alpha(int i) const noexcept {
+        const float a = (hover_.id >= IdCard && hover_.id <= IdTagChip && hover_.index == i) ? hover_.in_anim.value : 0.0f;
+        const float b = (hover_.prev_id >= IdCard && hover_.prev_id <= IdTagChip && hover_.prev_index == i) ? hover_.out_anim.value : 0.0f;
+        return std::clamp(a + b, 0.0f, 1.0f);
+    }
+
     void draw_card(Canvas& cv, const Grid& g, int i) {
         Item& it = items_[i];
         const D2D1_RECT_F r = card_rect(g, i);
-        const bool hov = hover_id_ >= IdCard && hover_id_ <= IdTagChip && hover_index_ == i;
+        const float ha = card_hover_alpha(i);
         const bool sel = selected_.contains(it.pt.id);
         const bool focus = focus_ == i;
 
-        cv.fill_round(r, 14, with_alpha(hov ? color::surface_high : color::surface_low, 0.92f));
+        cv.fill_round(r, 14, with_alpha(lerp_color(color::surface_low, color::surface_high, ha), 0.92f));
         if (sel) cv.stroke_round(r, 14, color::primary, 2.0f);
         else if (focus) cv.stroke_round(r, 14, with_alpha(color::primary, 0.6f), 1.0f);
-        else cv.stroke_round(r, 14, with_alpha(color::outline_variant, hov ? 0.9f : 0.45f));
+        else cv.stroke_round(r, 14, with_alpha(color::outline_variant, lerp(0.45f, 0.9f, ha)));
         cv.hit(r, IdCard, i);
 
         // Thumbnail (cropped or letterboxed through a reusable bitmap brush so the corners stay rounded)
@@ -893,12 +934,13 @@ private:
             cv.icon(glyph::play, rect(b.left + 6, b.top, 14, 22), hex(0xffffff), Font::IconSmall);
             cv.text(dur, rect(b.left + 21, b.top, dw + 2, 22), Font::Caption, hex(0xffffff));
         }
-        if (hov) {
+        if (ha > 0.002f) {
+            const Canvas::ScopedOpacity op{cv, ha};
             auto overlay_btn = [&](float x, wchar_t g, int id) {
                 const D2D1_RECT_F sb = rect(x, tr.top + 8, 28, 28);
-                const bool on = hover_id_ == id;
-                cv.fill_circle({sb.left + 14, sb.top + 14}, 14, hex(on ? 0x2b2930 : 0x000000, on ? 0.95f : 0.55f));
-                cv.icon(g, sb, on ? color::primary : hex(0xffffff), Font::IconSmall);
+                const float ba = hover_.alpha(id, i);
+                cv.fill_circle({sb.left + 14, sb.top + 14}, 14, lerp_color(hex(0x000000, 0.55f), hex(0x2b2930, 0.95f), ba));
+                cv.icon(g, sb, lerp_color(hex(0xffffff), color::primary, ba), Font::IconSmall);
                 cv.hit(sb, id, i);
             };
             overlay_btn(tr.right - 36, glyph::similar, IdSimilar);
@@ -1060,8 +1102,8 @@ private:
         float ry = y + 34.0f;
         for (int i = 0; i < static_cast<int>(std::size(HELP_ROWS)); ++i) {
             const D2D1_RECT_F rr = rect(x + 6.0f, ry, HELP_W - 12.0f, 28.0f);
-            if (hover_id_ == IdHelpItem && hover_index_ == i && HELP_ROWS[i].insert[0] != 0) {
-                cv.fill_round(rr, 8.0f, with_alpha(color::primary, 0.12f));
+            if (const float ha = hover_.alpha(IdHelpItem, i); ha > 0.002f && HELP_ROWS[i].insert[0] != 0) {
+                cv.fill_round(rr, 8.0f, with_alpha(color::primary, 0.12f * ha));
             }
             const D2D1_RECT_F badge = rect(rr.left + 6.0f, rr.top + 3.0f, 114.0f, 22.0f);
             cv.fill_round(badge, 6.0f, with_alpha(color::surface_highest, 0.9f));
@@ -1082,7 +1124,7 @@ private:
         field_.replace_all(t);
         field_.focused = true;
         help_pinned_ = false;
-        hover_id_ = IdNone;
+        clear_hover();
         caret_reset();
         update_dropdown();
         if (ins.ends_with(L' ')) run_search(0);
@@ -1203,7 +1245,7 @@ private:
         float y = r.top + 6;
         for (int i = 0; i < ActCount; ++i) {
             const D2D1_RECT_F rr = rect(r.left + 6, y, MENU_W - 12, 36);
-            if (hover_id_ == IdMenuItem && hover_index_ == i) cv.fill_round(rr, 8, with_alpha(color::on_surface, 0.08f));
+            if (const float ha = hover_.alpha(IdMenuItem, i); ha > 0.002f) cv.fill_round(rr, 8, with_alpha(color::on_surface, 0.08f * ha));
             cv.icon(acts[i].g, rect(rr.left + 8, rr.top, 20, 36), color::on_surface_variant);
             cv.text(acts[i].label, D2D1::RectF(rr.left + 38, rr.top, rr.right - 86, rr.bottom), Font::Body, color::on_surface);
             cv.text(acts[i].key, D2D1::RectF(rr.right - 96, rr.top, rr.right - 10, rr.bottom), Font::Caption, color::outline, Align::Right);
@@ -1220,7 +1262,7 @@ private:
         for (size_t i = 0; i < menu_tags_.size() && i < 10; ++i) {
             const auto& t = menu_tags_[i];
             const D2D1_RECT_F rr = rect(r.left + 6, y, MENU_W - 12, 32);
-            if (hover_id_ == IdMenuTag && hover_index_ == static_cast<int>(i)) cv.fill_round(rr, 8, with_alpha(color::on_surface, 0.08f));
+            if (const float ha = hover_.alpha(IdMenuTag, static_cast<int>(i)); ha > 0.002f) cv.fill_round(rr, 8, with_alpha(color::on_surface, 0.08f * ha));
             const int st = tag_state(t);
             const D2D1_RECT_F box = rect(rr.left + 10, rr.top + 8, 16, 16);
             if (st == 2) {
@@ -1364,7 +1406,7 @@ private:
     void open_preview(int index) {
         if (index < 0 || index >= static_cast<int>(items_.size())) return;
         close_popups();
-        hover_id_ = IdNone;
+        clear_hover();
         preview_wheel_ = 0;
         preview_initial_index_ = index;
         preview_initial_scroll_ = scroll_;
@@ -1376,7 +1418,7 @@ private:
         const int last = preview_;
         preview_ = -1;
         sh_.previews.clear();
-        hover_id_ = IdNone;
+        clear_hover();
         if (restore_focus && last < static_cast<int>(items_.size())) {
             focus_ = last;
             field_.focused = false;
@@ -1474,9 +1516,9 @@ private:
         }
         if (it.pt.p.k == 1) {
             const D2D1_POINT_2F c{(dest.left + dest.right) / 2, (dest.top + dest.bottom) / 2};
-            const bool on = hover_id_ == IdPvPlay;
-            cv.fill_circle(c, 30, hex(0x000000, on ? 0.75f : 0.55f));
-            cv.icon(glyph::play, rect(c.x - 28, c.y - 30, 60, 60), on ? color::primary : hex(0xffffff), Font::IconLarge);
+            const float ha = hover_.alpha(IdPvPlay);
+            cv.fill_circle(c, 30, hex(0x000000, lerp(0.55f, 0.75f, ha)));
+            cv.icon(glyph::play, rect(c.x - 28, c.y - 30, 60, 60), lerp_color(hex(0xffffff), color::primary, ha), Font::IconLarge);
             cv.hit(rect(c.x - 30, c.y - 30, 60, 60), IdPvPlay);
         }
 
@@ -1486,9 +1528,9 @@ private:
             if (!can) return;
             const float cx = next ? area.right - 28 : area.left + 28, cy = (area.top + area.bottom) / 2;
             const int id = next ? IdPvNext : IdPvPrev;
-            const bool on = hover_id_ == id;
-            cv.fill_circle({cx, cy}, 22, on ? with_alpha(color::surface_highest, 0.96f) : hex(0x000000, 0.45f));
-            cv.icon(next ? glyph::chevron_right : glyph::chevron_left, rect(cx - 22, cy - 22, 44, 44), on ? color::on_surface : hex(0xffffff, 0.9f));
+            const float ha = hover_.alpha(id);
+            cv.fill_circle({cx, cy}, 22, lerp_color(hex(0x000000, 0.45f), with_alpha(color::surface_highest, 0.96f), ha));
+            cv.icon(next ? glyph::chevron_right : glyph::chevron_left, rect(cx - 22, cy - 22, 44, 44), lerp_color(hex(0xffffff, 0.9f), color::on_surface, ha));
             cv.hit(rect(cx - 28, cy - 44, 56, 88), id);
         };
         arrow(false);
@@ -1619,7 +1661,8 @@ private:
         for (const auto& it : items_) {
             if (selected_.contains(it.pt.id)) paths.push_back(item_path(it));
         }
-        hover_id_ = IdNone;
+        clear_hover();
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         render();
         dragging_out_ = true;
         // Not topmost while the target works, so its dialogs (e.g. file conflict prompts) are not hidden behind this window
@@ -1653,6 +1696,7 @@ private:
     }
 
     void on_mouse_move(D2D1_POINT_2F p) {
+        if (fading_out_) return;
         if (!tracking_) {
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
             TrackMouseEvent(&tme);
@@ -1699,15 +1743,20 @@ private:
         const Hit* h = hit_test(hits_, p);
         const int id = h ? h->id : IdNone;
         const int idx = h ? h->index : 0;
-        if (id != hover_id_ || idx != hover_index_) {
+        if (id != raw_hover_id_ || idx != raw_hover_index_) {
             const bool was_help = show_help();
-            hover_id_ = id;
-            hover_index_ = idx;
+            raw_hover_id_ = id;
+            raw_hover_index_ = idx;
+            const bool animate = visible() && !sh_.test_mode;
+            const auto [vid, vidx] = visual_hover(id, idx);
+            const bool vis_changed = hover_.set(vid, vidx, animate);
             std::wstring tt, ts;
             const bool can_tip = !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_ && tooltip_for(id, idx, tt, ts);
-            tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, can_tip);
+            tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, can_tip, animate);
+            const bool tip_fading = animate && tooltip_.alpha.active();
             if (show_help() != was_help) apply_height();
-            invalidate();
+            if ((vis_changed && animate) || tip_fading) start_anim();
+            else if (vis_changed) invalidate();
         }
     }
 
@@ -2113,8 +2162,16 @@ private:
                 BeginPaint(hwnd_, &ps);
                 if (visible() || sh_.test_mode) render();
                 EndPaint(hwnd_, &ps);
-                if (visible() && (std::abs(target_scroll_ - scroll_) >= 0.5f || searching_ || loading_more_)) {
-                    InvalidateRect(hwnd_, nullptr, FALSE);
+                if (visible() && !sh_.test_mode && (fading_out_ || std::abs(target_fade_ - fade_) >= 0.005f)) {
+                    on_fade_timer();
+                }
+                if (visible() && anim_active_) {
+                    // Drain any due timers while QS_PAINT is clear so VSync frames don't starve fade/tooltip timers.
+                    MSG m;
+                    while (PeekMessageW(&m, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE)) {
+                        DispatchMessageW(&m);
+                    }
+                    if (visible() && anim_active_) InvalidateRect(hwnd_, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -2173,16 +2230,21 @@ private:
                 }
                 break;
             case WM_MOUSEMOVE: on_mouse_move(to_dip(lp)); return 0;
-            case WM_MOUSELEAVE:
+            case WM_MOUSELEAVE: {
                 tracking_ = false;
-                tooltip_.clear(hwnd_, TIMER_TOOLTIP);
-                if (hover_id_) {
+                const bool animate = visible() && !sh_.test_mode;
+                tooltip_.clear(hwnd_, TIMER_TOOLTIP, animate);
+                if (raw_hover_id_ != IdNone || hover_.id != IdNone) {
                     const bool was_help = show_help();
-                    hover_id_ = IdNone;
+                    clear_hover(animate);
                     if (show_help() != was_help) apply_height();
-                    invalidate();
+                    if (animate) start_anim();
+                    else invalidate();
+                } else if (animate && tooltip_.alpha.active()) {
+                    start_anim();
                 }
                 return 0;
+            }
             case WM_LBUTTONDOWN: on_lbutton_down(to_dip(lp), false); return 0;
             case WM_LBUTTONDBLCLK: on_lbutton_down(to_dip(lp), true); return 0;
             case WM_LBUTTONUP:
@@ -2236,11 +2298,16 @@ private:
                         return 0;
                     }
                     case TIMER_COPY: set_clipboard(); return 0;
-                    case TIMER_TOOLTIP:
-                        if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, hover_id_ != IdNone && !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_)) {
-                            invalidate();
+                    case TIMER_TOOLTIP: {
+                        std::wstring tt, ts;
+                        const bool allow = raw_hover_id_ != IdNone && !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_ && tooltip_for(raw_hover_id_, raw_hover_index_, tt, ts);
+                        const bool animate = visible() && !sh_.test_mode;
+                        if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, allow, std::move(tt), std::move(ts), animate)) {
+                            if (animate) start_anim();
+                            else invalidate();
                         }
                         return 0;
+                    }
                 }
                 return 0;
             case WM_APP_THUMBS: on_thumbs(); return 0;
@@ -2284,10 +2351,12 @@ private:
 
     std::unordered_set<uint64_t> selected_;
     int focus_ = -1;
-    int hover_id_ = IdNone;
-    int hover_index_ = 0;
+    int raw_hover_id_ = IdNone;
+    int raw_hover_index_ = 0;
+    HoverTracker hover_;
     HoverTooltip tooltip_;
     bool tracking_ = false;
+    bool anim_active_ = false;
     bool selecting_text_ = false;
 
     float scroll_ = 0, target_scroll_ = 0;
