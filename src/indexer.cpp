@@ -541,6 +541,10 @@ struct PyVision {
     PyVision() {
         cancel_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     }
+    PyVision(const PyVision&) = delete;
+    PyVision& operator=(const PyVision&) = delete;
+    PyVision(PyVision&&) = delete;
+    PyVision& operator=(PyVision&&) = delete;
 
     ~PyVision() {
         cancel();
@@ -855,6 +859,10 @@ int run_indexer(Settings& settings) {
                   }
                   done.store(true, std::memory_order_release);
               }} {}
+        VisionLoader(const VisionLoader&) = delete;
+        VisionLoader& operator=(const VisionLoader&) = delete;
+        VisionLoader(VisionLoader&&) = delete;
+        VisionLoader& operator=(VisionLoader&&) = delete;
 
         ~VisionLoader() { cancel_and_join(); }
 
@@ -982,17 +990,25 @@ int run_indexer(Settings& settings) {
     const fs::path onnx = fs::path{to_wide(settings.model_dir)} / (to_wide(settings.model_name) + L"-text.onnx");
     std::error_code onnx_ec;
     if (todo.empty() || stopping()) {
+        std::string export_err;
         if (!stopping() && !fs::exists(onnx, onnx_ec)) {
             if (loader.done.load(std::memory_order_acquire) && loader.error.empty()) {
                 loader.thread.join();
                 pr.phase(Phase::LoadingModel, L"Exporting text model");
                 try {
                     vision.export_text(settings.model_dir, settings.model_name);
-                } catch (...) {}
+                } catch (const std::exception& e) {
+                    if (!stopping()) {
+                        export_err = e.what();
+                        std::printf("export_text failed: %s\n", e.what());
+                    }
+                }
             } else {
                 loader.cancel_and_join();
                 pr.phase(Phase::LoadingModel, L"Exporting text model");
-                (void)export_text_only(settings);
+                if (export_text_only(settings) != 0 && !stopping()) {
+                    export_err = "Failed to export text model";
+                }
             }
         } else {
             loader.cancel_and_join();
@@ -1002,8 +1018,12 @@ int run_indexer(Settings& settings) {
         st.last_index_unix = unix_now();
         st.last_index_found = files.size();
         st.last_index_embedded = pr.d.embedded;
-        st.last_error.clear();
+        st.last_error = export_err;
         save_json_file(state_path(), st);
+        if (!export_err.empty()) {
+            pr.phase(Phase::Error, to_wide(export_err));
+            return 1;
+        }
         pr.phase(stopping() ? Phase::Stopped : Phase::Done);
         return stopping() ? 2 : 0;
     }
@@ -1087,7 +1107,8 @@ int run_indexer(Settings& settings) {
                 try {
                     item.data = f.kind == 0 ? dec.image(f.path, settings.video_frames) : dec.video(f.path, settings.video_frames);
                 } catch (...) {
-                    // Leaves item.data empty: the file is counted as failed and remembered so it is not retried
+                    // Leave item.data empty so the file is counted as failed and remembered not to be retried.
+                    item.data.reset();
                 }
                 if (!queue.push(std::move(item))) break;
             }

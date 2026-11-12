@@ -6,7 +6,7 @@
 
 namespace usyseek {
 
-enum class Phase : uint32_t {
+enum class Phase : uint8_t {
     Idle = 0,
     Starting,
     LoadingModel,

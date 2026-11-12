@@ -217,17 +217,6 @@ inline std::vector<FailedFile> load_failed_files(std::string_view coll) {
                 f.reason = to_wide(r3.substr(t4 + 1));
             }
             out.push_back(std::move(f));
-        } else {
-            // Legacy space-separated format: id mtime size
-            unsigned long long id = 0, sz = 0;
-            long long mt = 0;
-            if (std::sscanf(std::string{line}.c_str(), "%llu %lld %llu", &id, &mt, &sz) == 3) {
-                f.id = id;
-                f.mtime = mt;
-                f.size = sz;
-                f.reason = L"Decode failed";
-                out.push_back(std::move(f));
-            }
         }
     }
     return out;

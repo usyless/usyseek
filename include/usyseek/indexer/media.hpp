@@ -14,7 +14,7 @@
 
 namespace usyseek::media {
 
-enum class ResizeMode { Squash, Shortest, Longest };
+enum class ResizeMode : uint8_t { Squash, Shortest, Longest };
 
 inline ResizeMode parse_resize_mode(std::string_view s) {
     if (s == "shortest") return ResizeMode::Shortest;

@@ -17,7 +17,7 @@ int32_t usy_svg_render(UsyStr path, uint32_t box_w, uint32_t box_h, uint32_t fit
 namespace usyseek::svg {
 
 /// How the document is mapped onto the requested box.
-enum class Fit : uint32_t {
+enum class Fit : uint8_t {
     Stretch = 0, // exactly the box, aspect ignored
     Cover = 1,   // fills the box, centre-cropped
     Contain = 2, // aspect preserved, bitmap no larger than the box

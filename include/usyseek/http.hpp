@@ -28,6 +28,8 @@ public:
     Handle() = default;
     Handle(const Handle&) = delete;
     Handle& operator=(const Handle&) = delete;
+    Handle(Handle&&) = delete;
+    Handle& operator=(Handle&&) = delete;
     ~Handle() { close(); }
 
     void reset(HINTERNET h) noexcept {

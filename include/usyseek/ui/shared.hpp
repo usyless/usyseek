@@ -28,7 +28,7 @@ inline std::wstring format_hotkey(uint32_t mods, uint32_t vk) {
     if (mods & MOD_WIN) t += L"Win + ";
     wchar_t name[64]{};
     if (vk == VK_SPACE) wcscpy_s(name, L"Space");
-    else GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16), name, 64);
+    else GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16, name, 64);
     return t + (name[0] ? name : L"Key");
 }
 
@@ -221,6 +221,7 @@ inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring>
         }
     }
     std::vector<PCUITEMID_CHILD> children;
+    children.reserve(pidls.size());
     for (auto* id : pidls) children.push_back(same_parent ? ILFindLastID(id) : reinterpret_cast<PCUITEMID_CHILD>(id));
     wil::com_ptr<IDataObject> obj;
     if (FAILED(SHCreateDataObject(same_parent ? parent : nullptr, static_cast<UINT>(children.size()), children.data(), nullptr, IID_PPV_ARGS(&obj)))) return nullptr;
@@ -249,6 +250,10 @@ inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring>
 class AsyncDataObject final : public IDataObject, public IDataObjectAsyncCapability {
 public:
     explicit AsyncDataObject(wil::com_ptr<IDataObject> inner) : inner_(std::move(inner)) {}
+    AsyncDataObject(const AsyncDataObject&) = delete;
+    AsyncDataObject& operator=(const AsyncDataObject&) = delete;
+    AsyncDataObject(AsyncDataObject&&) = delete;
+    AsyncDataObject& operator=(AsyncDataObject&&) = delete;
     virtual ~AsyncDataObject() = default;
 
     // IUnknown

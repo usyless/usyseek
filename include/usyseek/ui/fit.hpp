@@ -1,11 +1,12 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <string_view>
 
 namespace usyseek::ui {
 
-enum class ThumbFit { Crop, Contain };
+enum class ThumbFit : uint8_t { Crop, Contain };
 
 struct FitRect {
     float left = 0.0f, top = 0.0f, width = 0.0f, height = 0.0f;

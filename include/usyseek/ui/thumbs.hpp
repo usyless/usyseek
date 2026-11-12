@@ -88,6 +88,10 @@ class Thumbs {
 public:
     /// `full` decodes the image itself (WIC) at up to `px` before falling back to the shell thumbnail: used for previews.
     explicit Thumbs(size_t max_bitmaps = 240, bool full = false) : max_bitmaps_{max_bitmaps}, full_{full} {}
+    Thumbs(const Thumbs&) = delete;
+    Thumbs& operator=(const Thumbs&) = delete;
+    Thumbs(Thumbs&&) = delete;
+    Thumbs& operator=(Thumbs&&) = delete;
     ~Thumbs() { stop(); }
 
     void start(HWND notify, UINT msg, unsigned threads = 3) {

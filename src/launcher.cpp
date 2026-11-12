@@ -21,7 +21,7 @@ constexpr int HOTKEY_ID = 1;
 constexpr UINT_PTR TIMER_STOP_INDEX = 1;
 constexpr UINT_PTR TIMER_TRAY_PROGRESS = 2;
 
-enum MenuId : UINT {
+enum MenuId : uint8_t {
     IdSearch = 100,
     IdSettings,
     IdCloseUi,

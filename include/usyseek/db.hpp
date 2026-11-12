@@ -6,7 +6,6 @@
 #include <glaze/glaze.hpp>
 #include <wil/resource.h>
 
-#include <mutex>
 #include <thread>
 
 extern "C" {
@@ -100,6 +99,8 @@ public:
     Db() = default;
     Db(const Db&) = delete;
     Db& operator=(const Db&) = delete;
+    Db(Db&&) = delete;
+    Db& operator=(Db&&) = delete;
     ~Db() {
         if (q_) usy_qd_free(q_);
     }
@@ -126,7 +127,7 @@ public:
         return false;
     }
 
-    enum class CollectionStatus {
+    enum class CollectionStatus : uint8_t {
         Ready,     // collection exists or was created
         NeedsDims, // collection does not exist and dim == 0
         Error,

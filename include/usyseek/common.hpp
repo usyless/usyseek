@@ -6,7 +6,6 @@
 #include <shlobj.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -14,7 +13,6 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <vector>
 
 #include <rapidhash.h>
 
@@ -34,7 +32,7 @@ inline constexpr wchar_t INDEXER_STOP_EVENT[] = L"Local\\usyseek.indexer.stop";
 inline constexpr wchar_t EVERYTHING_INSTANCE[] = L"uk.usyless.usyseek";
 
 // WM_COPYDATA commands sent to the launcher window
-enum class Cmd : ULONG_PTR {
+enum class Cmd : uint32_t {
     UiHello = 0x5553'0001,   // payload: uint64 pill hwnd
     StartIndex,
     StopIndex,
@@ -46,7 +44,7 @@ enum class Cmd : ULONG_PTR {
 };
 
 /// Whether the launcher currently holds the global search shortcut.
-enum class HotkeyState : uint32_t {
+enum class HotkeyState : uint8_t {
     Unknown = 0, // no launcher to ask
     Registered,
     Disabled,    // switched off in settings

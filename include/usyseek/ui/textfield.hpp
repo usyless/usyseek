@@ -133,7 +133,7 @@ public:
         BOOL trailing = FALSE, inside = FALSE;
         DWRITE_HIT_TEST_METRICS m{};
         layout->HitTestPoint(x - rect_.left + scroll_, 1.0f, &trailing, &inside, &m);
-        move_to(static_cast<size_t>(m.textPosition + (trailing ? m.length : 0)), extend);
+        move_to(static_cast<size_t>(m.textPosition) + (trailing ? static_cast<size_t>(m.length) : 0), extend);
     }
 
     /// Positions the IME candidate window under the caret (pixels = DIPs * scale).

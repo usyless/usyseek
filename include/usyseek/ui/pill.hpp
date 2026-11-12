@@ -193,7 +193,7 @@ private:
     static constexpr uint64_t COPY_MAX_PIXELS = 40'000'000;
     static constexpr int CLIPBOARD_ATTEMPTS = 10;
 
-    enum Id {
+    enum Id : uint8_t {
         IdNone = 0,
         IdField,
         IdChip,
@@ -226,7 +226,7 @@ private:
         IdPvCopy,
         IdPvClose,
     };
-    enum MenuAction { ActOpen, ActPreview, ActReveal, ActSimilar, ActCopy, ActCopyPath, ActCount };
+    enum MenuAction : uint8_t { ActOpen, ActPreview, ActReveal, ActSimilar, ActCopy, ActCopyPath, ActCount };
 
     struct Item {
         DbPoint pt;
@@ -1224,6 +1224,7 @@ private:
     void copy_media(const std::vector<const Item*>& sel) {
         if (sel.empty()) return;
         std::vector<std::wstring> paths;
+        paths.reserve(sel.size());
         for (const auto* it : sel) paths.push_back(item_path(*it));
         const Item& one = *sel.front();
         const bool decode = sel.size() == 1 && one.pt.p.k == 0 && !svg::is_svg(paths[0]) && static_cast<uint64_t>(one.pt.p.w) * one.pt.p.h <= COPY_MAX_PIXELS;

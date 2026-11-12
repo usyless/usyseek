@@ -129,7 +129,7 @@ inline ParsedQuery parse_query(std::wstring_view q) {
 
 class TextEncoder {
 public:
-    enum class State { Idle, Exporting, Loading, Ready, Failed };
+    enum class State : uint8_t { Idle, Exporting, Loading, Ready, Failed };
     std::function<void()> on_state_changed;
 
     /// Loads the text tower in the background. A request made while another load is running replaces it
@@ -250,6 +250,8 @@ private:
         Model() = default;
         Model(const Model&) = delete;
         Model& operator=(const Model&) = delete;
+        Model(Model&&) = delete;
+        Model& operator=(Model&&) = delete;
         ~Model() {
             if (tok) usy_tok_free(tok);
         }

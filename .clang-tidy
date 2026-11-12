@@ -28,10 +28,13 @@ Checks: >
   -readability-identifier-naming,
   -readability-redundant-member-init,
   -readability-function-cognitive-complexity,
-  -readability-avoid-nested-conditional-operator
+  -readability-avoid-nested-conditional-operator,
+  -readability-uppercase-literal-suffix,
+  -readability-implicit-bool-conversion,
+  -performance-no-int-to-ptr
 
 WarningsAsErrors: ''
-HeaderFilterRegex: '.*'
+HeaderFilterRegex: 'usyseek[/\\](src|include)[/\\]'
 CheckOptions:
   readability-identifier-naming.VariableCase: lower_case
   readability-braces-around-statements.ShortStatementLines: 1

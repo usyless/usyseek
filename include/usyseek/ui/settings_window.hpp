@@ -188,7 +188,7 @@ private:
     static constexpr float CARD_GAP = 16.0f;
     static constexpr UINT_PTR TIMER_CARET = 1, TIMER_POLL = 3, TIMER_DEVICE = 4;
 
-    enum Id {
+    enum Id : uint8_t {
         IdNone = 0,
         IdTab0,
         IdTab1,

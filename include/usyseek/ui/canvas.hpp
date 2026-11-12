@@ -213,7 +213,7 @@ inline float width(const D2D1_RECT_F& r) noexcept { return r.right - r.left; }
 inline float height(const D2D1_RECT_F& r) noexcept { return r.bottom - r.top; }
 inline D2D1_RECT_F snap(D2D1_RECT_F r) noexcept { return D2D1::RectF(std::round(r.left), std::round(r.top), std::round(r.right), std::round(r.bottom)); }
 
-enum class Align { Left, Center, Right };
+enum class Align : uint8_t { Left, Center, Right };
 
 /// Immediate-mode drawing helpers over one device context, plus hit-region recording.
 class Canvas {
