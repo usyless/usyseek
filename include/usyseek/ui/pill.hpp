@@ -5,9 +5,11 @@
 
 #include <shellscalingapi.h>
 
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <unordered_set>
+#include <utility>
 
 namespace usyseek::ui {
 
@@ -46,6 +48,7 @@ public:
     WindowTarget& target() noexcept { return target_; }
 
     void show() {
+        blur_hide_tick_ = 0;
         if (!visible()) {
             place();
             fade_ = sh_.test_mode ? 1.0f : 0.0f;
@@ -125,6 +128,26 @@ public:
     void toggle() {
         if (visible() && !fading_out_ && GetForegroundWindow() == hwnd_) hide();
         else show();
+    }
+
+    void tray_hide() {
+        blur_hide_tick_ = 0;
+        hide();
+    }
+
+    void tray_select(POINT pt) {
+        if (visible()) {
+            if (!fading_out_) hide();
+            blur_hide_tick_ = 0;
+            return;
+        }
+        // Fallback if WM_LBUTTONDOWN wasn't delivered before NIN_SELECT: don't re-open a pill that just hid from this click.
+        const ULONGLONG blur_tick = std::exchange(blur_hide_tick_, 0);
+        if (blur_tick != 0 && GetTickCount64() - blur_tick < 1500 &&
+            std::abs(pt.x - blur_hide_cursor_.x) <= 48 && std::abs(pt.y - blur_hide_cursor_.y) <= 48) {
+            return;
+        }
+        show();
     }
 
     /// Asks for a repaint. Any number of calls before the next WM_PAINT collapse into a single frame, and
@@ -2206,7 +2229,13 @@ private:
             }
             case WM_ACTIVATE:
                 if (LOWORD(wp) == WA_INACTIVE && sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && !dragging_out_) {
-                    if (GetTickCount64() - shown_tick_ > 250) hide();
+                    if (GetTickCount64() - shown_tick_ > 250) {
+                        if (visible() && !fading_out_) {
+                            GetCursorPos(&blur_hide_cursor_);
+                            blur_hide_tick_ = GetTickCount64();
+                        }
+                        hide();
+                    }
                 }
                 return 0;
             case WM_CAPTURECHANGED:
@@ -2334,6 +2363,8 @@ private:
     bool rendering_ = false;
     bool dirty_ = false; // state changed since the last frame
     ULONGLONG shown_tick_ = 0;
+    ULONGLONG blur_hide_tick_ = 0;
+    POINT blur_hide_cursor_{};
 
     TextField field_;
     int chip_ = -1;

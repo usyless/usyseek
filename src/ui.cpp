@@ -240,7 +240,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         }
         if (msg == m_toggle && m_toggle) {
             done = true;
-            pill.toggle();
+            switch (static_cast<ToggleMode>(wp)) {
+                case ToggleMode::Hide:
+                    pill.tray_hide();
+                    break;
+                case ToggleMode::TraySelect:
+                    pill.tray_select({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+                    break;
+                case ToggleMode::Toggle:
+                default:
+                    pill.toggle();
+                    break;
+            }
             return 0;
         }
         if (msg == m_settings && m_settings) {

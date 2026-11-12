@@ -52,6 +52,12 @@ enum class HotkeyState : uint8_t {
 };
 
 // Registered window messages (cross-process)
+enum class ToggleMode : uint8_t {
+    Toggle = 0,     // hotkey or direct invocation: hide if active, otherwise show
+    Hide = 1,       // hide if visible (tray click started while pill was open)
+    TraySelect = 2, // tray icon click fallback: avoid re-opening right after focus-loss hide
+};
+
 inline UINT msg_toggle_search() noexcept {
     static const UINT m = RegisterWindowMessageW(L"usyseek.toggle_search");
     return m;

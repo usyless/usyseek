@@ -9,6 +9,8 @@
 #include <shellapi.h>
 #include <wil/resource.h>
 
+#include <utility>
+
 #include "resource.h"
 
 namespace {
@@ -114,12 +116,20 @@ private:
                 return 0;
             case WM_TRAY:
                 switch (LOWORD(lp)) {
+                    case WM_LBUTTONDOWN:
+                    case WM_LBUTTONDBLCLK:
+                        tray_hide_on_select_ = is_pill_visible();
+                        break;
                     case NIN_SELECT:
+                        on_tray_select();
+                        break;
                     case NIN_KEYSELECT:
+                        tray_hide_on_select_ = false;
                         toggle_search();
                         break;
                     case WM_CONTEXTMENU:
                     case WM_RBUTTONUP:
+                        tray_hide_on_select_ = false;
                         show_menu();
                         break;
                 }
@@ -221,12 +231,31 @@ private:
         ui_ = spawn(exe_dir() / L"usyseek-ui.exe", arg, false);
     }
 
+    bool is_pill_visible() const {
+        return ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_) && IsWindowVisible(ui_hwnd_);
+    }
+
     void toggle_search() {
         if (ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_)) {
             AllowSetForegroundWindow(ui_.dwProcessId);
-            SetForegroundWindow(ui_hwnd_);
-            PostMessageW(ui_hwnd_, msg_toggle_search(), 0, 0);
+            PostMessageW(ui_hwnd_, msg_toggle_search(), static_cast<WPARAM>(ToggleMode::Toggle), 0);
         } else if (!ui_.hProcess) {
+            spawn_ui(L"--show");
+        }
+    }
+
+    void on_tray_select() {
+        const bool hide_only = std::exchange(tray_hide_on_select_, false);
+        if (ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_)) {
+            if (hide_only) {
+                PostMessageW(ui_hwnd_, msg_toggle_search(), static_cast<WPARAM>(ToggleMode::Hide), 0);
+                return;
+            }
+            AllowSetForegroundWindow(ui_.dwProcessId);
+            POINT pt{};
+            GetCursorPos(&pt);
+            PostMessageW(ui_hwnd_, msg_toggle_search(), static_cast<WPARAM>(ToggleMode::TraySelect), MAKELPARAM(pt.x, pt.y));
+        } else if (!ui_.hProcess && !hide_only) {
             spawn_ui(L"--show");
         }
     }
@@ -306,6 +335,7 @@ private:
         if (h == ui_.hProcess) {
             ui_.reset();
             ui_hwnd_ = nullptr;
+            tray_hide_on_select_ = false;
             maybe_stop_qdrant();
         } else if (h == indexer_.hProcess) {
             KillTimer(hwnd_, TIMER_STOP_INDEX);
@@ -504,6 +534,7 @@ private:
     wil::unique_process_information indexer_;
     wil::unique_process_information qdrant_;
     bool stopping_index_ = false;
+    bool tray_hide_on_select_ = false;
     std::wstring last_tip_;
 };
 
