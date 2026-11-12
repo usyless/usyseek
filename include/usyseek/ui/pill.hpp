@@ -894,7 +894,7 @@ private:
         drop_items_.clear();
         for (const auto& tc : sh_.tags) {
             const std::wstring w = to_wide(tc.v);
-            if (prefix.empty() || w.find(prefix) != std::wstring::npos) drop_items_.push_back(tc);
+            if (prefix.empty() || w.contains(prefix)) drop_items_.push_back(tc);
         }
         std::stable_sort(drop_items_.begin(), drop_items_.end(), [&](const TagCount& a, const TagCount& b) {
             const bool pa = to_wide(a.v).starts_with(prefix), pb = to_wide(b.v).starts_with(prefix);
@@ -910,7 +910,7 @@ private:
     void accept_dropdown(int index) {
         if (index < 0 || index >= static_cast<int>(drop_items_.size())) return;
         const std::wstring tag = to_wide(drop_items_[index].v);
-        const std::wstring value = tag.find(L' ') != std::wstring::npos ? L"\"" + tag + L"\"" : tag;
+        const std::wstring value = tag.contains(L' ') ? L"\"" + tag + L"\"" : tag;
         if (auto tok = tag_token()) {
             size_t end = field_.caret;
             while (end < field_.text.size() && !iswspace(field_.text[end])) ++end;

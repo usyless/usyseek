@@ -516,7 +516,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (HWND existing = FindWindowW(LAUNCHER_CLASS, nullptr)) {
             const std::wstring_view args{cmdline ? cmdline : L""};
-            if (args.find(L"--index") != std::wstring_view::npos) send_cmd(existing, Cmd::StartIndex);
+            if (args.contains(L"--index")) send_cmd(existing, Cmd::StartIndex);
             else PostMessageW(existing, msg_toggle_search(), 0, 0);
         }
         return 0;

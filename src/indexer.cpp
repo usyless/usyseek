@@ -111,7 +111,7 @@ struct Scope {
             if (l.size() > e.size() && l.starts_with(e) && l[e.size()] == L'\\') return true;
         }
         for (const auto& n : name_excludes) {
-            if (l.find(n) != std::wstring::npos) return true;
+            if (l.contains(n)) return true;
         }
         return false;
     }

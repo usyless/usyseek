@@ -932,7 +932,7 @@ private:
             }
             for (size_t i = 0; i < sh_.settings.exclude_dirs.size(); ++i) {
                 const std::wstring wex = to_wide(sh_.settings.exclude_dirs[i]);
-                const bool is_pat = wex.find(L'*') != std::wstring::npos || !(wex.size() >= 2 && wex[1] == L':');
+                const bool is_pat = wex.contains(L'*') || !(wex.size() >= 2 && wex[1] == L':');
                 rows.push_back({wex, is_pat ? L"Pattern" : L"Folder", false, static_cast<int>(i), 0.0f, 0.0f});
             }
 
@@ -1593,7 +1593,7 @@ private:
     static bool valid_repo(std::string_view repo) {
         const auto slash = repo.find('/');
         if (slash == std::string_view::npos || slash == 0 || slash + 1 >= repo.size() || repo.find('/', slash + 1) != std::string_view::npos) return false;
-        if (repo.find("..") != std::string_view::npos) return false;
+        if (repo.contains("..")) return false;
         return std::ranges::all_of(repo, [](unsigned char c) { return std::isalnum(c) != 0 || c == '/' || c == '-' || c == '_' || c == '.'; });
     }
 
@@ -1742,7 +1742,7 @@ private:
         const std::string prefix = want + ".";
         std::optional<std::string> best;
         for (const auto& v : idx.versions) {
-            if (!v.starts_with(prefix) || v.find('-') != std::string::npos) continue; // stable only
+            if (!v.starts_with(prefix) || v.contains('-')) continue; // stable only
             if (!best || parse_ver(v) > parse_ver(*best)) best = v;
         }
         if (!best) append_venv_log(L"No stable Python " + to_wide(want) + L".x release on NuGet");
