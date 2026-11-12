@@ -77,6 +77,7 @@ public:
     void finish_hide() {
         fading_out_ = false;
         fade_ = target_fade_ = 0.0f;
+        chip_anim_.snap(static_cast<float>(chip_ + 1));
         searching_ = false;
         loading_more_ = false;
         debounce_pending_ = false;
@@ -556,17 +557,17 @@ private:
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
         last_anim_ = now;
+        bool moving = false;
         const float d = target_scroll_ - scroll_;
         if (std::abs(d) < 0.5f) {
             scroll_ = target_scroll_;
-            return false;
+        } else {
+            scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
+            if (std::abs(target_scroll_ - scroll_) < 0.5f) scroll_ = target_scroll_;
+            else moving = true;
         }
-        scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
-        if (std::abs(target_scroll_ - scroll_) < 0.5f) {
-            scroll_ = target_scroll_;
-            return false;
-        }
-        return true;
+        if (chip_anim_.step(dt)) moving = true;
+        return moving;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -634,15 +635,27 @@ private:
         x -= total;
         const D2D1_RECT_F seg = rect(x, cy - 17, total, 34);
         cv.fill_round(seg, 17, with_alpha(color::surface_highest, 0.85f));
+        D2D1_RECT_F chip_rects[3]{};
         float cx = x + 3;
         for (int i = 0; i < 3; ++i) {
-            const D2D1_RECT_F r = rect(cx, cy - 14, widths[i], 28);
-            const bool on = chip_ == i - 1;
-            if (on) cv.fill_round(r, 14, color::primary_container);
-            else if (hover_id_ == IdChip && hover_index_ == i) cv.fill_round(r, 14, with_alpha(color::on_surface, 0.07f));
-            cv.text(labels[i], r, Font::SmallSemi, on ? color::on_primary_container : color::on_surface_variant, Align::Center);
-            cv.hit(r, IdChip, i);
+            chip_rects[i] = rect(cx, cy - 14, widths[i], 28);
             cx += widths[i];
+        }
+        const float ct = std::clamp(chip_anim_.value, 0.0f, 2.0f);
+        for (int i = 0; i < 3; ++i) {
+            const float act = std::max(0.0f, 1.0f - std::abs(ct - static_cast<float>(i)));
+            if (act < 0.5f && hover_id_ == IdChip && hover_index_ == i) {
+                cv.fill_round(chip_rects[i], 14, with_alpha(color::on_surface, 0.07f));
+            }
+        }
+        const int lo = std::clamp(static_cast<int>(std::floor(ct)), 0, 1);
+        const float frac = ct - static_cast<float>(lo);
+        cv.fill_round(lerp_rect(chip_rects[lo], chip_rects[lo + 1], frac), 14, color::primary_container);
+        for (int i = 0; i < 3; ++i) {
+            const float act = std::max(0.0f, 1.0f - std::abs(ct - static_cast<float>(i)));
+            cv.text(labels[i], chip_rects[i], Font::SmallSemi,
+                    lerp_color(color::on_surface_variant, color::on_primary_container, act), Align::Center);
+            cv.hit(chip_rects[i], IdChip, i);
         }
 
         // Text field
@@ -1676,6 +1689,8 @@ private:
             }
             case IdChip:
                 chip_ = idx - 1;
+                chip_anim_.set(static_cast<float>(idx), visible() && !sh_.test_mode);
+                if (visible() && !sh_.test_mode) start_anim();
                 if (!trim(field_.text).empty()) run_search(0);
                 break;
             case IdHelpBtn:
@@ -2165,6 +2180,7 @@ private:
 
     TextField field_;
     int chip_ = -1;
+    AnimFloat chip_anim_;
     std::wstring last_query_;
     uint64_t seq_ = 0;
     bool debounce_pending_ = false;

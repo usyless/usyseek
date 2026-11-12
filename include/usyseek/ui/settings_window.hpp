@@ -100,6 +100,8 @@ public:
         cuda_field_.placeholder = L"cu126";
         torch_field_.placeholder = L"Optional custom pip args (e.g. --index-url ... torch==2.7.1 torchvision==0.22.1)";
         sync_fields();
+        tab_anim_.snap(static_cast<float>(tab_));
+        sync_switch_targets(false);
         probe_venv();
         scan_models();
         return true;
@@ -115,6 +117,8 @@ public:
             scroll_ = target_scroll_ = 0.0f;
         }
         sync_fields();
+        tab_anim_.snap(static_cast<float>(tab_));
+        sync_switch_targets(false);
         probe_venv();
         scan_models();
         sh_.poll_indexer(true);
@@ -135,6 +139,7 @@ public:
             active_field_->focused = false;
             active_field_ = nullptr;
         }
+        snap_anims();
         KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_POLL);
         KillTimer(hwnd_, TIMER_DEVICE);
@@ -144,9 +149,12 @@ public:
     }
 
     void set_tab(int t) {
+        const bool animate = visible() && !sh_.test_mode;
         tab_ = t;
+        tab_anim_.set(static_cast<float>(t), animate);
         scroll_ = target_scroll_ = 0.0f;
         active_field_ = nullptr;
+        if (animate) start_anim();
         invalidate();
     }
 
@@ -384,10 +392,13 @@ private:
     void draw_switch(Canvas& cv, float right_x, float cy, bool on, int id, int idx = 0) {
         const D2D1_RECT_F r = rect(right_x - 44.0f, cy - 12.0f, 44.0f, 24.0f);
         const bool hov = hovered(id, idx);
-        cv.fill_round(r, 12.0f, on ? color::primary : (hov ? color::surface_highest : color::surface_high));
-        if (!on) cv.stroke_round(r, 12.0f, color::outline);
-        const float kx = on ? r.right - 12.0f : r.left + 12.0f;
-        cv.fill_circle({kx, cy}, on ? 8.0f : 7.0f, on ? color::on_primary : color::outline);
+        const float t = switch_anim_value(id, on);
+        const D2D1_COLOR_F off_track = hov ? color::surface_highest : color::surface_high;
+        cv.fill_round(r, 12.0f, lerp_color(off_track, color::primary, t));
+        if (t < 1.0f) cv.stroke_round(r, 12.0f, with_alpha(color::outline, 1.0f - t));
+        const float kx = lerp(r.left + 12.0f, r.right - 12.0f, t);
+        const float kr = lerp(7.0f, 8.0f, t);
+        cv.fill_circle({kx, cy}, kr, lerp_color(color::outline, color::on_primary, t));
         cv.hit(r, id, idx);
     }
 
@@ -556,17 +567,26 @@ private:
         cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(color::surface_lowest, 0.75f));
         const auto tabs = tab_defs();
         const FlowResult layout = tab_layout(sz.width);
+        D2D1_RECT_F rects[2]{};
         for (int i = 0; i < 2; ++i) {
             const FlowPlacement& p = layout.placements[i];
-            const float x = PAD + p.x;
+            rects[i] = rect(PAD + p.x, 8.0f + p.y, p.width, TABS_H - 16.0f);
+        }
+        const float t = std::clamp(tab_anim_.value, 0.0f, 1.0f);
+        for (int i = 0; i < 2; ++i) {
+            const float act = i == 0 ? 1.0f - t : t;
+            if (act < 0.5f && hovered(tabs[i].id)) {
+                cv.fill_round(rects[i], 10.0f, with_alpha(color::on_surface, 0.07f));
+            }
+        }
+        cv.fill_round(lerp_rect(rects[0], rects[1], t), 10.0f, color::primary_container);
+        for (int i = 0; i < 2; ++i) {
+            const D2D1_RECT_F r = rects[i];
+            const float act = i == 0 ? 1.0f - t : t;
             const float tw = cv.measure(tabs[i].label, Font::BodySemi);
-            const D2D1_RECT_F r = rect(x, 8.0f + p.y, p.width, TABS_H - 16.0f);
-            const bool on = tab_ == i;
-            if (on) cv.fill_round(r, 10.0f, color::primary_container);
-            else if (hovered(tabs[i].id)) cv.fill_round(r, 10.0f, with_alpha(color::on_surface, 0.07f));
-            const D2D1_COLOR_F fg = on ? color::on_primary_container : color::on_surface_variant;
-            cv.icon(tabs[i].g, rect(x + 12.0f, r.top, 18.0f, height(r)), fg, Font::IconSmall);
-            cv.text(tabs[i].label, rect(x + 34.0f, r.top, tw + 4.0f, height(r)), Font::BodySemi, fg);
+            const D2D1_COLOR_F fg = lerp_color(color::on_surface_variant, color::on_primary_container, act);
+            cv.icon(tabs[i].g, rect(r.left + 12.0f, r.top, 18.0f, height(r)), fg, Font::IconSmall);
+            cv.text(tabs[i].label, rect(r.left + 34.0f, r.top, tw + 4.0f, height(r)), Font::BodySemi, fg);
             cv.hit(r, tabs[i].id);
         }
         cv.hline(0, sz.width, strip_h, with_alpha(color::outline_variant, 0.65f));
@@ -1860,17 +1880,49 @@ private:
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
         last_anim_ = now;
+        bool moving = false;
         const float d = target_scroll_ - scroll_;
         if (std::abs(d) < 0.5f) {
             scroll_ = target_scroll_;
-            return false;
+        } else {
+            scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
+            if (std::abs(target_scroll_ - scroll_) < 0.5f) scroll_ = target_scroll_;
+            else moving = true;
         }
-        scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
-        if (std::abs(target_scroll_ - scroll_) < 0.5f) {
-            scroll_ = target_scroll_;
-            return false;
+        if (tab_anim_.step(dt)) moving = true;
+        if (sw_hotkey_.step(dt)) moving = true;
+        if (sw_startup_.step(dt)) moving = true;
+        if (sw_hide_focus_.step(dt)) moving = true;
+        return moving;
+    }
+
+    void sync_switch_targets(bool animate) noexcept {
+        sw_hotkey_.set(sh_.settings.hotkey_enabled ? 1.0f : 0.0f, animate);
+        sw_startup_.set(sh_.settings.launch_on_startup ? 1.0f : 0.0f, animate);
+        sw_hide_focus_.set(sh_.settings.hide_on_focus_loss ? 1.0f : 0.0f, animate);
+    }
+
+    void update_switch_anims() {
+        const bool animate = visible() && !sh_.test_mode;
+        sync_switch_targets(animate);
+        if (animate) start_anim();
+    }
+
+    void snap_anims() noexcept {
+        scroll_ = target_scroll_;
+        tab_anim_.snap(tab_anim_.target);
+        sw_hotkey_.snap(sw_hotkey_.target);
+        sw_startup_.snap(sw_startup_.target);
+        sw_hide_focus_.snap(sw_hide_focus_.target);
+    }
+
+    [[nodiscard]] float switch_anim_value(int id, bool fallback_on) const noexcept {
+        switch (id) {
+            case IdToggleHotkey: return std::clamp(sw_hotkey_.value, 0.0f, 1.0f);
+            case IdToggleStartup: return std::clamp(sw_startup_.value, 0.0f, 1.0f);
+            case IdToggleHideFocus: return std::clamp(sw_hide_focus_.value, 0.0f, 1.0f);
+            default: return fallback_on ? 1.0f : 0.0f;
         }
-        return true;
     }
 
     void commit_fields() {
@@ -2117,6 +2169,7 @@ private:
                 sh_.settings.hotkey_enabled = !sh_.settings.hotkey_enabled;
                 sh_.save();
                 reload_launcher_hotkey();
+                update_switch_anims();
                 break;
             case IdRecordHotkey:
                 if (recording_hotkey_) {
@@ -2132,15 +2185,18 @@ private:
                 sh_.settings.hotkey_enabled = true;
                 sh_.save();
                 reload_launcher_hotkey();
+                update_switch_anims();
                 break;
             case IdToggleStartup:
                 sh_.settings.launch_on_startup = !sh_.settings.launch_on_startup;
                 set_startup_enabled(sh_.settings.launch_on_startup);
                 sh_.save();
+                update_switch_anims();
                 break;
             case IdToggleHideFocus:
                 sh_.settings.hide_on_focus_loss = !sh_.settings.hide_on_focus_loss;
                 sh_.save();
+                update_switch_anims();
                 break;
             case IdThumbFit:
                 sh_.settings.thumb_fit = idx == static_cast<int>(ThumbFit::Contain) ? "contain" : "crop";
@@ -2527,6 +2583,10 @@ private:
     std::atomic<bool> redraw_posted_{false};
 
     int tab_ = 0;
+    AnimFloat tab_anim_;
+    AnimFloat sw_hotkey_;
+    AnimFloat sw_startup_;
+    AnimFloat sw_hide_focus_;
     int hover_id_ = IdNone;
     int hover_index_ = 0;
     bool tracking_ = false;

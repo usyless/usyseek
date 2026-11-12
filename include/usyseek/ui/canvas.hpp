@@ -1,8 +1,10 @@
 #pragma once
 
+#include "anim.hpp"
 #include "fit.hpp"
 #include "gfx.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 
@@ -14,6 +16,13 @@ inline D2D1_COLOR_F hex(uint32_t rgb, float a = 1.0f) noexcept {
 inline D2D1_COLOR_F with_alpha(D2D1_COLOR_F c, float a) noexcept {
     c.a = a;
     return c;
+}
+[[nodiscard]] inline D2D1_COLOR_F lerp_color(D2D1_COLOR_F a, D2D1_COLOR_F b, float t) noexcept {
+    const float k = std::clamp(t, 0.0f, 1.0f);
+    return {lerp(a.r, b.r, k), lerp(a.g, b.g, k), lerp(a.b, b.b, k), lerp(a.a, b.a, k)};
+}
+[[nodiscard]] inline D2D1_RECT_F lerp_rect(D2D1_RECT_F a, D2D1_RECT_F b, float t) noexcept {
+    return {lerp(a.left, b.left, t), lerp(a.top, b.top, t), lerp(a.right, b.right, t), lerp(a.bottom, b.bottom, t)};
 }
 
 // Material 3 dark tokens (from the mockup)
