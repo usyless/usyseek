@@ -58,11 +58,21 @@ public:
         CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_));
     }
 
-    std::optional<Decoded> image(const std::wstring& path) {
+    std::optional<Decoded> image(const std::wstring& path, uint32_t frame_count = 1) {
         if (svg::is_svg(path)) return vector_image(path);
         if (!wic_) return std::nullopt;
         wil::com_ptr<IWICBitmapDecoder> dec;
         if (FAILED(wic_->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) return std::nullopt;
+
+        if (frame_count > 1) {
+            GUID container{};
+            UINT count = 0;
+            if (SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatGif &&
+                SUCCEEDED(dec->GetFrameCount(&count)) && count > 1) {
+                return animated_gif(dec.get(), count, frame_count);
+            }
+        }
+
         wil::com_ptr<IWICBitmapFrameDecode> frame;
         if (FAILED(dec->GetFrame(0, &frame))) return std::nullopt;
 
@@ -161,6 +171,134 @@ public:
     }
 
 private:
+    static bool query_u16(IWICMetadataQueryReader* q, const wchar_t* name, UINT& out) {
+        if (!q) return false;
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        const bool ok = SUCCEEDED(q->GetMetadataByName(name, &v)) && (v.vt == VT_UI2 || v.vt == VT_UI1);
+        if (ok) out = (v.vt == VT_UI2) ? v.uiVal : v.bVal;
+        PropVariantClear(&v);
+        return ok;
+    }
+
+    std::optional<Decoded> animated_gif(IWICBitmapDecoder* dec, UINT total, uint32_t frame_count) {
+        UINT cw = 0, ch = 0;
+        {
+            wil::com_ptr<IWICMetadataQueryReader> gmeta;
+            if (SUCCEEDED(dec->GetMetadataQueryReader(&gmeta))) {
+                query_u16(gmeta.get(), L"/logscrdesc/Width", cw);
+                query_u16(gmeta.get(), L"/logscrdesc/Height", ch);
+            }
+        }
+        if (cw == 0 || ch == 0) {
+            wil::com_ptr<IWICBitmapFrameDecode> f0;
+            if (FAILED(dec->GetFrame(0, &f0)) || FAILED(f0->GetSize(&cw, &ch))) return std::nullopt;
+        }
+        if (cw < 32 || ch < 32 || static_cast<uint64_t>(cw) * ch * 4 > (512ull << 20)) return std::nullopt;
+
+        const UINT n = std::min<UINT>(total, std::max(1u, frame_count));
+        std::vector<UINT> targets;
+        targets.reserve(n);
+        if (n == total) {
+            for (UINT i = 0; i < total; ++i) targets.push_back(i);
+        } else {
+            for (uint32_t k = 0; k < n; ++k) {
+                const UINT idx = static_cast<UINT>((static_cast<uint64_t>(total) * (2ull * k + 1)) / (2ull * n));
+                if (targets.empty() || idx > targets.back()) targets.push_back(std::min(idx, total - 1));
+            }
+        }
+        if (targets.empty()) return std::nullopt;
+
+        std::vector<uint8_t> canvas(static_cast<size_t>(cw) * ch * 4, 0);
+        std::vector<uint8_t> prev_canvas;
+        std::vector<uint8_t> frame_buf;
+        std::vector<Frame> sampled;
+        std::vector<double> lumas;
+        sampled.reserve(targets.size());
+        lumas.reserve(targets.size());
+
+        size_t next_target = 0;
+        for (UINT i = 0; i <= targets.back(); ++i) {
+            while (next_target < targets.size() && targets[next_target] < i) ++next_target;
+            wil::com_ptr<IWICBitmapFrameDecode> frame;
+            if (FAILED(dec->GetFrame(i, &frame))) continue;
+            UINT fw = 0, fh = 0;
+            if (FAILED(frame->GetSize(&fw, &fh)) || fw == 0 || fh == 0) continue;
+
+            UINT left = 0, top = 0, disposal = 0;
+            {
+                wil::com_ptr<IWICMetadataQueryReader> fmeta;
+                if (SUCCEEDED(frame->GetMetadataQueryReader(&fmeta))) {
+                    query_u16(fmeta.get(), L"/imgdesc/Left", left);
+                    query_u16(fmeta.get(), L"/imgdesc/Top", top);
+                    query_u16(fmeta.get(), L"/grctlext/Disposal", disposal);
+                }
+            }
+
+            if (disposal == 3) prev_canvas = canvas;
+
+            wil::com_ptr<IWICFormatConverter> conv;
+            if (FAILED(wic_->CreateFormatConverter(&conv))) continue;
+            if (FAILED(conv->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) continue;
+            const size_t fstride = static_cast<size_t>(fw) * 4;
+            if (static_cast<uint64_t>(fstride) * fh > (512ull << 20)) continue;
+            frame_buf.resize(fstride * fh);
+            if (FAILED(conv->CopyPixels(nullptr, static_cast<UINT>(fstride), static_cast<UINT>(frame_buf.size()), frame_buf.data()))) continue;
+
+            const UINT copy_w = left < cw ? std::min(fw, cw - left) : 0;
+            const UINT copy_h = top < ch ? std::min(fh, ch - top) : 0;
+            for (UINT y = 0; y < copy_h; ++y) {
+                const uint8_t* src = frame_buf.data() + static_cast<size_t>(y) * fstride;
+                uint8_t* dst = canvas.data() + (static_cast<size_t>(top + y) * cw + left) * 4;
+                for (UINT x = 0; x < copy_w; ++x, src += 4, dst += 4) {
+                    const uint8_t a = src[3];
+                    if (a == 255) {
+                        std::memcpy(dst, src, 4);
+                    } else if (a > 0) {
+                        const uint32_t inv = 255u - a;
+                        dst[0] = static_cast<uint8_t>(std::min<uint32_t>(255, src[0] + (dst[0] * inv + 127) / 255));
+                        dst[1] = static_cast<uint8_t>(std::min<uint32_t>(255, src[1] + (dst[1] * inv + 127) / 255));
+                        dst[2] = static_cast<uint8_t>(std::min<uint32_t>(255, src[2] + (dst[2] * inv + 127) / 255));
+                        dst[3] = static_cast<uint8_t>(std::min<uint32_t>(255, a + (dst[3] * inv + 127) / 255));
+                    }
+                }
+            }
+
+            if (next_target < targets.size() && i == targets[next_target]) {
+                ++next_target;
+                wil::com_ptr<IWICBitmap> bmp;
+                if (SUCCEEDED(wic_->CreateBitmapFromMemory(cw, ch, GUID_WICPixelFormat32bppPBGRA, cw * 4, static_cast<UINT>(canvas.size()), canvas.data(), &bmp))) {
+                    Frame f;
+                    if (resize(bmp.get(), cw, ch, WICBitmapTransformRotate0, f)) {
+                        lumas.push_back(mean_luma(f.rgb));
+                        sampled.push_back(std::move(f));
+                    }
+                }
+            }
+
+            if (disposal == 2) {
+                for (UINT y = 0; y < copy_h; ++y) {
+                    std::memset(canvas.data() + (static_cast<size_t>(top + y) * cw + left) * 4, 0, static_cast<size_t>(copy_w) * 4);
+                }
+            } else if (disposal == 3) {
+                canvas.swap(prev_canvas);
+            }
+        }
+
+        if (sampled.empty()) return std::nullopt;
+        Decoded out;
+        out.width = cw;
+        out.height = ch;
+        if (!std::ranges::any_of(lumas, [](double l) { return l >= 5.0; })) {
+            out.frames = std::move(sampled);
+        } else {
+            for (size_t k = 0; k < sampled.size(); ++k) {
+                if (lumas[k] >= 5.0) out.frames.push_back(std::move(sampled[k]));
+            }
+        }
+        return out;
+    }
+
     /// SVG has no pixels of its own, so resvg rasterises it straight at the network input size.
     [[nodiscard]] std::optional<Decoded> vector_image(const std::wstring& path) const {
         const svg::Fit fit = mode_ == ResizeMode::Squash ? svg::Fit::Stretch

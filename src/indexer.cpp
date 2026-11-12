@@ -1072,7 +1072,7 @@ int run_indexer(Settings& settings) {
                 const FileEntry& f = files[todo[i]];
                 DecodedItem item{todo[i], {}};
                 try {
-                    item.data = f.kind == 0 ? dec.image(f.path) : dec.video(f.path, settings.video_frames);
+                    item.data = f.kind == 0 ? dec.image(f.path, settings.video_frames) : dec.video(f.path, settings.video_frames);
                 } catch (...) {
                     // Leaves item.data empty: the file is counted as failed and remembered so it is not retried
                 }
