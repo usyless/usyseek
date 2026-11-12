@@ -1,6 +1,7 @@
 #pragma once
 
 #include "canvas.hpp"
+#include "text_buffer.hpp"
 
 #include <imm.h>
 
@@ -32,74 +33,33 @@ inline void set_clipboard_text(HWND hwnd, std::wstring_view s) {
     CloseClipboard();
 }
 
-/// Single-line editable text with selection, word navigation, clipboard and IME positioning.
-class TextField {
+/// Single-line editable text with selection, word navigation, undo/redo, clipboard and IME positioning.
+class TextField : public TextBuffer {
 public:
-    std::wstring text;
     std::wstring placeholder;
-    size_t caret = 0;
-    size_t anchor = 0;
     bool focused = false;
     bool caret_on = true;
 
     void set(std::wstring s) {
-        text = std::move(s);
-        caret = anchor = text.size();
+        TextBuffer::set(std::move(s));
         scroll_ = 0.0f;
-    }
-    void select_all() {
-        anchor = 0;
-        caret = text.size();
-    }
-    [[nodiscard]] bool has_selection() const noexcept { return caret != anchor; }
-    [[nodiscard]] std::wstring_view selection() const {
-        const auto [a, b] = sel();
-        return std::wstring_view{text}.substr(a, b - a);
-    }
-
-    /// Returns true when the text changed.
-    bool on_char(wchar_t c) {
-        if (c < 0x20 || c == 0x7f) return false;
-        replace_selection(std::wstring_view{&c, 1});
-        return true;
     }
 
     /// Returns true when the text changed. `handled` reports whether the key was consumed.
     bool on_key(HWND hwnd, UINT vk, bool& handled) {
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;
+        const bool alt = GetKeyState(VK_MENU) < 0;
         handled = true;
-        auto move = [&](size_t to) {
-            caret = to;
-            if (!shift) anchor = caret;
-        };
         switch (vk) {
-            case VK_LEFT:
-                if (!shift && has_selection()) move(sel().first);
-                else move(ctrl ? word_left(caret) : (caret ? caret - 1 : 0));
-                return false;
-            case VK_RIGHT:
-                if (!shift && has_selection()) move(sel().second);
-                else move(ctrl ? word_right(caret) : std::min(text.size(), caret + 1));
-                return false;
-            case VK_HOME: move(0); return false;
-            case VK_END: move(text.size()); return false;
-            case VK_BACK:
-                if (!has_selection()) {
-                    if (caret == 0) return false;
-                    anchor = ctrl ? word_left(caret) : caret - 1;
-                }
-                replace_selection({});
-                return true;
-            case VK_DELETE:
-                if (!has_selection()) {
-                    if (caret >= text.size()) return false;
-                    anchor = ctrl ? word_right(caret) : caret + 1;
-                }
-                replace_selection({});
-                return true;
+            case VK_LEFT: move_left(ctrl, shift); return false;
+            case VK_RIGHT: move_right(ctrl, shift); return false;
+            case VK_HOME: move_home(shift); return false;
+            case VK_END: move_end(shift); return false;
+            case VK_BACK: return backspace(ctrl);
+            case VK_DELETE: return del(ctrl);
         }
-        if (ctrl) {
+        if (ctrl && !alt) {
             switch (vk) {
                 case 'A': select_all(); return false;
                 case 'C':
@@ -108,15 +68,17 @@ public:
                 case 'X':
                     if (!has_selection()) return false;
                     set_clipboard_text(hwnd, selection());
-                    replace_selection({});
-                    return true;
+                    return replace_selection({});
                 case 'V': {
                     std::wstring clip = clipboard_text(hwnd);
                     std::erase_if(clip, [](wchar_t c) { return c == L'\r' || c == L'\n' || c == L'\t'; });
                     if (clip.empty()) return false;
-                    replace_selection(clip);
-                    return true;
+                    return replace_selection(clip);
                 }
+                case 'Z': return shift ? redo() : undo();
+                case 'Y':
+                    if (!shift) return redo();
+                    break;
             }
         }
         handled = false;
@@ -171,13 +133,7 @@ public:
         BOOL trailing = FALSE, inside = FALSE;
         DWRITE_HIT_TEST_METRICS m{};
         layout->HitTestPoint(x - rect_.left + scroll_, 1.0f, &trailing, &inside, &m);
-        caret = std::min(text.size(), static_cast<size_t>(m.textPosition + (trailing ? m.length : 0)));
-        if (!extend) anchor = caret;
-    }
-
-    void select_word_at_caret() {
-        anchor = word_left(std::min(text.size(), caret + 1));
-        caret = word_right(anchor);
+        move_to(static_cast<size_t>(m.textPosition + (trailing ? m.length : 0)), extend);
     }
 
     /// Positions the IME candidate window under the caret (pixels = DIPs * scale).
@@ -194,29 +150,6 @@ public:
     [[nodiscard]] const D2D1_RECT_F& rect() const noexcept { return rect_; }
 
 private:
-    [[nodiscard]] std::pair<size_t, size_t> sel() const noexcept { return {std::min(caret, anchor), std::max(caret, anchor)}; }
-
-    void replace_selection(std::wstring_view s) {
-        const auto [a, b] = sel();
-        text.replace(a, b - a, s);
-        caret = anchor = a + s.size();
-    }
-
-    [[nodiscard]] size_t word_left(size_t i) const {
-        while (i > 0 && iswspace(text[i - 1])) --i;
-        while (i > 0 && !iswspace(text[i - 1]) && !is_sep(text[i - 1])) --i;
-        if (i > 0 && i == caret && is_sep(text[i - 1])) --i;
-        return i;
-    }
-    [[nodiscard]] size_t word_right(size_t i) const {
-        const size_t n = text.size();
-        if (i < n && is_sep(text[i])) return i + 1;
-        while (i < n && !iswspace(text[i]) && !is_sep(text[i])) ++i;
-        while (i < n && iswspace(text[i])) ++i;
-        return i;
-    }
-    static bool is_sep(wchar_t c) noexcept { return c == L'\\' || c == L'/' || c == L':' || c == L'.' || c == L'_' || c == L'-'; }
-
     wil::com_ptr<IDWriteTextLayout> make_layout(Canvas& cv) const {
         wil::com_ptr<IDWriteTextLayout> layout;
         IDWriteTextFormat* fmt = cv.fonts().get(font_);

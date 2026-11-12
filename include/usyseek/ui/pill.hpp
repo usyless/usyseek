@@ -914,13 +914,12 @@ private:
         if (auto tok = tag_token()) {
             size_t end = field_.caret;
             while (end < field_.text.size() && !iswspace(field_.text[end])) ++end;
-            field_.text.replace(tok->second, end - tok->second, value + L" ");
-            field_.caret = field_.anchor = tok->second + value.size() + 1;
+            field_.replace_range(tok->second, end - tok->second, value + L" ");
         } else {
             std::wstring t = trim(field_.text);
             if (!t.empty()) t += L' ';
             t += L"tag:" + value + L" ";
-            field_.set(t);
+            field_.replace_all(t);
         }
         drop_open_ = false;
         drop_from_button_ = false;
@@ -1000,7 +999,7 @@ private:
         std::wstring t = trim(field_.text);
         if (!t.empty()) t += L' ';
         t += ins;
-        field_.set(t);
+        field_.replace_all(t);
         field_.focused = true;
         help_pinned_ = false;
         hover_id_ = IdNone;
@@ -1202,7 +1201,7 @@ private:
     }
 
     void find_similar(const Item& it) {
-        field_.set(L"similar:" + item_path(it));
+        field_.replace_all(L"similar:" + item_path(it));
         field_.focused = true;
         run_search(0);
     }
