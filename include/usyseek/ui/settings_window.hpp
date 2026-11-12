@@ -186,7 +186,7 @@ private:
     static constexpr float TABS_H = 52.0f;
     static constexpr float PAD = 24.0f;
     static constexpr float CARD_GAP = 16.0f;
-    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_POLL = 3, TIMER_DEVICE = 4;
+    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_POLL = 3, TIMER_DEVICE = 4, TIMER_TOOLTIP = 5;
 
     enum Id : uint8_t {
         IdNone = 0,
@@ -210,6 +210,7 @@ private:
         IdAddExcludePattern,
         IdExcludeField,
         IdRemoveExclude,
+        IdLockedExclude,
         // Tab 2
         IdToggleHotkey,
         IdRecordHotkey,
@@ -559,6 +560,21 @@ private:
             cv.fill_round(tr, 3.0f, with_alpha(color::on_surface_variant, active ? 0.55f : 0.28f));
             cv.hit(D2D1::RectF(view.right - 12.0f, view.top, view.right, view.bottom), IdScrollbar);
             scroll_thumb_ = tr;
+        }
+
+        if (tooltip_.visible) {
+            if (const wchar_t* tip = tooltip_text(hover_id_)) {
+                draw_tooltip(cv, sz, tooltip_.anchor, tip);
+            }
+        }
+    }
+
+    static const wchar_t* tooltip_text(int id) noexcept {
+        switch (id) {
+            case IdRemoveInclude: return L"Remove folder";
+            case IdRemoveExclude: return L"Remove exclusion";
+            case IdLockedExclude: return L"System exclusion (cannot be removed)";
+            default: return nullptr;
         }
     }
 
@@ -984,7 +1000,9 @@ private:
                 text_middle(cv, row.text, rect(ir.left + 32.0f, ir.top, rw - 120.0f, row.h), Font::MonoSmall, row.locked ? color::outline : color::on_surface);
                 cv.text(row.tag, rect(ir.right - 92.0f, ir.top, 56.0f, row.h), Font::Caption, row.locked ? color::outline : color::on_surface_variant, Align::Right);
                 if (row.locked) {
-                    cv.icon(glyph::lock, rect(ir.right - 30.0f, ir.top, 24.0f, row.h), color::outline, Font::IconSmall);
+                    const D2D1_RECT_F lr = rect(ir.right - 30.0f, ir.top, 24.0f, row.h);
+                    cv.icon(glyph::lock, lr, color::outline, Font::IconSmall);
+                    cv.hit(lr, IdLockedExclude, row.index);
                 } else {
                     draw_button(cv, rect(ir.right - 30.0f, ir.top + (row.h - 28.0f) * 0.5f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveExclude, row.index, 3);
                 }
@@ -2478,7 +2496,7 @@ private:
                     const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
                     const int id = h ? h->id : 0;
                     const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdRepoField || id == IdBatchField || id == IdArchField || id == IdCudaField || id == IdTorchField || id == IdPyVerField;
-                    SetCursor(ibeam ? cursor_ibeam_ : (id ? cursor_hand_ : cursor_arrow_));
+                    SetCursor(ibeam ? cursor_ibeam_ : (id && id != IdLockedExclude ? cursor_hand_ : cursor_arrow_));
                     return TRUE;
                 }
                 break;
@@ -2509,19 +2527,27 @@ private:
                 if (id != hover_id_ || idx != hover_index_) {
                     hover_id_ = id;
                     hover_index_ = idx;
+                    tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, tooltip_text(id) != nullptr);
                     invalidate();
                 }
                 return 0;
             }
             case WM_MOUSELEAVE:
                 tracking_ = false;
+                tooltip_.clear(hwnd_, TIMER_TOOLTIP);
                 if (hover_id_) {
                     hover_id_ = IdNone;
                     invalidate();
                 }
                 return 0;
-            case WM_LBUTTONDOWN: on_lbutton_down(to_dip(lp), false); return 0;
-            case WM_LBUTTONDBLCLK: on_lbutton_down(to_dip(lp), true); return 0;
+            case WM_LBUTTONDOWN:
+                tooltip_.clear(hwnd_, TIMER_TOOLTIP);
+                on_lbutton_down(to_dip(lp), false);
+                return 0;
+            case WM_LBUTTONDBLCLK:
+                tooltip_.clear(hwnd_, TIMER_TOOLTIP);
+                on_lbutton_down(to_dip(lp), true);
+                return 0;
             case WM_LBUTTONUP:
                 dragging_scroll_ = false;
                 ReleaseCapture();
@@ -2530,11 +2556,13 @@ private:
                 dragging_scroll_ = false;
                 return 0;
             case WM_MOUSEWHEEL:
+                tooltip_.clear(hwnd_, TIMER_TOOLTIP);
                 target_scroll_ = std::clamp(target_scroll_ - GET_WHEEL_DELTA_WPARAM(wp) * 0.9f, 0.0f, max_scroll());
                 start_anim();
                 return 0;
             case WM_KEYDOWN:
             case WM_SYSKEYDOWN:
+                tooltip_.clear(hwnd_, TIMER_TOOLTIP);
                 if (msg == WM_SYSKEYDOWN && wp == VK_F4 && !recording_hotkey_) break;
                 on_key(static_cast<UINT>(wp));
                 return 0;
@@ -2559,6 +2587,9 @@ private:
                     case TIMER_DEVICE:
                         KillTimer(hwnd_, TIMER_DEVICE);
                         render();
+                        return 0;
+                    case TIMER_TOOLTIP:
+                        if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, hover_id_ != IdNone)) invalidate();
                         return 0;
                 }
                 return 0;
@@ -2589,6 +2620,7 @@ private:
     AnimFloat sw_hide_focus_;
     int hover_id_ = IdNone;
     int hover_index_ = 0;
+    HoverTooltip tooltip_;
     bool tracking_ = false;
     bool in_sizemove_ = false;
 

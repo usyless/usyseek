@@ -189,7 +189,7 @@ private:
     static constexpr float DEFAULT_W = 880.0f;
     static constexpr float DEFAULT_H = 640.0f;
     static constexpr float MENU_W = 256.0f;
-    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_DEBOUNCE = 2, TIMER_STATUS = 4, TIMER_DEVICE = 5, TIMER_FADE = 6, TIMER_DROP = 7, TIMER_COPY = 8;
+    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_DEBOUNCE = 2, TIMER_STATUS = 4, TIMER_DEVICE = 5, TIMER_FADE = 6, TIMER_DROP = 7, TIMER_COPY = 8, TIMER_TOOLTIP = 9;
     static constexpr uint64_t COPY_MAX_PIXELS = 40'000'000;
     static constexpr int CLIPBOARD_ATTEMPTS = 10;
 
@@ -202,8 +202,11 @@ private:
         IdFullscreen,
         IdClose,
         IdCard,
+        IdCardName,
+        IdCardDir,
         IdSimilar,
         IdCardPreview,
+        IdCardMoreTags,
         IdTagChip,
         IdScrollbar,
         IdMenu,
@@ -225,6 +228,7 @@ private:
         IdPvReveal,
         IdPvCopy,
         IdPvClose,
+        IdPvPath,
     };
     enum MenuAction : uint8_t { ActOpen, ActPreview, ActReveal, ActSimilar, ActCopy, ActCopyPath, ActCount };
 
@@ -574,12 +578,67 @@ private:
     // Drawing
     // ------------------------------------------------------------------------------------------
 
+    [[nodiscard]] bool tooltip_for(int id, int idx, std::wstring& title, std::wstring& subtitle) const {
+        title.clear();
+        subtitle.clear();
+        switch (id) {
+            case IdTagBtn: title = L"Filter by tag"; return true;
+            case IdHelpBtn: title = L"Search syntax & shortcuts"; return true;
+            case IdSettings: title = L"Settings"; return true;
+            case IdFullscreen: title = fullscreen_ ? L"Exit fullscreen (Esc)" : L"Fullscreen"; return true;
+            case IdClose: title = L"Hide (Esc)"; return true;
+            case IdCardPreview: title = L"Preview (Space)"; return true;
+            case IdSimilar: title = L"Find similar (Ctrl+S)"; return true;
+            case IdCardName:
+            case IdCardDir:
+                if (idx >= 0 && idx < static_cast<int>(items_.size())) {
+                    title = items_[idx].name;
+                    subtitle = items_[idx].dir;
+                    return !title.empty() || !subtitle.empty();
+                }
+                return false;
+            case IdCardMoreTags:
+                if (idx >= 0 && idx < static_cast<int>(items_.size())) {
+                    for (size_t k = 0; k < items_[idx].tags_w.size(); ++k) {
+                        if (k) title += L", ";
+                        title += items_[idx].tags_w[k];
+                    }
+                    return !title.empty();
+                }
+                return false;
+            case IdPvPlay: title = L"Open video"; return true;
+            case IdPvPrev: title = L"Previous (Left)"; return true;
+            case IdPvNext: title = L"Next (Right)"; return true;
+            case IdPvOpen: title = L"Open (Enter)"; return true;
+            case IdPvReveal: title = L"Show in Explorer (Ctrl+E)"; return true;
+            case IdPvCopy: title = L"Copy media (Ctrl+C)"; return true;
+            case IdPvClose: title = L"Close preview (Esc)"; return true;
+            case IdPvPath:
+                if (preview_valid()) {
+                    title = items_[preview_].name;
+                    subtitle = items_[preview_].dir;
+                    return !title.empty() || !subtitle.empty();
+                }
+                return false;
+            default: return false;
+        }
+    }
+
+    void draw_active_tooltip(Canvas& cv, D2D1_SIZE_F sz) const {
+        if (!tooltip_.visible || menu_open_ || drop_open_) return;
+        std::wstring title, sub;
+        if (tooltip_for(hover_id_, hover_index_, title, sub)) {
+            draw_tooltip(cv, sz, tooltip_.anchor, title, sub);
+        }
+    }
+
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(color::bg, 0.80f));
         if (preview_ >= 0) {
             draw_preview(cv, sz);
             if (menu_open_) draw_menu(cv);
+            draw_active_tooltip(cv, sz);
             return;
         }
         draw_header(cv, sz);
@@ -588,6 +647,7 @@ private:
         if (drop_open_) draw_dropdown(cv);
         if (show_help()) draw_help(cv, sz);
         if (menu_open_) draw_menu(cv);
+        draw_active_tooltip(cv, sz);
     }
 
     void icon_button(Canvas& cv, D2D1_RECT_F r, wchar_t g, int id, bool active = false) {
@@ -847,9 +907,14 @@ private:
 
         float y = tr.bottom + 10.0f;
         const float lx = r.left + 12.0f, rw = g.card_w - 24.0f;
-        cv.text(it.name, rect(lx, y, rw, 18.0f), Font::BodySemi, color::on_surface);
+        const D2D1_RECT_F name_r = rect(lx, y, rw, 18.0f);
+        cv.text(it.name, name_r, Font::BodySemi, color::on_surface);
+        if (cv.measure(it.name, Font::BodySemi) > rw) cv.hit(name_r, IdCardName, i);
         y += 20.0f;
-        cv.text(it.dir, rect(lx, y, rw, 16.0f), Font::MonoSmall, color::outline);
+        const D2D1_RECT_F dir_r = rect(lx, y, rw, 16.0f);
+        const std::wstring dir_disp = middle_truncate_dir(cv, it.dir, Font::MonoSmall, rw);
+        cv.text(dir_disp, dir_r, Font::MonoSmall, color::outline);
+        if (cv.measure(it.dir, Font::MonoSmall) > rw) cv.hit(dir_r, IdCardDir, i);
         y += 22.0f;
 
         // Tags (single line, +N overflow)
@@ -866,8 +931,10 @@ private:
         if (shown < it.tags_w.size()) {
             const std::wstring more = L"+" + std::to_wstring(it.tags_w.size() - shown);
             const float w = cv.measure(more, Font::Caption) + 12.0f;
-            cv.fill_round(rect(tx, y, w, 20.0f), 10.0f, with_alpha(color::on_surface, 0.08f));
-            cv.text(more, rect(tx, y, w, 20.0f), Font::Caption, color::on_surface_variant, Align::Center);
+            const D2D1_RECT_F mr = rect(tx, y, w, 20.0f);
+            cv.fill_round(mr, 10.0f, with_alpha(color::on_surface, 0.08f));
+            cv.text(more, mr, Font::Caption, color::on_surface_variant, Align::Center);
+            cv.hit(mr, IdCardMoreTags, i);
         }
         y += 28.0f;
         cv.hline(lx, lx + rw, y, with_alpha(color::outline_variant, 0.6f));
@@ -1056,6 +1123,7 @@ private:
     }
 
     void close_popups() {
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP);
         menu_open_ = false;
         drop_open_ = false;
         drop_from_button_ = false;
@@ -1446,8 +1514,13 @@ private:
         const D2D1_RECT_F pr = rect(x, cy - 13, pw, 26);
         cv.fill_round(pr, 13, with_alpha(color::surface_highest, 0.85f));
         cv.text(pos, pr, Font::SmallSemi, color::on_surface_variant, Align::Center);
+        const float path_w = std::max(40.0f, x - 34.0f);
+        const std::wstring dir_disp = middle_truncate_dir(cv, it.dir, Font::MonoSmall, path_w);
         cv.text(it.name, D2D1::RectF(18, 9, x - 16, 29), Font::BodySemi, color::on_surface);
-        cv.text(it.dir, D2D1::RectF(18, 29, x - 16, 46), Font::MonoSmall, color::outline);
+        cv.text(dir_disp, D2D1::RectF(18, 29, x - 16, 46), Font::MonoSmall, color::outline);
+        if (cv.measure(it.name, Font::BodySemi) > path_w || cv.measure(it.dir, Font::MonoSmall) > path_w) {
+            cv.hit(D2D1::RectF(18, 9, x - 16, 46), IdPvPath, preview_);
+        }
 
         // Footer: size, date, duration
         std::wstring meta = it.meta;
@@ -1630,6 +1703,9 @@ private:
             const bool was_help = show_help();
             hover_id_ = id;
             hover_index_ = idx;
+            std::wstring tt, ts;
+            const bool can_tip = !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_ && tooltip_for(id, idx, tt, ts);
+            tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, can_tip);
             if (show_help() != was_help) apply_height();
             invalidate();
         }
@@ -1642,6 +1718,7 @@ private:
 
     void on_lbutton_down(D2D1_POINT_2F p, bool dbl) {
         flush();
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP);
         selecting_text_ = false;
         dragging_scroll_ = false;
         drag_pending_ = false;
@@ -1723,6 +1800,9 @@ private:
             case IdSimilar: find_similar(items_[idx]); return;
             case IdCardPreview: open_preview(idx); return;
             case IdCard:
+            case IdCardName:
+            case IdCardDir:
+            case IdCardMoreTags:
             case IdTagChip: {
                 const uint64_t cid = items_[idx].pt.id;
                 if (dbl) {
@@ -1779,6 +1859,7 @@ private:
 
     void on_rbutton_down(D2D1_POINT_2F p) {
         flush();
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP);
         const Hit* h = hit_test(hits_, p);
         if (preview_valid()) {
             if (h && (h->id == IdPvImage || h->id == IdPvPlay)) {
@@ -1790,7 +1871,7 @@ private:
             }
             return;
         }
-        if (!h || (h->id != IdCard && h->id != IdTagChip && h->id != IdSimilar && h->id != IdCardPreview)) {
+        if (!h || h->id < IdCard || h->id > IdTagChip) {
             if (menu_open_) {
                 close_popups();
                 invalidate();
@@ -1803,6 +1884,7 @@ private:
     }
 
     void on_wheel(int delta) {
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP);
         if (menu_open_) return;
         if (preview_valid()) {
             // One notch per image, whatever the device's resolution
@@ -1836,6 +1918,7 @@ private:
     }
 
     void on_key(UINT vk) {
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP);
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;
         // A bare modifier press must not pull focus back to the search field before the chord's key arrives
@@ -2085,13 +2168,14 @@ private:
                     ScreenToClient(hwnd_, &pt);
                     const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
                     const int id = h ? h->id : 0;
-                    SetCursor(id == IdField || id == IdMenuField ? cursor_ibeam_ : (id == IdNone || id == IdGrid || id == IdMenu || id == IdDrop || id == IdHelp || id == IdCard || id == IdPreview || id == IdPvImage) ? cursor_arrow_ : cursor_hand_);
+                    SetCursor(id == IdField || id == IdMenuField ? cursor_ibeam_ : (id == IdNone || id == IdGrid || id == IdMenu || id == IdDrop || id == IdHelp || id == IdCard || id == IdCardName || id == IdCardDir || id == IdPreview || id == IdPvImage || id == IdPvPath) ? cursor_arrow_ : cursor_hand_);
                     return TRUE;
                 }
                 break;
             case WM_MOUSEMOVE: on_mouse_move(to_dip(lp)); return 0;
             case WM_MOUSELEAVE:
                 tracking_ = false;
+                tooltip_.clear(hwnd_, TIMER_TOOLTIP);
                 if (hover_id_) {
                     const bool was_help = show_help();
                     hover_id_ = IdNone;
@@ -2152,6 +2236,11 @@ private:
                         return 0;
                     }
                     case TIMER_COPY: set_clipboard(); return 0;
+                    case TIMER_TOOLTIP:
+                        if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, hover_id_ != IdNone && !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_)) {
+                            invalidate();
+                        }
+                        return 0;
                 }
                 return 0;
             case WM_APP_THUMBS: on_thumbs(); return 0;
@@ -2197,6 +2286,7 @@ private:
     int focus_ = -1;
     int hover_id_ = IdNone;
     int hover_index_ = 0;
+    HoverTooltip tooltip_;
     bool tracking_ = false;
     bool selecting_text_ = false;
 

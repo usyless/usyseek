@@ -306,12 +306,17 @@ public:
 
     /// Height of wrapped text in `w` DIPs.
     float measure_height(std::wstring_view s, Font f, float w) {
-        if (s.empty()) return 0.0f;
+        return measure_wrapped(s, f, w).height;
+    }
+
+    /// Width and height of wrapped text constrained to `w` DIPs.
+    D2D1_SIZE_F measure_wrapped(std::wstring_view s, Font f, float w) {
+        if (s.empty()) return {};
         wil::com_ptr<IDWriteTextLayout> layout = wrapped_layout(s, f, w);
-        if (!layout) return 0.0f;
+        if (!layout) return {};
         DWRITE_TEXT_METRICS m{};
         layout->GetMetrics(&m);
-        return m.height;
+        return {m.widthIncludingTrailingWhitespace, m.height};
     }
 
     void push_clip(D2D1_RECT_F r) {
@@ -369,6 +374,130 @@ inline const Hit* hit_test(const std::vector<Hit>& hits, D2D1_POINT_2F p) {
         if (contains(it->r, p)) return &*it;
     }
     return nullptr;
+}
+
+/// Truncates a directory path in the middle while keeping the drive/root and deepest folder names visible.
+inline std::wstring middle_truncate_dir(Canvas& cv, std::wstring_view path, Font f, float max_w) {
+    if (path.empty() || max_w <= 0.0f || cv.measure(path, f) <= max_w) return std::wstring{path};
+
+    size_t root_end = 0;
+    if (path.size() >= 3 && path[1] == L':' && path[2] == L'\\') {
+        root_end = 3;
+    } else if (path.starts_with(L"\\\\")) {
+        size_t slashes = 0;
+        for (size_t i = 2; i < path.size(); ++i) {
+            if (path[i] == L'\\') {
+                ++slashes;
+                if (slashes == 2) {
+                    root_end = i + 1;
+                    break;
+                }
+            }
+        }
+        if (root_end == 0) root_end = 2;
+    }
+
+    const std::wstring_view root = path.substr(0, root_end);
+    std::wstring best;
+    for (size_t i = path.size(); i > root_end; --i) {
+        if (path[i - 1] != L'\\') continue;
+        std::wstring cand{root};
+        cand += L'…';
+        cand += path.substr(i - 1);
+        if (cv.measure(cand, f) <= max_w) best = std::move(cand);
+        else break;
+    }
+    if (!best.empty()) return best;
+
+    size_t lo = 0, hi = path.size();
+    while (lo < hi) {
+        const size_t mid = (lo + hi + 1) / 2;
+        const size_t left_n = std::max<size_t>(root_end, mid / 3);
+        const size_t right_n = mid > left_n ? mid - left_n : 0;
+        if (left_n + right_n >= path.size()) {
+            hi = mid - 1;
+            continue;
+        }
+        std::wstring cand{path.substr(0, left_n)};
+        cand += L'…';
+        cand += path.substr(path.size() - right_n);
+        if (cv.measure(cand, f) <= max_w) lo = mid;
+        else hi = mid - 1;
+    }
+    const size_t left_n = std::min(path.size(), std::max<size_t>(root_end, lo / 3));
+    const size_t right_n = lo > left_n ? std::min(path.size() - left_n, lo - left_n) : 0;
+    std::wstring out{path.substr(0, left_n)};
+    out += L'…';
+    out += path.substr(path.size() - right_n);
+    return out;
+}
+
+/// Shared delayed-hover tooltip state for Direct2D windows.
+struct HoverTooltip {
+    static constexpr UINT DELAY_MS = 380;
+    D2D1_RECT_F anchor{};
+    bool visible = false;
+
+    void on_hover_changed(HWND hwnd, UINT_PTR timer_id, const Hit* h, bool eligible) noexcept {
+        visible = false;
+        if (hwnd) KillTimer(hwnd, timer_id);
+        anchor = h ? h->r : D2D1_RECT_F{};
+        if (eligible && hwnd) SetTimer(hwnd, timer_id, DELAY_MS, nullptr);
+    }
+
+    bool on_timer(HWND hwnd, UINT_PTR timer_id, bool allow) noexcept {
+        if (hwnd) KillTimer(hwnd, timer_id);
+        if (!allow) return false;
+        visible = true;
+        return true;
+    }
+
+    void clear(HWND hwnd, UINT_PTR timer_id) noexcept {
+        visible = false;
+        if (hwnd) KillTimer(hwnd, timer_id);
+    }
+};
+
+/// Draws a floating wrapped tooltip anchored near `anchor`, clamped within `win_sz`.
+inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std::wstring_view title, std::wstring_view subtitle = {}) {
+    if (title.empty() && subtitle.empty()) return;
+    constexpr float pad_x = 10.0f;
+    constexpr float pad_y = 6.0f;
+    constexpr float gap = 2.0f;
+    const float max_w = std::min(460.0f, std::max(140.0f, win_sz.width - 16.0f));
+    const float text_max_w = std::max(40.0f, max_w - pad_x * 2.0f);
+
+    const Font title_font = subtitle.empty() ? Font::SmallWrap : Font::SmallSemi;
+    const D2D1_SIZE_F ts = title.empty() ? D2D1_SIZE_F{} : cv.measure_wrapped(title, title_font, text_max_w);
+    const D2D1_SIZE_F ss = subtitle.empty() ? D2D1_SIZE_F{} : cv.measure_wrapped(subtitle, Font::MonoSmall, text_max_w);
+
+    const float content_w = std::max(ts.width, ss.width);
+    const float content_h = ts.height + (!title.empty() && !subtitle.empty() ? gap : 0.0f) + ss.height;
+    const float box_w = std::ceil(content_w) + pad_x * 2.0f;
+    const float box_h = std::ceil(content_h) + pad_y * 2.0f;
+
+    float x = (anchor.left + anchor.right - box_w) * 0.5f;
+    x = std::clamp(x, 8.0f, std::max(8.0f, win_sz.width - 8.0f - box_w));
+
+    float y = anchor.bottom + 8.0f;
+    if (y + box_h > win_sz.height - 8.0f && anchor.top - box_h - 8.0f >= 8.0f) {
+        y = anchor.top - box_h - 8.0f;
+    }
+    y = std::clamp(y, 8.0f, std::max(8.0f, win_sz.height - 8.0f - box_h));
+
+    const D2D1_RECT_F r = rect(x, y, box_w, box_h);
+    cv.shadow(r, 8.0f, 10.0f, 0.38f);
+    cv.fill_round(r, 8.0f, color::surface_highest);
+    cv.stroke_round(r, 8.0f, with_alpha(color::outline_variant, 0.85f));
+
+    float ty = y + pad_y;
+    if (!title.empty()) {
+        cv.text_wrap(title, rect(x + pad_x, ty, text_max_w, ts.height + 2.0f), title_font, color::on_surface);
+        ty += ts.height + gap;
+    }
+    if (!subtitle.empty()) {
+        cv.text_wrap(subtitle, rect(x + pad_x, ty, text_max_w, ss.height + 2.0f), Font::MonoSmall, color::on_surface_variant);
+    }
 }
 
 } // namespace usyseek::ui
