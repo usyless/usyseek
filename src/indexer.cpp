@@ -515,6 +515,9 @@ struct PyVision {
     wil::unique_process_information proc;
     wil::unique_handle pipe;
     wil::unique_event_nothrow ov_event;
+    wil::unique_event_nothrow cancel_event;
+    mutable std::mutex proc_mu;
+    bool cancelled = false;
     wil::unique_handle shm;
     void* shm_view = nullptr;
     size_t shm_bytes = 0;
@@ -522,8 +525,26 @@ struct PyVision {
     std::string shm_name;
     std::string read_buf;
 
+    PyVision() {
+        cancel_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    }
+
     ~PyVision() {
+        cancel();
         unmap_shm();
+    }
+
+    void cancel() noexcept {
+        if (cancel_event) SetEvent(cancel_event.get());
+        std::lock_guard lk{proc_mu};
+        cancelled = true;
+        if (job) TerminateJobObject(job.get(), 0);
+        else if (proc.hProcess) TerminateProcess(proc.hProcess, 0);
+    }
+
+    [[nodiscard]] bool is_cancelled() const noexcept {
+        std::lock_guard lk{proc_mu};
+        return cancelled;
     }
 
     void unmap_shm() noexcept {
@@ -536,6 +557,7 @@ struct PyVision {
     }
 
     void start(const VenvInfo& venv, const Settings& settings) {
+        if (is_cancelled()) throw std::runtime_error("Vision load cancelled");
         std::error_code ec;
         if (!venv.exists || !fs::exists(venv.python_exe, ec)) {
             throw std::runtime_error("Python environment not found");
@@ -556,7 +578,7 @@ struct PyVision {
             throw std::runtime_error("Could not create vision IPC pipe");
         }
         ov_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-        job = make_kill_on_close_job();
+        wil::unique_handle new_job = make_kill_on_close_job();
 
         std::wstring cmd = L"\"" + venv.python_exe + L"\" -u \"" + worker_script.wstring() + L"\" --worker \"" + pipe_name + L"\"";
         if (!settings.vision_script.empty()) {
@@ -564,19 +586,30 @@ struct PyVision {
         }
 
         STARTUPINFOW si{sizeof(si)};
+        wil::unique_process_information pi;
         if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
                             CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
-                            exe_dir().c_str(), &si, &proc)) {
+                            exe_dir().c_str(), &si, &pi)) {
             throw std::runtime_error("Failed to start Python vision worker");
         }
-        if (job) AssignProcessToJobObject(job.get(), proc.hProcess);
+        if (new_job) AssignProcessToJobObject(new_job.get(), pi.hProcess);
         PROCESS_POWER_THROTTLING_STATE throttling{};
         throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
         throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
         throttling.StateMask = 0; // Disable Windows EcoQoS / Efficiency Mode on worker
-        SetProcessInformation(proc.hProcess, ProcessPowerThrottling, &throttling, sizeof(throttling));
-        SetPriorityClass(proc.hProcess, ABOVE_NORMAL_PRIORITY_CLASS);
-        ResumeThread(proc.hThread);
+        SetProcessInformation(pi.hProcess, ProcessPowerThrottling, &throttling, sizeof(throttling));
+        SetPriorityClass(pi.hProcess, ABOVE_NORMAL_PRIORITY_CLASS);
+        {
+            std::lock_guard lk{proc_mu};
+            if (cancelled) {
+                if (new_job) TerminateJobObject(new_job.get(), 0);
+                else TerminateProcess(pi.hProcess, 0);
+                throw std::runtime_error("Vision load cancelled");
+            }
+            job = std::move(new_job);
+            proc = std::move(pi);
+            ResumeThread(proc.hThread);
+        }
 
         OVERLAPPED ov{};
         ov.hEvent = ov_event.get();
@@ -645,14 +678,19 @@ struct PyVision {
 
 private:
     DWORD wait_ov(OVERLAPPED& ov, const char* crash_msg) {
-        HANDLE handles[3] = {ov_event.get(), proc.hProcess, g_stop};
-        const DWORD count = g_stop ? 3 : 2;
+        HANDLE handles[4]{};
+        DWORD count = 0;
+        handles[count++] = ov_event.get();
+        handles[count++] = proc.hProcess;
+        if (cancel_event) handles[count++] = cancel_event.get();
+        if (g_stop) handles[count++] = g_stop;
         const DWORD w = WaitForMultipleObjects(count, handles, FALSE, INFINITE);
         if (w != WAIT_OBJECT_0) {
             CancelIoEx(pipe.get(), &ov);
             DWORD dummy = 0;
             GetOverlappedResult(pipe.get(), &ov, &dummy, TRUE);
-            if (w == WAIT_OBJECT_0 + 2) throw std::runtime_error("Indexing stopped");
+            if (g_stop && WaitForSingleObject(g_stop, 0) == WAIT_OBJECT_0) throw std::runtime_error("Indexing stopped");
+            if (cancel_event && WaitForSingleObject(cancel_event.get(), 0) == WAIT_OBJECT_0) throw std::runtime_error("Vision load cancelled");
             throw std::runtime_error(crash_msg);
         }
         DWORD bytes = 0;
@@ -664,6 +702,7 @@ private:
 
     template <typename Req>
     PyResp call(const Req& req) {
+        if (is_cancelled()) throw std::runtime_error("Vision load cancelled");
         std::string line;
         (void)glz::write_json(req, line);
         line.push_back('\n');
@@ -766,7 +805,7 @@ int run_indexer(Settings& settings) {
         }
     }
 
-    // --- Scan concurrently with the model load
+    // --- Scan & load the Python vision tower concurrently; cancel the model load if nothing needs indexing
     std::vector<FileEntry> files;
     std::wstring scan_error;
     std::jthread scanner([&] {
@@ -784,44 +823,54 @@ int run_indexer(Settings& settings) {
         files = walk_dirs(scope);
     });
 
-    // --- Python vision tower (out-of-process worker via shared memory)
-    pr.phase(Phase::LoadingModel, to_wide(settings.model_name));
     const VenvInfo venv = read_venv(to_wide(settings.venv_dir));
-    std::error_code venv_ec;
-    if (!venv.exists || !fs::exists(venv.python_exe, venv_ec)) {
-        pr.phase(Phase::Error, L"Python environment not found");
-        return 1;
-    }
-
     PyVision vision;
-    try {
-        vision.start(venv, settings);
-        wcsncpy_s(pr.d.device, vision.device.c_str(), std::size(pr.d.device) - 1);
+    struct VisionLoader {
+        PyVision& vision;
+        std::atomic<bool> done{false};
+        std::string error;
+        std::wstring error_msg;
+        std::jthread thread;
 
-        // The search UI needs the text tower as ONNX; export it once if missing
-        const fs::path onnx = fs::path{to_wide(settings.model_dir)} / (to_wide(settings.model_name) + L"-text.onnx");
-        std::error_code ec;
-        if (!fs::exists(onnx, ec)) {
-            pr.phase(Phase::LoadingModel, L"Exporting text model");
-            vision.export_text(settings.model_dir, settings.model_name);
+        VisionLoader(PyVision& v, const VenvInfo& env, const Settings& s)
+            : vision{v}, thread{[this, &env, &s] {
+                  try {
+                      vision.start(env, s);
+                  } catch (const std::exception& e) {
+                      error = e.what();
+                      error_msg = py_error_text(e);
+                  }
+                  done.store(true, std::memory_order_release);
+              }} {}
+
+        ~VisionLoader() { cancel_and_join(); }
+
+        void cancel_and_join() {
+            if (thread.joinable()) {
+                vision.cancel();
+                thread.join();
+            }
         }
-    } catch (const std::exception& e) {
-        scanner.request_stop();
-        if (stopping()) return 2;
-        pr.phase(Phase::Error, py_error_text(e));
-        std::printf("%s\n", e.what());
-        return 1;
-    }
+    } loader{vision, venv, settings};
 
-    if (!db.ensure_collection(coll, vision.dim, &err)) {
+    // Check collection existence without dims; if missing (NeedsDims), create it once vision finishes loading
+    const Db::CollectionStatus coll_status = db.ensure_collection_status(coll, 0, &err);
+    if (coll_status == Db::CollectionStatus::Error) {
+        loader.cancel_and_join();
         pr.phase(Phase::Error, to_wide(err));
         return 1;
     }
+    const bool collection_exists = (coll_status == Db::CollectionStatus::Ready);
 
     pr.phase(Phase::Scanning);
     scanner.join();
-    if (stopping()) return 2;
+    if (stopping()) {
+        loader.cancel_and_join();
+        pr.phase(Phase::Stopped);
+        return 2;
+    }
     if (!scan_error.empty()) {
+        loader.cancel_and_join();
         pr.phase(Phase::Error, scan_error);
         return 1;
     }
@@ -833,7 +882,7 @@ int run_indexer(Settings& settings) {
     std::vector<size_t> todo;
     std::unordered_set<uint64_t> found_ids;
     found_ids.reserve(files.size());
-    {
+    if (collection_exists) {
         constexpr size_t CHUNK = 1024;
         std::vector<uint64_t> ids;
         for (size_t i = 0; i < files.size() && !stopping(); i += CHUNK) {
@@ -866,15 +915,28 @@ int run_indexer(Settings& settings) {
             }
             pr.publish();
         }
+    } else {
+        for (size_t j = 0; j < files.size() && !stopping(); ++j) {
+            found_ids.insert(files[j].id);
+            if (failures.known(files[j])) {
+                ++pr.d.failed;
+                continue;
+            }
+            todo.push_back(j);
+        }
     }
     pr.d.found = files.size();
     pr.d.embedded = already_embedded;
-    if (stopping()) return 2;
+    if (stopping()) {
+        loader.cancel_and_join();
+        pr.phase(Phase::Stopped);
+        return 2;
+    }
 
     // --- Remove entries for deleted / newly excluded files
     pr.phase(Phase::Cleaning);
-    {
-        failures.prune(scope);
+    failures.prune(scope);
+    if (collection_exists) {
         std::optional<uint64_t> cursor;
         std::vector<uint64_t> stale;
         do {
@@ -903,7 +965,25 @@ int run_indexer(Settings& settings) {
         return a < b;
     });
     pr.d.todo = todo.size();
+
+    const fs::path onnx = fs::path{to_wide(settings.model_dir)} / (to_wide(settings.model_name) + L"-text.onnx");
+    std::error_code onnx_ec;
     if (todo.empty() || stopping()) {
+        if (!stopping() && !fs::exists(onnx, onnx_ec)) {
+            if (loader.done.load(std::memory_order_acquire) && loader.error.empty()) {
+                loader.thread.join();
+                pr.phase(Phase::LoadingModel, L"Exporting text model");
+                try {
+                    vision.export_text(settings.model_dir, settings.model_name);
+                } catch (...) {}
+            } else {
+                loader.cancel_and_join();
+                pr.phase(Phase::LoadingModel, L"Exporting text model");
+                (void)export_text_only(settings);
+            }
+        } else {
+            loader.cancel_and_join();
+        }
         failures.save();
         IndexState st = load_json_file<IndexState>(state_path());
         st.last_index_unix = unix_now();
@@ -912,7 +992,40 @@ int run_indexer(Settings& settings) {
         st.last_error.clear();
         save_json_file(state_path(), st);
         pr.phase(stopping() ? Phase::Stopped : Phase::Done);
-        return 0;
+        return stopping() ? 2 : 0;
+    }
+
+    // --- Wait for the background vision model load (or surface any load error)
+    if (!loader.done.load(std::memory_order_acquire)) {
+        pr.phase(Phase::LoadingModel, to_wide(settings.model_name));
+    }
+    loader.thread.join();
+    if (stopping()) {
+        pr.phase(Phase::Stopped);
+        return 2;
+    }
+    if (!loader.error.empty()) {
+        pr.phase(Phase::Error, loader.error_msg);
+        std::printf("%s\n", loader.error.c_str());
+        return 1;
+    }
+    wcsncpy_s(pr.d.device, vision.device.c_str(), std::size(pr.d.device) - 1);
+
+    if (!fs::exists(onnx, onnx_ec)) {
+        try {
+            pr.phase(Phase::LoadingModel, L"Exporting text model");
+            vision.export_text(settings.model_dir, settings.model_name);
+        } catch (const std::exception& e) {
+            if (stopping()) return 2;
+            pr.phase(Phase::Error, py_error_text(e));
+            std::printf("%s\n", e.what());
+            return 1;
+        }
+    }
+
+    if (!collection_exists && !db.ensure_collection(coll, vision.dim, &err)) {
+        pr.phase(Phase::Error, to_wide(err));
+        return 1;
     }
 
     // --- Batch size

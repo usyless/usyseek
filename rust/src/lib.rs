@@ -238,49 +238,61 @@ pub unsafe extern "C" fn usy_qd_health(q: *mut UsyQdrant, out: *mut UsyBuf) -> i
     })
 }
 
+/// Ensures `name` exists. When `dim == 0` and the collection does not exist, returns `2` without creating it.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_ensure_collection(q: *mut UsyQdrant, name: UsyStr, dim: u64, out: *mut UsyBuf) -> i32 {
     let q = unsafe { &*q };
     let name = name.as_str().to_owned();
-    run(out, || {
-        runtime().block_on(async {
-            if q.client.collection_exists(&name).await.map_err(err)? {
-                return Ok("exists".to_owned());
-            }
-            q.client
-                .create_collection(
-                    CreateCollectionBuilder::new(&name)
-                        .vectors_config(
-                            VectorParamsBuilder::new(dim, Distance::Cosine)
-                                .on_disk(true)
-                                .datatype(Datatype::Float16),
-                        )
-                        .hnsw_config(HnswConfigDiffBuilder::default().m(0))
-                        .on_disk_payload(true),
-                )
-                .await
-                .map_err(err)?;
+    let res: Result<String, (i32, String)> = runtime().block_on(async {
+        if q.client.collection_exists(&name).await.map_err(|e| (1, err(e)))? {
+            return Ok("exists".to_owned());
+        }
+        if dim == 0 {
+            return Err((2, "collection does not exist and requires dims".to_owned()));
+        }
+        q.client
+            .create_collection(
+                CreateCollectionBuilder::new(&name)
+                    .vectors_config(
+                        VectorParamsBuilder::new(dim, Distance::Cosine)
+                            .on_disk(true)
+                            .datatype(Datatype::Float16),
+                    )
+                    .hnsw_config(HnswConfigDiffBuilder::default().m(0))
+                    .on_disk_payload(true),
+            )
+            .await
+            .map_err(|e| (1, err(e)))?;
 
-            let idx = |field: &str, ty: FieldType| CreateFieldIndexCollectionBuilder::new(&name, field, ty).wait(true);
-            q.client.create_field_index(idx(F_TAGS, FieldType::Keyword)).await.map_err(err)?;
-            q.client.create_field_index(idx(F_ANCESTORS, FieldType::Keyword)).await.map_err(err)?;
-            q.client.create_field_index(idx(F_KIND, FieldType::Integer)).await.map_err(err)?;
-            q.client.create_field_index(idx(F_MTIME, FieldType::Integer)).await.map_err(err)?;
-            q.client
-                .create_field_index(
-                    idx(F_NAME, FieldType::Text).field_index_params(
-                        TextIndexParamsBuilder::new(TokenizerType::Prefix)
-                            .lowercase(true)
-                            .min_token_len(1)
-                            .max_token_len(32),
-                    ),
-                )
-                .await
-                .map_err(err)?;
-            let _ = F_PATH;
-            Ok("created".to_owned())
-        })
-    })
+        let idx = |field: &str, ty: FieldType| CreateFieldIndexCollectionBuilder::new(&name, field, ty).wait(true);
+        q.client.create_field_index(idx(F_TAGS, FieldType::Keyword)).await.map_err(|e| (1, err(e)))?;
+        q.client.create_field_index(idx(F_ANCESTORS, FieldType::Keyword)).await.map_err(|e| (1, err(e)))?;
+        q.client.create_field_index(idx(F_KIND, FieldType::Integer)).await.map_err(|e| (1, err(e)))?;
+        q.client.create_field_index(idx(F_MTIME, FieldType::Integer)).await.map_err(|e| (1, err(e)))?;
+        q.client
+            .create_field_index(
+                idx(F_NAME, FieldType::Text).field_index_params(
+                    TextIndexParamsBuilder::new(TokenizerType::Prefix)
+                        .lowercase(true)
+                        .min_token_len(1)
+                        .max_token_len(32),
+                ),
+            )
+            .await
+            .map_err(|e| (1, err(e)))?;
+        let _ = F_PATH;
+        Ok("created".to_owned())
+    });
+    match res {
+        Ok(s) => {
+            unsafe { write_out(out, s) };
+            0
+        }
+        Err((code, msg)) => {
+            unsafe { write_out(out, msg) };
+            code
+        }
+    }
 }
 
 /// payloads: JSON array (one object per point, same order as ids).

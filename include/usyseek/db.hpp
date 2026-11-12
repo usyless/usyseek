@@ -126,11 +126,23 @@ public:
         return false;
     }
 
-    bool ensure_collection(std::string_view name, uint64_t dim, std::string* error = nullptr) {
+    enum class CollectionStatus {
+        Ready,     // collection exists or was created
+        NeedsDims, // collection does not exist and dim == 0
+        Error,
+    };
+
+    /// Checks or creates `name`. Pass `dim == 0` to check existence without requiring dimensions.
+    CollectionStatus ensure_collection_status(std::string_view name, uint64_t dim = 0, std::string* error = nullptr) {
         RustBuf out;
-        const bool ok = usy_qd_ensure_collection(q_, ustr(name), dim, &out.b) == 0;
-        if (!ok && error) *error = out.str();
-        return ok;
+        const int32_t rc = usy_qd_ensure_collection(q_, ustr(name), dim, &out.b);
+        if (rc == 0) return CollectionStatus::Ready;
+        if (error) *error = out.str();
+        return rc == 2 ? CollectionStatus::NeedsDims : CollectionStatus::Error;
+    }
+
+    bool ensure_collection(std::string_view name, uint64_t dim, std::string* error = nullptr) {
+        return ensure_collection_status(name, dim, error) == CollectionStatus::Ready;
     }
 
     bool upsert(std::string_view coll, std::span<const uint64_t> ids, std::span<const float> vectors, size_t dim,
