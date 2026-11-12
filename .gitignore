@@ -7,3 +7,4 @@ build/
 .claude
 open-vscode.bat
 build.bat
+rust/target
