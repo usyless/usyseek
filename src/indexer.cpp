@@ -181,6 +181,26 @@ struct Scope {
         for (const auto& n : name_excludes) q += L" !path:\"" + n + L"\"";
         return q;
     }
+
+    [[nodiscard]] std::wstring everything_exclude_folders() const {
+        std::wstring out;
+        auto append = [&](std::wstring_view item) {
+            if (!out.empty()) out += L';';
+            out += item;
+        };
+        for (const auto& e : abs_excludes) {
+            // Skip whole-drive excludes (e.g. "d:") since they are already omitted from -volumes
+            if (e.size() == 2 && e[1] == L':') continue;
+            append(e);
+        }
+        for (const auto& n : name_excludes) {
+            // n is stored as "\name\" -> Everything folder filter wants "**\name" or just "name"
+            if (n.size() > 2) {
+                append(L"**\\" + std::wstring{n.substr(1, n.size() - 2)});
+            }
+        }
+        return out;
+    }
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -211,15 +231,26 @@ bool write_everything_exe(const fs::path& target) {
 
 class EverythingSession {
 public:
-    bool open(const std::set<wchar_t>& drives, std::wstring& error) {
+    bool open(const Scope& scope, std::wstring& error) {
         // Always run our own private Everything instance (never use or interfere with a user-running instance)
         const fs::path exe = data_dir() / L"Everything" / L"Everything.exe";
         if (!write_everything_exe(exe)) {
             error = L"Could not extract Everything.exe";
             return false;
         }
+
+        std::wstring vols;
+        for (wchar_t d : scope.drives()) {
+            if (!vols.empty()) vols += L';';
+            vols += d;
+            vols += L':';
+        }
         owned_.reset(new ulp::Everything(EVERYTHING_INSTANCE, exe.wstring()));
-        switch (owned_->try_load(L"-safe-mode -no-auto-index -volumes \"\"")) {
+        switch (owned_->try_load(
+            L"-safe-mode -no-auto-index"
+            L" -volumes \"" + vols + L"\""
+            L" -exclude-folders \"" + scope.everything_exclude_folders() + L"\""
+        )) {
             case ulp::Everything::LoadStatus::Success: break;
             case ulp::Everything::LoadStatus::UACRejected:
                 error = L"Everything needs administrator access to read the drive index";
@@ -229,25 +260,6 @@ public:
                 return false;
         }
 
-        std::wstring vols;
-        for (wchar_t d : drives) {
-            if (!vols.empty()) vols += L';';
-            vols += d;
-            vols += L':';
-        }
-        std::wstring cmd = L"\"" + exe.wstring() + L"\" -safe-mode -startup -no-auto-index -volumes \"" + vols + L"\" -instance \"" + EVERYTHING_INSTANCE + L"\"";
-        STARTUPINFOW si{sizeof(si)};
-        wil::unique_process_information pi;
-        if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-            error = L"Everything failed to start";
-            return false;
-        }
-        WaitForSingleObject(pi.hProcess, 10'000);
-        for (int i = 0; i < 50 && !stopping(); ++i) Sleep(100);
-        if (!owned_->wait_for_load()) {
-            error = L"Everything did not finish indexing";
-            return false;
-        }
         return true;
     }
 
@@ -761,7 +773,7 @@ int run_indexer(Settings& settings) {
         ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
         EverythingSession ev;
         if (g_no_everything) scan_error = L"disabled";
-        else if (ev.open(scope.drives(), scan_error)) {
+        else if (ev.open(scope, scan_error)) {
             if (!stopping()) files = ev.query(scope, scan_error);
             return;
         }
