@@ -13,12 +13,22 @@ int main() {
     CHECK(is_duplicate_path_rule(L"D:\\\\Media\\\\Holiday", list));
     CHECK(is_duplicate_path_rule(L"  D:\\Media\\Holiday  ", list));
     CHECK(is_duplicate_path_rule(L"*\\Node_Modules\\", list));
+    CHECK(is_duplicate_path_rule(L"*\\Node_Modules\\*", list));
     CHECK(is_duplicate_path_rule(L"*/node_modules", list));
+    CHECK(is_duplicate_path_rule(L"*/node_modules/*", list));
     CHECK(is_duplicate_path_rule(L"c:", list));
+    CHECK(is_duplicate_path_rule(L"C:/", list));
+    CHECK(is_duplicate_path_rule(L"C:\\*", list));
+    CHECK(is_duplicate_path_rule(L"C:/*", list));
+    CHECK(is_duplicate_path_rule(L"D:\\Media\\Holiday\\*", list));
 
     CHECK(normalize_path_rule(L"C:\\") == L"c:\\");
     CHECK(normalize_path_rule(L"C:\\\\") == L"c:\\");
+    CHECK(normalize_path_rule(L"C:/") == L"c:\\");
+    CHECK(normalize_path_rule(L"C:\\*") == L"c:\\");
+    CHECK(normalize_path_rule(L"C:/*") == L"c:\\");
     CHECK(normalize_path_rule(L"C:/Temp/") == L"c:\\temp");
+    CHECK(normalize_path_rule(L"C:/Temp/*") == L"c:\\temp");
 
     CHECK(!is_duplicate_path_rule(L"D:\\Media", list));
     CHECK(!is_duplicate_path_rule(L"D:\\Media\\Holiday\\2024", list));

@@ -93,9 +93,13 @@ struct Scope {
             if (raw.empty()) return;
             const bool absolute = raw.size() >= 2 && raw[1] == L':';
             if (absolute) {
+                while (raw.size() > 2 && (raw.ends_with(L'*') || raw.ends_with(L'\\') || raw.ends_with(L'/'))) {
+                    raw.pop_back();
+                }
                 abs_excludes.push_back(normalise_dir(raw));
             } else {
                 std::wstring n = lower(raw);
+                std::replace(n.begin(), n.end(), L'/', L'\\');
                 while (n.starts_with(L'*') || n.starts_with(L'\\')) n.erase(0, 1);
                 while (n.ends_with(L'*') || n.ends_with(L'\\')) n.pop_back();
                 if (!n.empty()) name_excludes.push_back(L"\\" + n + L"\\");
@@ -232,6 +236,13 @@ bool write_everything_exe(const fs::path& target) {
 class EverythingSession {
 public:
     bool open(const Scope& scope, std::wstring& error) {
+        const auto drives = scope.drives();
+        if (drives.empty()) {
+            empty_ = true;
+            return true;
+        }
+        empty_ = false;
+
         // Always run our own private Everything instance (never use or interfere with a user-running instance)
         const fs::path exe = data_dir() / L"Everything" / L"Everything.exe";
         if (!write_everything_exe(exe)) {
@@ -240,7 +251,7 @@ public:
         }
 
         std::wstring vols;
-        for (wchar_t d : scope.drives()) {
+        for (wchar_t d : drives) {
             if (!vols.empty()) vols += L';';
             vols += d;
             vols += L':';
@@ -265,6 +276,7 @@ public:
 
     std::vector<FileEntry> query(const Scope& scope, std::wstring& error) {
         std::vector<FileEntry> out;
+        if (empty_) return out;
         static constexpr auto flags = ulp::everything::RequestFlags{0}.file_name().parent_path().size().date_modified();
         static constexpr ulp::everything::EverythingSearch opts{.RequestFlags = flags};
         if (!ulp::Everything::do_query(scope.query(), opts)) {
@@ -289,6 +301,7 @@ public:
     }
 
 private:
+    bool empty_ = false;
     std::unique_ptr<ulp::Everything> owned_;
 };
 

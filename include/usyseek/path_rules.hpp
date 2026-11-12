@@ -21,8 +21,10 @@ inline std::wstring normalize_path_rule(std::wstring_view raw) {
         out.push_back(c);
     }
 
-    const bool drive_root = out.size() == 3 && out[1] == L':' && out[2] == L'\\';
-    if (!drive_root && !out.empty() && out.back() == L'\\') out.pop_back();
+    while (!out.empty() && (out.back() == L'*' || out.back() == L'\\')) {
+        if (out.size() == 3 && out[1] == L':' && out[2] == L'\\') break;
+        out.pop_back();
+    }
     if (out.size() == 2 && out[1] == L':') out.push_back(L'\\');
     return out;
 }
