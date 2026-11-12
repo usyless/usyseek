@@ -132,12 +132,25 @@ struct Scope {
             const DWORD mask = GetLogicalDrives();
             for (int i = 0; i < 26; ++i) {
                 if (!(mask & (1u << i))) continue;
-                const wchar_t root[] = {static_cast<wchar_t>(L'A' + i), L':', L'\\', 0};
-                if (GetDriveTypeW(root) == DRIVE_FIXED) out.insert(root[0]);
+                const wchar_t drive = static_cast<wchar_t>(L'A' + i);
+                const wchar_t root[] = {drive, L':', L'\\', 0};
+                if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
+                
+                // Check if the entire drive root (e.g. "D:\" or "D:") is in abs_excludes
+                const wchar_t probe[] = {drive, L':', L'\\', L'*', 0};
+                if (!excluded(probe)) {
+                    out.insert(drive);
+                }
             }
         } else {
             for (const auto& i : includes) {
-                if (i.size() >= 2 && i[1] == L':') out.insert(static_cast<wchar_t>(towupper(i[0])));
+                if (i.size() >= 2 && i[1] == L':') {
+                    const wchar_t drive = static_cast<wchar_t>(towupper(i[0]));
+                    const wchar_t probe[] = {drive, L':', L'\\', L'*', 0};
+                    if (!excluded(probe)) {
+                        out.insert(drive);
+                    }
+                }
             }
         }
         return out;
