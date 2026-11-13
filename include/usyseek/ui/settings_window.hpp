@@ -762,7 +762,7 @@ private:
             cv.stroke_round(r, 14.0f, with_alpha(col, is_err ? 0.45f : 0.35f));
 
             cv.icon(is_err ? glyph::warning : (is_info ? glyph::tag : glyph::warning),
-                    rect(lx, y + 14.0f, 22.0f, 24.0f), col, Font::IconSmall);
+                    rect(lx, y + 14.0f, 20.0f, 16.0f), col, Font::IconSmall);
             float ty = y + 14.0f;
             cv.text_wrap(meta, rect(text_x, ty, text_w, meta_h), Font::Caption, col);
             ty += meta_h + 2.0f;
