@@ -5,6 +5,7 @@
 #include <usyseek/notifications.hpp>
 #include <usyseek/status.hpp>
 #include <usyseek/db.hpp>
+#include <usyseek/indexer/everything_config.hpp>
 #include <usyseek/indexer/media.hpp>
 
 #include <condition_variable>
@@ -249,6 +250,16 @@ bool write_everything_exe(const fs::path& target) {
     return ulp::fs::write(target, std::span<const char>{ptr, size});
 }
 
+bool write_everything_lean_config(const fs::path& target) {
+    if (const auto existing = ulp::fs::read_as_bytes(target);
+        existing && *existing == usyseek::indexer::EVERYTHING_LEAN_CONFIG) {
+        return true;
+    }
+    std::error_code ec;
+    fs::create_directories(target.parent_path(), ec);
+    return ulp::fs::write(target, usyseek::indexer::EVERYTHING_LEAN_CONFIG);
+}
+
 [[nodiscard]] int kind_of_lower(std::wstring_view lower_path, bool allow_images, bool allow_videos) noexcept {
     const auto dot = lower_path.find_last_of(L'.');
     if (dot == std::wstring_view::npos) return -1;
@@ -275,10 +286,19 @@ public:
         empty_ = false;
 
         // Always run our own private Everything instance (never use or interfere with a user-running instance)
-        const fs::path exe = data_dir() / L"Everything" / L"Everything.exe";
+        const fs::path everything_dir = data_dir() / L"Everything";
+        const fs::path exe = everything_dir / L"Everything.exe";
         if (!write_everything_exe(exe)) {
             error = L"Could not extract Everything.exe";
             return false;
+        }
+
+        const fs::path lean_ini = everything_dir / L"everything-lean.ini";
+        std::wstring lean_ini_arg;
+        if (write_everything_lean_config(lean_ini)) {
+            lean_ini_arg = lean_ini.wstring();
+        } else {
+            wlog(L"Could not write lean Everything config, continuing with defaults\n");
         }
 
         std::wstring vols;
@@ -289,10 +309,7 @@ public:
         }
 
         owned_ = std::make_unique<ulp::Everything3>(ulp::everything3::InstanceName{EVERYTHING_INSTANCE}, exe);
-        const std::wstring args =
-            L"-safe-mode -no-auto-index"
-            L" -volumes \"" + vols + L"\""
-            L" -exclude-folders \"" + scope.everything_exclude_folders() + L"\"";
+        const std::wstring args = usyseek::indexer::build_everything_args(vols, scope.everything_exclude_folders(), lean_ini_arg);
 
         bool launched = false;
         const auto status = owned_->try_load(
