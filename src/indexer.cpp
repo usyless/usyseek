@@ -118,8 +118,7 @@ struct Scope {
         for (const auto& d : s.exclude_dirs) add_exclude(to_wide(d));
     }
 
-    [[nodiscard]] bool excluded(std::wstring_view path) const {
-        const std::wstring l = lower(path);
+    [[nodiscard]] bool excluded_lower(std::wstring_view l) const noexcept {
         for (const auto& e : abs_excludes) {
             if (l.size() > e.size() && l.starts_with(e) && l[e.size()] == L'\\') return true;
         }
@@ -129,14 +128,21 @@ struct Scope {
         return false;
     }
 
-    [[nodiscard]] bool in_scope(std::wstring_view path) const {
-        if (excluded(path)) return false;
+    [[nodiscard]] bool in_scope_lower(std::wstring_view l) const noexcept {
+        if (excluded_lower(l)) return false;
         if (whole_pc) return true;
-        const std::wstring l = lower(path);
         for (const auto& i : includes) {
             if (l.size() > i.size() && l.starts_with(i) && l[i.size()] == L'\\') return true;
         }
         return false;
+    }
+
+    [[nodiscard]] bool excluded(std::wstring_view path) const {
+        return excluded_lower(lower(path));
+    }
+
+    [[nodiscard]] bool in_scope(std::wstring_view path) const {
+        return in_scope_lower(lower(path));
     }
 
     [[nodiscard]] std::set<wchar_t> drives() const {
@@ -243,11 +249,26 @@ bool write_everything_exe(const fs::path& target) {
     return ulp::fs::write(target, std::span<const char>{ptr, size});
 }
 
+[[nodiscard]] int kind_of_lower(std::wstring_view lower_path, bool allow_images, bool allow_videos) noexcept {
+    const auto dot = lower_path.find_last_of(L'.');
+    if (dot == std::wstring_view::npos) return -1;
+    const auto slash = lower_path.find_last_of(L'\\');
+    if (slash != std::wstring_view::npos && dot < slash) return -1;
+    const std::wstring_view ext = lower_path.substr(dot + 1);
+    if (allow_images) {
+        for (const auto e : media::IMAGE_EXTS) if (ext == e) return 0;
+    }
+    if (allow_videos) {
+        for (const auto e : media::VIDEO_EXTS) if (ext == e) return 1;
+    }
+    return -1;
+}
+
 class EverythingSession {
 public:
     bool open(const Scope& scope, std::wstring& error) {
         const auto drives = scope.drives();
-        if (drives.empty()) {
+        if (drives.empty() || (!scope.images && !scope.videos)) {
             empty_ = true;
             return true;
         }
@@ -261,58 +282,190 @@ public:
         }
 
         std::wstring vols;
-        for (wchar_t d : drives) {
+        for (const wchar_t d : drives) {
             if (!vols.empty()) vols += L';';
             vols += d;
             vols += L':';
         }
-        owned_.reset(new ulp::Everything(EVERYTHING_INSTANCE, exe.wstring()));
-        switch (owned_->try_load(
+
+        owned_ = std::make_unique<ulp::Everything3>(ulp::everything3::InstanceName{EVERYTHING_INSTANCE}, exe);
+        const std::wstring args =
             L"-safe-mode -no-auto-index"
             L" -volumes \"" + vols + L"\""
-            L" -exclude-folders \"" + scope.everything_exclude_folders() + L"\""
-        )) {
-            case ulp::Everything::LoadStatus::Success: break;
-            case ulp::Everything::LoadStatus::UACRejected:
-                error = L"Everything needs administrator access to read the drive index";
-                return false;
-            default:
-                error = L"Everything failed to start";
-                return false;
+            L" -exclude-folders \"" + scope.everything_exclude_folders() + L"\"";
+
+        bool launched = false;
+        const auto status = owned_->try_load(
+            args,
+            [&] { launched = true; },
+            std::chrono::milliseconds(0)
+        );
+        if (status == ulp::Everything3::LoadStatus::UACRejected) {
+            error = L"Everything needs administrator access to read the drive index";
+            return false;
+        }
+        if (status == ulp::Everything3::LoadStatus::Success) {
+            return true;
+        }
+        if (!launched) {
+            error = L"Everything failed to start";
+            return false;
         }
 
-        return true;
+        // Poll in short slices so stopping() cancels startup promptly instead of blocking for minutes.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+        while (!stopping()) {
+            if (owned_->wait_for_load(std::chrono::milliseconds(50))) {
+                return true;
+            }
+            const DWORD err = Everything3_GetLastError();
+            if (err != EVERYTHING3_OK &&
+                err != EVERYTHING3_ERROR_IPC_PIPE_NOT_FOUND &&
+                err != EVERYTHING3_ERROR_DISCONNECTED &&
+                err != EVERYTHING3_ERROR_SHUTDOWN) {
+                owned_->close_everything(false);
+                error = L"Everything failed to start";
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                owned_->close_everything(false);
+                error = L"Everything timed out while loading index";
+                return false;
+            }
+        }
+
+        owned_->close_everything(false);
+        error = L"Stopped";
+        return false;
     }
 
     std::vector<FileEntry> query(const Scope& scope, std::wstring& error) {
         std::vector<FileEntry> out;
-        if (empty_) return out;
-        static constexpr auto flags = ulp::everything::RequestFlags{0}.file_name().parent_path().size().date_modified();
-        static constexpr ulp::everything::EverythingSearch opts{.RequestFlags = flags};
-        if (!ulp::Everything::do_query(scope.query(), opts)) {
-            error = L"Everything query failed";
+        if (empty_ || !owned_) return out;
+
+        const auto& client = owned_->client();
+        if (!client) {
+            error = L"Everything client not connected";
             return out;
         }
-        out.reserve(ulp::Everything::query_results_count());
-        ulp::Everything::walk_results<flags>(ulp::everything::Callbacks{
-            .on_file = [&](const ulp::everything::File<flags>& f) {
-                FileEntry e;
-                e.path = std::wstring{f.parent_path()} + L"\\" + f.filename();
-                e.kind = media::kind_of(e.path);
-                if (e.kind < 0 || !scope.in_scope(e.path)) return;
-                e.size = f.size_or_default();
-                e.mtime = filetime_to_unix(f.date_modified_or_default());
-                e.id = path_id(e.path);
-                out.push_back(std::move(e));
-            },
-        });
-        ulp::Everything::reset_results();
+
+        ulp::everything3::SearchState state;
+        if (!state) {
+            error = L"Everything search state failed";
+            return out;
+        }
+
+        // Request server-side sorting only when Everything has a fast sort index for path order.
+        bool sorted_on_server = false;
+        if (client.is_property_fast_sort(ulp::everything3::PropertyId::Path)) {
+            state.add_sort(ulp::everything3::PropertyId::Path, true);
+            if (client.is_property_fast_sort(ulp::everything3::PropertyId::Name)) {
+                state.add_sort(ulp::everything3::PropertyId::Name, true);
+            }
+            sorted_on_server = true;
+        } else if (client.is_property_fast_sort(ulp::everything3::PropertyId::FullPath)) {
+            state.add_sort(ulp::everything3::PropertyId::FullPath, true);
+            sorted_on_server = true;
+        }
+
+        state.set_text(scope.query())
+             .request_properties(
+                 ulp::everything3::PropertyId::FullPath,
+                 ulp::everything3::PropertyId::Size,
+                 ulp::everything3::PropertyId::DateModified
+             );
+
+        struct StopWaitGuard {
+            HANDLE handle = nullptr;
+            StopWaitGuard() = default;
+            StopWaitGuard(const StopWaitGuard&) = delete;
+            StopWaitGuard& operator=(const StopWaitGuard&) = delete;
+            ~StopWaitGuard() { release(); }
+            void release() noexcept {
+                if (handle) {
+                    UnregisterWaitEx(handle, INVALID_HANDLE_VALUE);
+                    handle = nullptr;
+                }
+            }
+        } stop_guard;
+
+        if (g_stop) {
+            RegisterWaitForSingleObject(
+                &stop_guard.handle,
+                g_stop,
+                [](PVOID param, BOOLEAN) {
+                    Everything3_ShutdownClient(static_cast<EVERYTHING3_CLIENT*>(param));
+                },
+                client.native_handle(),
+                INFINITE,
+                WT_EXECUTEONLYONCE
+            );
+        }
+
+        const ulp::everything3::ResultList results = client.search(state);
+        stop_guard.release();
+
+        if (!results) {
+            error = stopping() ? L"Stopped" : L"Everything query failed";
+            return out;
+        }
+
+        const EVERYTHING3_RESULT_LIST* raw = results.native_handle();
+        const std::size_t count = results.viewport_count();
+        const std::size_t reserve_count = results.file_count();
+        out.reserve(reserve_count > 0 && reserve_count <= count ? reserve_count : count);
+
+        std::wstring path_buf(1024, L'\0');
+        std::wstring lower_buf;
+        lower_buf.reserve(1024);
+
+        for (std::size_t i = 0; i < count; ++i) {
+            if ((i & 1023u) == 1023u && stopping()) {
+                out.clear();
+                return out;
+            }
+            if (Everything3_IsFolderResult(raw, i) != FALSE) continue;
+
+            std::size_t len = Everything3_GetResultFullPathNameW(raw, i, path_buf.data(), path_buf.size());
+            if (len >= path_buf.size() - 1) {
+                const std::size_t req = Everything3_GetResultFullPathNameW(raw, i, nullptr, 0);
+                if (req <= 1) continue;
+                if (req > path_buf.size()) {
+                    path_buf.resize(req);
+                    len = Everything3_GetResultFullPathNameW(raw, i, path_buf.data(), path_buf.size());
+                }
+            }
+            if (len == 0) continue;
+
+            lower_buf.assign(path_buf.data(), len);
+            CharLowerBuffW(lower_buf.data(), static_cast<DWORD>(len));
+            const std::wstring_view lpath{lower_buf.data(), len};
+
+            const int kind = kind_of_lower(lpath, scope.images, scope.videos);
+            if (kind < 0 || !scope.in_scope_lower(lpath)) continue;
+
+            const std::uint64_t raw_size = Everything3_GetResultSize(raw, i);
+            const std::uint64_t raw_dm = Everything3_GetResultDateModified(raw, i);
+
+            FileEntry e;
+            e.path.assign(path_buf.data(), len);
+            e.size = (raw_size == EVERYTHING3_UINT64_MAX) ? 0 : raw_size;
+            e.mtime = (raw_dm == EVERYTHING3_UINT64_MAX) ? 0 : filetime_to_unix(raw_dm);
+            e.kind = kind;
+            e.id = rapidhash(lower_buf.data(), len * sizeof(wchar_t));
+            out.push_back(std::move(e));
+        }
+
+        if (!sorted_on_server && out.size() > 1) {
+            std::ranges::sort(out, {}, &FileEntry::path);
+        }
+
         return out;
     }
 
 private:
     bool empty_ = false;
-    std::unique_ptr<ulp::Everything> owned_;
+    std::unique_ptr<ulp::Everything3> owned_;
 };
 
 std::vector<FileEntry> walk_dirs(const Scope& scope) {
