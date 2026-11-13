@@ -147,9 +147,15 @@ public:
     }
 
     /// Drops GPU resources bound to preview players on D3D/D2D device reset or adapter switch.
-    void reset_preview_gpu() noexcept {
+    void reset_preview_gpu() {
         gif_.reset_gpu();
         video_.reset_gpu();
+    }
+
+    /// Cancels and joins background clipboard copy workers before message-queue teardown.
+    void stop_workers() {
+        for (auto& [id, worker] : copy_workers_) worker.request_stop();
+        copy_workers_.clear();
     }
 
     /// COM objects this window still holds; released before OLE is uninitialised.

@@ -50,9 +50,17 @@ struct Progress {
         wlog(L"[%s] %.*s\n", phase_label(p), static_cast<int>(msg.size()), msg.data());
     }
     void set_message(std::wstring_view msg) {
+        if (msg.empty()) {
+            d.message[0] = L'\0';
+            return;
+        }
         wcsncpy_s(d.message, msg.data(), std::min(msg.size(), std::size(d.message) - 1));
     }
     void set_current(std::wstring_view path) {
+        if (path.empty()) {
+            d.current[0] = L'\0';
+            return;
+        }
         wcsncpy_s(d.current, path.data(), std::min(path.size(), std::size(d.current) - 1));
     }
     void publish(bool force = false) {
@@ -227,6 +235,7 @@ bool write_everything_exe(const fs::path& target) {
     const HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(IDR_EVERYTHING_EXE), RT_RCDATA);
     if (!res) return false;
     const HGLOBAL loaded = LoadResource(nullptr, res);
+    if (!loaded) return false;
     const auto* ptr = static_cast<const char*>(LockResource(loaded));
     const DWORD size = SizeofResource(nullptr, res);
     if (!ptr || size == 0) return false;

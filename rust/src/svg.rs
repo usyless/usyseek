@@ -96,6 +96,11 @@ fn render(path: &str, box_w: u32, box_h: u32, fit: u32, background: u32) -> Resu
 /// `background`: 0xAARRGGBB painted under the document, alpha 0 = keep transparency.
 ///
 /// Returns 0 on success with `info.width * info.height * 4` bytes in `out`; otherwise `out` holds the error message.
+///
+/// # Safety
+///
+/// `path.ptr` (when non-null and `path.len > 0`) must point to `path.len` valid readable bytes for this call,
+/// and non-null `info` / `out` pointers must be valid and uniquely writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_svg_render(
     path: UsyStr,

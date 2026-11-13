@@ -88,18 +88,18 @@ public:
 
     [[nodiscard]] StatusData read() const noexcept {
         const auto* s = shared();
-        StatusData out;
         for (int i = 0; i < 64; ++i) {
             const uint32_t a = s->seq.load(std::memory_order_acquire);
             if (a & 1) {
                 YieldProcessor();
                 continue;
             }
-            std::memcpy(&out, &s->data, sizeof(StatusData));
+            StatusData candidate;
+            std::memcpy(&candidate, &s->data, sizeof(StatusData));
             std::atomic_thread_fence(std::memory_order_acquire);
-            if (s->seq.load(std::memory_order_acquire) == a) break;
+            if (s->seq.load(std::memory_order_acquire) == a) return candidate;
         }
-        return out;
+        return {};
     }
 
 private:

@@ -218,13 +218,21 @@ private:
     // Processes
     // ------------------------------------------------------------------------------------------
 
-    wil::unique_process_information spawn(const fs::path& exe, const std::wstring& args, bool no_window) {
+    wil::unique_process_information spawn(const fs::path& exe, const std::wstring& args, bool no_window, HANDLE std_out = nullptr) {
         wil::unique_process_information pi;
         std::wstring cmd = L"\"" + exe.wstring() + L"\" " + args;
         STARTUPINFOW si{sizeof(si)};
+        BOOL inherit = FALSE;
+        if (std_out && std_out != INVALID_HANDLE_VALUE) {
+            si.dwFlags |= STARTF_USESTDHANDLES;
+            si.hStdInput = nullptr;
+            si.hStdOutput = std_out;
+            si.hStdError = std_out;
+            inherit = TRUE;
+        }
         DWORD flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
         if (no_window) flags |= CREATE_NO_WINDOW;
-        if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, flags,
+        if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, inherit, flags,
                             nullptr, exe_dir().c_str(), &si, &pi)) {
             const DWORD err = GetLastError();
             const std::string name = to_utf8(exe.filename().wstring());
@@ -352,8 +360,15 @@ private:
         ensure_qdrant();
         ResetEvent(stop_event_.get());
 
-        indexer_ = spawn(exe_dir() / L"usyseek-indexer.exe", L"", true);
+        std::error_code ec;
+        fs::create_directories(data_dir(), ec);
+        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+        wil::unique_hfile log_file{CreateFileW((data_dir() / L"indexer.log").c_str(), GENERIC_WRITE,
+                                               FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS,
+                                               FILE_ATTRIBUTE_NORMAL, nullptr)};
+        indexer_ = spawn(exe_dir() / L"usyseek-indexer.exe", L"", true, log_file.get());
         stopping_index_ = false;
+        indexer_status_.reset();
         if (indexer_.hProcess) SetTimer(hwnd_, TIMER_TRAY_PROGRESS, 1000, nullptr);
         notify_ui();
         update_tip();
@@ -398,19 +413,22 @@ private:
             indexer_.reset();
             const bool was_stopping = stopping_index_;
             stopping_index_ = false;
+            std::wstring status_msg;
+            if (auto b = indexer_status_ ? std::move(indexer_status_) : StatusBlock::open()) {
+                const StatusData d = b->read();
+                if (d.message[0]) status_msg = d.message;
+            }
+            indexer_status_.reset();
             close_everything_instance();
             if (code != 0 && code != 2 && code != 3) {
-                std::wstring msg = L"Indexing failed. Open Notifications to view details.";
-                if (auto b = StatusBlock::open()) {
-                    const StatusData d = b->read();
-                    if (d.message[0]) {
-                        msg = L"Indexing failed: " + std::wstring{d.message};
-                    }
-                }
+                if (status_msg.empty()) status_msg = to_wide(read_indexer_log_error());
+                const std::wstring msg = status_msg.empty()
+                    ? L"Indexing failed. See data\\indexer.log for details."
+                    : (L"Indexing failed: " + status_msg);
                 if (!was_stopping) {
                     push_notification_to_disk(
                         "error", "Indexer", "Indexing ended with errors",
-                        to_utf8(msg) + " (exit code " + std::to_string(code) + ")",
+                        to_utf8(msg) + " (exit code " + std::to_string(code) + ", log: data\\indexer.log)",
                         "indexer-exit", true);
                 }
                 if (!is_ui_running()) {
@@ -492,8 +510,9 @@ private:
         NOTIFYICONDATAW nid = tray_data();
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         nid.uCallbackMessage = WM_TRAY;
-        nid.hIcon = static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
-                                                  GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR));
+        tray_icon_.reset(static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                                       GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR)));
+        nid.hIcon = tray_icon_.get();
         wcscpy_s(nid.szTip, APP_NAME);
         Shell_NotifyIconW(NIM_ADD, &nid);
         nid.uVersion = NOTIFYICON_VERSION_4;
@@ -506,10 +525,60 @@ private:
         Shell_NotifyIconW(NIM_DELETE, &nid);
     }
 
+    static std::string read_indexer_log_error() {
+        wil::unique_hfile f{CreateFileW((data_dir() / L"indexer.log").c_str(), GENERIC_READ,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr)};
+        if (!f) return {};
+        LARGE_INTEGER size{};
+        if (!GetFileSizeEx(f.get(), &size) || size.QuadPart <= 0) return {};
+        constexpr LONGLONG TAIL = 8192;
+        if (size.QuadPart > TAIL) {
+            LARGE_INTEGER off{};
+            off.QuadPart = size.QuadPart - TAIL;
+            SetFilePointerEx(f.get(), off, nullptr, FILE_BEGIN);
+        }
+        const DWORD want = static_cast<DWORD>(std::min<LONGLONG>(size.QuadPart, TAIL));
+        std::string buf(want, '\0');
+        DWORD got = 0;
+        if (!ReadFile(f.get(), buf.data(), want, &got, nullptr) || got == 0) return {};
+        buf.resize(got);
+
+        std::string last_line;
+        std::string best_line;
+        size_t pos = 0;
+        while (pos < buf.size()) {
+            const size_t nl = buf.find('\n', pos);
+            const size_t end = (nl == std::string::npos) ? buf.size() : nl;
+            std::string_view line{buf.data() + pos, end - pos};
+            while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.remove_suffix(1);
+            while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.remove_prefix(1);
+            if (!line.empty()) {
+                last_line.assign(line);
+                if (line.contains("runtime error:") ||
+                    line.contains("AddressSanitizer") ||
+                    line.contains("UndefinedBehaviorSanitizer") ||
+                    line.contains("ERROR:") ||
+                    line.contains("[Error]")) {
+                    best_line.assign(line);
+                }
+            }
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+        }
+        std::string out = !best_line.empty() ? std::move(best_line) : std::move(last_line);
+        if (out.size() > 220) {
+            out.resize(217);
+            out += "...";
+        }
+        return out;
+    }
+
     std::wstring format_index_progress(bool multiline) const {
         if (!indexer_.hProcess) return {};
-        if (auto block = StatusBlock::open()) {
-            const StatusData d = block->read();
+        if (!indexer_status_) indexer_status_ = StatusBlock::open();
+        if (indexer_status_) {
+            const StatusData d = indexer_status_->read();
             if (stopping_index_) {
                 if (d.found > 0) {
                     wchar_t pbuf[32];
@@ -627,6 +696,8 @@ private:
     wil::unique_process_information ui_;
     wil::unique_process_information indexer_;
     wil::unique_process_information qdrant_;
+    wil::unique_hicon tray_icon_;
+    mutable std::optional<StatusBlock> indexer_status_;
     bool stopping_index_ = false;
     bool tray_hide_on_select_ = false;
     bool balloon_opens_notifs_ = true;

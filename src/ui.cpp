@@ -137,8 +137,14 @@ int run_automated_test(Shared& sh, Pill& pill, SettingsWindow& settings_win, con
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     ulp::win::COMWrapper<false> com{COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE};
-    // OLE proper (not just COM) for dragging media out and putting it on the clipboard
-    const HRESULT ole = OleInitialize(nullptr);
+    // OLE proper (not just COM) for dragging media out and putting it on the clipboard.
+    // Keep alive across Pill/SettingsWindow/Shared destruction.
+    struct OleScope {
+        HRESULT hr = OleInitialize(nullptr);
+        ~OleScope() {
+            if (SUCCEEDED(hr)) OleUninitialize();
+        }
+    } ole;
     ulp::win::dark::init_dark_mode();
 
     int argc = 0;
@@ -198,7 +204,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         return 1;
     }
 
-    sh.call_hwnd = pill.hwnd();
+    sh.call_hwnd.store(pill.hwnd(), std::memory_order_release);
     if (settings_corrupt && !sh.test_mode) {
         sh.notify("warning", "Settings", "Corrupted settings.json reset to defaults",
                   "settings.json could not be parsed cleanly. Default settings are in use until saved.", "settings-corrupt");
@@ -216,7 +222,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.previews.start(pill.hwnd(), WM_APP_THUMBS, 1);
 
     sh.engine.on_result = [&](std::unique_ptr<SearchResult> r) {
-        PostMessageW(pill.hwnd(), WM_APP_RESULT, 0, reinterpret_cast<LPARAM>(r.release()));
+        const HWND hwnd = sh.call_hwnd.load(std::memory_order_acquire);
+        if (!hwnd || !r) return;
+        if (PostMessageW(hwnd, WM_APP_RESULT, 0, reinterpret_cast<LPARAM>(r.get()))) {
+            (void)r.release();
+        }
     };
     sh.engine.on_db_state = [&](bool ready, std::string err) {
         sh.call([&, ready, err = std::move(err)] {
@@ -404,10 +414,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         code = static_cast<int>(msg.wParam);
     }
 
+    sh.call_hwnd.store(nullptr, std::memory_order_release);
     sh.thumbs.stop();
     sh.previews.stop();
     sh.engine.stop();
+    settings_win.stop();
+    pill.stop_workers();
+
+    MSG leftover;
+    while (PeekMessageW(&leftover, pill.hwnd(), WM_APP_CALL, WM_APP_CALL, PM_REMOVE)) {
+        if (leftover.wParam == 0 && leftover.lParam) {
+            delete reinterpret_cast<std::function<void()>*>(leftover.lParam);
+        }
+    }
+    while (PeekMessageW(&leftover, pill.hwnd(), WM_APP_RESULT, WM_APP_RESULT, PM_REMOVE)) {
+        delete reinterpret_cast<SearchResult*>(leftover.lParam);
+    }
+
     pill.release_com_objects();
-    if (SUCCEEDED(ole)) OleUninitialize();
     return code;
 }

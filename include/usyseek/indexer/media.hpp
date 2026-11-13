@@ -105,6 +105,7 @@ public:
             if (reason) *reason = std::wstring{msg};
             return std::nullopt;
         };
+        if (!wic_) return fail(L"WIC imaging factory unavailable");
         wil::com_ptr<IMFAttributes> attr;
         if (FAILED(MFCreateAttributes(&attr, 2))) return fail(L"Media Foundation attributes failed");
         attr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);

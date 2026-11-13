@@ -134,11 +134,21 @@ public:
     enum class State : uint8_t { Idle, Exporting, Loading, Ready, Failed };
     std::function<void()> on_state_changed;
 
+    ~TextEncoder() { stop(); }
+
+    void stop() noexcept {
+        stopping_.store(true, std::memory_order_release);
+        if (stop_evt_) SetEvent(stop_evt_.get());
+        loader_ = {};
+    }
+
     /// Loads the text tower in the background. A request made while another load is running replaces it
     /// as soon as that one finishes; asking again for a model that failed retries it.
     void load_async(fs::path model_dir, std::string model_name) {
+        if (stopping_.load(std::memory_order_acquire)) return;
         {
             const std::lock_guard lk{m_};
+            if (stopping_.load(std::memory_order_acquire)) return;
             const bool same = model_name == name_ && model_dir == dir_;
             if (same && (busy_ || state_ == State::Ready)) return;
             name_ = std::move(model_name);
@@ -290,6 +300,7 @@ private:
 
     void load_loop() {
         for (;;) {
+            if (stopping_.load(std::memory_order_acquire)) break;
             fs::path dir;
             std::string name;
             uint64_t generation = 0;
@@ -314,6 +325,10 @@ private:
             std::shared_ptr<const Model> previous; // released after the lock
             {
                 const std::lock_guard lk{m_};
+                if (stopping_.load(std::memory_order_acquire)) {
+                    busy_ = false;
+                    break;
+                }
                 if (generation != wanted_) continue; // another model was requested while this one loaded
                 previous = std::exchange(model_, std::move(model));
                 cache_.clear();
@@ -325,7 +340,7 @@ private:
             break;
         }
         cv_.notify_all();
-        notify();
+        if (!stopping_.load(std::memory_order_acquire)) notify();
         SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
     }
 
@@ -343,9 +358,17 @@ private:
             const fs::path idx_exe = exe_dir() / L"usyseek-indexer.exe";
             std::wstring cmd = L"\"" + idx_exe.wstring() + L"\" --export-text";
             STARTUPINFOW si{sizeof(si)};
+            wil::unique_handle job = make_kill_on_close_job();
             wil::unique_process_information pi;
-            if (CreateProcessW(idx_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, exe_dir().c_str(), &si, &pi)) {
-                WaitForSingleObject(pi.hProcess, 180'000);
+            if (CreateProcessW(idx_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, exe_dir().c_str(), &si, &pi)) {
+                if (job) AssignProcessToJobObject(job.get(), pi.hProcess);
+                ResumeThread(pi.hThread);
+                HANDLE waits[2]{pi.hProcess, stop_evt_.get()};
+                const DWORD n = stop_evt_ ? 2u : 1u;
+                WaitForMultipleObjects(n, waits, FALSE, 180'000);
+            }
+            if (stopping_.load(std::memory_order_acquire)) {
+                throw std::runtime_error("Model loading cancelled");
             }
             state_ = State::Loading;
             notify();
@@ -383,6 +406,8 @@ private:
     mutable std::mutex m_;
     std::condition_variable cv_;
     std::atomic<State> state_{State::Idle};
+    std::atomic<bool> stopping_{false};
+    wil::unique_event_nothrow stop_evt_{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
     bool busy_ = false;   // a loader thread is running
     uint64_t wanted_ = 0; // bumped by every request, so a loader can tell it was superseded
     std::wstring error_;
@@ -440,6 +465,7 @@ public:
         }
         cv_.notify_all();
         thread_ = {};
+        encoder_.stop();
     }
 
     void search(SearchRequest r) {

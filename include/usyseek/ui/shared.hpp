@@ -55,7 +55,7 @@ struct Shared {
     StatusData indexer{};
     wil::unique_event_nothrow stop_event_;
 
-    HWND call_hwnd = nullptr;        // window that runs marshalled callbacks
+    std::atomic<HWND> call_hwnd{nullptr}; // window that runs marshalled callbacks
     bool test_mode = false;
     HotkeyState hotkey_state = HotkeyState::Unknown;
     int background_jobs = 0;         // downloads / installs in flight: the process must not idle-exit under them
@@ -69,8 +69,11 @@ struct Shared {
 
     /// Runs `fn` on the UI thread (safe from any thread).
     void call(std::function<void()> fn) {
-        if (!call_hwnd) return;
-        PostMessageW(call_hwnd, WM_APP_CALL, 0, reinterpret_cast<LPARAM>(new std::function<void()>(std::move(fn))));
+        const HWND hwnd = call_hwnd.load(std::memory_order_acquire);
+        if (!hwnd) return;
+        auto p = std::make_unique<std::function<void()>>(std::move(fn));
+        if (!PostMessageW(hwnd, WM_APP_CALL, 0, reinterpret_cast<LPARAM>(p.get()))) return;
+        (void)p.release();
     }
 
     void refresh_tags() {

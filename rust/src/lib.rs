@@ -63,6 +63,29 @@ impl UsyBuf {
     }
 }
 
+unsafe fn slice_from<'a, T>(ptr: *const T, len: usize) -> Result<&'a [T], String> {
+    if len == 0 {
+        Ok(&[])
+    } else if ptr.is_null() {
+        Err("null slice pointer with non-zero length".into())
+    } else {
+        Ok(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+}
+
+unsafe fn qdrant_ref<'a>(q: *mut UsyQdrant) -> Result<&'a UsyQdrant, String> {
+    if q.is_null() {
+        Err("null qdrant handle".into())
+    } else {
+        Ok(unsafe { &*q })
+    }
+}
+
+/// Frees a buffer previously allocated by Rust and returned via `UsyBuf`.
+///
+/// # Safety
+///
+/// `b` must either have `b.ptr == null` or originate from a Rust `UsyBuf` returned by this library and not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_buf_free(b: UsyBuf) {
     if !b.ptr.is_null() {
@@ -202,6 +225,11 @@ fn payload_selector(fields: &[String]) -> SelectorOptions {
     }
 }
 
+/// Connects to a Qdrant gRPC endpoint and returns an owned handle, or null with error text in `out`.
+///
+/// # Safety
+///
+/// `url` (when non-empty) must point to valid readable bytes; `out` may be null or a valid writable `UsyBuf`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_connect(url: UsyStr, out: *mut UsyBuf) -> *mut UsyQdrant {
     let url = url.as_str().to_owned();
@@ -219,6 +247,11 @@ pub unsafe extern "C" fn usy_qd_connect(url: UsyStr, out: *mut UsyBuf) -> *mut U
     }
 }
 
+/// Frees a `UsyQdrant` handle returned by `usy_qd_connect`.
+///
+/// # Safety
+///
+/// `q` must be null or a live pointer returned by `usy_qd_connect` that has not yet been freed or used concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_free(q: *mut UsyQdrant) {
     if !q.is_null() {
@@ -227,10 +260,14 @@ pub unsafe extern "C" fn usy_qd_free(q: *mut UsyQdrant) {
 }
 
 /// Returns 0 when the server answers a health check.
+///
+/// # Safety
+///
+/// `q` must be null or a valid `UsyQdrant` pointer; `out` must be null or uniquely writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_health(q: *mut UsyQdrant, out: *mut UsyBuf) -> i32 {
-    let q = unsafe { &*q };
     run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
         runtime()
             .block_on(q.client.health_check())
             .map(|r| r.version)
@@ -239,9 +276,16 @@ pub unsafe extern "C" fn usy_qd_health(q: *mut UsyQdrant, out: *mut UsyBuf) -> i
 }
 
 /// Ensures `name` exists. When `dim == 0` and the collection does not exist, returns `2` without creating it.
+///
+/// # Safety
+///
+/// `q` must be null or valid; `name` (when non-empty) must point to valid readable bytes; `out` must be null or uniquely writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_ensure_collection(q: *mut UsyQdrant, name: UsyStr, dim: u64, out: *mut UsyBuf) -> i32 {
-    let q = unsafe { &*q };
+    let Ok(q) = (unsafe { qdrant_ref(q) }) else {
+        unsafe { write_out(out, "null qdrant handle".into()) };
+        return 1;
+    };
     let name = name.as_str().to_owned();
     let res: Result<String, (i32, String)> = runtime().block_on(async {
         if q.client.collection_exists(&name).await.map_err(|e| (1, err(e)))? {
@@ -296,6 +340,10 @@ pub unsafe extern "C" fn usy_qd_ensure_collection(q: *mut UsyQdrant, name: UsySt
 }
 
 /// payloads: JSON array (one object per point, same order as ids).
+///
+/// # Safety
+///
+/// `q` must be null or valid; when `count > 0`, `ids` must point to `count` `u64`s and `vectors` to `count * dim` `f32`s; `name`/`payloads`/`out` must be valid for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_upsert(
     q: *mut UsyQdrant,
@@ -307,12 +355,13 @@ pub unsafe extern "C" fn usy_qd_upsert(
     payloads: UsyStr,
     out: *mut UsyBuf,
 ) -> i32 {
-    let q = unsafe { &*q };
     let name = name.as_str().to_owned();
-    let ids = unsafe { slice::from_raw_parts(ids, count) };
-    let vectors = unsafe { slice::from_raw_parts(vectors, count * dim) };
     let payloads = payloads.as_str();
     run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
+        let total_floats = count.checked_mul(dim).ok_or_else(|| "vector slice size overflow".to_string())?;
+        let ids = unsafe { slice_from(ids, count) }?;
+        let vectors = unsafe { slice_from(vectors, total_floats) }?;
         let arr: Vec<Json> = serde_json::from_str(payloads).map_err(err)?;
         if arr.len() != count {
             return Err("payload count mismatch".into());
@@ -334,6 +383,10 @@ pub unsafe extern "C" fn usy_qd_upsert(
 
 /// request: { "limit", "offset", "threshold", "filter", "fields": [..], "id": u64 (query by stored point) }
 /// vector/dim: optional query vector (dim == 0 -> use "id").
+///
+/// # Safety
+///
+/// `q` must be null or valid; when `dim > 0` and `vector` is non-null, `vector` must point to `dim` `f32`s; `name`/`request`/`out` must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_query(
     q: *mut UsyQdrant,
@@ -343,15 +396,15 @@ pub unsafe extern "C" fn usy_qd_query(
     request: UsyStr,
     out: *mut UsyBuf,
 ) -> i32 {
-    let q = unsafe { &*q };
     let name = name.as_str().to_owned();
-    let vector: Vec<f32> = if dim > 0 && !vector.is_null() {
-        unsafe { slice::from_raw_parts(vector, dim) }.to_vec()
-    } else {
-        Vec::new()
-    };
     let request = request.as_str();
     run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
+        let vector: Vec<f32> = if dim > 0 && !vector.is_null() {
+            unsafe { slice_from(vector, dim) }?.to_vec()
+        } else {
+            Vec::new()
+        };
         let req: Json = serde_json::from_str(request).map_err(err)?;
         let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(100);
         let offset = req.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -389,12 +442,16 @@ pub unsafe extern "C" fn usy_qd_query(
 }
 
 /// request: { "limit", "filter", "fields", "offset": u64 id cursor, "order_mtime": bool }
+///
+/// # Safety
+///
+/// `q` must be null or valid; `name`/`request`/`out` must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_scroll(q: *mut UsyQdrant, name: UsyStr, request: UsyStr, out: *mut UsyBuf) -> i32 {
-    let q = unsafe { &*q };
     let name = name.as_str().to_owned();
     let request = request.as_str();
     run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
         let req: Json = serde_json::from_str(request).map_err(err)?;
         let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
         let fields = str_list(req.get("fields"));
@@ -422,6 +479,10 @@ pub unsafe extern "C" fn usy_qd_scroll(q: *mut UsyQdrant, name: UsyStr, request:
 }
 
 /// request: { "fields": [..] }
+///
+/// # Safety
+///
+/// `q` must be null or valid; when `count > 0`, `ids` must point to `count` readable `u64`s; `name`/`request`/`out` must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_retrieve(
     q: *mut UsyQdrant,
@@ -431,11 +492,11 @@ pub unsafe extern "C" fn usy_qd_retrieve(
     request: UsyStr,
     out: *mut UsyBuf,
 ) -> i32 {
-    let q = unsafe { &*q };
     let name = name.as_str().to_owned();
-    let ids: Vec<PointId> = unsafe { slice::from_raw_parts(ids, count) }.iter().map(|&i| i.into()).collect();
     let request = request.as_str();
     run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
+        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| i.into()).collect();
         let req: Json = serde_json::from_str(request).unwrap_or(Json::Null);
         let fields = str_list(req.get("fields"));
         let res = runtime()
@@ -455,6 +516,10 @@ pub unsafe extern "C" fn usy_qd_retrieve(
 }
 
 /// Merges `payload` (JSON object) into the given points.
+///
+/// # Safety
+///
+/// `q` must be null or valid; when `count > 0`, `ids` must point to `count` readable `u64`s; `name`/`payload`/`out` must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_set_payload(
     q: *mut UsyQdrant,
@@ -464,11 +529,11 @@ pub unsafe extern "C" fn usy_qd_set_payload(
     payload: UsyStr,
     out: *mut UsyBuf,
 ) -> i32 {
-    let q = unsafe { &*q };
     let name = name.as_str().to_owned();
-    let ids: Vec<PointId> = unsafe { slice::from_raw_parts(ids, count) }.iter().map(|&i| i.into()).collect();
     let payload = payload.as_str();
     run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
+        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| i.into()).collect();
         let p: Json = serde_json::from_str(payload).map_err(err)?;
         let p = Payload::try_from(p).map_err(err)?;
         runtime()
@@ -482,12 +547,17 @@ pub unsafe extern "C" fn usy_qd_set_payload(
     })
 }
 
+/// Deletes points with the given `ids` from `name`.
+///
+/// # Safety
+///
+/// `q` must be null or valid; when `count > 0`, `ids` must point to `count` readable `u64`s; `name`/`out` must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_delete(q: *mut UsyQdrant, name: UsyStr, ids: *const u64, count: usize, out: *mut UsyBuf) -> i32 {
-    let q = unsafe { &*q };
     let name = name.as_str().to_owned();
-    let ids: Vec<PointId> = unsafe { slice::from_raw_parts(ids, count) }.iter().map(|&i| i.into()).collect();
     run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
+        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| i.into()).collect();
         runtime()
             .block_on(q.client.delete_points(
                 DeletePointsBuilder::new(&name).points(PointsIdsList { ids }).wait(true),
@@ -497,11 +567,16 @@ pub unsafe extern "C" fn usy_qd_delete(q: *mut UsyQdrant, name: UsyStr, ids: *co
     })
 }
 
+/// Drops collection `name` if it exists.
+///
+/// # Safety
+///
+/// `q` must be null or valid; `name`/`out` must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_drop_collection(q: *mut UsyQdrant, name: UsyStr, out: *mut UsyBuf) -> i32 {
-    let q = unsafe { &*q };
     let name = name.as_str().to_owned();
     run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
         runtime().block_on(async {
             if q.client.collection_exists(&name).await.map_err(err)? {
                 q.client.delete_collection(&name).await.map_err(err)?;
@@ -512,11 +587,15 @@ pub unsafe extern "C" fn usy_qd_drop_collection(q: *mut UsyQdrant, name: UsyStr,
 }
 
 /// Exact count; result is the number as a string. Missing collection counts as 0.
+///
+/// # Safety
+///
+/// `q` must be null or valid; `name`/`out` must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_count(q: *mut UsyQdrant, name: UsyStr, out: *mut UsyBuf) -> i32 {
-    let q = unsafe { &*q };
     let name = name.as_str().to_owned();
     run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
         runtime().block_on(async {
             if !q.client.collection_exists(&name).await.map_err(err)? {
                 return Ok("0".to_owned());
@@ -528,11 +607,15 @@ pub unsafe extern "C" fn usy_qd_count(q: *mut UsyQdrant, name: UsyStr, out: *mut
 }
 
 /// Tag facet counts: [{ "v": tag, "c": count }]
+///
+/// # Safety
+///
+/// `q` must be null or valid; `name`/`out` must be valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_facet_tags(q: *mut UsyQdrant, name: UsyStr, limit: u64, out: *mut UsyBuf) -> i32 {
-    let q = unsafe { &*q };
     let name = name.as_str().to_owned();
     run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
         let res = runtime()
             .block_on(q.client.facet(FacetCountsBuilder::new(&name, F_TAGS).limit(limit).exact(true)))
             .map_err(err)?;
@@ -560,6 +643,11 @@ pub struct UsyTokenizer {
     ctx: usize,
 }
 
+/// Loads a HuggingFace tokenizer JSON file and configures fixed truncation/padding to `context_length`.
+///
+/// # Safety
+///
+/// `path` (when non-empty) must point to readable bytes; `out` must be null or uniquely writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_tok_load(path: UsyStr, context_length: usize, out: *mut UsyBuf) -> *mut UsyTokenizer {
     let path = path.as_str().to_owned();
@@ -582,6 +670,11 @@ pub unsafe extern "C" fn usy_tok_load(path: UsyStr, context_length: usize, out: 
     Box::into_raw(Box::new(UsyTokenizer { tok, ctx: context_length }))
 }
 
+/// Frees a `UsyTokenizer` handle returned by `usy_tok_load`.
+///
+/// # Safety
+///
+/// `t` must be null or a live pointer returned by `usy_tok_load` not yet freed or used concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_tok_free(t: *mut UsyTokenizer) {
     if !t.is_null() {
@@ -590,10 +683,20 @@ pub unsafe extern "C" fn usy_tok_free(t: *mut UsyTokenizer) {
 }
 
 /// Writes exactly `context_length` ids into `ids`. Returns the count written, 0 on failure.
+///
+/// # Safety
+///
+/// `t` must be null or valid; `text` must be valid; `ids` must be null or point to `context_length` writable `i64` elements.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_tok_encode(t: *mut UsyTokenizer, text: UsyStr, ids: *mut i64) -> usize {
+    if t.is_null() || ids.is_null() {
+        return 0;
+    }
     let t = unsafe { &*t };
     let Ok(enc) = t.tok.encode(text.as_str(), true) else { return 0 };
+    if t.ctx == 0 {
+        return 0;
+    }
     let out = unsafe { slice::from_raw_parts_mut(ids, t.ctx) };
     out.fill(0);
     for (o, &i) in out.iter_mut().zip(enc.get_ids()) {
@@ -605,4 +708,32 @@ pub unsafe extern "C" fn usy_tok_encode(t: *mut UsyTokenizer, text: UsyStr, ids:
 #[unsafe(no_mangle)]
 pub extern "C" fn usy_buf_empty() -> UsyBuf {
     UsyBuf::empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_qdrant_and_empty_slices_fail_safely() {
+        let empty = || UsyStr { ptr: ptr::null(), len: 0 };
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_health(ptr::null_mut(), &mut buf) }, 1);
+        unsafe { usy_buf_free(buf) };
+
+        let mut buf2 = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_retrieve(ptr::null_mut(), empty(), ptr::null(), 0, empty(), &mut buf2) }, 1);
+        unsafe { usy_buf_free(buf2) };
+
+        let mut buf3 = usy_buf_empty();
+        assert_eq!(
+            unsafe { usy_qd_upsert(ptr::null_mut(), empty(), ptr::null(), usize::MAX, ptr::null(), 4, empty(), &mut buf3) },
+            1
+        );
+        unsafe { usy_buf_free(buf3) };
+
+        assert_eq!(unsafe { slice_from::<u64>(ptr::null(), 0).unwrap().len() }, 0);
+        assert!(unsafe { slice_from::<u64>(ptr::null(), 2) }.is_err());
+        assert_eq!(unsafe { usy_tok_encode(ptr::null_mut(), empty(), ptr::null_mut()) }, 0);
+    }
 }

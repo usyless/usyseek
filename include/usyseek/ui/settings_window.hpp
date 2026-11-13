@@ -111,6 +111,12 @@ public:
     [[nodiscard]] bool visible() const noexcept { return IsWindowVisible(hwnd_) != FALSE; }
     WindowTarget& target() noexcept { return target_; }
 
+    /// Cancels and joins background download/install jobs before tearing down the window.
+    void stop() {
+        venv_job_.thread = {};
+        model_job_.thread = {};
+    }
+
     void show(int tab = -1) {
         if (tab >= 0) {
             tab_ = std::clamp(tab, 0, 2);
@@ -1731,7 +1737,9 @@ private:
 
     /// Any thread.
     void request_redraw() {
-        if (!redraw_posted_.exchange(true)) PostMessageW(hwnd_, WM_APP_REDRAW, 0, 0);
+        if (!redraw_posted_.exchange(true) && !PostMessageW(hwnd_, WM_APP_REDRAW, 0, 0)) {
+            redraw_posted_ = false;
+        }
     }
 
     void report(Job& job, std::wstring_view line, bool failed = false) {
