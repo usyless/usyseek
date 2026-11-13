@@ -214,6 +214,7 @@ public:
         }
         layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
         layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         const DWRITE_TRIMMING no_trim{.granularity = DWRITE_TRIMMING_GRANULARITY_NONE, .delimiter = 0, .delimiterCount = 0};
         layout->SetTrimming(&no_trim, nullptr);
         DWRITE_TEXT_METRICS m{};
