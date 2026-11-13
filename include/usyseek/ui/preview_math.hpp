@@ -266,6 +266,9 @@ public:
     }
 
     [[nodiscard]] bool in_flight() const noexcept { return in_flight_; }
+    [[nodiscard]] bool has_pending() const noexcept { return pending_.has_value(); }
+    [[nodiscard]] bool active() const noexcept { return in_flight_ || pending_.has_value(); }
+    [[nodiscard]] int64_t started_ms() const noexcept { return started_ms_; }
 
 private:
     bool in_flight_ = false;

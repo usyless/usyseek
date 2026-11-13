@@ -163,6 +163,7 @@ public:
             gpu_recovery_.pos_s = current_time();
             gpu_recovery_.want_play = want_play_;
         }
+        scrubbing_ = false;
         shutdown_engine();
         reset_frame_state();
         if (gpu_recovery_.active) {
@@ -240,6 +241,7 @@ public:
     void suspend() noexcept {
         if (!engine_ || current_path_.empty() || phase_ == LoadPhase::Failed) return;
         want_play_ = false;
+        scrubbing_ = false;
         engine_->Pause();
     }
 
@@ -278,7 +280,7 @@ public:
                     }
                     if (!autoplay_handled_) {
                         autoplay_handled_ = true;
-                        if (want_play_) {
+                        if (want_play_ && !scrubbing_) {
                             engine_->Play();
                         } else {
                             engine_->Pause();
@@ -293,12 +295,7 @@ public:
                     break;
                 case MF_MEDIA_ENGINE_EVENT_SEEKED: {
                     if (phase_ != LoadPhase::Loading && phase_ != LoadPhase::Ready) break;
-                    seek_frame_ready_ = true;
-                    if (const auto next = seek_state_.on_seeked(now_ms())) {
-                        if (FAILED(engine_->SetCurrentTime(*next))) {
-                            seek_state_.cancel_current();
-                        }
-                    }
+                    advance_seek();
                     changed = true;
                     break;
                 }
@@ -310,6 +307,7 @@ public:
                     }
                     phase_ = LoadPhase::Failed;
                     want_play_ = false;
+                    scrubbing_ = false;
                     has_frame_ = false;
                     gpu_recovery_ = {};
                     changed = true;
@@ -342,6 +340,13 @@ public:
         if (!engine_ || !d3d || !dc || current_path_.empty() ||
             phase_ == LoadPhase::Idle || phase_ == LoadPhase::Failed) {
             return MediaTickStatus::NoChange;
+        }
+
+        // Recover if Media Foundation finished seeking without delivering SEEKED.
+        if ((phase_ == LoadPhase::Loading || phase_ == LoadPhase::Ready) &&
+            seek_state_.in_flight() && engine_->IsSeeking() == FALSE &&
+            (now_ms() - seek_state_.started_ms()) >= 1000) {
+            advance_seek();
         }
 
         LONGLONG pts = -1;
@@ -435,12 +440,33 @@ public:
 
     void toggle_play() noexcept {
         if (!engine_ || phase_ == LoadPhase::Idle || phase_ == LoadPhase::Failed) return;
+        if (scrubbing_) {
+            want_play_ = !want_play_;
+            return;
+        }
         autoplay_handled_ = true;
         if (want_play_ && is_playing()) {
             want_play_ = false;
             engine_->Pause();
         } else {
             want_play_ = true;
+            engine_->Play();
+        }
+    }
+
+    /// Pauses playback during an interactive scrub while preserving intended play state (`want_play_`).
+    void begin_scrub() noexcept {
+        if (!engine_ || phase_ == LoadPhase::Idle || phase_ == LoadPhase::Failed) return;
+        scrubbing_ = true;
+        engine_->Pause();
+    }
+
+    /// Ends an interactive scrub and resumes playback if `want_play_` is still true.
+    void end_scrub() noexcept {
+        if (!scrubbing_) return;
+        scrubbing_ = false;
+        if (!engine_ || phase_ == LoadPhase::Idle || phase_ == LoadPhase::Failed) return;
+        if (autoplay_handled_ && want_play_) {
             engine_->Play();
         }
     }
@@ -481,6 +507,12 @@ public:
         return !engine_->IsPaused() && !engine_->IsEnded();
     }
     [[nodiscard]] bool want_play() const noexcept { return want_play_; }
+    [[nodiscard]] bool is_scrubbing() const noexcept { return scrubbing_; }
+    [[nodiscard]] bool is_seeking() const noexcept {
+        if (!engine_ || phase_ == LoadPhase::Idle || phase_ == LoadPhase::Failed) return false;
+        return seek_state_.active() || seek_frame_ready_ || (engine_->IsSeeking() != FALSE);
+    }
+    [[nodiscard]] bool needs_timer() const noexcept { return is_playing() || is_seeking(); }
     [[nodiscard]] bool is_muted() const noexcept { return muted_; }
     [[nodiscard]] bool audio_only() const noexcept { return audio_only_; }
     [[nodiscard]] bool has_frame() const noexcept {
@@ -618,11 +650,23 @@ private:
         current_path_.clear();
         phase_ = LoadPhase::Idle;
         want_play_ = false;
+        scrubbing_ = false;
         autoplay_handled_ = false;
         audio_only_ = false;
         opening_sync_ = false;
         deferred_resume_seek_.reset();
         reset_frame_state();
+    }
+
+    void advance_seek() noexcept {
+        if (const auto next = seek_state_.on_seeked(now_ms())) {
+            if (FAILED(engine_->SetCurrentTime(*next))) {
+                seek_state_.cancel_current();
+                seek_frame_ready_ = true;
+            }
+        } else {
+            seek_frame_ready_ = true;
+        }
     }
 
     void shutdown_engine() noexcept {
@@ -648,6 +692,7 @@ private:
     bool mf_started_ = false;
     bool muted_ = false;
     bool want_play_ = false;
+    bool scrubbing_ = false;
     bool autoplay_handled_ = false;
     bool audio_only_ = false;
     bool opening_sync_ = false;

@@ -133,6 +133,9 @@ void test_gif_compositor() {
 void test_seek_state() {
     SeekState s;
     CHECK(!s.in_flight());
+    CHECK(!s.has_pending());
+    CHECK(!s.active());
+    CHECK(s.started_ms() == 0);
 
     // Invalid inputs ignored.
     CHECK(!s.request(5.0, 0.0, 1000).has_value());
@@ -142,10 +145,16 @@ void test_seek_state() {
     const auto r1 = s.request(-2.0, 20.0, 1000);
     CHECK(r1.has_value() && approx_d(*r1, 0.0));
     CHECK(s.in_flight());
+    CHECK(!s.has_pending());
+    CHECK(s.active());
+    CHECK(s.started_ms() == 1000);
 
     // Rapid second seek within TIMEOUT_MS is queued rather than spamming Media Foundation.
     const auto r2 = s.request(12.5, 20.0, 1050);
     CHECK(!r2.has_value());
+    CHECK(s.has_pending());
+    CHECK(s.active());
+    CHECK(s.started_ms() == 1000);
     CHECK(approx_d(s.displayed_time(1.0, false, 20.0), 12.5));
 
     // Newer scrub replaces pending target.
@@ -157,24 +166,39 @@ void test_seek_state() {
     const auto next = s.on_seeked(1120);
     CHECK(next.has_value() && approx_d(*next, 15.0));
     CHECK(s.in_flight());
+    CHECK(!s.has_pending());
+    CHECK(s.active());
+    CHECK(s.started_ms() == 1120);
 
     // Second completion clears in_flight_.
     CHECK(!s.on_seeked(1140).has_value());
     CHECK(!s.in_flight());
+    CHECK(!s.active());
 
     // While paused after seek, displayed_time continues showing 15.0 until playing settles it.
     CHECK(approx_d(s.displayed_time(14.8, false, 20.0), 15.0));
     s.on_frame_presented(true);
     CHECK(approx_d(s.displayed_time(15.2, true, 20.0), 15.2));
 
+    // Paused settle clears show_target_ once a paused frame lands.
+    CHECK(s.request(8.0, 20.0, 1500).has_value());
+    CHECK(!s.on_seeked(1520).has_value());
+    CHECK(approx_d(s.displayed_time(7.9, false, 20.0), 8.0));
+    s.settle_paused_display();
+    CHECK(approx_d(s.displayed_time(7.9, false, 20.0), 7.9));
+
     // Missed completion timeout override (>= 180ms) dispatches cleanly instead of getting stuck.
     CHECK(s.request(3.0, 20.0, 2000).has_value());
     CHECK(!s.request(4.0, 20.0, 2100).has_value());
     const auto timed_out = s.request(6.0, 20.0, 2000 + SeekState::TIMEOUT_MS);
     CHECK(timed_out.has_value() && approx_d(*timed_out, 6.0));
+    CHECK(!s.has_pending());
+    CHECK(s.started_ms() == 2000 + SeekState::TIMEOUT_MS);
 
     s.cancel_current();
     CHECK(!s.in_flight());
+    CHECK(!s.has_pending());
+    CHECK(!s.active());
     CHECK(approx_d(s.displayed_time(25.0, false, 20.0), 20.0));
 }
 

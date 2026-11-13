@@ -104,8 +104,9 @@ public:
         KillTimer(hwnd_, TIMER_DEVICE);
         KillTimer(hwnd_, TIMER_FADE);
         KillTimer(hwnd_, TIMER_GIF);
-        KillTimer(hwnd_, TIMER_VIDEO);
+        set_video_timer(false);
         dragging_seek_ = false;
+        gif_scrub_resume_ = false;
         gif_.close();
         video_.close();
         sh_.previews.clear();
@@ -127,12 +128,13 @@ public:
         selecting_text_ = false;
         dragging_scroll_ = false;
         dragging_seek_ = false;
+        gif_scrub_resume_ = false;
         ReleaseCapture();
         close_popups();
         KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_STATUS);
         KillTimer(hwnd_, TIMER_GIF);
-        KillTimer(hwnd_, TIMER_VIDEO);
+        set_video_timer(false);
         gif_.set_playing(false);
         video_.suspend();
         if (sh_.test_mode) {
@@ -878,7 +880,7 @@ private:
                         return true;
                     }
                     if (gif_.has_animation()) {
-                        title = gif_.playing() ? L"Pause (K)" : L"Play (K)";
+                        title = (dragging_seek_ ? gif_scrub_resume_ : gif_.playing()) ? L"Pause (K)" : L"Play (K)";
                         return true;
                     }
                 }
@@ -1771,10 +1773,19 @@ private:
                     const D2D1_RECT_F dest = preview_dest_dims(nw, nh, nw, nh, area);
                     const auto px_w = static_cast<uint32_t>(std::max(1.0f, std::round(width(dest) * target_.scale())));
                     const auto px_h = static_cast<uint32_t>(std::max(1.0f, std::round(height(dest) * target_.scale())));
-                    if (video_.set_output_size(px_w, px_h) &&
-                        video_.tick(sh_.gfx.d3d(), target_.dc()) == MediaTickStatus::DeviceLost) {
-                        recover();
-                        return false;
+                    const bool had_frame = video_.has_frame();
+                    const bool resized = video_.set_output_size(px_w, px_h);
+                    if (resized || video_.is_seeking()) {
+                        const MediaTickStatus st = video_.tick(sh_.gfx.d3d(), target_.dc());
+                        if (st == MediaTickStatus::DeviceLost) {
+                            recover();
+                            return false;
+                        }
+                        if (st == MediaTickStatus::FrameReady) {
+                            last_scrubber_redraw_ = std::chrono::steady_clock::now();
+                            if (!had_frame || !queue_preview_media_dirty()) full_dirty_ = true;
+                            sync_preview_timers();
+                        }
                     }
                 }
             }
@@ -1785,23 +1796,35 @@ private:
         return true;
     }
 
+    void set_video_timer(bool active) {
+        if (!hwnd_) {
+            video_timer_active_ = false;
+            return;
+        }
+        if (active) {
+            if (!video_timer_active_) {
+                SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+                video_timer_active_ = true;
+            }
+        } else if (video_timer_active_) {
+            KillTimer(hwnd_, TIMER_VIDEO);
+            video_timer_active_ = false;
+        }
+    }
+
     void sync_preview_timers() {
         if (!hwnd_) return;
         if (!visible() || !preview_valid()) {
             KillTimer(hwnd_, TIMER_GIF);
-            KillTimer(hwnd_, TIMER_VIDEO);
+            set_video_timer(false);
             return;
         }
         const Item& it = items_[preview_];
         if (it.pt.p.k == 1) {
             KillTimer(hwnd_, TIMER_GIF);
-            if (video_.active() && !video_.failed() && video_.is_playing()) {
-                SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
-            } else {
-                KillTimer(hwnd_, TIMER_VIDEO);
-            }
+            set_video_timer(video_.active() && !video_.failed() && video_.needs_timer());
         } else {
-            KillTimer(hwnd_, TIMER_VIDEO);
+            set_video_timer(false);
             if (gif_.has_animation() && gif_.playing()) {
                 SetTimer(hwnd_, TIMER_GIF, std::clamp(gif_.current_delay_ms(), 10u, 60000u), nullptr);
             } else {
@@ -1822,17 +1845,24 @@ private:
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
-    void invalidate_preview_media() {
-        if (!visible()) return;
+    bool queue_preview_media_dirty() {
         if (pv_media_rect_.right <= pv_media_rect_.left || pv_media_rect_.bottom <= pv_media_rect_.top) {
-            invalidate();
-            return;
+            return false;
         }
         pending_dirty_.push_back(D2D1::RectF(pv_media_rect_.left - 2.0f, pv_media_rect_.top - 2.0f,
                                              pv_media_rect_.right + 2.0f, pv_media_rect_.bottom + 2.0f));
         if (pv_ctrl_rect_.right > pv_ctrl_rect_.left && pv_ctrl_rect_.bottom > pv_ctrl_rect_.top) {
             pending_dirty_.push_back(D2D1::RectF(pv_ctrl_rect_.left - 4.0f, pv_ctrl_rect_.top - 4.0f,
                                                  pv_ctrl_rect_.right + 4.0f, pv_ctrl_rect_.bottom + 4.0f));
+        }
+        return true;
+    }
+
+    void invalidate_preview_media() {
+        if (!visible()) return;
+        if (!queue_preview_media_dirty()) {
+            invalidate();
+            return;
         }
         dirty_ = true;
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1871,34 +1901,38 @@ private:
         const bool had_frame = video_.has_frame();
         const bool had_failed = video_.failed();
         const bool changed = video_.process_events();
-        sync_preview_timers();
         if (!had_failed && video_.failed() && preview_valid() && items_[preview_].pt.p.k == 1) {
             sh_.notify("warning", "Preview", "Inline video playback failed",
                 "Could not play video inline (" + to_utf8(item_path(items_[preview_])) +
                     "). Click Play to open in your default media player.",
                 "preview-video");
         }
-        if (!preview_valid() || items_[preview_].pt.p.k != 1) return;
+        if (!preview_valid() || items_[preview_].pt.p.k != 1) {
+            sync_preview_timers();
+            return;
+        }
         if (target_.ready()) {
             const MediaTickStatus st = video_.tick(sh_.gfx.d3d(), target_.dc());
             if (st == MediaTickStatus::DeviceLost) {
                 recover();
                 return;
             }
+            sync_preview_timers();
             if (had_frame != video_.has_frame() || had_failed != video_.failed()) {
                 invalidate();
             } else if (st == MediaTickStatus::FrameReady || changed) {
                 last_scrubber_redraw_ = std::chrono::steady_clock::now();
                 invalidate_preview_media();
             }
-        } else if (changed) {
-            invalidate();
+        } else {
+            sync_preview_timers();
+            if (changed) invalidate();
         }
     }
 
     void on_video_timer() {
-        if (!visible() || !preview_valid() || items_[preview_].pt.p.k != 1 || !video_.active() || !video_.is_playing()) {
-            KillTimer(hwnd_, TIMER_VIDEO);
+        if (!visible() || !preview_valid() || items_[preview_].pt.p.k != 1 || !video_.active() || !video_.needs_timer()) {
+            set_video_timer(false);
             return;
         }
         const bool had_frame = video_.has_frame();
@@ -1915,10 +1949,12 @@ private:
             } else {
                 invalidate_preview_media();
             }
-        } else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_scrubber_redraw_).count() >= 200) {
+        } else if (video_.is_playing() &&
+                   std::chrono::duration_cast<std::chrono::milliseconds>(now - last_scrubber_redraw_).count() >= 200) {
             last_scrubber_redraw_ = now;
             invalidate_preview_controls();
         }
+        if (!video_.needs_timer()) set_video_timer(false);
     }
 
     void open_preview(int index) {
@@ -1935,12 +1971,13 @@ private:
         if (preview_ < 0) return;
         const int last = preview_;
         preview_ = -1;
-        dragging_seek_ = false;
+        gif_scrub_resume_ = false;
+        if (std::exchange(dragging_seek_, false) && GetCapture() == hwnd_) ReleaseCapture();
         pv_media_rect_ = {};
         pv_ctrl_rect_ = {};
         pv_seek_rect_ = {};
         KillTimer(hwnd_, TIMER_GIF);
-        KillTimer(hwnd_, TIMER_VIDEO);
+        set_video_timer(false);
         gif_.close();
         video_.close();
         sh_.previews.clear();
@@ -1963,7 +2000,8 @@ private:
             return;
         }
         index = std::clamp(index, 0, static_cast<int>(items_.size()) - 1);
-        dragging_seek_ = false;
+        gif_scrub_resume_ = false;
+        if (std::exchange(dragging_seek_, false) && GetCapture() == hwnd_) ReleaseCapture();
         pv_media_rect_ = {};
         pv_ctrl_rect_ = {};
         pv_seek_rect_ = {};
@@ -2042,7 +2080,9 @@ private:
 
         float lx = ctrl.left + 5.0f;
         float rx = ctrl.right - 5.0f;
-        const bool playing = is_video_ctrl ? video_.is_playing() : gif_.playing();
+        const bool playing = is_video_ctrl
+            ? (video_.is_scrubbing() ? video_.want_play() : video_.is_playing())
+            : (dragging_seek_ ? gif_scrub_resume_ : gif_.playing());
         const D2D1_RECT_F play_r = rect(lx, ctrl.top + 3.0f, 28.0f, 28.0f);
         icon_button(cv, play_r, playing ? glyph::pause : glyph::play, IdPvPlay);
         lx += 32.0f;
@@ -2234,17 +2274,52 @@ private:
         cv.text(meta, D2D1::RectF(18, sz.height - PV_BOTTOM, sz.width - 18, sz.height), Font::Caption, color::outline, Align::Center);
     }
 
-    void preview_seek_to_x(float x) {
-        if (!preview_valid() || pv_seek_rect_.right <= pv_seek_rect_.left) return;
+    bool preview_seek_to_x(float x, bool force = false) {
+        if (!preview_valid() || pv_seek_rect_.right <= pv_seek_rect_.left) return false;
         const float ratio = std::clamp((x - pv_seek_rect_.left) / width(pv_seek_rect_), 0.0f, 1.0f);
+        if (!force && ratio == seek_drag_ratio_) return false;
         seek_drag_ratio_ = ratio;
         if (items_[preview_].pt.p.k == 1) {
             const double dur = video_.duration();
-            if (dur > 0.0) video_.seek(static_cast<double>(ratio) * dur);
+            if (dur > 0.0) {
+                video_.seek(static_cast<double>(ratio) * dur);
+                sync_preview_timers();
+            }
         } else if (gif_.has_animation()) {
             gif_.seek_fraction(ratio);
             sync_preview_timers();
         }
+        return true;
+    }
+
+    void begin_seek_drag(float x) {
+        if (!preview_valid()) return;
+        dragging_seek_ = true;
+        if (items_[preview_].pt.p.k == 1 && !video_.failed()) {
+            video_.begin_scrub();
+        } else if (gif_.has_animation()) {
+            gif_scrub_resume_ = gif_.playing();
+            gif_.set_playing(false);
+        }
+        SetCapture(hwnd_);
+        preview_seek_to_x(x, true);
+        invalidate_preview_media();
+    }
+
+    void end_seek_drag() {
+        if (!dragging_seek_) return;
+        dragging_seek_ = false;
+        const bool resume_gif = std::exchange(gif_scrub_resume_, false);
+        if (preview_valid()) {
+            if (items_[preview_].pt.p.k == 1 && !video_.failed()) {
+                video_.end_scrub();
+                sync_preview_timers();
+            } else if (gif_.has_animation()) {
+                gif_.set_playing(resume_gif);
+                sync_preview_timers();
+            }
+        }
+        invalidate_preview_controls();
     }
 
     void preview_toggle_play() {
@@ -2254,9 +2329,39 @@ private:
             sync_preview_timers();
             invalidate_preview_controls();
         } else if (gif_.has_animation()) {
-            gif_.toggle_play();
+            if (dragging_seek_) {
+                gif_scrub_resume_ = !gif_scrub_resume_;
+            } else {
+                gif_.toggle_play();
+            }
             sync_preview_timers();
             invalidate_preview_controls();
+        }
+    }
+
+    void preview_relative_seek(double delta_s, int gif_dir) {
+        if (!preview_valid()) return;
+        const Item& it = items_[preview_];
+        if (it.pt.p.k == 1 && !video_.failed()) {
+            const double dur = video_.duration();
+            if (dur > 0.0) {
+                const double base = dragging_seek_ ? static_cast<double>(seek_drag_ratio_) * dur : video_.current_time();
+                const double target = std::clamp(base + delta_s, 0.0, dur);
+                if (dragging_seek_) seek_drag_ratio_ = static_cast<float>(target / dur);
+                video_.seek(target);
+                sync_preview_timers();
+            }
+            invalidate_preview_media();
+        } else if (gif_.has_animation()) {
+            gif_.step_frame(gif_dir);
+            if (dragging_seek_) {
+                const size_t total = gif_.frame_count();
+                seek_drag_ratio_ = total > 1
+                    ? static_cast<float>(gif_.current_frame()) / static_cast<float>(total - 1)
+                    : 0.0f;
+            }
+            sync_preview_timers();
+            invalidate_preview_media();
         }
     }
 
@@ -2282,10 +2387,7 @@ private:
                 }
                 return;
             case IdPvSeek:
-                dragging_seek_ = true;
-                SetCapture(hwnd_);
-                preview_seek_to_x(p.x);
-                invalidate_preview_media();
+                begin_seek_drag(p.x);
                 return;
             case IdPvBar: return;
             case IdPvReveal: reveal_item_file(path); return;
@@ -2340,25 +2442,11 @@ private:
                 return true;
             case 'J':
             case VK_OEM_COMMA:
-                if (it.pt.p.k == 1 && !video_.failed()) {
-                    video_.seek_relative(vk == 'J' ? -5.0 : -0.05);
-                    invalidate_preview_media();
-                } else if (gif_.has_animation()) {
-                    gif_.step_frame(-1);
-                    sync_preview_timers();
-                    invalidate_preview_media();
-                }
+                preview_relative_seek(vk == 'J' ? -5.0 : -0.05, -1);
                 return true;
             case 'L':
             case VK_OEM_PERIOD:
-                if (it.pt.p.k == 1 && !video_.failed()) {
-                    video_.seek_relative(vk == 'L' ? 5.0 : 0.05);
-                    invalidate_preview_media();
-                } else if (gif_.has_animation()) {
-                    gif_.step_frame(1);
-                    sync_preview_timers();
-                    invalidate_preview_media();
-                }
+                preview_relative_seek(vk == 'L' ? 5.0 : 0.05, 1);
                 return true;
             default: break;
         }
@@ -2471,11 +2559,12 @@ private:
         }
         if (dragging_seek_) {
             if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
-                dragging_seek_ = false;
+                end_seek_drag();
                 ReleaseCapture();
             } else {
-                preview_seek_to_x(p.x);
-                invalidate_preview_media();
+                if (preview_seek_to_x(p.x)) {
+                    invalidate_preview_media();
+                }
                 return;
             }
         }
@@ -3000,7 +3089,7 @@ private:
             case WM_CAPTURECHANGED:
                 selecting_text_ = false;
                 dragging_scroll_ = false;
-                dragging_seek_ = false;
+                end_seek_drag();
                 end_drag_detect();
                 return 0;
             case WM_SETCURSOR:
@@ -3042,7 +3131,7 @@ private:
             case WM_LBUTTONUP:
                 selecting_text_ = false;
                 if (dragging_scroll_) dragging_scroll_ = false;
-                if (dragging_seek_) dragging_seek_ = false;
+                if (dragging_seek_) end_seek_drag();
                 end_drag_detect();
                 ReleaseCapture();
                 return 0;
@@ -3201,7 +3290,9 @@ private:
 
     uint64_t gfx_epoch_ = 0;
     bool video_muted_ = false;
+    bool video_timer_active_ = false;
     bool dragging_seek_ = false;
+    bool gif_scrub_resume_ = false;
     float seek_drag_ratio_ = 0.0f;
     D2D1_RECT_F pv_media_rect_{};
     D2D1_RECT_F pv_ctrl_rect_{};
