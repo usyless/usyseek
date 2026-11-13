@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 
 namespace usyseek::ui {
@@ -114,6 +115,8 @@ enum class Font : uint8_t {
     Count
 };
 
+enum class Align : uint8_t { Left, Center, Right };
+
 class Fonts {
 public:
     bool init(IDWriteFactory3* dw) {
@@ -182,6 +185,50 @@ public:
         return m.widthIncludingTrailingWhitespace;
     }
 
+    struct WrappedEntry {
+        std::wstring text;
+        Font font = Font::Body;
+        float width = 0.0f;
+        Align align = Align::Left;
+        D2D1_SIZE_F metrics{};
+        wil::com_ptr<IDWriteTextLayout> layout;
+    };
+
+    /// Returns a cached word-wrapped DirectWrite layout and its measured bounds for `(s, f, w)`.
+    [[nodiscard]] WrappedEntry* wrapped(std::wstring_view s, Font f, float w) {
+        if (s.empty() || !dw_) return nullptr;
+        const float cw = w > 1.0f ? w : 1.0f;
+        const auto wbits = std::bit_cast<uint32_t>(cw);
+        const uint64_t key = rapidhash(s.data(), s.size() * sizeof(wchar_t)) ^
+                             (static_cast<uint64_t>(f) * 0x9e3779b97f4a7c15ull) ^
+                             (static_cast<uint64_t>(wbits) * 0xbf58476d1ce4e5b9ull);
+        if (const auto it = wrapped_cache_.find(key); it != wrapped_cache_.end()) {
+            WrappedEntry& e = it->second;
+            if (e.text == s && e.font == f && e.width == cw) return &e;
+        }
+        wil::com_ptr<IDWriteTextLayout> layout;
+        if (FAILED(dw_->CreateTextLayout(s.data(), static_cast<UINT32>(s.size()), get(f), cw, 10000.0f, &layout))) {
+            return nullptr;
+        }
+        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        const DWRITE_TRIMMING no_trim{.granularity = DWRITE_TRIMMING_GRANULARITY_NONE, .delimiter = 0, .delimiterCount = 0};
+        layout->SetTrimming(&no_trim, nullptr);
+        DWRITE_TEXT_METRICS m{};
+        layout->GetMetrics(&m);
+        if (wrapped_cache_.size() >= 512) wrapped_cache_.clear();
+        auto [it, inserted] = wrapped_cache_.insert_or_assign(
+            key, WrappedEntry{
+                     .text = std::wstring{s},
+                     .font = f,
+                     .width = cw,
+                     .align = Align::Left,
+                     .metrics = D2D1_SIZE_F{.width = m.widthIncludingTrailingWhitespace, .height = m.height},
+                     .layout = std::move(layout),
+                 });
+        return &it->second;
+    }
+
 private:
     std::wstring pick(const wchar_t* preferred, const wchar_t* fallback) {
         wil::com_ptr<IDWriteFontCollection> sys;
@@ -196,6 +243,7 @@ private:
     IDWriteFactory3* dw_ = nullptr;
     std::array<wil::com_ptr<IDWriteTextFormat>, static_cast<size_t>(Font::Count)> formats_;
     std::unordered_map<uint64_t, float> width_cache_;
+    std::unordered_map<uint64_t, WrappedEntry> wrapped_cache_;
 };
 
 struct Hit {
@@ -213,18 +261,37 @@ inline float width(const D2D1_RECT_F& r) noexcept { return r.right - r.left; }
 inline float height(const D2D1_RECT_F& r) noexcept { return r.bottom - r.top; }
 inline D2D1_RECT_F snap(D2D1_RECT_F r) noexcept { return D2D1::RectF(std::round(r.left), std::round(r.top), std::round(r.right), std::round(r.bottom)); }
 
-enum class Align : uint8_t { Left, Center, Right };
-
 /// Immediate-mode drawing helpers over one device context, plus hit-region recording.
 class Canvas {
 public:
-    Canvas(ID2D1DeviceContext6* dc, Fonts& fonts, std::vector<Hit>& hits, float opacity = 1.0f)
-        : dc_{dc}, fonts_{fonts}, hits_{hits}, opacity_{std::clamp(opacity, 0.0f, 1.0f)} {
-        dc_->CreateSolidColorBrush(color::on_surface, &brush_);
-    }
+    Canvas(WindowTarget& target, Fonts& fonts, std::vector<Hit>& hits,
+           std::optional<D2D1_RECT_F> dirty_clip = std::nullopt, float opacity = 1.0f)
+        : target_{target}, dc_{target.dc()}, fonts_{fonts}, hits_{hits},
+          dirty_clip_{dirty_clip}, opacity_{std::clamp(opacity, 0.0f, 1.0f)} {}
 
     [[nodiscard]] ID2D1DeviceContext6* dc() const noexcept { return dc_; }
     [[nodiscard]] Fonts& fonts() const noexcept { return fonts_; }
+    [[nodiscard]] bool has_dirty_clip() const noexcept { return dirty_clip_.has_value(); }
+
+    /// Returns true if `r` (expanded by `pad`) overlaps the dirty clip and active stack clip.
+    [[nodiscard]] bool intersects_clip(D2D1_RECT_F r, float pad = 0.0f) const noexcept {
+        const float l = r.left - pad;
+        const float t = r.top - pad;
+        const float ri = r.right + pad;
+        const float b = r.bottom + pad;
+        if (dirty_clip_) {
+            if (ri <= dirty_clip_->left || l >= dirty_clip_->right || b <= dirty_clip_->top || t >= dirty_clip_->bottom) {
+                return false;
+            }
+        }
+        if (!clips_.empty()) {
+            const D2D1_RECT_F& c = clips_.back();
+            if (ri <= c.left || l >= c.right || b <= c.top || t >= c.bottom) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     struct ScopedOpacity {
         Canvas& cv;
@@ -241,8 +308,13 @@ public:
 
     ID2D1SolidColorBrush* brush(D2D1_COLOR_F c) {
         c.a *= opacity_;
-        brush_->SetColor(c);
-        return brush_.get();
+        ID2D1SolidColorBrush* b = target_.solid_brush();
+        if (b && (!has_color_ || c.r != last_color_.r || c.g != last_color_.g || c.b != last_color_.b || c.a != last_color_.a)) {
+            b->SetColor(c);
+            last_color_ = c;
+            has_color_ = true;
+        }
+        return b;
     }
 
     void hit(D2D1_RECT_F r, int id, int index = 0) {
@@ -258,19 +330,32 @@ public:
         }
     }
 
-    void fill(D2D1_RECT_F r, D2D1_COLOR_F c) { dc_->FillRectangle(r, brush(c)); }
-    void fill_round(D2D1_RECT_F r, float radius, D2D1_COLOR_F c) { dc_->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), brush(c)); }
+    void fill(D2D1_RECT_F r, D2D1_COLOR_F c) {
+        if (!intersects_clip(r, 1.0f)) return;
+        dc_->FillRectangle(r, brush(c));
+    }
+    void fill_round(D2D1_RECT_F r, float radius, D2D1_COLOR_F c) {
+        if (!intersects_clip(r, 1.0f)) return;
+        dc_->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), brush(c));
+    }
     void stroke_round(D2D1_RECT_F r, float radius, D2D1_COLOR_F c, float w = 1.0f) {
+        if (!intersects_clip(r, (w * 0.5f) + 1.0f)) return;
         const float h = w * 0.5f;
         dc_->DrawRoundedRectangle(D2D1::RoundedRect(inset(r, h, h), radius, radius), brush(c), w);
     }
-    void fill_circle(D2D1_POINT_2F c, float r, D2D1_COLOR_F col) { dc_->FillEllipse(D2D1::Ellipse(c, r, r), brush(col)); }
-    void stroke_circle(D2D1_POINT_2F c, float r, D2D1_COLOR_F col, float w = 1.0f) { dc_->DrawEllipse(D2D1::Ellipse(c, r, r), brush(col), w); }
+    void fill_circle(D2D1_POINT_2F c, float r, D2D1_COLOR_F col) {
+        if (!intersects_clip(D2D1::RectF(c.x - r, c.y - r, c.x + r, c.y + r), 1.0f)) return;
+        dc_->FillEllipse(D2D1::Ellipse(c, r, r), brush(col));
+    }
+    void stroke_circle(D2D1_POINT_2F c, float r, D2D1_COLOR_F col, float w = 1.0f) {
+        if (!intersects_clip(D2D1::RectF(c.x - r, c.y - r, c.x + r, c.y + r), (w * 0.5f) + 1.0f)) return;
+        dc_->DrawEllipse(D2D1::Ellipse(c, r, r), brush(col), w);
+    }
     void hline(float x0, float x1, float y, D2D1_COLOR_F c) { fill(D2D1::RectF(x0, y, x1, y + 1.0f), c); }
     void vline(float x, float y0, float y1, D2D1_COLOR_F c) { fill(D2D1::RectF(x, y0, x + 1.0f, y1), c); }
 
     void text(std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c, Align a = Align::Left) {
-        if (s.empty()) return;
+        if (s.empty() || !intersects_clip(r, 1.0f)) return;
         IDWriteTextFormat* fmt = fonts_.get(f);
         fmt->SetTextAlignment(text_alignment(a));
         dc_->DrawText(s.data(), static_cast<UINT32>(s.size()), fmt, r, brush(c), D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -278,10 +363,18 @@ public:
 
     void text_wrap(std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c, Align a = Align::Left) {
         if (s.empty()) return;
-        wil::com_ptr<IDWriteTextLayout> layout = wrapped_layout(s, f, width(r));
-        if (!layout) return;
-        layout->SetTextAlignment(text_alignment(a));
-        dc_->DrawTextLayout(D2D1::Point2F(r.left, r.top), layout.get(), brush(c), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        Fonts::WrappedEntry* e = fonts_.wrapped(s, f, width(r));
+        if (!e || !e->layout) return;
+        const D2D1_RECT_F bounds = D2D1::RectF(
+            r.left, r.top,
+            r.left + std::max(width(r), e->metrics.width),
+            r.top + std::max(height(r), e->metrics.height));
+        if (!intersects_clip(bounds, 2.0f)) return;
+        if (e->align != a) {
+            e->layout->SetTextAlignment(text_alignment(a));
+            e->align = a;
+        }
+        dc_->DrawTextLayout(D2D1::Point2F(r.left, r.top), e->layout.get(), brush(c), D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 
     void icon(wchar_t g, D2D1_RECT_F r, D2D1_COLOR_F c, Font f = Font::Icon) {
@@ -294,26 +387,22 @@ public:
     }
 
     void fill_bitmap_round(ID2D1Bitmap1* bmp, D2D1_RECT_F tr, float radius, ThumbFit fit = ThumbFit::Crop) {
+        if (!bmp || !intersects_clip(tr, 1.0f)) return;
         const D2D1_SIZE_F bs = bmp->GetSize();
         if (bs.width <= 0.0f || bs.height <= 0.0f) return;
         const FitRect dest = fit_image(bs.width, bs.height, FitRect{tr.left, tr.top, width(tr), height(tr)}, fit);
         const float s = dest.width / bs.width;
         const D2D1_RECT_F drawn = fit == ThumbFit::Contain ? rect(dest.left, dest.top, dest.width, dest.height) : tr;
-        if (!bmp_brush_) {
-            const auto bp = D2D1::BitmapBrushProperties1(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_INTERPOLATION_MODE_LINEAR);
-            dc_->CreateBitmapBrush(bmp, &bp, nullptr, &bmp_brush_);
-        } else {
-            bmp_brush_->SetBitmap(bmp);
-        }
-        if (bmp_brush_) {
-            bmp_brush_->SetOpacity(opacity_);
-            bmp_brush_->SetTransform(D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(dest.left, dest.top));
-            dc_->FillRoundedRectangle(D2D1::RoundedRect(drawn, radius, radius), bmp_brush_.get());
+        if (ID2D1BitmapBrush1* bb = target_.bitmap_brush(bmp)) {
+            bb->SetOpacity(opacity_);
+            bb->SetTransform(D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(dest.left, dest.top));
+            dc_->FillRoundedRectangle(D2D1::RoundedRect(drawn, radius, radius), bb);
         }
     }
 
     /// Plain (unclipped, square) bitmap draw with high-quality resampling.
     void bitmap(ID2D1Bitmap* bmp, D2D1_RECT_F dest) {
+        if (!bmp || !intersects_clip(dest, 1.0f)) return;
         dc_->DrawBitmap(bmp, &dest, opacity_, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
     }
 
@@ -324,12 +413,8 @@ public:
 
     /// Width and height of wrapped text constrained to `w` DIPs.
     D2D1_SIZE_F measure_wrapped(std::wstring_view s, Font f, float w) {
-        if (s.empty()) return {};
-        wil::com_ptr<IDWriteTextLayout> layout = wrapped_layout(s, f, w);
-        if (!layout) return {};
-        DWRITE_TEXT_METRICS m{};
-        layout->GetMetrics(&m);
-        return {m.widthIncludingTrailingWhitespace, m.height};
+        const auto* e = fonts_.wrapped(s, f, w);
+        return e ? e->metrics : D2D1_SIZE_F{};
     }
 
     void push_clip(D2D1_RECT_F r) {
@@ -350,6 +435,8 @@ public:
 
     /// Soft drop shadow approximated with stacked translucent rounded rects (cheap, no effects).
     void shadow(D2D1_RECT_F r, float radius, float spread = 10.0f, float alpha = 0.28f) {
+        const D2D1_RECT_F bounds = D2D1::RectF(r.left - (spread * 0.6f), r.top - (spread * 0.2f), r.right + (spread * 0.6f), r.bottom + spread);
+        if (!intersects_clip(bounds, 1.0f)) return;
         constexpr int steps = 5;
         for (int i = steps; i >= 1; --i) {
             const float t = static_cast<float>(i) / steps;
@@ -363,23 +450,15 @@ private:
         return a == Align::Left ? DWRITE_TEXT_ALIGNMENT_LEADING : a == Align::Center ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_TRAILING;
     }
 
-    wil::com_ptr<IDWriteTextLayout> wrapped_layout(std::wstring_view s, Font f, float w) {
-        wil::com_ptr<IDWriteTextLayout> layout;
-        if (FAILED(fonts_.dwrite()->CreateTextLayout(s.data(), static_cast<UINT32>(s.size()), fonts_.get(f), std::max(1.0f, w), 10000.0f, &layout))) return nullptr;
-        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-        layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
-        const DWRITE_TRIMMING no_trim{DWRITE_TRIMMING_GRANULARITY_NONE, 0, 0};
-        layout->SetTrimming(&no_trim, nullptr);
-        return layout;
-    }
-
+    WindowTarget& target_;
     ID2D1DeviceContext6* dc_;
     Fonts& fonts_;
     std::vector<Hit>& hits_;
+    std::optional<D2D1_RECT_F> dirty_clip_;
     float opacity_ = 1.0f;
+    D2D1_COLOR_F last_color_{};
+    bool has_color_ = false;
     std::vector<D2D1_RECT_F> clips_;
-    wil::com_ptr<ID2D1SolidColorBrush> brush_;
-    wil::com_ptr<ID2D1BitmapBrush1> bmp_brush_;
 };
 
 inline const Hit* hit_test(const std::vector<Hit>& hits, D2D1_POINT_2F p) {
@@ -533,47 +612,73 @@ struct HoverTooltip {
     }
 };
 
-/// Draws a floating wrapped tooltip anchored near `anchor`, clamped within `win_sz`.
-inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std::wstring_view title,
-                         std::wstring_view subtitle = {}, float opacity = 1.0f) {
-    if (opacity <= 0.008f || (title.empty() && subtitle.empty())) return;
-    const Canvas::ScopedOpacity op{cv, opacity};
+struct TooltipLayout {
+    D2D1_RECT_F box{};
+    D2D1_RECT_F dirty{};
+    D2D1_SIZE_F title_sz{};
+    D2D1_SIZE_F sub_sz{};
+    float text_max_w = 0.0f;
+    Font title_font = Font::SmallWrap;
+    bool valid = false;
+};
+
+/// Computes the screen-space box and shadow-inflated dirty rect for a tooltip anchored near `anchor`.
+[[nodiscard]] inline TooltipLayout measure_tooltip_layout(Fonts& fonts, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor,
+                                                          std::wstring_view title, std::wstring_view subtitle) {
+    TooltipLayout out;
+    if (title.empty() && subtitle.empty()) return out;
     constexpr float pad_x = 10.0f;
     constexpr float pad_y = 6.0f;
     constexpr float gap = 2.0f;
     const float max_w = std::min(460.0f, std::max(140.0f, win_sz.width - 16.0f));
-    const float text_max_w = std::max(40.0f, max_w - pad_x * 2.0f);
-
-    const Font title_font = subtitle.empty() ? Font::SmallWrap : Font::SmallSemi;
-    const D2D1_SIZE_F ts = title.empty() ? D2D1_SIZE_F{} : cv.measure_wrapped(title, title_font, text_max_w);
-    const D2D1_SIZE_F ss = subtitle.empty() ? D2D1_SIZE_F{} : cv.measure_wrapped(subtitle, Font::MonoSmall, text_max_w);
-
-    const float content_w = std::max(ts.width, ss.width);
-    const float content_h = ts.height + (!title.empty() && !subtitle.empty() ? gap : 0.0f) + ss.height;
+    out.text_max_w = std::max(40.0f, max_w - (pad_x * 2.0f));
+    out.title_font = subtitle.empty() ? Font::SmallWrap : Font::SmallSemi;
+    if (!title.empty()) {
+        if (const auto* e = fonts.wrapped(title, out.title_font, out.text_max_w)) out.title_sz = e->metrics;
+    }
+    if (!subtitle.empty()) {
+        if (const auto* e = fonts.wrapped(subtitle, Font::MonoSmall, out.text_max_w)) out.sub_sz = e->metrics;
+    }
+    const float content_w = std::max(out.title_sz.width, out.sub_sz.width);
+    const float content_h = out.title_sz.height + (!title.empty() && !subtitle.empty() ? gap : 0.0f) + out.sub_sz.height;
     const float box_w = std::ceil(content_w) + pad_x * 2.0f;
     const float box_h = std::ceil(content_h) + pad_y * 2.0f;
-
     float x = (anchor.left + anchor.right - box_w) * 0.5f;
     x = std::clamp(x, 8.0f, std::max(8.0f, win_sz.width - 8.0f - box_w));
-
     float y = anchor.bottom + 8.0f;
     if (y + box_h > win_sz.height - 8.0f && anchor.top - box_h - 8.0f >= 8.0f) {
         y = anchor.top - box_h - 8.0f;
     }
     y = std::clamp(y, 8.0f, std::max(8.0f, win_sz.height - 8.0f - box_h));
+    out.box = rect(x, y, box_w, box_h);
+    // Covers the 10.0 DIP drop shadow in Canvas::shadow(r, 8.0f, 10.0f, 0.38f)
+    out.dirty = D2D1::RectF(out.box.left - 6.0f, out.box.top - 2.0f, out.box.right + 6.0f, out.box.bottom + 10.0f);
+    out.valid = true;
+    return out;
+}
 
-    const D2D1_RECT_F r = rect(x, y, box_w, box_h);
+/// Draws a floating wrapped tooltip anchored near `anchor`, clamped within `win_sz`.
+inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std::wstring_view title,
+                         std::wstring_view subtitle = {}, float opacity = 1.0f) {
+    if (opacity <= 0.008f || (title.empty() && subtitle.empty())) return;
+    const TooltipLayout tl = measure_tooltip_layout(cv.fonts(), win_sz, anchor, title, subtitle);
+    if (!tl.valid || !cv.intersects_clip(tl.dirty, 1.0f)) return;
+    const Canvas::ScopedOpacity op{cv, opacity};
+    constexpr float pad_x = 10.0f;
+    constexpr float pad_y = 6.0f;
+    constexpr float gap = 2.0f;
+    const D2D1_RECT_F r = tl.box;
     cv.shadow(r, 8.0f, 10.0f, 0.38f);
     cv.fill_round(r, 8.0f, color::surface_highest);
     cv.stroke_round(r, 8.0f, with_alpha(color::outline_variant, 0.85f));
 
-    float ty = y + pad_y;
+    float ty = r.top + pad_y;
     if (!title.empty()) {
-        cv.text_wrap(title, rect(x + pad_x, ty, text_max_w, ts.height + 2.0f), title_font, color::on_surface);
-        ty += ts.height + gap;
+        cv.text_wrap(title, rect(r.left + pad_x, ty, tl.text_max_w, tl.title_sz.height + 2.0f), tl.title_font, color::on_surface);
+        ty += tl.title_sz.height + gap;
     }
     if (!subtitle.empty()) {
-        cv.text_wrap(subtitle, rect(x + pad_x, ty, text_max_w, ss.height + 2.0f), Font::MonoSmall, color::on_surface_variant);
+        cv.text_wrap(subtitle, rect(r.left + pad_x, ty, tl.text_max_w, tl.sub_sz.height + 2.0f), Font::MonoSmall, color::on_surface_variant);
     }
 }
 

@@ -5,8 +5,10 @@
 
 #include <shellscalingapi.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <ranges>
 #include <set>
 #include <unordered_set>
 #include <utility>
@@ -70,6 +72,9 @@ public:
         sh_.refresh_hotkey_state();
         SetTimer(hwnd_, TIMER_STATUS, 1000, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
+        full_dirty_ = true;
+        pending_dirty_.clear();
+        last_tooltip_dirty_.reset();
         render();
         ValidateRect(hwnd_, nullptr);
         if (!sh_.test_mode && fade_ < 1.0f) {
@@ -95,6 +100,9 @@ public:
         raw_hover_index_ = 0;
         hover_.set(IdNone, 0, false);
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        pending_dirty_.clear();
+        last_tooltip_dirty_.reset();
+        full_dirty_ = true;
         ShowWindow(hwnd_, SW_HIDE);
         ValidateRect(hwnd_, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
@@ -154,6 +162,7 @@ public:
     /// WM_PAINT is only delivered once pending input has been handled, so typing never waits on drawing.
     void invalidate() {
         dirty_ = true;
+        full_dirty_ = true;
         if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
@@ -163,15 +172,60 @@ public:
         if (!ensure_target()) return;
         rendering_ = true;
         dirty_ = false;
+
+        const float prev_scroll = scroll_;
+        const float prev_chip = chip_anim_.value;
+        if (sh_.test_mode || dragging_scroll_ || std::abs(target_scroll_ - scroll_) >= 0.5f ||
+            chip_anim_.active() || searching_ || loading_more_ || preview_loading()) {
+            full_dirty_ = true;
+        }
+
+        std::vector<D2D1_RECT_F> dirty_dips;
+        if (!full_dirty_) {
+            dirty_dips = std::exchange(pending_dirty_, {});
+            if (hover_.in_anim.value != hover_.in_anim.target) queue_hover_dirty(dirty_dips, hover_.id, hover_.index, full_dirty_);
+            if (hover_.prev_id != IdNone && hover_.out_anim.value != hover_.out_anim.target) {
+                queue_hover_dirty(dirty_dips, hover_.prev_id, hover_.prev_index, full_dirty_);
+            }
+        } else {
+            pending_dirty_.clear();
+        }
+
         const bool anim = step_anim();
-        auto* dc = target_.dc();
-        hits_.clear();
-        dc->BeginDraw();
-        dc->SetTransform(D2D1::Matrix3x2F::Identity());
-        dc->Clear(D2D1::ColorF(0, 0, 0, 0));
-        Canvas cv{dc, sh_.fonts, hits_};
-        draw(cv);
-        if (!target_.present(!in_sizemove_)) recover();
+        if (scroll_ != prev_scroll || chip_anim_.value != prev_chip) {
+            full_dirty_ = true;
+        }
+
+        std::optional<D2D1_RECT_F> curr_tip_dirty;
+        if (!menu_open_ && !drop_open_ && tooltip_.alpha.value > 0.008f &&
+            (!tooltip_.title.empty() || !tooltip_.subtitle.empty())) {
+            const TooltipLayout tl = measure_tooltip_layout(sh_.fonts, target_.size(), tooltip_.anchor, tooltip_.title, tooltip_.subtitle);
+            if (tl.valid) curr_tip_dirty = tl.dirty;
+        }
+        if (!full_dirty_) {
+            if (curr_tip_dirty) dirty_dips.push_back(*curr_tip_dirty);
+            if (last_tooltip_dirty_ && (!curr_tip_dirty || !rect_equal(*last_tooltip_dirty_, *curr_tip_dirty))) {
+                dirty_dips.push_back(*last_tooltip_dirty_);
+            }
+        }
+
+        const bool request_full = std::exchange(full_dirty_, false);
+        std::vector<Hit> partial_hits;
+        bool drew_full = false;
+        const bool ok = target_.render_frame(request_full, dirty_dips, !in_sizemove_, [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
+            if (full_frame) {
+                drew_full = true;
+                hits_.clear();
+                Canvas cv{target_, sh_.fonts, hits_, clip};
+                draw(cv);
+            } else {
+                Canvas cv{target_, sh_.fonts, partial_hits, clip};
+                draw(cv);
+            }
+        });
+        if (!ok) recover();
+        if (!drew_full && !partial_hits.empty()) sync_card_overlay_hits(hits_, partial_hits);
+        last_tooltip_dirty_ = curr_tip_dirty;
         rendering_ = false;
         anim_active_ = visible() && (anim || searching_ || loading_more_);
     }
@@ -348,7 +402,88 @@ private:
         }
     }
 
-    void clear_hover(bool animate = false) noexcept {
+    [[nodiscard]] static bool rect_equal(D2D1_RECT_F a, D2D1_RECT_F b) noexcept {
+        return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+    }
+
+    void queue_hover_dirty(std::vector<D2D1_RECT_F>& out, int id, int idx, bool& force_full) const {
+        if (id == IdNone) return;
+        if (id == IdScrollbar) {
+            if (scroll_thumb_.right > scroll_thumb_.left && scroll_thumb_.bottom > scroll_thumb_.top) {
+                out.push_back(D2D1::RectF(scroll_thumb_.left - 4.0f, scroll_thumb_.top - 2.0f,
+                                          scroll_thumb_.right + 2.0f, scroll_thumb_.bottom + 2.0f));
+            }
+            return;
+        }
+        if (id >= IdCard && id <= IdTagChip) {
+            for (const Hit& h : hits_) {
+                if (h.id == IdCard && h.index == idx) {
+                    out.push_back(h.r);
+                    return;
+                }
+            }
+            force_full = true;
+            return;
+        }
+        bool found = false;
+        for (const Hit& h : hits_) {
+            if (h.id == id && h.index == idx) {
+                out.push_back(h.r);
+                found = true;
+            }
+        }
+        if (!found) force_full = true;
+    }
+
+    void queue_hover_dirty(int id, int idx) {
+        queue_hover_dirty(pending_dirty_, id, idx, full_dirty_);
+    }
+
+    static void sync_card_overlay_hits(std::vector<Hit>& hits, const std::vector<Hit>& partial_hits) {
+        std::vector<int> touched_cards;
+        for (const Hit& h : partial_hits) {
+            if (h.id == IdCard && std::ranges::find(touched_cards, h.index) == touched_cards.end()) {
+                touched_cards.push_back(h.index);
+            }
+        }
+        if (touched_cards.empty()) return;
+
+        for (const int card_idx : touched_cards) {
+            std::erase_if(hits, [card_idx](const Hit& h) {
+                return h.index == card_idx && (h.id == IdSimilar || h.id == IdCardPreview);
+            });
+
+            std::vector<Hit> overlays;
+            for (const Hit& ph : partial_hits) {
+                if (ph.index == card_idx && (ph.id == IdSimilar || ph.id == IdCardPreview)) {
+                    const bool dup = std::ranges::any_of(overlays, [&](const Hit& ex) {
+                        return ex.id == ph.id && ex.index == ph.index;
+                    });
+                    if (!dup) overlays.push_back(ph);
+                }
+            }
+            if (overlays.empty()) continue;
+
+            const auto card_it = std::ranges::find_if(hits, [card_idx](const Hit& h) {
+                return h.id == IdCard && h.index == card_idx;
+            });
+            if (card_it != hits.end()) {
+                hits.insert(std::next(card_it), overlays.begin(), overlays.end());
+            }
+        }
+    }
+
+    void clear_tooltip_now() {
+        if (last_tooltip_dirty_ && tooltip_.alpha.value > 0.008f) {
+            pending_dirty_.push_back(*last_tooltip_dirty_);
+            if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        tooltip_.clear(hwnd_, TIMER_TOOLTIP);
+    }
+
+    void clear_hover(bool animate = false) {
+        queue_hover_dirty(hover_.id, hover_.index);
+        queue_hover_dirty(hover_.prev_id, hover_.prev_index);
         raw_hover_id_ = IdNone;
         raw_hover_index_ = 0;
         hover_.set(IdNone, 0, animate);
@@ -408,6 +543,7 @@ private:
             SetWindowPos(hwnd_, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED);
             apply_height();
         }
+        full_dirty_ = true;
         render();
     }
 
@@ -436,6 +572,9 @@ private:
         sh_.thumbs.reset_gpu();
         sh_.previews.reset_gpu();
         target_.release();
+        full_dirty_ = true;
+        pending_dirty_.clear();
+        last_tooltip_dirty_.reset();
         SetTimer(hwnd_, TIMER_DEVICE, 100, nullptr);
     }
 
@@ -874,14 +1013,18 @@ private:
         const int last_row = static_cast<int>((scroll_ + height(g.view)) / (g.card_h + GAP)) + 1;
         const UINT px = static_cast<UINT>(std::max(g.card_w, g.thumb_h * 1.6f) * target_.scale());
         thumb_px_ = px;
-        // Prefetch one row beyond the viewport in both directions
-        for (int i = std::max(0, (first_row - 1) * g.cols); i < std::min<int>(static_cast<int>(items_.size()), (last_row + 2) * g.cols); ++i) {
-            const bool visible = i >= first_row * g.cols && i < (last_row + 1) * g.cols;
-            if (visible) draw_card(cv, g, i);
-        }
-        // Request visible thumbnails last so they're served first (LIFO)
-        for (int i = std::min<int>(static_cast<int>(items_.size()), (last_row + 2) * g.cols) - 1; i >= std::max(0, (first_row - 1) * g.cols); --i) {
-            if (!sh_.thumbs.get(items_[i].pt.id)) sh_.thumbs.request(items_[i].pt.id, item_path(items_[i]), px);
+        if (cv.intersects_clip(g.view, 1.0f)) {
+            const int first_vis = std::max(0, first_row * g.cols);
+            const int last_vis = std::min<int>(static_cast<int>(items_.size()), (last_row + 1) * g.cols);
+            for (int i = first_vis; i < last_vis; ++i) {
+                if (cv.intersects_clip(card_rect(g, i), 2.0f)) draw_card(cv, g, i);
+            }
+            // Request visible thumbnails last so they're served first (LIFO); skip when drawing a dirty rect
+            if (!cv.has_dirty_clip()) {
+                for (int i = std::min<int>(static_cast<int>(items_.size()), (last_row + 2) * g.cols) - 1; i >= std::max(0, (first_row - 1) * g.cols); --i) {
+                    if (!sh_.thumbs.get(items_[i].pt.id)) sh_.thumbs.request(items_[i].pt.id, item_path(items_[i]), px);
+                }
+            }
         }
 
         if (has_more_ && !items_.empty()) {
@@ -1685,7 +1828,7 @@ private:
             if (selected_.contains(it.pt.id)) paths.push_back(item_path(it));
         }
         clear_hover();
-        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        clear_tooltip_now();
         render();
         dragging_out_ = true;
         // Not topmost while the target works, so its dialogs (e.g. file conflict prompts) are not hidden behind this window
@@ -1757,7 +1900,7 @@ private:
                 selecting_text_ = false;
                 ReleaseCapture();
             } else {
-                Canvas cv{target_.dc(), sh_.fonts, hits_};
+                Canvas cv{target_, sh_.fonts, hits_};
                 field_.click(cv, p.x, true);
                 invalidate();
                 return;
@@ -1772,12 +1915,20 @@ private:
             raw_hover_index_ = idx;
             const bool animate = visible() && !sh_.test_mode;
             const auto [vid, vidx] = visual_hover(id, idx);
+            if (vid != hover_.id || vidx != hover_.index) {
+                queue_hover_dirty(hover_.id, hover_.index);
+                queue_hover_dirty(hover_.prev_id, hover_.prev_index);
+                queue_hover_dirty(vid, vidx);
+            }
             const bool vis_changed = hover_.set(vid, vidx, animate);
             std::wstring tt, ts;
             const bool can_tip = !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_ && tooltip_for(id, idx, tt, ts);
             tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, can_tip, animate);
             const bool tip_fading = animate && tooltip_.alpha.active();
-            if (show_help() != was_help) apply_height();
+            if (show_help() != was_help) {
+                full_dirty_ = true;
+                apply_height();
+            }
             if ((vis_changed && animate) || tip_fading) start_anim();
             else if (vis_changed) invalidate();
         }
@@ -1790,7 +1941,7 @@ private:
 
     void on_lbutton_down(D2D1_POINT_2F p, bool dbl) {
         flush();
-        tooltip_.clear(hwnd_, TIMER_TOOLTIP);
+        clear_tooltip_now();
         selecting_text_ = false;
         dragging_scroll_ = false;
         drag_pending_ = false;
@@ -1828,7 +1979,7 @@ private:
         switch (id) {
             case IdField: {
                 field_.focused = true;
-                Canvas cv{target_.dc(), sh_.fonts, hits_};
+                Canvas cv{target_, sh_.fonts, hits_};
                 field_.click(cv, p.x, shift);
                 if (dbl) field_.select_word_at_caret();
                 selecting_text_ = !dbl;
@@ -1916,7 +2067,7 @@ private:
             }
             case IdMenuField: {
                 menu_field_.focused = true;
-                Canvas cv{target_.dc(), sh_.fonts, hits_};
+                Canvas cv{target_, sh_.fonts, hits_};
                 menu_field_.click(cv, p.x, shift);
                 break;
             }
@@ -1931,7 +2082,7 @@ private:
 
     void on_rbutton_down(D2D1_POINT_2F p) {
         flush();
-        tooltip_.clear(hwnd_, TIMER_TOOLTIP);
+        clear_tooltip_now();
         const Hit* h = hit_test(hits_, p);
         if (preview_valid()) {
             if (h && (h->id == IdPvImage || h->id == IdPvPlay)) {
@@ -1956,7 +2107,7 @@ private:
     }
 
     void on_wheel(int delta) {
-        tooltip_.clear(hwnd_, TIMER_TOOLTIP);
+        clear_tooltip_now();
         if (menu_open_) return;
         if (preview_valid()) {
             // One notch per image, whatever the device's resolution
@@ -1990,7 +2141,7 @@ private:
     }
 
     void on_key(UINT vk) {
-        tooltip_.clear(hwnd_, TIMER_TOOLTIP);
+        clear_tooltip_now();
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;
         // A bare modifier press must not pull focus back to the search field before the chord's key arrives
@@ -2202,6 +2353,7 @@ private:
                 if (wp != SIZE_MINIMIZED) {
                     target_.resize(LOWORD(lp), HIWORD(lp));
                     scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
+                    full_dirty_ = true;
                     render();
                 }
                 return 0;
@@ -2210,13 +2362,15 @@ private:
                 in_sizemove_ = false;
                 save_rect();
                 if (sh_.gfx.adapter_stale(hwnd_)) recover();
+                full_dirty_ = true;
                 render();
                 return 0;
             case WM_DISPLAYCHANGE:
                 if (sh_.gfx.adapter_stale(hwnd_)) recover();
-                InvalidateRect(hwnd_, nullptr, FALSE);
+                invalidate();
                 return 0;
             case WM_DPICHANGED: {
+                full_dirty_ = true;
                 const RECT* r = reinterpret_cast<const RECT*>(lp);
                 SetWindowPos(hwnd_, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
                 return 0;
@@ -2266,7 +2420,10 @@ private:
                 if (raw_hover_id_ != IdNone || hover_.id != IdNone) {
                     const bool was_help = show_help();
                     clear_hover(animate);
-                    if (show_help() != was_help) apply_height();
+                    if (show_help() != was_help) {
+                        full_dirty_ = true;
+                        apply_height();
+                    }
                     if (animate) start_anim();
                     else invalidate();
                 } else if (animate && tooltip_.alpha.active()) {
@@ -2307,6 +2464,7 @@ private:
                         return 0;
                     case TIMER_DEVICE:
                         KillTimer(hwnd_, TIMER_DEVICE);
+                        full_dirty_ = true;
                         render();
                         return 0;
                     case TIMER_FADE:
@@ -2362,6 +2520,9 @@ private:
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
     bool rendering_ = false;
     bool dirty_ = false; // state changed since the last frame
+    bool full_dirty_ = true;
+    std::vector<D2D1_RECT_F> pending_dirty_;
+    std::optional<D2D1_RECT_F> last_tooltip_dirty_;
     ULONGLONG shown_tick_ = 0;
     ULONGLONG blur_hide_tick_ = 0;
     POINT blur_hide_cursor_{};

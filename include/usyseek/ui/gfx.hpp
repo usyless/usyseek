@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dirty_rects.hpp"
+
 #include <usyseek/common.hpp>
 
 #include <d2d1_3.h>
@@ -11,8 +13,12 @@
 #include <wincodec.h>
 #include <wil/com.h>
 
+#include <algorithm>
+#include <cmath>
 #include <functional>
+#include <span>
 #include <unordered_map>
+#include <vector>
 
 namespace usyseek::ui {
 
@@ -183,6 +189,10 @@ public:
     }
 
     void release() {
+        if (bmp_brush_) bmp_brush_->SetBitmap(nullptr);
+        bmp_brush_.reset();
+        solid_brush_.reset();
+        dirty_tracker_.reset();
         if (dc_) dc_->SetTarget(nullptr);
         target_.reset();
         visual_.reset();
@@ -197,6 +207,26 @@ public:
     [[nodiscard]] float scale() const noexcept { return dpi_ / 96.0f; }
     [[nodiscard]] D2D1_SIZE_F size() const noexcept { return {static_cast<float>(w_) / scale(), static_cast<float>(h_) / scale()}; }
 
+    /// Reusable solid-color brush for the active device context.
+    [[nodiscard]] ID2D1SolidColorBrush* solid_brush() {
+        if (!solid_brush_ && dc_) {
+            dc_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), &solid_brush_);
+        }
+        return solid_brush_.get();
+    }
+
+    /// Reusable bitmap brush bound to `bmp` for thumbnail rendering.
+    [[nodiscard]] ID2D1BitmapBrush1* bitmap_brush(ID2D1Bitmap1* bmp) {
+        if (!bmp || !dc_) return nullptr;
+        if (!bmp_brush_) {
+            const auto bp = D2D1::BitmapBrushProperties1(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_INTERPOLATION_MODE_LINEAR);
+            dc_->CreateBitmapBrush(bmp, &bp, nullptr, &bmp_brush_);
+        } else {
+            bmp_brush_->SetBitmap(bmp);
+        }
+        return bmp_brush_.get();
+    }
+
     bool resize(UINT w, UINT h) {
         if (w == 0 || h == 0) return ready();
         const float dpi = static_cast<float>(GetDpiForWindow(hwnd_));
@@ -208,18 +238,75 @@ public:
         if (FAILED(swap_->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, 0))) return rebuild();
         w_ = w;
         h_ = h;
+        dirty_tracker_.reset();
         return create_target();
     }
 
-    /// Ends the frame and presents. Returns false if the device must be recovered.
-    bool present(bool vsync = true) {
+    /// Draws and presents a frame. When `full_redraw` is false and both swap-chain buffers are synced,
+    /// only the union of previous and current dirty regions is cleared, drawn clipped, and passed to `Present1`.
+    /// Returns false if the device must be recovered.
+    template <typename DrawFn>
+    bool render_frame(bool full_redraw, std::span<const D2D1_RECT_F> dirty_dips, bool vsync, DrawFn&& draw_fn) {
+        if (!ready()) return false;
+        const float s = scale();
+        if (capture_) full_redraw = true;
+
+        std::vector<PixelRect> curr_px;
+        if (!full_redraw) {
+            curr_px.reserve(dirty_dips.size());
+            for (const D2D1_RECT_F& r : dirty_dips) {
+                const PixelRect px = dip_to_pixel_rect(r.left, r.top, r.right, r.bottom, s, w_, h_, 2.0f);
+                if (!px.empty()) curr_px.push_back(px);
+            }
+        }
+
+        const FlipDirtyTracker::Plan p = dirty_tracker_.plan(full_redraw, curr_px, w_, h_);
+        if (p.skip) return true;
+
+        std::vector<RECT> present_rects;
+        dc_->BeginDraw();
+        dc_->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (p.full) {
+            dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
+            draw_fn(std::nullopt, true);
+        } else {
+            present_rects.reserve(p.render_rects.size());
+            for (const PixelRect& pr : p.render_rects) {
+                present_rects.push_back(RECT{.left = pr.left, .top = pr.top, .right = pr.right, .bottom = pr.bottom});
+                const D2D1_RECT_F clip = D2D1::RectF(
+                    static_cast<float>(pr.left) / s,
+                    static_cast<float>(pr.top) / s,
+                    static_cast<float>(pr.right) / s,
+                    static_cast<float>(pr.bottom) / s);
+                dc_->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+                dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
+                draw_fn(clip, false);
+                dc_->PopAxisAlignedClip();
+            }
+        }
+
         HRESULT hr = dc_->EndDraw();
+        if (bmp_brush_) bmp_brush_->SetBitmap(nullptr);
         if (SUCCEEDED(hr) && capture_) {
             capture_ok_ = write_png(*capture_);
             capture_.reset();
         }
-        if (SUCCEEDED(hr)) hr = swap_->Present(vsync ? 1 : 0, 0);
-        return SUCCEEDED(hr) || hr == DXGI_STATUS_OCCLUDED;
+        if (SUCCEEDED(hr)) {
+            DXGI_PRESENT_PARAMETERS params{};
+            if (!p.full) {
+                params.DirtyRectsCount = static_cast<UINT>(present_rects.size());
+                params.pDirtyRects = present_rects.data();
+            }
+            hr = swap_->Present1(vsync ? 1 : 0, 0, &params);
+        }
+        if (hr == DXGI_STATUS_OCCLUDED) {
+            dirty_tracker_.reset();
+            return true;
+        }
+        if (FAILED(hr)) return false;
+
+        dirty_tracker_.commit(full_redraw, p);
+        return true;
     }
 
     void request_capture(fs::path p) {
@@ -288,6 +375,8 @@ private:
     HWND hwnd_ = nullptr;
     wil::com_ptr<ID2D1DeviceContext6> dc_;
     wil::com_ptr<ID2D1Bitmap1> target_;
+    wil::com_ptr<ID2D1SolidColorBrush> solid_brush_;
+    wil::com_ptr<ID2D1BitmapBrush1> bmp_brush_;
     wil::com_ptr<IDXGISwapChain1> swap_;
     wil::com_ptr<IDCompositionDevice> dcomp_;
     wil::com_ptr<IDCompositionTarget> dcomp_target_;
@@ -295,6 +384,7 @@ private:
     UINT w_ = 0, h_ = 0;
     float dpi_ = 96.0f;
     uint64_t epoch_ = 0;
+    FlipDirtyTracker dirty_tracker_;
     std::optional<fs::path> capture_;
     bool capture_ok_ = false;
 };
