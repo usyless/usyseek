@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pagination.hpp"
 #include "shared.hpp"
 #include "textfield.hpp"
 
@@ -600,8 +601,13 @@ private:
             const std::wstring q = trim(field_.text);
             if (q.empty()) {
                 ++seq_;
+                if (menu_open_) close_popups();
                 items_.clear();
+                pagination_.reset();
                 selected_.clear();
+                deferred_select_.reset();
+                drag_pending_ = false;
+                focus_ = -1;
                 error_.clear();
                 searching_ = false;
                 scroll_ = target_scroll_ = 0.0f;
@@ -634,12 +640,19 @@ public:
         semantic_ = r->semantic;
         if (!r->append) {
             if (preview_ >= 0) close_preview(false);
+            if (menu_open_) close_popups();
             items_.clear();
             selected_.clear();
+            deferred_select_.reset();
+            drag_pending_ = false;
             focus_ = -1;
             scroll_ = target_scroll_ = 0.0f;
         }
-        for (auto& p : r->points) items_.push_back(make_item(std::move(p)));
+        const bool keep_more = pagination_.apply_page(
+            r->points, r->append, r->error.empty(), r->next_offset,
+            [](const DbPoint& p) { return p.id; },
+            [&](DbPoint&& p) { items_.push_back(make_item(std::move(p))); });
+        if (!keep_more) has_more_ = false;
         apply_height();
         invalidate();
     }
@@ -1605,7 +1618,7 @@ private:
         selected_ = {items_[index].pt.id};
         field_.focused = false;
         // Browsing towards the end pulls in the next page, as scrolling the grid would
-        if (index >= static_cast<int>(items_.size()) - 3 && has_more_ && !loading_more_ && !searching_) run_search(items_.size());
+        if (index >= static_cast<int>(items_.size()) - 3 && has_more_ && !loading_more_ && !searching_) run_search(pagination_.next_offset());
         request_preview();
         invalidate();
     }
@@ -2034,7 +2047,7 @@ private:
                 }
                 if (ctrl) {
                     if (!selected_.erase(cid)) selected_.insert(cid);
-                } else if (shift && focus_ >= 0) {
+                } else if (shift && focus_ >= 0 && std::cmp_less(focus_, items_.size())) {
                     selected_.clear();
                     for (int k = std::min(focus_, idx); k <= std::max(focus_, idx); ++k) selected_.insert(items_[k].pt.id);
                 } else if (selected_.contains(cid) && selected_.size() > 1) {
@@ -2074,6 +2087,7 @@ private:
             case IdDropItem: accept_dropdown(idx); return;
             case IdGrid:
                 selected_.clear();
+                focus_ = -1;
                 break;
             default: break;
         }
@@ -2152,6 +2166,7 @@ private:
             else if (fullscreen_) toggle_fullscreen();
             else if (!selected_.empty() && !field_.focused) {
                 selected_.clear();
+                focus_ = -1;
                 field_.focused = true;
             } else hide();
             invalidate();
@@ -2500,7 +2515,7 @@ private:
             case WM_APP_THUMBS: on_thumbs(); return 0;
             case WM_APP_CALL:
                 if (wp == 1) {
-                    run_search(items_.size());
+                    run_search(pagination_.next_offset());
                 } else if (wp == 2) {
                     invalidate();
                 } else if (lp) {
@@ -2540,6 +2555,7 @@ private:
     double last_ms_ = 0;
     std::wstring error_;
     std::vector<Item> items_;
+    PaginationTracker pagination_;
 
     std::unordered_set<uint64_t> selected_;
     int focus_ = -1;

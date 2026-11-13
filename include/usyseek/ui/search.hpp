@@ -409,6 +409,7 @@ struct SearchResult {
     bool append = false;
     bool semantic = false;
     bool has_more = false;
+    uint64_t next_offset = 0;
     double ms = 0.0;
     std::vector<DbPoint> points;
     std::wstring error;
@@ -557,7 +558,9 @@ private:
                 res->error = to_wide(err);
                 return res;
             }
-            res->has_more = pts->points.size() >= PAGE;
+            const uint64_t raw_count = pts->points.size();
+            res->has_more = raw_count >= PAGE;
+            res->next_offset = r.offset + raw_count;
             res->points = std::move(pts->points);
             if (self_id) std::erase_if(res->points, [&](const DbPoint& p) { return p.id == self_id; });
         } else {
@@ -573,6 +576,7 @@ private:
                 return res;
             }
             res->has_more = pts->points.size() >= sr.limit;
+            res->next_offset = pts->points.size();
             if (r.offset < pts->points.size()) {
                 res->points.assign(std::make_move_iterator(pts->points.begin() + static_cast<ptrdiff_t>(r.offset)), std::make_move_iterator(pts->points.end()));
             }
