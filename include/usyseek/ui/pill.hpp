@@ -2178,10 +2178,11 @@ private:
         draw_preview_controls(cv, sz, area, dest, it, is_video, is_gif_ready);
 
         // Previous / next
+        const D2D1_RECT_F nav_area = preview_media_area(sz, false);
         auto arrow = [&](bool next) {
             const bool can = next ? preview_ + 1 < count : preview_ > 0;
             if (!can) return;
-            const float cx = next ? area.right - 28 : area.left + 28, cy = (area.top + area.bottom) / 2;
+            const float cx = next ? nav_area.right - 28 : nav_area.left + 28, cy = (nav_area.top + nav_area.bottom) / 2;
             const int id = next ? IdPvNext : IdPvPrev;
             const float ha = hover_.alpha(id);
             cv.fill_circle({cx, cy}, 22, lerp_color(hex(0x000000, 0.45f), with_alpha(color::surface_highest, 0.96f), ha));

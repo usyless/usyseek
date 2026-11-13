@@ -647,6 +647,7 @@ private:
             case IdRemoveInclude: return L"Remove folder";
             case IdRemoveExclude: return L"Remove exclusion";
             case IdLockedExclude: return L"System exclusion (cannot be removed)";
+            case IdClearFailed: return L"Clear failed list and retry indexing";
             case IdClearFailedDisabled: return L"Stop indexing before retrying failed files";
             case IdDismissNotif: return L"Dismiss notification";
             default: return nullptr;
