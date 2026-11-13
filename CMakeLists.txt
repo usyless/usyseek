@@ -43,7 +43,7 @@ set_tracked_cache_version(USYSEEK_GLAZE_VERSION "v9.1.0" "glaze git tag")
 set_tracked_cache_version(USYSEEK_PYBIND11_VERSION "v3.1.0" "pybind11 git tag")
 set_tracked_cache_version(USYSEEK_MIMALLOC_VERSION "v3.5.3" "Version (git tag/branch) to use for mimalloc")
 set_tracked_cache_version(USYSEEK_ORT_VERSION "1.31.1" "onnxruntime release")
-set_tracked_cache_version(USYSEEK_QDRANT_VERSION "v1.20.0" "qdrant release")
+set_tracked_cache_version(USYSEEK_QDRANT_VERSION "v1.20.1" "qdrant release")
 set_tracked_cache_version(USYSEEK_QDRANT_WEB_UI_VERSION "v0.2.20" "qdrant-web-ui release")
 set_tracked_cache_version(USYSEEK_EVERYTHING_VERSION "1.5.0.1424b" "Voidtools Everything release")
 
