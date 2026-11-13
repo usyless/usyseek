@@ -58,26 +58,35 @@ public:
         CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_));
     }
 
-    std::optional<Decoded> image(const std::wstring& path, uint32_t frame_count = 1) {
-        if (svg::is_svg(path)) return vector_image(path);
-        if (!wic_) return std::nullopt;
+    std::optional<Decoded> image(const std::wstring& path, uint32_t frame_count = 1, std::wstring* reason = nullptr) {
+        auto fail = [&](std::wstring_view msg) -> std::optional<Decoded> {
+            if (reason) *reason = std::wstring{msg};
+            return std::nullopt;
+        };
+        if (svg::is_svg(path)) return vector_image(path, reason);
+        if (!wic_) return fail(L"WIC imaging factory unavailable");
         wil::com_ptr<IWICBitmapDecoder> dec;
-        if (FAILED(wic_->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) return std::nullopt;
+        if (FAILED(wic_->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) {
+            return fail(L"Unsupported image codec or unreadable file");
+        }
 
         if (frame_count > 1) {
             GUID container{};
             UINT count = 0;
             if (SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatGif &&
                 SUCCEEDED(dec->GetFrameCount(&count)) && count > 1) {
-                return animated_gif(dec.get(), count, frame_count);
+                auto gif = animated_gif(dec.get(), count, frame_count);
+                if (!gif && reason) *reason = L"GIF frames could not be decoded";
+                return gif;
             }
         }
 
         wil::com_ptr<IWICBitmapFrameDecode> frame;
-        if (FAILED(dec->GetFrame(0, &frame))) return std::nullopt;
+        if (FAILED(dec->GetFrame(0, &frame))) return fail(L"Failed to read image frame");
 
         UINT w = 0, h = 0;
-        if (FAILED(frame->GetSize(&w, &h)) || w < 32 || h < 32) return std::nullopt;
+        if (FAILED(frame->GetSize(&w, &h))) return fail(L"Failed to read image dimensions");
+        if (w < 32 || h < 32) return fail(L"Image smaller than 32x32 minimum");
 
         const WICBitmapTransformOptions orient = orientation(frame.get());
         const bool swapped = (orient & WICBitmapTransformRotate90) != 0;
@@ -86,21 +95,27 @@ public:
         out.width = swapped ? h : w;
         out.height = swapped ? w : h;
         Frame f;
-        if (!resize(frame.get(), w, h, orient, f)) return std::nullopt;
+        if (!resize(frame.get(), w, h, orient, f)) return fail(L"Image pixel conversion/resize failed");
         out.frames.push_back(std::move(f));
         return out;
     }
 
-    std::optional<Decoded> video(const std::wstring& path, uint32_t frame_count) {
+    std::optional<Decoded> video(const std::wstring& path, uint32_t frame_count, std::wstring* reason = nullptr) {
+        auto fail = [&](std::wstring_view msg) -> std::optional<Decoded> {
+            if (reason) *reason = std::wstring{msg};
+            return std::nullopt;
+        };
         wil::com_ptr<IMFAttributes> attr;
-        if (FAILED(MFCreateAttributes(&attr, 2))) return std::nullopt;
+        if (FAILED(MFCreateAttributes(&attr, 2))) return fail(L"Media Foundation attributes failed");
         attr->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
         wil::com_ptr<IMFSourceReader> reader;
-        if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), attr.get(), &reader))) return std::nullopt;
+        if (FAILED(MFCreateSourceReaderFromURL(path.c_str(), attr.get(), &reader))) {
+            return fail(L"Unsupported video container or unreadable file");
+        }
 
         const DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
         reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
-        if (FAILED(reader->SetStreamSelection(stream, TRUE))) return std::nullopt;
+        if (FAILED(reader->SetStreamSelection(stream, TRUE))) return fail(L"No video stream found");
 
         UINT32 rotation = 0;
         {
@@ -114,12 +129,14 @@ public:
         MFCreateMediaType(&type);
         type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-        if (FAILED(reader->SetCurrentMediaType(stream, nullptr, type.get()))) return std::nullopt;
+        if (FAILED(reader->SetCurrentMediaType(stream, nullptr, type.get()))) return fail(L"Unsupported video codec (missing decoder)");
 
         wil::com_ptr<IMFMediaType> current;
-        if (FAILED(reader->GetCurrentMediaType(stream, &current))) return std::nullopt;
+        if (FAILED(reader->GetCurrentMediaType(stream, &current))) return fail(L"Could not query video stream format");
         UINT32 w = 0, h = 0;
-        if (FAILED(MFGetAttributeSize(current.get(), MF_MT_FRAME_SIZE, &w, &h)) || w == 0 || h == 0) return std::nullopt;
+        if (FAILED(MFGetAttributeSize(current.get(), MF_MT_FRAME_SIZE, &w, &h)) || w == 0 || h == 0) {
+            return fail(L"Invalid video frame dimensions");
+        }
 
         PROPVARIANT dur;
         PropVariantInit(&dur);
@@ -142,13 +159,18 @@ public:
 
         const uint32_t n = duration > 0 ? std::max(1u, frame_count) : 1;
         std::vector<uint8_t> bgrx(static_cast<size_t>(w) * h * 4);
+        bool saw_frame = false;
+        bool seek_failed = false;
         for (uint32_t k = 0; k < n; ++k) {
             if (duration > 0) {
                 PROPVARIANT pos;
                 InitPropVariantFromInt64(static_cast<LONGLONG>(duration * (2ull * k + 1) / (2ull * n)), &pos);
                 const HRESULT hr = reader->SetCurrentPosition(GUID_NULL, pos);
                 PropVariantClear(&pos);
-                if (FAILED(hr)) break;
+                if (FAILED(hr)) {
+                    seek_failed = true;
+                    break;
+                }
             }
             wil::com_ptr<IMFSample> sample;
             for (int tries = 0; tries < 16 && !sample; ++tries) {
@@ -163,10 +185,15 @@ public:
             if (FAILED(wic_->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGR, w * 4, static_cast<UINT>(bgrx.size()), bgrx.data(), &bmp))) continue;
             Frame f;
             if (!resize(bmp.get(), w, h, orient, f)) continue;
+            saw_frame = true;
             if (mean_luma(f.rgb) < 5.0) continue; // black frames (fades, intros) poison the average
             out.frames.push_back(std::move(f));
         }
-        if (out.frames.empty()) return std::nullopt;
+        if (out.frames.empty()) {
+            if (seek_failed) return fail(L"Video seek failed while sampling frames");
+            if (saw_frame) return fail(L"All sampled video frames were blank/black");
+            return fail(L"No decodable video frames found");
+        }
         return out;
     }
 
@@ -300,11 +327,15 @@ private:
     }
 
     /// SVG has no pixels of its own, so resvg rasterises it straight at the network input size.
-    [[nodiscard]] std::optional<Decoded> vector_image(const std::wstring& path) const {
+    [[nodiscard]] std::optional<Decoded> vector_image(const std::wstring& path, std::wstring* reason = nullptr) const {
         const svg::Fit fit = mode_ == ResizeMode::Squash ? svg::Fit::Stretch
                            : mode_ == ResizeMode::Shortest ? svg::Fit::Cover : svg::Fit::Contain;
-        const auto raster = svg::render(path, size_, size_, fit);
-        if (!raster || raster->width > size_ || raster->height > size_) return std::nullopt;
+        std::string svg_err;
+        const auto raster = svg::render(path, size_, size_, fit, svg::WHITE, &svg_err);
+        if (!raster || raster->width > size_ || raster->height > size_) {
+            if (reason) *reason = svg_err.empty() ? L"SVG rasterization failed" : to_wide(svg_err);
+            return std::nullopt;
+        }
 
         Decoded out;
         out.width = raster->src_width;

@@ -2,6 +2,7 @@
 // Lives only for the duration of an index run; the launcher kills it outright on stop.
 
 #include <usyseek/settings.hpp>
+#include <usyseek/notifications.hpp>
 #include <usyseek/status.hpp>
 #include <usyseek/db.hpp>
 #include <usyseek/indexer/media.hpp>
@@ -309,16 +310,29 @@ std::vector<FileEntry> walk_dirs(const Scope& scope) {
     std::vector<FileEntry> out;
     std::vector<std::wstring> stack{scope.includes.begin(), scope.includes.end()};
     const uint64_t min_bytes = static_cast<uint64_t>(scope.min_kb) * 1024;
+    size_t reparse_skipped = 0;
     while (!stack.empty() && !stopping()) {
         const std::wstring dir = std::move(stack.back());
         stack.pop_back();
         WIN32_FIND_DATAW fd;
         wil::unique_hfind h{FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH)};
-        if (!h) continue;
+        if (!h) {
+            const DWORD err = GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_NO_MORE_FILES) {
+                const std::string utf8_dir = to_utf8(dir);
+                push_notification_to_disk(
+                    "warning", "Indexer", "Could not read folder",
+                    utf8_dir + ": " + win32_error_utf8(err), "walk-" + utf8_dir, true);
+            }
+            continue;
+        }
         do {
             if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == 0 || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0))) continue;
             std::wstring path = dir + L"\\" + fd.cFileName;
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                ++reparse_skipped;
+                continue;
+            }
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 if (!scope.excluded(path + L"\\x")) stack.push_back(std::move(path));
                 continue;
@@ -333,6 +347,12 @@ std::vector<FileEntry> walk_dirs(const Scope& scope) {
             e.path = std::move(path);
             out.push_back(std::move(e));
         } while (FindNextFileW(h.get(), &fd));
+    }
+    if (reparse_skipped > 0) {
+        push_notification_to_disk(
+            "info", "Indexer", "Skipped symlinks / junctions",
+            "Skipped " + std::to_string(reparse_skipped) + " symlink/junction entries during folder traversal.",
+            "walk-reparse", true);
     }
     return out;
 }
@@ -385,7 +405,12 @@ struct FailureCache {
             out += to_utf8(f.reason.empty() ? L"Decode failed" : f.reason);
             out += '\n';
         }
-        (void)ulp::fs::write(path, std::string_view{out});
+        if (!ulp::fs::write(path, std::string_view{out})) {
+            push_notification_to_disk(
+                "error", "Indexer", "Failed to save failed-files log",
+                "Could not write " + to_utf8(path.wstring()) + " (" + win32_error_utf8(GetLastError()) + ").",
+                "save-failed-log", true);
+        }
     }
 };
 
@@ -438,6 +463,7 @@ private:
 struct DecodedItem {
     size_t index = 0;
     std::optional<media::Decoded> data;
+    std::wstring reason;
 };
 
 std::vector<std::string> ancestors_of(std::wstring_view path) {
@@ -503,6 +529,7 @@ struct PyLoadInfo {
     std::string resize_mode;
     std::string device;
     std::string backend;
+    bool fallback_cpu = false;
 };
 struct PyResp {
     bool ok = false;
@@ -645,6 +672,12 @@ struct PyVision {
         dim = r.info.dim;
         mode = media::parse_resize_mode(r.info.resize_mode);
         device = to_wide(r.info.device + " \xc2\xb7 " + r.info.backend);
+        if (r.info.fallback_cpu) {
+            push_notification_to_disk(
+                "warning", "Compute", "GPU unavailable — indexing on CPU",
+                "Device is set to GPU (ROCm / CUDA), but torch.cuda.is_available() is false. Check your PyTorch build or drivers in Settings.",
+                "gpu-cpu-fallback", true);
+        }
     }
 
     void export_text(const std::string& model_dir, const std::string& model_name) {
@@ -822,20 +855,35 @@ int run_indexer(Settings& settings) {
         }
     }
 
+    if (!scope.whole_pc && scope.includes.empty()) {
+        push_notification_to_disk("warning", "Scanner", "No included folders configured",
+            "Indexing is set to Specific Folders but no folders are included. Add folders in Settings -> Indexing Scope or enable Whole PC.",
+            "indexer-empty-scope");
+    }
+
     // --- Scan & load the Python vision tower concurrently; cancel the model load if nothing needs indexing
     std::vector<FileEntry> files;
     std::wstring scan_error;
     std::jthread scanner([&] {
         ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
         EverythingSession ev;
-        if (g_no_everything) scan_error = L"disabled";
-        else if (ev.open(scope, scan_error)) {
+        const bool unc_only = !scope.whole_pc && !scope.includes.empty() && scope.drives().empty();
+        if (g_no_everything) {
+            scan_error = L"disabled";
+        } else if (unc_only) {
+            scan_error = L"Non-drive / network path";
+        } else if (ev.open(scope, scan_error)) {
             if (!stopping()) files = ev.query(scope, scan_error);
             return;
         }
         if (scope.whole_pc) return;
         // Specific folders can still be walked directly when Everything is unavailable
         wlog(L"Everything unavailable (%s), walking included folders\n", scan_error.c_str());
+        if (!g_no_everything) {
+            push_notification_to_disk("warning", "Scanner", "Using slower directory walk",
+                "Everything index was not used (" + to_utf8(scan_error) + "). Walking included folders directly.",
+                "indexer-scan-fallback");
+        }
         scan_error.clear();
         files = walk_dirs(scope);
     });
@@ -906,6 +954,7 @@ int run_indexer(Settings& settings) {
     if (collection_exists) {
         constexpr size_t CHUNK = 1024;
         std::vector<uint64_t> ids;
+        bool retrieve_warned = false;
         for (size_t i = 0; i < files.size() && !stopping(); i += CHUNK) {
             const size_t end = std::min(files.size(), i + CHUNK);
             ids.clear();
@@ -914,8 +963,13 @@ int run_indexer(Settings& settings) {
                 found_ids.insert(files[j].id);
             }
             std::unordered_map<uint64_t, MediaPayload> existing;
-            if (auto pts = db.retrieve(coll, ids, {"m", "s", "t"})) {
+            std::string ret_err;
+            if (auto pts = db.retrieve(coll, ids, {"m", "s", "t"}, &ret_err)) {
                 for (auto& p : pts->points) existing.emplace(p.id, std::move(p.p));
+            } else if (!stopping() && !retrieve_warned) {
+                retrieve_warned = true;
+                push_notification_to_disk("warning", "Database", "Could not read existing metadata from Qdrant",
+                    ret_err + " (Some unchanged files may be re-embedded.)", "indexer-retrieve");
             }
             for (size_t j = i; j < end; ++j) {
                 auto& f = files[j];
@@ -965,8 +1019,15 @@ int run_indexer(Settings& settings) {
             req.limit = 4096;
             req.offset = cursor;
             req.fields = {"p"};
-            auto page = db.scroll(coll, req);
-            if (!page) break;
+            std::string scroll_err;
+            auto page = db.scroll(coll, req, &scroll_err);
+            if (!page) {
+                if (!stopping()) {
+                    push_notification_to_disk("warning", "Database", "Stale entry cleanup incomplete",
+                        scroll_err, "indexer-scroll");
+                }
+                break;
+            }
             for (const auto& p : page->points) {
                 if (found_ids.contains(p.id)) continue;
                 const std::wstring path = to_wide(p.p.p);
@@ -976,7 +1037,11 @@ int run_indexer(Settings& settings) {
         } while (cursor && !stopping());
         if (!stale.empty()) {
             wlog(L"Removing %zu stale entries\n", stale.size());
-            db.remove(coll, stale);
+            std::string rm_err;
+            if (!db.remove(coll, stale, &rm_err)) {
+                push_notification_to_disk("warning", "Database", "Failed to remove stale database entries",
+                    rm_err, "indexer-remove-stale");
+            }
         }
     }
 
@@ -1019,7 +1084,10 @@ int run_indexer(Settings& settings) {
         st.last_index_found = files.size();
         st.last_index_embedded = pr.d.embedded;
         st.last_error = export_err;
-        save_json_file(state_path(), st);
+        if (!save_json_file(state_path(), st)) {
+            push_notification_to_disk("warning", "Indexer", "Failed to save state.json",
+                win32_error_utf8(), "indexer-save-state");
+        }
         if (!export_err.empty()) {
             pr.phase(Phase::Error, to_wide(export_err));
             return 1;
@@ -1074,11 +1142,16 @@ int run_indexer(Settings& settings) {
                 batch = vision.benchmark_batch(128);
             } catch (const std::exception& e) {
                 std::printf("benchmark_batch failed: %s\n", e.what());
+                push_notification_to_disk("warning", "Indexer", "Auto-batch benchmark failed",
+                    std::string{"Using fallback batch size 16: "} + e.what(), "indexer-autobatch");
                 batch = 16;
             }
             cached.auto_batch = batch;
             cached.auto_batch_key = auto_batch_key;
-            save_json_file(state_path(), cached);
+            if (!save_json_file(state_path(), cached)) {
+                push_notification_to_disk("warning", "Indexer", "Failed to save state.json",
+                    win32_error_utf8(), "indexer-save-state");
+            }
         }
     }
     batch = std::max(1u, batch);
@@ -1103,12 +1176,17 @@ int run_indexer(Settings& settings) {
                 const size_t i = next.fetch_add(1);
                 if (i >= todo.size() || stopping()) break;
                 const FileEntry& f = files[todo[i]];
-                DecodedItem item{todo[i], {}};
+                DecodedItem item{todo[i], {}, {}};
                 try {
-                    item.data = f.kind == 0 ? dec.image(f.path, settings.video_frames) : dec.video(f.path, settings.video_frames);
-                } catch (...) {
+                    item.data = f.kind == 0 ? dec.image(f.path, settings.video_frames, &item.reason)
+                                            : dec.video(f.path, settings.video_frames, &item.reason);
+                } catch (const std::exception& e) {
                     // Leave item.data empty so the file is counted as failed and remembered not to be retried.
                     item.data.reset();
+                    item.reason = to_wide(e.what());
+                } catch (...) {
+                    item.data.reset();
+                    item.reason = L"Decode exception";
                 }
                 if (!queue.push(std::move(item))) break;
             }
@@ -1121,12 +1199,22 @@ int run_indexer(Settings& settings) {
     std::vector<uint64_t> up_ids;
     std::vector<float> up_vecs;
     std::vector<MediaPayload> up_payloads;
+    std::mutex upsert_mx;
+    std::string upsert_err;
+    uint64_t upsert_failures = 0;
     auto flush = [&](bool wait) {
         if (upload.valid()) upload.get();
         if (!up_ids.empty()) {
-            upload = std::async(std::launch::async, [&db, &coll, ids = std::move(up_ids), vecs = std::move(up_vecs), pls = std::move(up_payloads), dim = vision.dim] {
+            upload = std::async(std::launch::async, [&db, &coll, &upsert_mx, &upsert_err, &upsert_failures,
+                                                     ids = std::move(up_ids), vecs = std::move(up_vecs),
+                                                     pls = std::move(up_payloads), dim = vision.dim] {
                 std::string e;
-                if (!db.upsert(coll, ids, vecs, dim, pls, &e)) std::printf("upsert failed: %s\n", e.c_str());
+                if (!db.upsert(coll, ids, vecs, dim, pls, &e)) {
+                    std::printf("upsert failed: %s\n", e.c_str());
+                    std::lock_guard lk{upsert_mx};
+                    ++upsert_failures;
+                    if (upsert_err.empty()) upsert_err = std::move(e);
+                }
             });
             up_ids = {};
             up_vecs = {};
@@ -1138,6 +1226,7 @@ int run_indexer(Settings& settings) {
     const size_t frame_bytes = static_cast<size_t>(vision.size) * vision.size * 3;
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t done_this_run = 0;
+    uint64_t failed_this_run = 0;
     std::vector<DecodedItem> pending;
 
     while (!stopping()) {
@@ -1157,7 +1246,8 @@ int run_indexer(Settings& settings) {
             pr.set_current(f.path);
             if (!item.data || item.data->frames.empty()) {
                 ++pr.d.failed;
-                failures.add(f);
+                ++failed_this_run;
+                failures.add(f, item.reason);
                 continue;
             }
             frames += item.data->frames.size();
@@ -1183,14 +1273,20 @@ int run_indexer(Settings& settings) {
                 batch = hint;
                 pr.d.batch = batch;
                 std::printf("Reduced batch size to %u after running out of VRAM\n", batch);
+                push_notification_to_disk("warning", "Compute", "Reduced batch size after out-of-VRAM",
+                    "GPU memory limit reached; batch size automatically lowered to " + std::to_string(batch) + ".",
+                    "indexer-vram");
             }
         } catch (const std::exception& e) {
             if (stopping()) break;
             std::printf("embed failed: %s\n", e.what());
             const std::wstring reason = py_error_text(e);
             pr.set_message(reason);
+            push_notification_to_disk("warning", "Compute", "Embedding batch failed",
+                e.what(), "indexer-embed");
             for (const auto& it : pending) {
                 ++pr.d.failed;
+                ++failed_this_run;
                 failures.add(files[it.index], reason);
             }
             continue;
@@ -1235,13 +1331,33 @@ int run_indexer(Settings& settings) {
     flush(true);
     failures.save();
 
+    if (failed_this_run > 0) {
+        push_notification_to_disk("warning", "Indexer",
+            std::to_string(failed_this_run) + (failed_this_run == 1 ? " file failed to index" : " files failed to index"),
+            "Skipped files were recorded in the failed list. Check Settings -> Embeddings & Progress or use Retry Failed after fixing.",
+            "indexer-file-failures");
+    }
+
+    if (upsert_failures > 0) {
+        const std::string detail = "Failed " + std::to_string(upsert_failures) + " batch upload(s) to Qdrant: " + upsert_err;
+        push_notification_to_disk("error", "Database", "Failed to store embeddings in Qdrant",
+            detail, "indexer-upsert");
+        if (!was_stopped) {
+            pr.phase(Phase::Error, to_wide(detail));
+            return 1;
+        }
+    }
+
     IndexState st = load_json_file<IndexState>(state_path());
     st.last_index_unix = unix_now();
     st.last_index_found = files.size();
     st.last_index_embedded = pr.d.embedded;
     st.last_error.clear();
     if (auto_batch && batch < st.auto_batch) st.auto_batch = batch;
-    save_json_file(state_path(), st);
+    if (!save_json_file(state_path(), st)) {
+        push_notification_to_disk("warning", "Indexer", "Failed to save state.json",
+            win32_error_utf8(), "indexer-save-state");
+    }
     pr.phase(was_stopped ? Phase::Stopped : Phase::Done);
     return was_stopped ? 2 : 0;
 }
@@ -1275,6 +1391,10 @@ int wmain(int argc, wchar_t** argv) {
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 3;
 
     g_progress.block = StatusBlock::create();
+    if (!g_progress.block) {
+        push_notification_to_disk("warning", "Indexer", "Progress shared memory unavailable",
+            "Live indexing progress cannot be shown in Settings (" + win32_error_utf8() + ").", "indexer-shm");
+    }
     g_progress.d.pid = GetCurrentProcessId();
     g_progress.d.started_unix = unix_now();
     wil::unique_event_nothrow stop{OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, INDEXER_STOP_EVENT)};
@@ -1289,9 +1409,15 @@ int wmain(int argc, wchar_t** argv) {
         g_progress.phase(Phase::Error, to_wide(e.what()));
     }
     if (g_progress.d.phase == Phase::Error) {
+        const std::string err_utf8 = to_utf8(g_progress.d.message);
+        push_notification_to_disk("error", "Indexer", "Indexing failed",
+            err_utf8.empty() ? std::string{"Indexer stopped with an error."} : err_utf8, "indexer-error");
         IndexState st = load_json_file<IndexState>(state_path());
-        st.last_error = to_utf8(g_progress.d.message);
-        save_json_file(state_path(), st);
+        st.last_error = err_utf8;
+        if (!save_json_file(state_path(), st)) {
+            push_notification_to_disk("warning", "Indexer", "Failed to save state.json",
+                win32_error_utf8(), "indexer-save-state");
+        }
     }
     // Keep the final status readable for a moment so the UI can pick it up
     Sleep(1500);

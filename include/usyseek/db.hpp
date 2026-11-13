@@ -158,48 +158,67 @@ public:
 
     std::optional<DbPoints> query(std::string_view coll, std::span<const float> vector, const QueryRequest& req, std::string* error = nullptr) {
         auto json = glz::write<JSON_SKIP_NULL>(req);
-        if (!json) return std::nullopt;
+        if (!json) {
+            if (error) *error = "Failed to serialize query request";
+            return std::nullopt;
+        }
         RustBuf out;
         if (usy_qd_query(q_, ustr(coll), vector.empty() ? nullptr : vector.data(), vector.size(), ustr(*json), &out.b) != 0) {
             if (error) *error = out.str();
             return std::nullopt;
         }
-        return parse_points(out.view());
+        return parse_points(out.view(), error);
     }
 
     std::optional<DbPoints> scroll(std::string_view coll, const ScrollRequest& req, std::string* error = nullptr) {
         auto json = glz::write<JSON_SKIP_NULL>(req);
-        if (!json) return std::nullopt;
+        if (!json) {
+            if (error) *error = "Failed to serialize scroll request";
+            return std::nullopt;
+        }
         RustBuf out;
         if (usy_qd_scroll(q_, ustr(coll), ustr(*json), &out.b) != 0) {
             if (error) *error = out.str();
             return std::nullopt;
         }
-        return parse_points(out.view());
+        return parse_points(out.view(), error);
     }
 
-    std::optional<DbPoints> retrieve(std::string_view coll, std::span<const uint64_t> ids, const std::vector<std::string>& fields) {
+    std::optional<DbPoints> retrieve(std::string_view coll, std::span<const uint64_t> ids, const std::vector<std::string>& fields, std::string* error = nullptr) {
         auto json = glz::write<JSON_SKIP_NULL>(FieldsRequest{fields});
-        if (!json) return std::nullopt;
+        if (!json) {
+            if (error) *error = "Failed to serialize retrieve request";
+            return std::nullopt;
+        }
         RustBuf out;
-        if (usy_qd_retrieve(q_, ustr(coll), ids.data(), ids.size(), ustr(*json), &out.b) != 0) return std::nullopt;
-        return parse_points(out.view());
+        if (usy_qd_retrieve(q_, ustr(coll), ids.data(), ids.size(), ustr(*json), &out.b) != 0) {
+            if (error) *error = out.str();
+            return std::nullopt;
+        }
+        return parse_points(out.view(), error);
     }
 
-    bool set_tags(std::string_view coll, std::span<const uint64_t> ids, const std::vector<std::string>& tags) {
+    bool set_tags(std::string_view coll, std::span<const uint64_t> ids, const std::vector<std::string>& tags, std::string* error = nullptr) {
         struct TagsOnly {
             std::vector<std::string> t;
         };
         auto json = glz::write_json(TagsOnly{tags});
-        if (!json) return false;
+        if (!json) {
+            if (error) *error = "Failed to serialize tags payload";
+            return false;
+        }
         RustBuf out;
-        return usy_qd_set_payload(q_, ustr(coll), ids.data(), ids.size(), ustr(*json), &out.b) == 0;
+        const bool ok = usy_qd_set_payload(q_, ustr(coll), ids.data(), ids.size(), ustr(*json), &out.b) == 0;
+        if (!ok && error) *error = out.str();
+        return ok;
     }
 
-    bool remove(std::string_view coll, std::span<const uint64_t> ids) {
+    bool remove(std::string_view coll, std::span<const uint64_t> ids, std::string* error = nullptr) {
         if (ids.empty()) return true;
         RustBuf out;
-        return usy_qd_delete(q_, ustr(coll), ids.data(), ids.size(), &out.b) == 0;
+        const bool ok = usy_qd_delete(q_, ustr(coll), ids.data(), ids.size(), &out.b) == 0;
+        if (!ok && error) *error = out.str();
+        return ok;
     }
 
     bool drop_collection(std::string_view coll, std::string* error = nullptr) {
@@ -225,9 +244,12 @@ public:
     }
 
 private:
-    static std::optional<DbPoints> parse_points(std::string_view json) {
+    static std::optional<DbPoints> parse_points(std::string_view json, std::string* error = nullptr) {
         DbPoints pts;
-        if (glz::read<JSON_READ>(pts, json)) return std::nullopt;
+        if (const auto err = glz::read<JSON_READ>(pts, json)) {
+            if (error) *error = "Failed to parse database response: " + glz::format_error(err, json);
+            return std::nullopt;
+        }
         return pts;
     }
 

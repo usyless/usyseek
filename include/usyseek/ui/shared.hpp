@@ -4,6 +4,7 @@
 #include "search.hpp"
 #include "thumbs.hpp"
 
+#include <usyseek/notifications.hpp>
 #include <usyseek/progress.hpp>
 #include <usyseek/status.hpp>
 
@@ -47,6 +48,8 @@ struct Shared {
     std::optional<uint64_t> db_count;
     IndexState index_state;
     std::vector<FailedFile> failed_files;
+    std::vector<Notification> notifications;
+    std::pair<int64_t, uint64_t> notifications_stamp_{0, 0};
     bool indexer_running = false;
     bool indexer_stopping = false;
     StatusData indexer{};
@@ -58,6 +61,7 @@ struct Shared {
     int background_jobs = 0;         // downloads / installs in flight: the process must not idle-exit under them
 
     std::function<void()> open_settings;
+    std::function<void()> open_notifications;
     std::function<void()> visibility_changed;
     std::function<void()> settings_changed; // repaint dependants
     std::function<void()> tags_refreshed;
@@ -131,18 +135,99 @@ struct Shared {
             index_state = load_json_file<IndexState>(state_path());
             failed_files = load_failed_files(settings.model_name);
         }
+        const bool notifs_changed = reload_notifications(force);
 
-        return force || finished || indexer_running != was_running || indexer_stopping != prev_stopping ||
+        return force || finished || notifs_changed || indexer_running != was_running || indexer_stopping != prev_stopping ||
                (indexer_running && (indexer.embedded != prev_embedded || indexer.found != prev_found || indexer.failed != prev_failed || indexer.phase != prev_phase));
     }
 
+    bool reload_notifications(bool force = false) {
+        if (test_mode) return false;
+        const auto stamp = notifications_file_stamp();
+        if (!force && stamp == notifications_stamp_) return false;
+        notifications_stamp_ = stamp;
+        notifications = load_notifications();
+        return true;
+    }
+
+    void notify(std::string severity, std::string source, std::string title, std::string detail, std::string key = {}) {
+        auto apply = [this, sev = std::move(severity), src = std::move(source), t = std::move(title), d = std::move(detail), k = std::move(key)]() mutable {
+            if (test_mode) {
+                NotificationStoreData store{test_next_notif_id_++, std::move(notifications)};
+                apply_notification(store, sev, src, t, d, k, unix_now());
+                notifications = std::move(store.items);
+            } else {
+                notifications = push_notification_to_disk(sev, src, t, d, k, false);
+                notifications_stamp_ = notifications_file_stamp();
+            }
+            if (redraw_all) redraw_all();
+        };
+        if (call_hwnd && GetWindowThreadProcessId(call_hwnd, nullptr) != GetCurrentThreadId()) {
+            call(std::move(apply));
+        } else {
+            apply();
+        }
+    }
+
+    void notify(std::string severity, std::string source, std::wstring_view title, std::wstring_view detail, std::string key = {}) {
+        notify(std::move(severity), std::move(source), to_utf8(title), to_utf8(detail), std::move(key));
+    }
+
+    void dismiss_notification(uint64_t id) {
+        if (test_mode) {
+            NotificationStoreData store{test_next_notif_id_, std::move(notifications)};
+            ::usyseek::dismiss_notification(store, id);
+            notifications = std::move(store.items);
+        } else {
+            notifications = dismiss_notification_on_disk(id, false);
+            notifications_stamp_ = notifications_file_stamp();
+        }
+        if (redraw_all) redraw_all();
+    }
+
+    void clear_notifications() {
+        if (test_mode) {
+            notifications.clear();
+        } else {
+            notifications = clear_notifications_on_disk(false);
+            notifications_stamp_ = notifications_file_stamp();
+        }
+        if (redraw_all) redraw_all();
+    }
+
+    void clear_notification_key(std::string_view source, std::string_view key) {
+        if (test_mode) {
+            NotificationStoreData store{test_next_notif_id_, std::move(notifications)};
+            ::usyseek::clear_notification_key(store, source, key);
+            notifications = std::move(store.items);
+        } else {
+            notifications = clear_notification_key_on_disk(source, key, false);
+            notifications_stamp_ = notifications_file_stamp();
+        }
+        if (redraw_all) redraw_all();
+    }
+
+    [[nodiscard]] size_t error_notification_count() const noexcept {
+        return static_cast<size_t>(std::ranges::count_if(notifications, [](const Notification& n) {
+            return n.severity == "error";
+        }));
+    }
+
     bool polled_once_ = false;
+    uint64_t test_next_notif_id_ = 1;
 
     void save() {
-        if (!test_mode) save_settings(settings);
+        if (!test_mode && !save_settings(settings)) {
+            notify("error", "Settings", "Failed to save settings", "Could not write settings.json (" + win32_error_utf8(GetLastError()) + ").", "save-settings");
+        }
         engine.set_settings(settings);
     }
 };
+
+/// Native Windows confirmation dialog (Yes / No, defaulting to No).
+inline bool confirm_box(HWND owner, const wchar_t* title, const std::wstring& message) {
+    return MessageBoxW(owner, message.c_str(), title, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES;
+}
 
 /// Applies the dark immersive frame + backdrop attributes used by both windows.
 inline void style_window(HWND hwnd, int backdrop, bool round = true) {
@@ -156,20 +241,28 @@ inline void style_window(HWND hwnd, int backdrop, bool round = true) {
     DwmExtendFrameIntoClientArea(hwnd, &m);
 }
 
-inline void open_file(const std::wstring& path) {
+inline bool open_file(const std::wstring& path, std::string* error = nullptr) {
     SHELLEXECUTEINFOW sei{sizeof(sei)};
     sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
     sei.lpVerb = L"open";
     sei.lpFile = path.c_str();
     sei.nShow = SW_SHOWNORMAL;
-    ShellExecuteExW(&sei);
+    if (ShellExecuteExW(&sei)) return true;
+    if (error) *error = win32_error_utf8(GetLastError());
+    return false;
 }
 
-inline void reveal_in_explorer(const std::wstring& path) {
-    if (PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(path.c_str())) {
-        SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
-        ILFree(pidl);
+inline bool reveal_in_explorer(const std::wstring& path, std::string* error = nullptr) {
+    PIDLIST_ABSOLUTE pidl = ILCreateFromPathW(path.c_str());
+    if (!pidl) {
+        if (error) *error = "Path could not be resolved on disk (it may have been moved or deleted).";
+        return false;
     }
+    const HRESULT hr = SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+    ILFree(pidl);
+    if (SUCCEEDED(hr)) return true;
+    if (error) *error = win32_error_utf8(static_cast<DWORD>(hr));
+    return false;
 }
 
 /// Hands `n` bytes to `obj` as an HGLOBAL of format `cf` (the data object takes ownership).
@@ -360,17 +453,29 @@ private:
 /// The target is asked to finish the drop on its own thread, so its dialogs (such as "file already exists")
 /// never block this one inside the drag loop. Returns the data object's async state when the target is still
 /// working on the drop afterwards, null otherwise.
-inline wil::com_ptr<IDataObjectAsyncCapability> drag_media(HWND hwnd, std::span<const std::wstring> paths) {
+inline wil::com_ptr<IDataObjectAsyncCapability> drag_media(HWND hwnd, std::span<const std::wstring> paths, std::string* error = nullptr) {
     auto inner = media_data_object(paths);
-    if (!inner) return nullptr;
+    if (!inner) {
+        if (error) *error = "None of the selected files could be found on disk for drag-and-drop.";
+        return nullptr;
+    }
     auto* wrapper = new (std::nothrow) AsyncDataObject(std::move(inner));
-    if (!wrapper) return nullptr;
+    if (!wrapper) {
+        if (error) *error = "Out of memory starting drag operation.";
+        return nullptr;
+    }
     wil::com_ptr<IDataObject> obj;
     obj.attach(static_cast<IDataObject*>(wrapper));
     auto async = obj.try_query<IDataObjectAsyncCapability>();
-    if (!async) return nullptr;
+    if (!async) {
+        if (error) *error = "Could not initialize drag data object.";
+        return nullptr;
+    }
     DWORD effect = DROPEFFECT_NONE;
-    SHDoDragDrop(hwnd, obj.get(), nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
+    const HRESULT hr = SHDoDragDrop(hwnd, obj.get(), nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
+    if (FAILED(hr) && error) {
+        *error = "Drag-and-drop failed (" + win32_error_utf8(static_cast<DWORD>(hr)) + ").";
+    }
     BOOL in_operation = FALSE;
     if (SUCCEEDED(async->InOperation(&in_operation)) && in_operation) return async;
     return nullptr;

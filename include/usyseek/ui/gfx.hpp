@@ -55,6 +55,8 @@ public:
         return !d3d_ || FAILED(d3d_->GetDeviceRemovedReason());
     }
 
+    [[nodiscard]] bool is_warp() const noexcept { return warp_; }
+
     /// True when the DXGI adapter list changed or `hwnd` now sits on another GPU's monitor.
     [[nodiscard]] bool adapter_stale(HWND hwnd) const {
         if (!dxgi_factory_ || !dxgi_factory_->IsCurrent()) return true;

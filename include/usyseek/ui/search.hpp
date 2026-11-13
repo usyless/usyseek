@@ -32,9 +32,10 @@ struct ParsedQuery {
     std::vector<std::string> names;
     std::optional<std::wstring> similar;
     std::optional<int> kind;
+    std::optional<std::wstring> unknown_type;
 
     [[nodiscard]] bool empty() const {
-        return text.empty() && tags.empty() && not_tags.empty() && dirs.empty() && names.empty() && !similar;
+        return text.empty() && tags.empty() && not_tags.empty() && dirs.empty() && names.empty() && !similar && !kind && !unknown_type;
     }
 };
 
@@ -92,6 +93,7 @@ inline ParsedQuery parse_query(std::wstring_view q) {
             const std::wstring v = lower(read_value(i + 5));
             if (v.starts_with(L"im") || v.starts_with(L"ph") || v.starts_with(L"pic")) out.kind = 0;
             else if (v.starts_with(L"vid")) out.kind = 1;
+            else if (!v.empty()) out.unknown_type = v;
             continue;
         }
         if (starts(L"dir:") || starts(L"in:")) {
@@ -423,6 +425,8 @@ class Engine {
 public:
     std::function<void(std::unique_ptr<SearchResult>)> on_result;
     std::function<void(std::function<void()>)> post_ui; // marshal a callback to the UI thread
+    std::function<void(bool ready, std::string error)> on_db_state;
+    std::function<void(std::string title, std::string detail)> on_job_dropped;
 
     void start(const Settings& s) {
         settings_ = s;
@@ -478,6 +482,14 @@ private:
         if (db_.connect(s.qdrant_grpc_port)) {
             send_to_launcher(Cmd::NeedQdrant);
             db_ready_ = db_.wait_ready(std::chrono::seconds(30));
+            if (on_db_state) {
+                on_db_state(db_ready_.load(), db_ready_ ? std::string{} : ("Qdrant gRPC on 127.0.0.1:" + std::to_string(s.qdrant_grpc_port) + " did not become ready within 30s."));
+            }
+        } else {
+            db_ready_ = false;
+            if (on_db_state) {
+                on_db_state(false, "Could not create gRPC channel to Qdrant on 127.0.0.1:" + std::to_string(s.qdrant_grpc_port) + ".");
+            }
         }
         for (;;) {
             std::optional<SearchRequest> req;
@@ -496,7 +508,11 @@ private:
                 s = settings_;
             }
             if (job) {
-                if (db_ready_) job(db_);
+                if (db_ready_) {
+                    job(db_);
+                } else if (on_job_dropped) {
+                    on_job_dropped("Database unavailable", "Queued database update could not run because Qdrant is disconnected.");
+                }
                 continue;
             }
             if (req && on_result) on_result(execute(*req, s));
@@ -514,6 +530,10 @@ private:
         }
 
         ParsedQuery q = parse_query(r.query);
+        if (q.unknown_type) {
+            res->error = L"Unknown type filter 'type:" + *q.unknown_type + L"' (use image or video)";
+            return res;
+        }
         if (q.empty()) return res;
 
         DbFilter f;

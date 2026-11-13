@@ -113,7 +113,7 @@ public:
 
     void show(int tab = -1) {
         if (tab >= 0) {
-            tab_ = tab;
+            tab_ = std::clamp(tab, 0, 2);
             scroll_ = target_scroll_ = 0.0f;
         }
         sync_fields();
@@ -122,6 +122,7 @@ public:
         probe_venv();
         scan_models();
         sh_.poll_indexer(true);
+        sh_.reload_notifications();
         sh_.refresh_tags();
         sh_.refresh_hotkey_state();
         full_dirty_ = true;
@@ -251,12 +252,16 @@ private:
         IdNone = 0,
         IdTab0,
         IdTab1,
+        IdTab2,
         IdToggleIndex,
         IdOpenQdrantUi,
         IdClearDatabase,
         IdClearFailed,
+        IdClearFailedDisabled,
         IdOpenFailedLog,
         IdFailedRow,
+        IdClearAllNotifs,
+        IdDismissNotif,
         IdScopeAll,
         IdScopeCustom,
         IdAddInclude,
@@ -567,17 +572,27 @@ private:
         int id;
     };
 
-    static std::array<TabDef, 2> tab_defs() {
+    static std::array<TabDef, 3> tab_defs() {
         return {{
             {glyph::clock, L"Embeddings & Progress", IdTab0},
             {glyph::settings, L"Application & Venv Settings", IdTab1},
+            {glyph::warning, L"Notifications", IdTab2},
         }};
+    }
+
+    std::wstring tab_label(int i) const {
+        const auto tabs = tab_defs();
+        std::wstring s = tabs[static_cast<size_t>(i)].label;
+        if (i == 2 && !sh_.notifications.empty()) {
+            s += L" (" + format_count(sh_.notifications.size()) + L")";
+        }
+        return s;
     }
 
     FlowResult tab_layout(float total_w) const {
         std::vector<FlowItem> items;
-        for (const TabDef& t : tab_defs()) {
-            items.push_back({sh_.fonts.measure(t.label, Font::BodySemi) + 46.0f, TABS_H - 16.0f});
+        for (int i = 0; i < 3; ++i) {
+            items.push_back({sh_.fonts.measure(tab_label(i), Font::BodySemi) + 46.0f, TABS_H - 16.0f});
         }
         return flow_layout(items, 8.0f, 8.0f, total_w - PAD * 2.0f);
     }
@@ -602,8 +617,10 @@ private:
 
         if (tab_ == 0) {
             y = draw_tab_progress(cv, cx, y, cw);
-        } else {
+        } else if (tab_ == 1) {
             y = draw_tab_settings(cv, cx, y, cw);
+        } else {
+            y = draw_tab_notifications(cv, cx, y, cw);
         }
 
         content_h_ = (y + scroll_ - view.top) + PAD;
@@ -630,6 +647,8 @@ private:
             case IdRemoveInclude: return L"Remove folder";
             case IdRemoveExclude: return L"Remove exclusion";
             case IdLockedExclude: return L"System exclusion (cannot be removed)";
+            case IdClearFailedDisabled: return L"Stop indexing before retrying failed files";
+            case IdDismissNotif: return L"Dismiss notification";
             default: return nullptr;
         }
     }
@@ -639,29 +658,123 @@ private:
         cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(color::surface_lowest, 0.75f));
         const auto tabs = tab_defs();
         const FlowResult layout = tab_layout(sz.width);
-        D2D1_RECT_F rects[2]{};
-        for (int i = 0; i < 2; ++i) {
+        D2D1_RECT_F rects[3]{};
+        for (int i = 0; i < 3; ++i) {
             const FlowPlacement& p = layout.placements[i];
             rects[i] = rect(PAD + p.x, 8.0f + p.y, p.width, TABS_H - 16.0f);
         }
-        const float t = std::clamp(tab_anim_.value, 0.0f, 1.0f);
-        for (int i = 0; i < 2; ++i) {
-            const float act = i == 0 ? 1.0f - t : t;
+        const float t = std::clamp(tab_anim_.value, 0.0f, 2.0f);
+        const int i0 = std::clamp(static_cast<int>(std::floor(t)), 0, 2);
+        const int i1 = std::clamp(i0 + 1, 0, 2);
+        const float frac = t - static_cast<float>(i0);
+        for (int i = 0; i < 3; ++i) {
+            const float act = std::clamp(1.0f - std::abs(t - static_cast<float>(i)), 0.0f, 1.0f);
             if (const float ha = hover_alpha(tabs[i].id); act < 0.5f && ha > 0.002f) {
                 cv.fill_round(rects[i], 10.0f, with_alpha(color::on_surface, 0.07f * ha));
             }
         }
-        cv.fill_round(lerp_rect(rects[0], rects[1], t), 10.0f, color::primary_container);
-        for (int i = 0; i < 2; ++i) {
+        cv.fill_round(lerp_rect(rects[i0], rects[i1], frac), 10.0f, color::primary_container);
+        const bool any_notifs = !sh_.notifications.empty();
+        const bool has_errors = sh_.error_notification_count() > 0;
+        for (int i = 0; i < 3; ++i) {
             const D2D1_RECT_F r = rects[i];
-            const float act = i == 0 ? 1.0f - t : t;
-            const float tw = cv.measure(tabs[i].label, Font::BodySemi);
-            const D2D1_COLOR_F fg = lerp_color(color::on_surface_variant, color::on_primary_container, act);
+            const float act = std::clamp(1.0f - std::abs(t - static_cast<float>(i)), 0.0f, 1.0f);
+            const std::wstring lbl = tab_label(i);
+            const float tw = cv.measure(lbl, Font::BodySemi);
+            const D2D1_COLOR_F base_fg = (i == 2 && any_notifs)
+                ? (has_errors ? color::error : color::amber)
+                : color::on_surface_variant;
+            const D2D1_COLOR_F fg = lerp_color(base_fg, color::on_primary_container, act);
             cv.icon(tabs[i].g, rect(r.left + 12.0f, r.top, 18.0f, height(r)), fg, Font::IconSmall);
-            cv.text(tabs[i].label, rect(r.left + 34.0f, r.top, tw + 4.0f, height(r)), Font::BodySemi, fg);
+            cv.text(lbl, rect(r.left + 34.0f, r.top, tw + 4.0f, height(r)), Font::BodySemi, fg);
             cv.hit(r, tabs[i].id);
         }
         cv.hline(0, sz.width, strip_h, with_alpha(color::outline_variant, 0.65f));
+    }
+
+    float draw_tab_notifications(Canvas& cv, float x, float y, float w) {
+        const float lx = x + 22.0f, rw = w - 44.0f;
+        const size_t total_n = sh_.notifications.size();
+        const size_t err_n = sh_.error_notification_count();
+        const size_t warn_n = total_n >= err_n ? total_n - err_n : 0;
+
+        // 1. Summary & Clear All card
+        {
+            std::wstring caption;
+            if (total_n == 0) {
+                caption = L"No active errors or warnings. Indexing, search, database, and environment alerts appear here.";
+            } else {
+                caption = format_count(total_n) + (total_n == 1 ? L" active notification" : L" active notifications");
+                if (err_n > 0) caption += L"  •  " + format_count(err_n) + (err_n == 1 ? L" error" : L" errors");
+                if (warn_n > 0) caption += L"  •  " + format_count(warn_n) + (warn_n == 1 ? L" warning" : L" warnings");
+            }
+            const float btn_w = total_n > 0 ? button_width(cv, L"Clear All", true, 124.0f) : 0.0f;
+            const CardHeader hd = make_header(cv, rw, L"Notifications", color::on_surface, caption, btn_w, total_n > 0 ? 34.0f : 0.0f);
+            const float h = 16.0f + hd.h + 16.0f;
+            const float next_y = card_begin(cv, x, y, w, h);
+            const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
+            if (total_n > 0) {
+                draw_button(cv, rect(side.left, side.top, btn_w, 34.0f), glyph::del, L"Clear All", IdClearAllNotifs, 0, 2);
+            }
+            y = next_y;
+        }
+
+        if (total_n == 0) {
+            const float h = 112.0f;
+            const float next_y = card_begin(cv, x, y, w, h);
+            cv.icon(glyph::check, rect(lx, y + 24.0f, rw, 28.0f), color::mint, Font::Icon);
+            cv.text(L"All clear", rect(lx, y + 54.0f, rw, 24.0f), Font::BodySemi, color::on_surface, Align::Center);
+            cv.text(L"Everything is running without warnings or errors.", rect(lx, y + 78.0f, rw, 20.0f),
+                    Font::Caption, color::outline, Align::Center);
+            return next_y;
+        }
+
+        // 2. Notification cards
+        for (size_t i = 0; i < total_n; ++i) {
+            const Notification& n = sh_.notifications[i];
+            const bool is_err = n.severity == "error";
+            const bool is_info = n.severity == "info";
+            const D2D1_COLOR_F col = is_err ? color::error : (is_info ? color::primary : color::amber);
+            const std::wstring sev = is_err ? L"Error" : (is_info ? L"Info" : L"Warning");
+            std::wstring meta = sev;
+            if (!n.source.empty()) meta += L"  •  " + to_wide(n.source);
+            if (n.unix_ts > 0) meta += L"  •  " + format_ago(n.unix_ts);
+            if (n.count > 1) meta += L"  •  ×" + format_count(n.count);
+
+            const std::wstring title = to_wide(n.title);
+            const std::wstring detail = to_wide(n.detail);
+            const float text_x = lx + 30.0f;
+            const float text_w = std::max(120.0f, rw - 30.0f - 40.0f);
+            const float meta_h = text_height(cv, meta, Font::Caption, text_w, 18.0f);
+            const float title_h = text_height(cv, title, Font::BodySemi, text_w, 22.0f);
+            const float detail_h = detail.empty() ? 0.0f : text_height(cv, detail, Font::Small, text_w, 18.0f);
+            const float body_h = meta_h + 2.0f + title_h + (detail_h > 0.0f ? 4.0f + detail_h : 0.0f);
+            const float card_h = std::max(64.0f, 14.0f + body_h + 14.0f);
+
+            const D2D1_RECT_F r = rect(x, y, w, card_h);
+            cv.fill_round(r, 14.0f, with_alpha(is_err ? color::error_container : color::surface, is_err ? 0.20f : 0.90f));
+            cv.stroke_round(r, 14.0f, with_alpha(col, is_err ? 0.45f : 0.35f));
+
+            cv.icon(is_err ? glyph::warning : (is_info ? glyph::tag : glyph::warning),
+                    rect(lx, y + 14.0f, 22.0f, 24.0f), col, Font::IconSmall);
+            float ty = y + 14.0f;
+            cv.text_wrap(meta, rect(text_x, ty, text_w, meta_h), Font::Caption, col);
+            ty += meta_h + 2.0f;
+            cv.text_wrap(title, rect(text_x, ty, text_w, title_h), Font::BodySemi, color::on_surface);
+            if (detail_h > 0.0f) {
+                ty += title_h + 4.0f;
+                cv.text_wrap(detail, rect(text_x, ty, text_w, detail_h), Font::Small, color::on_surface_variant);
+            }
+
+            const D2D1_RECT_F dr = rect(lx + rw - 32.0f, y + 12.0f, 32.0f, 32.0f);
+            const float ha = hover_alpha(IdDismissNotif, static_cast<int>(i));
+            if (ha > 0.002f) cv.fill_round(dr, 8.0f, with_alpha(color::on_surface, 0.10f * ha));
+            cv.icon(glyph::close, dr, lerp_color(color::outline, color::on_surface, ha), Font::IconSmall);
+            cv.hit(dr, IdDismissNotif, static_cast<int>(i));
+
+            y += card_h + 10.0f;
+        }
+        return y;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -729,8 +842,10 @@ private:
             const std::wstring cur = stopping ? L"Stopping indexer — finishing current batch…"
                                    : (running && d.current[0] ? (std::wstring{L"Processing: "} + d.current)
                                    : (running && d.message[0] ? std::wstring{d.message} : L"On-demand scanner idle — zero background GPU/RAM usage"));
+            const bool db_disconnected = !sh_.engine.db_ready() && !sh_.test_mode;
             const std::wstring db_info = L"Qdrant collection: " + to_wide(sh_.settings.model_name) +
-                                         L"  •  127.0.0.1:" + std::to_wstring(sh_.settings.qdrant_http_port);
+                                         L"  •  127.0.0.1:" + std::to_wstring(sh_.settings.qdrant_http_port) +
+                                         (db_disconnected ? L"  •  Disconnected" : L"");
 
             const wchar_t* label = L"LOCAL MEDIA EMBEDDING STATUS";
             const float label_h = text_height(cv, label, Font::Label, rw, 16.0f);
@@ -772,7 +887,7 @@ private:
             flow_text(cv, progress_text, cur, Font::MonoSmall, stopping ? color::amber : color::on_surface_variant, rw, 20.0f, true, Align::Right);
 
             Flow database{8.0f, 8.0f};
-            flow_text(cv, database, db_info, Font::Caption, color::outline, rw, 32.0f, true);
+            flow_text(cv, database, db_info, Font::Caption, db_disconnected ? color::error : color::outline, rw, 32.0f, true);
             database.add(button_width(cv, L"Open Qdrant Web UI", true, 166.0f), 32.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::open, L"Open Qdrant Web UI", IdOpenQdrantUi);
             });
@@ -849,7 +964,20 @@ private:
 
             const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
             draw_button(cv, rect(side.left, side.top, 126.0f, 32.0f), glyph::open, L"Open Log File", IdOpenFailedLog);
-            draw_button(cv, rect(side.left + 134.0f, side.top, 132.0f, 32.0f), glyph::refresh, L"Retry Failed", IdClearFailed);
+            const D2D1_RECT_F retry_r = rect(side.left + 134.0f, side.top, 132.0f, 32.0f);
+            if (sh_.indexer_running) {
+                cv.fill_round(retry_r, 10.0f, with_alpha(color::surface_high, 0.45f));
+                cv.stroke_round(retry_r, 10.0f, with_alpha(color::outline_variant, 0.40f));
+                const float tw = cv.measure(L"Retry Failed", Font::SmallSemi);
+                const float total = 24.0f + tw;
+                const float sx = retry_r.left + (width(retry_r) - total) * 0.5f;
+                const D2D1_COLOR_F dfg = with_alpha(color::on_surface_variant, 0.45f);
+                cv.icon(glyph::refresh, rect(sx, retry_r.top, 18.0f, height(retry_r)), dfg, Font::IconSmall);
+                cv.text(L"Retry Failed", rect(sx + 24.0f, retry_r.top, tw + 4.0f, height(retry_r)), Font::SmallSemi, dfg);
+                cv.hit(retry_r, IdClearFailedDisabled);
+            } else {
+                draw_button(cv, retry_r, glyph::refresh, L"Retry Failed", IdClearFailed);
+            }
 
             for (size_t i = 0; i < rows.size(); ++i) {
                 const auto& ff = sh_.failed_files[i];
@@ -1515,8 +1643,10 @@ private:
 
             if (has_log) {
                 const D2D1_RECT_F lr = rect(lx, log_y, rw, log_h);
-                cv.fill_round(lr, 8.0f, color::surface_lowest);
-                cv.text_wrap(venv_log, inset(lr, 10.0f, 6.0f), Font::MonoSmall, color::on_surface_variant);
+                cv.fill_round(lr, 8.0f, venv_view.failed ? with_alpha(color::error_container, 0.35f) : color::surface_lowest);
+                if (venv_view.failed) cv.stroke_round(lr, 8.0f, with_alpha(color::error, 0.45f));
+                cv.text_wrap(venv_log, inset(lr, 10.0f, 6.0f), Font::MonoSmall,
+                             venv_view.failed ? color::error : color::on_surface_variant);
             }
             y = next_y;
         }
@@ -1562,7 +1692,9 @@ private:
         sei.lpParameters = args.c_str();
         sei.lpDirectory = vdir.c_str();
         sei.nShow = SW_SHOWNORMAL;
-        ShellExecuteExW(&sei);
+        if (!ShellExecuteExW(&sei)) {
+            sh_.notify("error", "Venv", "Failed to open terminal in venv folder", win32_error_utf8(), "venv-cmd");
+        }
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1680,6 +1812,13 @@ private:
     // Model download (Hugging Face)
     // ------------------------------------------------------------------------------------------
 
+    void notify_async(std::string level, std::string source, std::string title, std::string detail, std::string key = {}) {
+        sh_.call([this, level = std::move(level), source = std::move(source), title = std::move(title),
+                  detail = std::move(detail), key = std::move(key)] {
+            sh_.notify(level.c_str(), source.c_str(), title, detail, key);
+        });
+    }
+
     /// open_clip weights for the PE models live under timm/<model name>.
     [[nodiscard]] std::string default_repo() const { return "timm/" + sh_.settings.model_name; }
 
@@ -1696,6 +1835,12 @@ private:
     void download_model(const std::stop_token& stop, const std::string& repo, const fs::path& dir, const std::string& name) {
         std::error_code ec;
         fs::create_directories(dir, ec);
+        if (ec) {
+            const std::wstring msg = L"Cannot create model folder: " + to_wide(ec.message());
+            report(model_job_, msg, true);
+            notify_async("error", "Model", "Model download failed", to_utf8(msg), "model-download");
+            return;
+        }
         const std::wstring base = L"https://huggingface.co/" + to_wide(repo) + L"/resolve/main/";
         const std::wstring wname = to_wide(name);
         struct Item {
@@ -1719,7 +1864,9 @@ private:
                 return;
             }
             if (!r.ok) {
-                report(model_job_, item.remote + L" from " + to_wide(repo) + L": " + r.error, true);
+                const std::wstring msg = item.remote + L" from " + to_wide(repo) + L": " + r.error;
+                report(model_job_, msg, true);
+                notify_async("error", "Model", "Model download failed", to_utf8(msg), "model-download");
                 return;
             }
         }
@@ -1757,7 +1904,7 @@ private:
                 });
     }
 
-    void exec_logged(const fs::path& exe, const std::vector<std::wstring>& args) {
+    bool exec_logged(const fs::path& exe, const std::vector<std::wstring>& args) {
         std::wstring full = L"\"" + exe.wstring() + L"\"";
         std::wstring disp = exe.filename().wstring();
         for (const auto& a : args) {
@@ -1766,12 +1913,17 @@ private:
         }
         append_venv_log(L"> " + disp);
         auto on_line = [this](std::string_view out) { append_venv_log(to_wide(out)); };
-        (void)ulp::win::proc::run_process<{.allow_visible_windows = false}>(
+        const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false}>(
             ulp::win::proc::process_settings{
                 .commandline = full,
                 .on_stdout_line = on_line,
                 .on_stderr_line = on_line,
             });
+        if (res.status != 0) {
+            report(venv_job_, disp + L" exited with code " + std::to_wstring(res.status), true);
+            return false;
+        }
+        return true;
     }
 
     fs::path find_base_python() const {
@@ -1819,18 +1971,22 @@ private:
         append_venv_log(L"Querying NuGet for Python " + to_wide(want) + L"…");
         const auto body = http::get(L"https://api.nuget.org/v3-flatcontainer/python/index.json");
         if (!body) {
-            append_venv_log(L"Could not reach api.nuget.org");
+            report(venv_job_, L"Could not reach api.nuget.org", true);
+            notify_async("error", "Venv", "NuGet lookup failed", "Could not reach api.nuget.org.", "venv-setup");
             return std::nullopt;
         }
         NugetVersionIndex idx;
         if (glz::read<JSON_READ>(idx, *body)) {
-            append_venv_log(L"Unexpected response from NuGet");
+            report(venv_job_, L"Unexpected response from NuGet", true);
+            notify_async("error", "Venv", "NuGet lookup failed", "Unexpected JSON response from api.nuget.org.", "venv-setup");
             return std::nullopt;
         }
         const bool exact = std::count(want.begin(), want.end(), '.') >= 2 || want.find('-') != std::string::npos;
         if (exact) {
             if (std::find(idx.versions.begin(), idx.versions.end(), want) != idx.versions.end()) return want;
-            append_venv_log(L"Python " + to_wide(want) + L" is not published on NuGet");
+            const std::wstring msg = L"Python " + to_wide(want) + L" is not published on NuGet";
+            report(venv_job_, msg, true);
+            notify_async("error", "Venv", "Requested Python version unavailable", to_utf8(msg), "venv-setup");
             return std::nullopt;
         }
         const std::string prefix = want + ".";
@@ -1839,7 +1995,11 @@ private:
             if (!v.starts_with(prefix) || v.contains('-')) continue; // stable only
             if (!best || parse_ver(v) > parse_ver(*best)) best = v;
         }
-        if (!best) append_venv_log(L"No stable Python " + to_wide(want) + L".x release on NuGet");
+        if (!best) {
+            const std::wstring msg = L"No stable Python " + to_wide(want) + L".x release on NuGet";
+            report(venv_job_, msg, true);
+            notify_async("error", "Venv", "Requested Python version unavailable", to_utf8(msg), "venv-setup");
+        }
         return best;
     }
 
@@ -1858,20 +2018,40 @@ private:
             const http::Result dl = http::download(url, pkg, [this](uint64_t done, uint64_t total) { report_progress(venv_job_, done, total); }, stop);
             report_progress(venv_job_, 0, 0);
             if (!dl.ok) {
-                append_venv_log(dl.cancelled ? L"Download cancelled." : L"Download failed: " + dl.error);
+                if (dl.cancelled) {
+                    append_venv_log(L"Download cancelled.");
+                } else {
+                    const std::wstring msg = L"Download failed: " + dl.error;
+                    report(venv_job_, msg, true);
+                    notify_async("error", "Venv", "Portable Python download failed", to_utf8(msg), "venv-setup");
+                }
                 return;
             }
 
             // .nupkg is a zip; Windows 10+ ships bsdtar which extracts zips natively
             append_venv_log(L"Extracting…");
             fs::remove_all(root, ec);
+            if (ec) {
+                const std::wstring msg = L"Failed to clear old Python folder: " + to_wide(ec.message());
+                report(venv_job_, msg, true);
+                notify_async("error", "Venv", "Portable Python extraction failed", to_utf8(msg), "venv-setup");
+                return;
+            }
             fs::create_directories(root, ec);
+            if (ec) {
+                const std::wstring msg = L"Failed to create Python folder: " + to_wide(ec.message());
+                report(venv_job_, msg, true);
+                notify_async("error", "Venv", "Portable Python extraction failed", to_utf8(msg), "venv-setup");
+                return;
+            }
             wchar_t sys_dir[MAX_PATH]{};
             GetSystemDirectoryW(sys_dir, MAX_PATH);
-            exec_logged(fs::path{sys_dir} / L"tar.exe", {L"-xf", pkg.wstring(), L"-C", root.wstring(), L"tools"});
+            const bool tar_ok = exec_logged(fs::path{sys_dir} / L"tar.exe", {L"-xf", pkg.wstring(), L"-C", root.wstring(), L"tools"});
             fs::remove(pkg, ec);
-            if (!fs::exists(root / L"tools" / L"python.exe", ec)) {
-                append_venv_log(L"Extraction failed: tools\\python.exe missing");
+            if (!tar_ok || !fs::exists(root / L"tools" / L"python.exe", ec)) {
+                report(venv_job_, L"Extraction failed: tools\\python.exe missing", true);
+                notify_async("error", "Venv", "Portable Python extraction failed",
+                             "tar.exe could not extract tools\\python.exe from the NuGet package.", "venv-setup");
                 return;
             }
         } else {
@@ -1880,7 +2060,10 @@ private:
 
         // Packages install straight into the portable interpreter (no venv)
         const fs::path py = root / L"tools" / L"python.exe";
-        exec_logged(py, {L"-m", L"ensurepip", L"--upgrade"});
+        if (!exec_logged(py, {L"-m", L"ensurepip", L"--upgrade"})) {
+            notify_async("error", "Venv", "ensurepip failed", "Could not bootstrap pip inside portable Python.", "venv-setup");
+            return;
+        }
         sh_.call([this, root] {
             sh_.settings.venv_dir = to_utf8(root.wstring());
             sh_.save();
@@ -1893,14 +2076,20 @@ private:
     void install_packages_in_worker(const VenvJobInputs& in) {
         const VenvInfo info = read_venv(to_wide(in.venv_dir));
         if (!info.exists || !fs::exists(info.python_exe)) {
-            append_venv_log(L"python.exe not found — create a venv or download a portable Python first.");
+            const std::wstring msg = L"python.exe not found — create a venv or download a portable Python first.";
+            report(venv_job_, msg, true);
+            notify_async("error", "Venv", "Python environment not found", to_utf8(msg), "venv-setup");
             return;
         }
         install_packages_into(in, info.python_exe);
     }
 
     void install_packages_into(const VenvJobInputs& in, const fs::path& py) {
-        exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"pip"});
+        if (!exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"pip"})) {
+            notify_async("error", "Venv", "pip upgrade failed", "pip exited with an error while upgrading itself.", "venv-setup");
+            return;
+        }
+        bool torch_ok = true;
         const std::wstring custom_args = trim(to_wide(in.torch_pip_args));
         if (!custom_args.empty()) {
             int argc = 0;
@@ -1908,28 +2097,42 @@ private:
             std::vector<std::wstring> args = {L"-m", L"pip", L"install", L"--upgrade"};
             for (int i = 0; i < argc; ++i) args.emplace_back(argv[i]);
             if (argv) LocalFree(argv);
-            exec_logged(py, args);
+            torch_ok = exec_logged(py, args);
         } else if (in.torch_backend == "manual") {
             append_venv_log(L"Manual PyTorch mode: skipping Torch install, installing requirements.txt…");
         } else if (in.torch_backend == "rocm") {
             const std::wstring arch = to_wide(in.rocm_arch.empty() ? "gfx1030" : in.rocm_arch);
-            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", L"https://stable.repo.amd.com/rocm/whl-next/",
-                             L"torch[device-" + arch + L"]", L"torchvision[device-" + arch + L"]", L"rocm[libraries,device-" + arch + L"]"});
+            torch_ok = exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", L"https://stable.repo.amd.com/rocm/whl-next/",
+                                        L"torch[device-" + arch + L"]", L"torchvision[device-" + arch + L"]", L"rocm[libraries,device-" + arch + L"]"});
         } else if (in.torch_backend == "cuda") {
-            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cuda", in.cuda_version)),
-                             L"torch", L"torchvision"});
+            torch_ok = exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cuda", in.cuda_version)),
+                                        L"torch", L"torchvision"});
         } else {
-            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cpu", "")),
-                             L"torch", L"torchvision"});
+            torch_ok = exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cpu", "")),
+                                        L"torch", L"torchvision"});
+        }
+        if (!torch_ok) {
+            report(venv_job_, L"PyTorch installation failed — check settings and retry.", true);
+            notify_async("error", "Venv", "PyTorch installation failed",
+                         "pip failed to install PyTorch (" + in.torch_backend + "). Check Settings -> Python Environment.", "venv-setup");
+            return;
         }
         fs::path req = exe_dir() / L"python" / L"requirements.txt";
         if (!fs::exists(req)) {
             if (auto found = find_upwards(L"python\\requirements.txt")) req = *found;
         }
+        bool req_ok = false;
         if (fs::exists(req)) {
-            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"-r", req.wstring()});
+            req_ok = exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"-r", req.wstring()});
         } else {
-            exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"open-clip-torch", L"timm", L"safetensors", L"onnx", L"onnxscript"});
+            append_venv_log(L"requirements.txt not found; installing fallback package list…");
+            req_ok = exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"open-clip-torch", L"timm", L"safetensors", L"onnx", L"onnxscript"});
+        }
+        if (!req_ok) {
+            report(venv_job_, L"Package installation failed — see error above.", true);
+            notify_async("error", "Venv", "Python package installation failed",
+                         "pip exited with an error while installing open_clip / ONNX dependencies.", "venv-setup");
+            return;
         }
         append_venv_log(L"Packages up to date.");
     }
@@ -2045,14 +2248,47 @@ private:
         }
     }
 
+    bool send_launcher_or_notify(Cmd cmd, const char* action) {
+        if (send_to_launcher(cmd)) return true;
+        sh_.notify("error", "Launcher", std::string{"Could not "} + action,
+            "The usyseek.exe background launcher is not running or could not be reached.", "launcher-ipc");
+        return false;
+    }
+
+    bool confirm_and_set_model(const std::string& next_model) {
+        if (next_model.empty() || next_model == sh_.settings.model_name) return true;
+        if (in_modal_) return false;
+        in_modal_ = true;
+        std::wstring msg = L"Switch embedding model from '" + to_wide(sh_.settings.model_name) +
+                           L"' to '" + to_wide(next_model) + L"'?\n\n";
+        if (sh_.indexer_running) {
+            msg += L"Indexing is currently active in '" + to_wide(sh_.settings.model_name) +
+                   L"'. Switching does not stop it, and new searches/indexing for '" + to_wide(next_model) +
+                   L"' will use a separate collection.\n\n";
+        }
+        msg += L"Each model uses its own Qdrant collection, so you will need to download (if missing) and index files for '" +
+               to_wide(next_model) + L"' before searching with it.";
+        const bool ok = confirm_box(hwnd_, L"Change Embedding Model", msg);
+        in_modal_ = false;
+        if (!ok) {
+            model_field_.set(to_wide(sh_.settings.model_name));
+            invalidate();
+            return false;
+        }
+        sh_.settings.model_name = next_model;
+        model_field_.set(to_wide(next_model));
+        repo_field_.set(L""); // the repository belonged to the previous model
+        scan_models();
+        sh_.save();
+        if (sh_.settings_changed) sh_.settings_changed();
+        return true;
+    }
+
     void commit_fields() {
         bool changed = false;
         const std::string m = to_utf8(trim(model_field_.text));
         if (!m.empty() && m != sh_.settings.model_name) {
-            sh_.settings.model_name = m;
-            repo_field_.set(L""); // the repository belonged to the previous model
-            scan_models();
-            changed = true;
+            confirm_and_set_model(m);
         }
         const std::string a = to_utf8(trim(arch_field_.text));
         if (!a.empty() && a != sh_.settings.rocm_arch) {
@@ -2060,9 +2296,19 @@ private:
             changed = true;
         }
         const std::string cu = to_utf8(trim(cuda_field_.text));
-        if (!cu.empty() && cu != sh_.settings.cuda_version) {
-            sh_.settings.cuda_version = cu;
-            changed = true;
+        if (!cu.empty()) {
+            const std::string norm = normalize_cuda_version(cu);
+            std::string cu_lower = cu;
+            std::ranges::transform(cu_lower, cu_lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (norm != cu_lower) {
+                sh_.notify("warning", "Settings", "Invalid CUDA tag '" + cu + "'",
+                    "Expected format like cu126 or cu130; fell back to '" + norm + "'.", "settings-cuda");
+            }
+            if (norm != sh_.settings.cuda_version) {
+                sh_.settings.cuda_version = norm;
+                cuda_field_.set(to_wide(norm));
+                changed = true;
+            }
         }
         const std::string tp = to_utf8(trim(torch_field_.text));
         if (tp != sh_.settings.torch_pip_args) {
@@ -2079,9 +2325,21 @@ private:
         if (!bs_txt.empty() && _wcsicmp(bs_txt.c_str(), L"auto") != 0) {
             try {
                 const long v = std::stol(bs_txt);
-                if (v > 0) new_bs = static_cast<uint32_t>(std::clamp(v, 1L, 4096L));
+                if (v <= 0) {
+                    new_bs = sh_.settings.batch_size;
+                    sh_.notify("warning", "Settings", "Invalid batch size '" + to_utf8(bs_txt) + "'",
+                        "Batch size must be a positive number (1..4096) or blank/auto.", "settings-batch");
+                } else {
+                    new_bs = static_cast<uint32_t>(std::clamp(v, 1L, 4096L));
+                    if (v > 4096L) {
+                        sh_.notify("warning", "Settings", "Batch size clamped to 4096",
+                            "Entered batch size " + std::to_string(v) + " exceeds the 4096 maximum.", "settings-batch");
+                    }
+                }
             } catch (...) {
                 new_bs = sh_.settings.batch_size;
+                sh_.notify("warning", "Settings", "Invalid batch size '" + to_utf8(bs_txt) + "'",
+                    "Could not parse batch size; reverted to previous value.", "settings-batch");
             }
         }
         if (new_bs != sh_.settings.batch_size) {
@@ -2112,6 +2370,15 @@ private:
     void add_exclude_from_field() {
         const std::wstring v = trim(exclude_field_.text);
         if (v.empty()) return;
+        const bool wildcard_only = std::ranges::all_of(v, [](wchar_t ch) {
+            return ch == L'*' || ch == L'?' || ch == L'\\' || ch == L'/';
+        });
+        if (wildcard_only) {
+            exclude_error_ = L"Exclusion pattern cannot consist solely of wildcards";
+            exclude_error_for_text_ = exclude_field_.text;
+            invalidate();
+            return;
+        }
         if (add_exclude(v)) exclude_field_.set(L"");
         invalidate();
     }
@@ -2125,7 +2392,7 @@ private:
 
     /// Hands the saved shortcut to the launcher and learns whether it could be registered.
     void reload_launcher_hotkey() {
-        send_to_launcher(Cmd::ReloadSettings);
+        send_launcher_or_notify(Cmd::ReloadSettings, "reload hotkey in launcher");
         sh_.refresh_hotkey_state();
         if (sh_.redraw_all) sh_.redraw_all();
     }
@@ -2164,62 +2431,90 @@ private:
         switch (id) {
             case IdTab0: set_tab(0); return;
             case IdTab1: set_tab(1); return;
+            case IdTab2: set_tab(2); return;
+            case IdClearAllNotifs:
+                sh_.clear_notifications();
+                break;
+            case IdDismissNotif:
+                if (idx >= 0 && idx < static_cast<int>(sh_.notifications.size())) {
+                    sh_.dismiss_notification(sh_.notifications[static_cast<size_t>(idx)].id);
+                }
+                break;
             case IdToggleIndex:
                 if (sh_.indexer_running) {
                     if (!sh_.indexer_stopping) {
                         sh_.indexer_stopping = true;
-                        send_to_launcher(Cmd::StopIndex);
+                        send_launcher_or_notify(Cmd::StopIndex, "stop indexing");
                     }
                 } else {
                     sh_.indexer_stopping = false;
-                    send_to_launcher(Cmd::StartIndex);
+                    send_launcher_or_notify(Cmd::StartIndex, "start indexing");
                 }
                 sh_.poll_indexer();
                 break;
             case IdOpenQdrantUi:
-                send_to_launcher(Cmd::NeedQdrant);
-                open_file(L"http://127.0.0.1:" + std::to_wstring(sh_.settings.qdrant_http_port) + L"/dashboard");
+                send_launcher_or_notify(Cmd::NeedQdrant, "start Qdrant");
+                if (std::string open_err;
+                    !open_file(L"http://127.0.0.1:" + std::to_wstring(sh_.settings.qdrant_http_port) + L"/dashboard", &open_err)) {
+                    sh_.notify("error", "Browser", "Failed to open Qdrant Web UI", open_err, "open-qdrant-ui");
+                }
                 break;
             case IdClearDatabase: {
                 const std::wstring msg = L"Clear all indexed embeddings and tags in collection '" +
                                          to_wide(sh_.settings.model_name) + L"'?\n\nYour media files on disk will not be touched.";
-                if (MessageBoxW(hwnd_, msg.c_str(), L"Clear Database", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES) {
-                    if (sh_.indexer_running) send_to_launcher(Cmd::StopIndex);
-                    const std::string coll = sh_.settings.model_name;
-                    std::error_code ec;
-                    fs::remove(failed_path(coll), ec);
-                    fs::remove(state_path(), ec);
-                    sh_.index_state = {};
-                    sh_.failed_files.clear();
-                    sh_.db_count = 0;
-                    sh_.tags.clear();
-                    sh_.engine.post([this, coll](Db& db) {
-                        db.drop_collection(coll);
-                        sh_.call([this] {
-                            sh_.poll_indexer();
-                            sh_.refresh_tags();
-                            if (sh_.redraw_all) sh_.redraw_all();
+                if (!in_modal_) {
+                    in_modal_ = true;
+                    const bool confirmed = confirm_box(hwnd_, L"Clear Database", msg);
+                    in_modal_ = false;
+                    if (confirmed) {
+                        if (sh_.indexer_running) send_launcher_or_notify(Cmd::StopIndex, "stop indexing");
+                        const std::string coll = sh_.settings.model_name;
+                        std::error_code ec;
+                        fs::remove(failed_path(coll), ec);
+                        fs::remove(state_path(), ec);
+                        sh_.index_state = {};
+                        sh_.failed_files.clear();
+                        sh_.db_count = 0;
+                        sh_.tags.clear();
+                        sh_.engine.post([this, coll](Db& db) {
+                            std::string drop_err;
+                            const bool ok = db.drop_collection(coll, &drop_err);
+                            sh_.call([this, ok, drop_err, coll] {
+                                if (!ok) {
+                                    sh_.notify("error", "Database", "Failed to drop Qdrant collection '" + coll + "'", drop_err, "db-drop");
+                                }
+                                sh_.poll_indexer();
+                                sh_.refresh_tags();
+                                if (sh_.redraw_all) sh_.redraw_all();
+                            });
                         });
-                    });
+                    }
                 }
                 break;
             }
             case IdClearFailed: {
+                if (sh_.indexer_running) break;
                 std::error_code ec;
                 fs::remove(failed_path(sh_.settings.model_name), ec);
-                sh_.failed_files.clear();
-                if (!sh_.indexer_running) {
-                    send_to_launcher(Cmd::StartIndex);
-                    sh_.poll_indexer(true);
+                if (ec) {
+                    sh_.notify("error", "Indexer", "Failed to clear failed-files cache", ec.message(), "clear-failed");
+                    break;
                 }
+                sh_.failed_files.clear();
+                send_launcher_or_notify(Cmd::StartIndex, "start indexing");
+                sh_.poll_indexer(true);
                 break;
             }
             case IdOpenFailedLog:
-                open_file(failed_path(sh_.settings.model_name).wstring());
+                if (std::string open_err; !open_file(failed_path(sh_.settings.model_name).wstring(), &open_err)) {
+                    sh_.notify("error", "Indexer", "Failed to open failed-files log", open_err, "open-failed-log");
+                }
                 break;
             case IdFailedRow:
                 if (idx >= 0 && idx < static_cast<int>(sh_.failed_files.size()) && !sh_.failed_files[idx].path.empty()) {
-                    reveal_in_explorer(sh_.failed_files[idx].path);
+                    if (std::string rev_err; !reveal_in_explorer(sh_.failed_files[idx].path, &rev_err)) {
+                        sh_.notify("error", "Explorer", "Failed to reveal file in Explorer", rev_err, "reveal-failed");
+                    }
                 }
                 break;
             case IdScopeAll:
@@ -2307,12 +2602,17 @@ private:
                 reload_launcher_hotkey();
                 update_switch_anims();
                 break;
-            case IdToggleStartup:
-                sh_.settings.launch_on_startup = !sh_.settings.launch_on_startup;
-                set_startup_enabled(sh_.settings.launch_on_startup);
-                sh_.save();
+            case IdToggleStartup: {
+                const bool want = !sh_.settings.launch_on_startup;
+                if (!set_startup_enabled(want)) {
+                    sh_.notify("error", "Settings", "Failed to update Windows startup setting", win32_error_utf8(), "startup-reg");
+                } else {
+                    sh_.settings.launch_on_startup = want;
+                    sh_.save();
+                }
                 update_switch_anims();
                 break;
+            }
             case IdToggleHideFocus:
                 sh_.settings.hide_on_focus_loss = !sh_.settings.hide_on_focus_loss;
                 sh_.save();
@@ -2346,12 +2646,7 @@ private:
                 break;
             case IdModelChip:
                 if (idx >= 0 && idx < static_cast<int>(models_.size())) {
-                    sh_.settings.model_name = models_[idx];
-                    model_field_.set(to_wide(sh_.settings.model_name));
-                    repo_field_.set(L"");
-                    refresh_model_files();
-                    sh_.save();
-                    if (sh_.settings_changed) sh_.settings_changed();
+                    confirm_and_set_model(models_[idx]);
                 }
                 break;
             case IdModelField: focus_field(model_field_); break;
@@ -2379,7 +2674,9 @@ private:
                 IndexState st = load_json_file<IndexState>(state_path());
                 st.auto_batch = 0;
                 st.auto_batch_key.clear();
-                save_json_file(state_path(), st);
+                if (!save_json_file(state_path(), st)) {
+                    sh_.notify("warning", "Settings", "Failed to save state.json", win32_error_utf8(), "save-state");
+                }
                 sh_.index_state = std::move(st);
                 break;
             }
@@ -2430,12 +2727,28 @@ private:
             case IdUpdateVenv:
                 run_venv_task([this, in = venv_job_inputs()](const std::stop_token&) { install_packages_in_worker(in); });
                 return;
-            case IdRecreateVenv:
+            case IdRecreateVenv: {
+                if (in_modal_) break;
+                std::wstring msg = L"Recreate Python environment at:\n" + to_wide(sh_.settings.venv_dir) +
+                                   L"\n\nExisting files and packages in this folder will be deleted and reinstalled.";
+                if (sh_.indexer_running) {
+                    msg += L"\n\nWarning: Indexing is currently running and may fail or abort if its Python environment is replaced.";
+                }
+                in_modal_ = true;
+                const bool confirmed = confirm_box(hwnd_, L"Recreate Python Environment", msg);
+                in_modal_ = false;
+                if (!confirmed) break;
                 if (venv_.portable) {
                     // Portable interpreters are not venvs: re-download the selected version instead
                     run_venv_task([this, in = venv_job_inputs()](const std::stop_token& stop) {
                         std::error_code ec;
                         fs::remove_all(to_wide(in.venv_dir), ec);
+                        if (ec) {
+                            const std::wstring err = L"Failed to remove existing environment: " + to_wide(ec.message());
+                            report(venv_job_, err, true);
+                            notify_async("error", "Venv", "Failed to remove Python environment", to_utf8(err), "venv-setup");
+                            return;
+                        }
                         download_portable_python(in, stop);
                     });
                     return;
@@ -2446,19 +2759,47 @@ private:
                     if (fs::exists(vdir, ec)) {
                         append_venv_log(L"Removing old environment…");
                         fs::remove_all(vdir, ec);
+                        if (ec) {
+                            const std::wstring err = L"Failed to remove existing environment: " + to_wide(ec.message());
+                            report(venv_job_, err, true);
+                            notify_async("error", "Venv", "Failed to remove Python environment", to_utf8(err), "venv-setup");
+                            return;
+                        }
                     }
-                    exec_logged(in.base_python, {L"-m", L"venv", vdir.wstring()});
+                    if (!exec_logged(in.base_python, {L"-m", L"venv", vdir.wstring()})) {
+                        notify_async("error", "Venv", "Failed to create Python venv",
+                                     "Could not create virtual environment at '" + in.venv_dir + "'.", "venv-setup");
+                        return;
+                    }
                     install_packages_in_worker(in);
                 });
                 return;
-            case IdDeleteVenv:
+            }
+            case IdDeleteVenv: {
+                if (in_modal_) break;
+                std::wstring msg = L"Delete Python environment at:\n" + to_wide(sh_.settings.venv_dir) +
+                                   L"\n\nYou will need to recreate it before indexing or exporting text models.";
+                if (sh_.indexer_running) {
+                    msg += L"\n\nWarning: Indexing is currently running and uses this environment.";
+                }
+                in_modal_ = true;
+                const bool confirmed = confirm_box(hwnd_, L"Delete Python Environment", msg);
+                in_modal_ = false;
+                if (!confirmed) break;
                 run_venv_task([this, in = venv_job_inputs()](const std::stop_token&) {
                     const fs::path vdir = to_wide(in.venv_dir);
                     std::error_code ec;
                     fs::remove_all(vdir, ec);
+                    if (ec) {
+                        const std::wstring err = L"Failed to delete environment: " + to_wide(ec.message());
+                        report(venv_job_, err, true);
+                        notify_async("error", "Venv", "Failed to delete Python environment", to_utf8(err), "venv-setup");
+                        return;
+                    }
                     append_venv_log(L"Virtual environment deleted.");
                 });
                 return;
+            }
             case IdScrollbar:
                 if (contains(scroll_thumb_, p)) {
                     dragging_scroll_ = true;
@@ -2719,6 +3060,7 @@ private:
                         return 0;
                     case TIMER_POLL: {
                         bool changed = sh_.poll_indexer();
+                        if (sh_.reload_notifications()) changed = true;
                         if (refresh_model_files()) {
                             scan_models(); // a model was added to or removed from the folder
                             changed = true;
@@ -2797,6 +3139,7 @@ private:
     TextField py_ver_field_;
     TextField* active_field_ = nullptr;
     bool recording_hotkey_ = false;
+    bool in_modal_ = false;
 
     struct ModelFiles {
         bool weights = false, tokenizer = false, onnx = false;

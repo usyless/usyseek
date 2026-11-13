@@ -29,6 +29,7 @@ inline constexpr wchar_t PILL_CLASS[] = L"usyseek.pill";
 inline constexpr wchar_t SETTINGS_CLASS[] = L"usyseek.settings";
 inline constexpr wchar_t STATUS_SHM[] = L"Local\\usyseek.indexer.status";
 inline constexpr wchar_t INDEXER_STOP_EVENT[] = L"Local\\usyseek.indexer.stop";
+inline constexpr wchar_t NOTIFICATIONS_MUTEX[] = L"Local\\usyseek.notifications";
 inline constexpr wchar_t EVERYTHING_INSTANCE[] = L"uk.usyless.usyseek";
 
 // WM_COPYDATA commands sent to the launcher window
@@ -72,6 +73,14 @@ inline UINT msg_indexer_changed() noexcept {
 }
 inline UINT msg_quit_ui() noexcept {
     static const UINT m = RegisterWindowMessageW(L"usyseek.quit_ui");
+    return m;
+}
+inline UINT msg_notifications_changed() noexcept {
+    static const UINT m = RegisterWindowMessageW(L"usyseek.notifications_changed");
+    return m;
+}
+inline UINT msg_open_notifications() noexcept {
+    static const UINT m = RegisterWindowMessageW(L"usyseek.open_notifications");
     return m;
 }
 

@@ -136,6 +136,7 @@ def load(cfg):
         "dim": _dim,
         "device": name,
         "backend": backend,
+        "fallback_cpu": bool(want_gpu and _device == "cpu"),
         "torch": torch.__version__,
     }
 

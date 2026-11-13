@@ -145,11 +145,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool show_pill = true;
     bool show_settings = false;
+    bool show_notifications = false;
     std::optional<fs::path> test_dir;
     for (int i = 1; i < argc; ++i) {
         const std::wstring_view a{argv[i]};
         if (a == L"--settings") {
             show_settings = true;
+            show_pill = false;
+        } else if (a == L"--notifications") {
+            show_notifications = true;
             show_pill = false;
         } else if (a == L"--show") {
             show_pill = true;
@@ -163,22 +167,46 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     if (!test_dir) {
         if (HWND existing = FindWindowW(PILL_CLASS, nullptr)) {
             AllowSetForegroundWindow( ASFW_ANY );
-            PostMessageW(existing, show_settings ? msg_open_settings() : msg_toggle_search(), 0, 0);
+            const UINT msg = show_notifications ? msg_open_notifications() : (show_settings ? msg_open_settings() : msg_toggle_search());
+            PostMessageW(existing, msg, 0, 0);
             return 0;
         }
     }
 
     Shared sh;
-    sh.settings = load_settings();
-    if (!sh.gfx.init()) return 1;
-    if (!sh.fonts.init(sh.gfx.dwrite())) return 1;
+    sh.test_mode = test_dir.has_value();
+    bool settings_corrupt = false;
+    sh.settings = load_settings(&settings_corrupt);
+    if (!sh.test_mode) sh.reload_notifications(true);
+    if (!sh.gfx.init()) {
+        MessageBoxW(nullptr, L"Failed to initialize Direct3D / Direct2D graphics.", APP_NAME, MB_ICONERROR | MB_OK);
+        return 1;
+    }
+    if (!sh.fonts.init(sh.gfx.dwrite())) {
+        MessageBoxW(nullptr, L"Failed to initialize DirectWrite fonts.", APP_NAME, MB_ICONERROR | MB_OK);
+        return 1;
+    }
 
     Pill pill{sh};
     SettingsWindow settings_win{sh};
-    if (!pill.create(inst)) return 1;
-    if (!settings_win.create(inst)) return 1;
+    if (!pill.create(inst)) {
+        MessageBoxW(nullptr, L"Failed to create the search window.", APP_NAME, MB_ICONERROR | MB_OK);
+        return 1;
+    }
+    if (!settings_win.create(inst)) {
+        MessageBoxW(nullptr, L"Failed to create the settings window.", APP_NAME, MB_ICONERROR | MB_OK);
+        return 1;
+    }
 
     sh.call_hwnd = pill.hwnd();
+    if (settings_corrupt && !sh.test_mode) {
+        sh.notify("warning", "Settings", "Corrupted settings.json reset to defaults",
+                  "settings.json could not be parsed cleanly. Default settings are in use until saved.", "settings-corrupt");
+    }
+    if (sh.gfx.is_warp()) {
+        sh.notify("warning", "Graphics", "Hardware GPU rendering unavailable",
+                  "Direct3D fell back to WARP software rendering; animations and video playback may be slower.", "warp-fallback");
+    }
     sh.gfx.on_device_changed = [&] {
         sh.thumbs.reset_gpu();
         sh.previews.reset_gpu();
@@ -190,8 +218,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.engine.on_result = [&](std::unique_ptr<SearchResult> r) {
         PostMessageW(pill.hwnd(), WM_APP_RESULT, 0, reinterpret_cast<LPARAM>(r.release()));
     };
+    sh.engine.on_db_state = [&](bool ready, std::string err) {
+        sh.call([&, ready, err = std::move(err)] {
+            if (ready) {
+                sh.clear_notification_key("Database", "db-connect");
+                sh.refresh_tags();
+            } else if (!err.empty()) {
+                sh.notify("error", "Database", "Could not connect to Qdrant", err, "db-connect");
+            }
+            if (sh.redraw_all) sh.redraw_all();
+        });
+    };
+    sh.engine.on_job_dropped = [&](std::string title, std::string detail) {
+        sh.notify("error", "Database", std::move(title), std::move(detail), "db-job-dropped");
+    };
     sh.engine.encoder().on_state_changed = [&] {
         sh.call([&] {
+            if (sh.engine.encoder().state() == TextEncoder::State::Failed) {
+                sh.notify("error", "Search Model", "Text encoder failed to load",
+                          to_utf8(sh.engine.encoder().error()), "encoder-failed");
+            } else if (sh.engine.encoder().state() == TextEncoder::State::Ready) {
+                sh.clear_notification_key("Search Model", "encoder-failed");
+            }
             pill.on_encoder_changed();
             settings_win.invalidate();
         });
@@ -200,7 +248,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.engine.encoder().load_async(to_wide(sh.settings.model_dir), sh.settings.model_name);
 
     sh.open_settings = [&] {
-        settings_win.show();
+        settings_win.show(0);
+        if (pill.visible()) pill.hide();
+    };
+    sh.open_notifications = [&] {
+        settings_win.show(2);
         if (pill.visible()) pill.hide();
     };
     sh.tags_refreshed = [&] { pill.on_tags_refreshed(); };
@@ -230,7 +282,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     const UINT m_toggle = msg_toggle_search();
     const UINT m_settings = msg_open_settings();
+    const UINT m_open_notifs = msg_open_notifications();
     const UINT m_idx = msg_indexer_changed();
+    const UINT m_notifs = msg_notifications_changed();
     const UINT m_quit = msg_quit_ui();
 
     pill.extra_handler = [&](UINT msg, WPARAM wp, LPARAM lp, bool& done) -> LRESULT {
@@ -261,10 +315,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             if (pill.visible()) pill.hide();
             return 0;
         }
+        if (msg == m_open_notifs && m_open_notifs) {
+            done = true;
+            if (sh.open_notifications) sh.open_notifications();
+            return 0;
+        }
         if (msg == m_idx && m_idx) {
             done = true;
             pill.on_indexer_changed();
             settings_win.invalidate();
+            return 0;
+        }
+        if (msg == m_notifs && m_notifs) {
+            done = true;
+            sh.reload_notifications(true);
+            if (sh.redraw_all) sh.redraw_all();
             return 0;
         }
         if (msg == WM_APP_RESULT) {
@@ -291,13 +356,23 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             wil::unique_process_information pi;
             if (CreateProcessW(launcher_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, exe_dir().c_str(), &si, &pi)) {
                 for (int i = 0; i < 40 && !find_launcher(); ++i) Sleep(25);
+            } else {
+                sh.notify("warning", "Launcher", "Could not start background launcher",
+                          "Failed to launch usyseek.exe (" + win32_error_utf8(GetLastError()) + "). Indexing and tray controls require the launcher.", "launcher-missing");
             }
+        } else {
+            sh.notify("warning", "Launcher", "Background launcher not found",
+                      "usyseek.exe was not found next to usyseek-ui.exe. Indexing, tray icon, and global hotkey are unavailable.", "launcher-missing");
         }
     }
 
     if (HWND launcher = find_launcher()) {
         send_cmd_value(launcher, Cmd::UiHello, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pill.hwnd())));
         sh.refresh_hotkey_state();
+        sh.clear_notification_key("Launcher", "launcher-missing");
+    } else if (!test_dir) {
+        sh.notify("warning", "Launcher", "Background launcher did not respond",
+                  "usyseek.exe did not become ready in time. Starting/stopping the indexer from Settings may fail.", "launcher-missing");
     }
 
     wil::unique_handle own_job;
@@ -306,13 +381,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         // Standalone run (e.g. from IDE or --test): start qdrant ourselves if it isn't already up
         own_job = make_kill_on_close_job();
         own_qdrant = start_qdrant(sh.settings, own_job.get());
+        if (!own_qdrant.hProcess && !test_dir) {
+            const DWORD err = GetLastError();
+            sh.notify("error", "Database", "Failed to start local Qdrant",
+                      err ? win32_error_utf8(err) : "Could not start qdrant.exe in standalone mode.", "qdrant-start");
+        }
     }
 
     int code = 0;
     if (test_dir) {
         code = run_automated_test(sh, pill, settings_win, *test_dir);
     } else {
-        if (show_settings) settings_win.show();
+        if (show_notifications) settings_win.show(2);
+        else if (show_settings) settings_win.show(0);
         else if (show_pill) pill.show();
 
         MSG msg;

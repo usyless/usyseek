@@ -20,17 +20,27 @@ inline std::wstring clipboard_text(HWND hwnd) {
     return out;
 }
 
-inline void set_clipboard_text(HWND hwnd, std::wstring_view s) {
-    if (!OpenClipboard(hwnd)) return;
+inline bool set_clipboard_text(HWND hwnd, std::wstring_view s) {
+    if (!OpenClipboard(hwnd)) return false;
+    bool ok = false;
     EmptyClipboard();
     if (HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (s.size() + 1) * sizeof(wchar_t))) {
         auto* p = static_cast<wchar_t*>(GlobalLock(h));
-        std::memcpy(p, s.data(), s.size() * sizeof(wchar_t));
-        p[s.size()] = 0;
-        GlobalUnlock(h);
-        if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+        if (p) {
+            std::memcpy(p, s.data(), s.size() * sizeof(wchar_t));
+            p[s.size()] = 0;
+            GlobalUnlock(h);
+            if (SetClipboardData(CF_UNICODETEXT, h)) {
+                ok = true;
+            } else {
+                GlobalFree(h);
+            }
+        } else {
+            GlobalFree(h);
+        }
     }
     CloseClipboard();
+    return ok;
 }
 
 /// Single-line editable text with selection, word navigation, undo/redo, clipboard and IME positioning.

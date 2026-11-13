@@ -122,6 +122,7 @@ public:
 
         if (session_.settled_static && !ui_settled_static_) {
             ui_settled_static_ = true;
+            ui_static_fallback_error_ = session_.static_fallback_error;
             ui_total_frames_ = 0;
             changed = true;
             return changed;
@@ -314,6 +315,7 @@ public:
 
     [[nodiscard]] bool active() const noexcept { return ui_active_; }
     [[nodiscard]] bool settled_static() const noexcept { return ui_settled_static_; }
+    [[nodiscard]] bool static_fallback_error() const noexcept { return ui_static_fallback_error_; }
     [[nodiscard]] bool has_animation() const noexcept { return ui_active_ && !ui_settled_static_ && ui_total_frames_ > 1; }
     [[nodiscard]] bool has_frame() const noexcept { return ui_active_ && ui_current_pixels_ != nullptr && ui_out_w_ > 0 && ui_out_h_ > 0; }
     [[nodiscard]] bool playing() const noexcept { return ui_playing_; }
@@ -343,6 +345,7 @@ private:
         uint64_t gen = 0;
         bool has_header = false;
         bool settled_static = false;
+        bool static_fallback_error = false;
         bool streaming = false;
         bool decode_complete = false;
         uint32_t native_w = 0, native_h = 0;
@@ -362,6 +365,7 @@ private:
         session_.gen = 0;
         session_.has_header = false;
         session_.settled_static = false;
+        session_.static_fallback_error = false;
         session_.streaming = false;
         session_.decode_complete = false;
         session_.native_w = session_.native_h = 0;
@@ -379,6 +383,7 @@ private:
         ui_max_px_ = 0;
         ui_active_ = false;
         ui_settled_static_ = false;
+        ui_static_fallback_error_ = false;
         ui_streaming_ = false;
         ui_playing_ = false;
         ui_waiting_stream_frame_ = false;
@@ -501,11 +506,12 @@ private:
         return out;
     }
 
-    void mark_static(uint64_t gen) noexcept {
+    void mark_static(uint64_t gen, bool fallback_error = false) noexcept {
         {
             const std::scoped_lock lk{mtx_};
             if (session_.gen != gen || stopping_) return;
             session_.settled_static = true;
+            session_.static_fallback_error = fallback_error;
         }
         post_signal();
     }
@@ -541,7 +547,7 @@ private:
 
         auto opened = open_gif_decoder(wic, job.path);
         if (!opened || !opened->decoder) {
-            mark_static(job.gen);
+            mark_static(job.gen, true);
             return;
         }
 
@@ -549,7 +555,7 @@ private:
         UINT total = 0;
         if (FAILED(opened->decoder->GetContainerFormat(&container)) || container != GUID_ContainerFormatGif ||
             FAILED(opened->decoder->GetFrameCount(&total)) || total <= 1) {
-            mark_static(job.gen);
+            mark_static(job.gen, false);
             return;
         }
 
@@ -565,19 +571,19 @@ private:
         if (cw == 0 || ch == 0) {
             wil::com_ptr<IWICBitmapFrameDecode> f0;
             if (FAILED(opened->decoder->GetFrame(0, &f0)) || FAILED(f0->GetSize(&cw, &ch))) {
-                mark_static(job.gen);
+                mark_static(job.gen, true);
                 return;
             }
         }
         if (cw == 0 || ch == 0 || cw > MAX_CANVAS_DIM || ch > MAX_CANVAS_DIM ||
             static_cast<uint64_t>(cw) * ch * 4u > MAX_CANVAS_BYTES) {
-            mark_static(job.gen);
+            mark_static(job.gen, true);
             return;
         }
 
         const auto [out_w, out_h] = fit_scaled_size(cw, ch, job.max_px);
         if (out_w == 0 || out_h == 0) {
-            mark_static(job.gen);
+            mark_static(job.gen, true);
             return;
         }
 
@@ -678,6 +684,7 @@ private:
                 session_.decode_complete = true;
                 if (session_.cached_frames.size() <= 1) {
                     session_.settled_static = true;
+                    session_.static_fallback_error = true;
                 }
             }
             post_signal();
@@ -758,6 +765,7 @@ private:
     UINT ui_max_px_ = 0;
     bool ui_active_ = false;
     bool ui_settled_static_ = false;
+    bool ui_static_fallback_error_ = false;
     bool ui_streaming_ = false;
     bool ui_playing_ = false;
     bool ui_waiting_stream_frame_ = false;

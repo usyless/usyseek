@@ -312,6 +312,8 @@ private:
         IdField,
         IdChip,
         IdTagBtn,
+        IdNotifyBtn,
+        IdStatusNotify,
         IdSettings,
         IdFullscreen,
         IdClose,
@@ -833,6 +835,12 @@ private:
         subtitle.clear();
         switch (id) {
             case IdTagBtn: title = L"Filter by tag"; return true;
+            case IdNotifyBtn:
+            case IdStatusNotify:
+                title = L"View notifications";
+                subtitle = format_count(sh_.notifications.size()) +
+                           (sh_.notifications.size() == 1 ? L" active notification" : L" active notifications");
+                return true;
             case IdHelpBtn: title = L"Search syntax & shortcuts"; return true;
             case IdSettings: title = L"Settings"; return true;
             case IdFullscreen: title = fullscreen_ ? L"Exit fullscreen (Esc)" : L"Fullscreen"; return true;
@@ -939,6 +947,20 @@ private:
         btn(glyph::close, IdClose);
         btn(fullscreen_ ? glyph::exit_fullscreen : glyph::fullscreen, IdFullscreen);
         btn(glyph::settings, IdSettings);
+        if (!sh_.notifications.empty()) {
+            const bool has_err = sh_.error_notification_count() > 0;
+            const D2D1_COLOR_F ncol = has_err ? color::error : color::amber;
+            const std::wstring cnt = format_count(sh_.notifications.size());
+            const float bw = std::max(44.0f, 26.0f + cv.measure(cnt, Font::Caption) + 12.0f);
+            x -= bw + 4;
+            const D2D1_RECT_F nr = rect(x, cy - 15, bw, 30);
+            const float ha = hover_.alpha(IdNotifyBtn);
+            cv.fill_round(nr, 15, lerp_color(with_alpha(ncol, 0.16f), with_alpha(ncol, 0.28f), ha));
+            cv.stroke_round(nr, 15, with_alpha(ncol, lerp(0.45f, 0.75f, ha)));
+            cv.icon(glyph::warning, rect(nr.left + 8, nr.top, 16, 30), ncol, Font::IconSmall);
+            cv.text(cnt, rect(nr.left + 25, nr.top, bw - 31, 30), Font::Caption, ncol);
+            cv.hit(nr, IdNotifyBtn);
+        }
         x -= 8;
         cv.vline(x, cy - 12, cy + 12, color::outline_variant);
         x -= 4;
@@ -1040,6 +1062,9 @@ private:
         if (!model_error.empty()) {
             sep();
             piece(model_error, color::error);
+        } else if (!sh_.engine.db_ready() && !sh_.test_mode) {
+            sep();
+            piece(L"Database unavailable", color::error);
         }
         if (!error_.empty() && error_ != model_error) {
             sep();
@@ -1055,6 +1080,21 @@ private:
         if (sh_.hotkey_unavailable()) {
             sep();
             piece(format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk) + L" is taken by another app", color::amber);
+        }
+        if (!sh_.notifications.empty()) {
+            sep();
+            const bool has_err = sh_.error_notification_count() > 0;
+            const D2D1_COLOR_F nc = has_err ? color::error : color::amber;
+            const std::wstring ntxt = format_count(sh_.notifications.size()) +
+                                      (sh_.notifications.size() == 1 ? L" alert" : L" alerts");
+            const float nw = cv.measure(ntxt, Font::SmallSemi);
+            const D2D1_RECT_F nr = rect(x - 4, y + 3, nw + 8, STATUS_H - 6);
+            if (const float ha = hover_.alpha(IdStatusNotify); ha > 0.002f) {
+                cv.fill_round(nr, 6, with_alpha(nc, 0.14f * ha));
+            }
+            cv.text(ntxt, rect(x, y, nw + 2, STATUS_H), Font::SmallSemi, nc);
+            cv.hit(nr, IdStatusNotify);
+            x += nw;
         }
 
         if (expanded() && !items_.empty()) {
@@ -1440,10 +1480,45 @@ private:
         if (on && std::find(menu_tags_.begin(), menu_tags_.end(), tag) == menu_tags_.end()) menu_tags_.insert(menu_tags_.begin(), tag);
         sh_.engine.post([this, changes = std::move(changes)](Db& db) {
             const std::string coll = sh_.engine.collection();
-            for (const auto& c : changes) db.set_tags(coll, std::span{&c.id, 1}, c.tags);
+            std::string first_err;
+            size_t fail_cnt = 0;
+            for (const auto& c : changes) {
+                std::string err;
+                if (!db.set_tags(coll, std::span{&c.id, 1}, c.tags, &err)) {
+                    ++fail_cnt;
+                    if (first_err.empty()) first_err = std::move(err);
+                }
+            }
+            if (fail_cnt > 0) {
+                sh_.call([this, fail_cnt, first_err] {
+                    sh_.notify("error", "Tags",
+                        "Failed to update tags on " + std::to_string(fail_cnt) + (fail_cnt == 1 ? " item" : " items"),
+                        first_err, "tags-save");
+                });
+            }
             sh_.refresh_tags();
         });
         invalidate();
+    }
+
+    void open_item_file(const std::wstring& path) {
+        std::string err;
+        if (!open_file(path, &err)) {
+            sh_.notify("error", "Open File", "Failed to open file", err + ": " + to_utf8(path), "open-file");
+        }
+    }
+
+    void reveal_item_file(const std::wstring& path) {
+        std::string err;
+        if (!reveal_in_explorer(path, &err)) {
+            sh_.notify("error", "Explorer", "Failed to reveal file in Explorer", err + ": " + to_utf8(path), "reveal-file");
+        }
+    }
+
+    void copy_item_text(const std::wstring& text) {
+        if (!set_clipboard_text(hwnd_, text)) {
+            sh_.notify("error", "Clipboard", "Failed to copy path to clipboard", win32_error_utf8(), "clipboard");
+        }
     }
 
     [[nodiscard]] D2D1_RECT_F menu_rect() const {
@@ -1532,10 +1607,10 @@ private:
         close_popups();
         switch (a) {
             case ActOpen:
-                for (size_t i = 0; i < sel.size() && i < 8; ++i) open_file(item_path(*sel[i]));
+                for (size_t i = 0; i < sel.size() && i < 8; ++i) open_item_file(item_path(*sel[i]));
                 break;
             case ActPreview: open_preview(static_cast<int>(&primary - items_.data())); return;
-            case ActReveal: reveal_in_explorer(item_path(primary)); break;
+            case ActReveal: reveal_item_file(item_path(primary)); break;
             case ActSimilar: {
                 const Item copy = primary;
                 if (preview_ >= 0) close_preview(false);
@@ -1549,7 +1624,7 @@ private:
                     if (!all.empty()) all += L"\r\n";
                     all += item_path(*it);
                 }
-                set_clipboard_text(hwnd_, all);
+                copy_item_text(all);
                 break;
             }
         }
@@ -1590,6 +1665,13 @@ private:
                 if (decode) {
                     image = decode_image(paths[0], 0, false);
                     if (image && static_cast<uint64_t>(image->w) * image->h > COPY_MAX_PIXELS) image.reset();
+                    else if (!image) {
+                        const std::string p_utf8 = to_utf8(paths[0]);
+                        sh_.call([this, p_utf8] {
+                            sh_.notify("warning", "Clipboard", "Copied file link only (image decode failed)",
+                                p_utf8 + " exceeded pixel limits or could not be decoded for bitmap paste.", "clipboard-decode");
+                        });
+                    }
                     if (lower(fs::path{paths[0]}.extension().wstring()) == L".png") png = paths[0];
                 }
                 *payload = build_clipboard_payload(std::move(paths), image ? &*image : nullptr, png ? &*png : nullptr);
@@ -1617,7 +1699,12 @@ private:
             return;
         }
         // Render now: this process exits when idle and the clipboard must outlive it
-        if (SUCCEEDED(hr)) OleFlushClipboard();
+        if (SUCCEEDED(hr)) {
+            OleFlushClipboard();
+        } else {
+            sh_.notify("error", "Clipboard", "Failed to copy media to clipboard",
+                win32_error_utf8(static_cast<DWORD>(hr)), "clipboard");
+        }
         pending_clipboard_.reset();
         end_copy();
     }
@@ -1749,7 +1836,14 @@ private:
         if (!preview_valid() || items_[preview_].pt.p.k == 1) return;
         const bool had_anim = gif_.has_animation();
         const bool had_frame = gif_.has_frame();
+        const bool had_static_err = gif_.static_fallback_error();
         if (gif_.process_worker_signal()) {
+            if (!had_static_err && gif_.static_fallback_error()) {
+                sh_.notify("warning", "Preview", "Animated GIF playback unavailable",
+                    "Could not decode animated GIF frames; displaying static thumbnail instead (" +
+                        to_utf8(item_path(items_[preview_])) + ").",
+                    "preview-gif");
+            }
             sync_preview_timers();
             if (had_anim != gif_.has_animation() || had_frame != gif_.has_frame() || gif_.settled_static()) {
                 invalidate();
@@ -1772,6 +1866,12 @@ private:
         const bool had_failed = video_.failed();
         const bool changed = video_.process_events();
         sync_preview_timers();
+        if (!had_failed && video_.failed() && preview_valid() && items_[preview_].pt.p.k == 1) {
+            sh_.notify("warning", "Preview", "Inline video playback failed",
+                "Could not play video inline (" + to_utf8(item_path(items_[preview_])) +
+                    "). Click Play to open in your default media player.",
+                "preview-video");
+        }
         if (!preview_valid() || items_[preview_].pt.p.k != 1) return;
         if (target_.ready()) {
             const MediaTickStatus st = video_.tick(sh_.gfx.d3d(), target_.dc());
@@ -2066,6 +2166,11 @@ private:
                 cv.fill_circle(c, 30, hex(0x000000, lerp(0.55f, 0.75f, ha)));
                 cv.icon(glyph::play, rect(c.x - 28, c.y - 30, 60, 60), lerp_color(hex(0xffffff), color::primary, ha), Font::IconLarge);
                 cv.hit(rect(c.x - 30, c.y - 30, 60, 60), IdPvPlay);
+                const wchar_t* msg = L"Video playback failed — click Play to open externally";
+                const float mw = cv.measure(msg, Font::Caption) + 20.0f;
+                const D2D1_RECT_F badge = rect(c.x - mw * 0.5f, c.y + 38.0f, mw, 24.0f);
+                cv.fill_round(badge, 12.0f, hex(0x000000, 0.72f));
+                cv.text(msg, badge, Font::Caption, color::amber, Align::Center);
             }
         }
         pv_media_rect_ = dest;
@@ -2153,10 +2258,10 @@ private:
             case IdPvClose: close_preview(); return;
             case IdPvPrev: preview_step(-1); return;
             case IdPvNext: preview_step(1); return;
-            case IdPvOpen: open_file(path); return;
+            case IdPvOpen: open_item_file(path); return;
             case IdPvPlay:
                 if (items_[preview_].pt.p.k == 1 && video_.failed()) {
-                    open_file(path);
+                    open_item_file(path);
                 } else {
                     preview_toggle_play();
                 }
@@ -2175,11 +2280,11 @@ private:
                 invalidate_preview_media();
                 return;
             case IdPvBar: return;
-            case IdPvReveal: reveal_in_explorer(path); return;
+            case IdPvReveal: reveal_item_file(path); return;
             case IdPvCopy: copy_media({&items_[preview_]}); return;
             case IdPvImage:
                 if (dbl) {
-                    open_file(path);
+                    open_item_file(path);
                 } else {
                     begin_drag_detect(preview_);
                 }
@@ -2212,7 +2317,7 @@ private:
                 swallow_space_ = true;
                 close_preview();
                 return true;
-            case VK_RETURN: open_file(item_path(it)); return true;
+            case VK_RETURN: open_item_file(item_path(it)); return true;
             case 'K':
             case 'P':
             case VK_MEDIA_PLAY_PAUSE:
@@ -2251,12 +2356,12 @@ private:
         }
         if (ctrl && vk == 'C') {
             if (shift) {
-                set_clipboard_text(hwnd_, item_path(it));
+                copy_item_text(item_path(it));
             } else {
                 copy_media({&it});
             }
         } else if (ctrl && vk == 'E') {
-            reveal_in_explorer(item_path(it));
+            reveal_item_file(item_path(it));
         } else if (ctrl && vk == 'S') {
             const Item copy = it;
             close_preview(false);
@@ -2304,8 +2409,12 @@ private:
         dragging_out_ = true;
         // Not topmost while the target works, so its dialogs (e.g. file conflict prompts) are not hidden behind this window
         SetWindowPos(hwnd_, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        auto async_drop = drag_media(hwnd_, paths);
+        std::string drag_err;
+        auto async_drop = drag_media(hwnd_, paths, &drag_err);
         dragging_out_ = false;
+        if (!drag_err.empty()) {
+            sh_.notify("error", "Drag & Drop", "Failed to start file drag operation", drag_err, "drag-drop");
+        }
         if (async_drop) {
             async_drops_.push_back(std::move(async_drop));
             ++sh_.background_jobs;
@@ -2495,6 +2604,11 @@ private:
                     apply_height();
                 }
                 break;
+            case IdNotifyBtn:
+            case IdStatusNotify:
+                if (sh_.open_notifications) sh_.open_notifications();
+                else if (sh_.open_settings) sh_.open_settings();
+                return;
             case IdSettings:
                 if (sh_.open_settings) sh_.open_settings();
                 else hide();
@@ -2510,7 +2624,7 @@ private:
             case IdTagChip: {
                 const uint64_t cid = items_[idx].pt.id;
                 if (dbl) {
-                    open_file(item_path(items_[idx]));
+                    open_item_file(item_path(items_[idx]));
                     return;
                 }
                 if (ctrl) {

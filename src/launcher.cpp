@@ -3,6 +3,7 @@
 // Deliberately does nothing else so its working set stays tiny.
 
 #include <usyseek/settings.hpp>
+#include <usyseek/notifications.hpp>
 #include <usyseek/status.hpp>
 #include <usyseek/db.hpp>
 
@@ -35,7 +36,14 @@ class Launcher {
 public:
     bool init(HINSTANCE inst) {
         inst_ = inst;
-        settings_ = load_settings();
+        bool settings_corrupt = false;
+        settings_ = load_settings(&settings_corrupt);
+        if (settings_corrupt) {
+            push_notification_to_disk(
+                "warning", "Settings", "Corrupted settings.json reset to defaults",
+                "settings.json could not be parsed cleanly. Default settings are in use until you save new ones.",
+                "settings-corrupt", false);
+        }
         job_ = make_kill_on_close_job();
         stop_event_.reset(CreateEventW(nullptr, TRUE, FALSE, INDEXER_STOP_EVENT));
         taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
@@ -132,6 +140,10 @@ private:
                         tray_hide_on_select_ = false;
                         show_menu();
                         break;
+                    case NIN_BALLOONUSERCLICK:
+                        if (balloon_opens_notifs_) open_notifications();
+                        else open_settings();
+                        break;
                 }
                 return 0;
             case WM_COPYDATA:
@@ -139,7 +151,13 @@ private:
             case WM_TIMER:
                 if (wp == TIMER_STOP_INDEX) {
                     KillTimer(hwnd, TIMER_STOP_INDEX);
-                    if (indexer_.hProcess) TerminateProcess(indexer_.hProcess, 1);
+                    if (indexer_.hProcess) {
+                        TerminateProcess(indexer_.hProcess, 1);
+                        push_notification_to_disk(
+                            "warning", "Indexer", "Indexer had to be force-stopped",
+                            "usyseek-indexer.exe did not exit within 6 seconds after requesting stop and was terminated.",
+                            "indexer-force-stop", true);
+                    }
                 } else if (wp == TIMER_TRAY_PROGRESS) {
                     if (indexer_.hProcess) update_tip();
                     else KillTimer(hwnd, TIMER_TRAY_PROGRESS);
@@ -205,6 +223,12 @@ private:
         if (no_window) flags |= CREATE_NO_WINDOW;
         if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, flags,
                             nullptr, exe_dir().c_str(), &si, &pi)) {
+            const DWORD err = GetLastError();
+            const std::string name = to_utf8(exe.filename().wstring());
+            push_notification_to_disk(
+                "error", "Launcher", "Failed to start " + name,
+                win32_error_utf8(err), "spawn-" + name, true);
+            show_balloon(APP_NAME, (L"Failed to start " + exe.filename().wstring() + L": " + to_wide(win32_error_utf8(err))).c_str(), NIIF_ERROR, true);
             return {};
         }
         AssignProcessToJobObject(job_.get(), pi.hProcess);
@@ -216,6 +240,14 @@ private:
     void ensure_qdrant() {
         if (qdrant_.hProcess) return;
         qdrant_ = start_qdrant(settings_, job_.get());
+        if (!qdrant_.hProcess) {
+            const DWORD err = GetLastError();
+            const std::string detail = err ? win32_error_utf8(err) : "Could not launch qdrant.exe.";
+            push_notification_to_disk(
+                "error", "Database", "Failed to start Qdrant",
+                detail, "qdrant-start", true);
+            show_balloon(APP_NAME, L"Failed to start local Qdrant database. Check Notifications in Settings.", NIIF_ERROR, true);
+        }
     }
 
     void maybe_stop_qdrant() {
@@ -267,6 +299,16 @@ private:
             PostMessageW(ui_hwnd_, msg_open_settings(), 0, 0);
         } else if (!ui_.hProcess) {
             spawn_ui(L"--settings");
+        }
+    }
+
+    void open_notifications() {
+        if (ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_)) {
+            AllowSetForegroundWindow(ui_.dwProcessId);
+            SetForegroundWindow(ui_hwnd_);
+            PostMessageW(ui_hwnd_, msg_open_notifications(), 0, 0);
+        } else if (!ui_.hProcess) {
+            spawn_ui(L"--notifications");
         }
     }
 
@@ -333,21 +375,59 @@ private:
 
     void on_process_exit(HANDLE h) {
         if (h == ui_.hProcess) {
+            DWORD code = 0;
+            GetExitCodeProcess(ui_.hProcess, &code);
             ui_.reset();
             ui_hwnd_ = nullptr;
             tray_hide_on_select_ = false;
+            if (code != 0) {
+                push_notification_to_disk(
+                    "error", "Launcher", "UI process exited unexpectedly",
+                    "usyseek-ui.exe terminated with exit code " + std::to_string(code) + ".",
+                    "ui-exit", false);
+            }
             maybe_stop_qdrant();
         } else if (h == indexer_.hProcess) {
+            DWORD code = 0;
+            GetExitCodeProcess(indexer_.hProcess, &code);
             KillTimer(hwnd_, TIMER_STOP_INDEX);
             KillTimer(hwnd_, TIMER_TRAY_PROGRESS);
             indexer_.reset();
+            const bool was_stopping = stopping_index_;
             stopping_index_ = false;
             close_everything_instance();
+            if (code != 0 && code != 2 && code != 3) {
+                std::wstring msg = L"Indexing failed. Open Notifications to view details.";
+                if (auto b = StatusBlock::open()) {
+                    const StatusData d = b->read();
+                    if (d.message[0]) {
+                        msg = L"Indexing failed: " + std::wstring{d.message};
+                    }
+                }
+                if (!was_stopping) {
+                    push_notification_to_disk(
+                        "error", "Indexer", "Indexing ended with errors",
+                        to_utf8(msg) + " (exit code " + std::to_string(code) + ")",
+                        "indexer-exit", true);
+                }
+                if (!is_ui_running()) {
+                    show_balloon(APP_NAME, msg.c_str(), NIIF_ERROR, true);
+                }
+            }
             notify_ui();
             maybe_stop_qdrant();
             update_tip();
         } else if (h == qdrant_.hProcess) {
+            DWORD code = 0;
+            GetExitCodeProcess(qdrant_.hProcess, &code);
             qdrant_.reset();
+            if (is_ui_running() || indexer_.hProcess) {
+                push_notification_to_disk(
+                    "error", "Database", "Qdrant database process exited",
+                    "qdrant.exe exited while in use (exit code " + std::to_string(code) + ").",
+                    "qdrant-exit", true);
+                show_balloon(APP_NAME, L"Qdrant database stopped unexpectedly (code " + std::to_wstring(code) + L").", NIIF_ERROR, true);
+            }
         }
         SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
     }
@@ -360,14 +440,26 @@ private:
     // Tray / hotkey
     // ------------------------------------------------------------------------------------------
 
+    void show_balloon(const wchar_t* title, const std::wstring& body, DWORD flags, bool open_notifs) {
+        balloon_opens_notifs_ = open_notifs;
+        NOTIFYICONDATAW nid = tray_data();
+        nid.uFlags = NIF_INFO;
+        wcscpy_s(nid.szInfoTitle, title);
+        wcsncpy_s(nid.szInfo, body.c_str(), _TRUNCATE);
+        nid.dwInfoFlags = flags;
+        Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+
     void register_hotkey() {
         UnregisterHotKey(hwnd_, HOTKEY_ID);
         if (!settings_.hotkey_enabled || settings_.hotkey_vk == 0) {
             hotkey_state_ = HotkeyState::Disabled;
+            clear_notification_key_on_disk("Hotkeys", "hotkey-unavailable");
             return;
         }
         if (RegisterHotKey(hwnd_, HOTKEY_ID, settings_.hotkey_mods | MOD_NOREPEAT, settings_.hotkey_vk)) {
             hotkey_state_ = HotkeyState::Registered;
+            clear_notification_key_on_disk("Hotkeys", "hotkey-unavailable");
             return;
         }
         // Tell the user once per combination; the UI shows the state for as long as it lasts
@@ -376,13 +468,12 @@ private:
         hotkey_state_ = HotkeyState::Unavailable;
         failed_mods_ = settings_.hotkey_mods;
         failed_vk_ = settings_.hotkey_vk;
+        push_notification_to_disk(
+            "warning", "Hotkeys", "Global shortcut is already in use",
+            to_utf8(hotkey_text(settings_)) + " could not be registered because another application already owns it. Pick a different shortcut in Settings.",
+            "hotkey-unavailable", true);
         if (!already_reported) {
-            NOTIFYICONDATAW nid = tray_data();
-            nid.uFlags = NIF_INFO;
-            wcscpy_s(nid.szInfoTitle, APP_NAME);
-            wcscpy_s(nid.szInfo, L"The search shortcut is already used by another app. Pick a different one in Settings.");
-            nid.dwInfoFlags = NIIF_WARNING;
-            Shell_NotifyIconW(NIM_MODIFY, &nid);
+            show_balloon(APP_NAME, L"The search shortcut is already used by another app. Pick a different one in Settings.", NIIF_WARNING, false);
         }
     }
 
@@ -535,6 +626,7 @@ private:
     wil::unique_process_information qdrant_;
     bool stopping_index_ = false;
     bool tray_hide_on_select_ = false;
+    bool balloon_opens_notifs_ = true;
     std::wstring last_tip_;
 };
 
@@ -556,7 +648,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
     ulp::win::dark::init_dark_mode();
 
     Launcher launcher;
-    if (!launcher.init(inst)) return 1;
+    if (!launcher.init(inst)) {
+        MessageBoxW(nullptr, L"Could not initialize the background usyseek launcher window.", APP_NAME, MB_ICONERROR | MB_OK);
+        return 1;
+    }
     const int code = launcher.run();
     launcher.shutdown();
     return code;

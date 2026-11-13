@@ -65,10 +65,12 @@ inline constexpr auto JSON_READ = glz::opts{.error_on_unknown_keys = false};
 inline constexpr auto JSON_WRITE = glz::opts{.prettify = true};
 
 template <typename T>
-inline T load_json_file(const fs::path& p) {
+inline T load_json_file(const fs::path& p, bool* parse_ok = nullptr) {
     T value{};
+    if (parse_ok) *parse_ok = true;
     if (auto bytes = ulp::fs::read_as_bytes(p)) {
-        (void)glz::read<JSON_READ>(value, *bytes);
+        const auto err = glz::read<JSON_READ>(value, *bytes);
+        if (err && parse_ok) *parse_ok = false;
     }
     return value;
 }
@@ -142,12 +144,15 @@ inline bool set_startup_enabled(bool enable) {
     return st == ERROR_SUCCESS;
 }
 
-inline Settings load_settings() {
+inline Settings load_settings(bool* corrupt_recovered = nullptr) {
     std::error_code ec;
     const bool existed = fs::exists(settings_path(), ec);
-    Settings s = load_json_file<Settings>(settings_path());
+    bool ok = true;
+    Settings s = load_json_file<Settings>(settings_path(), &ok);
+    const bool corrupted = existed && !ok;
+    if (corrupt_recovered) *corrupt_recovered = corrupted;
     s.launch_on_startup = is_startup_enabled();
-    if (!existed) {
+    if (!existed || corrupted) {
         s.exclude_dirs = default_excludes();
     }
     if (s.model_dir.empty()) {
