@@ -43,7 +43,7 @@ public:
         gfx_epoch_ = sh_.gfx.epoch();
         gif_.set_notify(hwnd_, WM_APP_GIF);
         video_.set_notify(hwnd_, WM_APP_VIDEO);
-        video_.set_muted(sh_.test_mode || video_muted_);
+        apply_video_audio(false);
 
         field_.placeholder = L"Search images & videos";
         cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
@@ -106,7 +106,9 @@ public:
         KillTimer(hwnd_, TIMER_GIF);
         set_video_timer(false);
         dragging_seek_ = false;
+        dragging_volume_ = false;
         gif_scrub_resume_ = false;
+        pv_vol_rect_ = {};
         gif_.close();
         video_.close();
         sh_.previews.clear();
@@ -128,6 +130,7 @@ public:
         selecting_text_ = false;
         dragging_scroll_ = false;
         dragging_seek_ = false;
+        dragging_volume_ = false;
         gif_scrub_resume_ = false;
         ReleaseCapture();
         close_popups();
@@ -349,6 +352,7 @@ private:
         IdPvNext,
         IdPvPlay,
         IdPvMute,
+        IdPvVolume,
         IdPvSeek,
         IdPvBar,
         IdPvOpen,
@@ -886,9 +890,18 @@ private:
                 }
                 title = L"Open video";
                 return true;
-            case IdPvMute:
-                title = video_.is_muted() ? L"Unmute (M)" : L"Mute (M)";
+            case IdPvMute: {
+                const int pct = static_cast<int>(std::lround(displayed_video_volume() * 100.0f));
+                title = effective_video_muted() ? L"Unmute (M)" : L"Mute (M)";
+                subtitle = L"Volume: " + std::to_wstring(pct) + L"%  \u2022  Scroll to adjust";
                 return true;
+            }
+            case IdPvVolume: {
+                const int pct = static_cast<int>(std::lround(displayed_video_volume() * 100.0f));
+                title = L"Volume: " + std::to_wstring(pct) + L"%";
+                subtitle = L"Drag, scroll, or +/- keys";
+                return true;
+            }
             case IdPvPrev: title = L"Previous (Left)"; return true;
             case IdPvNext: title = L"Next (Right)"; return true;
             case IdPvOpen: title = L"Open (Enter)"; return true;
@@ -1967,15 +1980,22 @@ private:
         preview_go(index);
     }
 
+    void reset_preview_interaction_state() noexcept {
+        gif_scrub_resume_ = false;
+        const bool was_seek = std::exchange(dragging_seek_, false);
+        const bool was_vol = std::exchange(dragging_volume_, false);
+        if ((was_seek || was_vol) && GetCapture() == hwnd_) ReleaseCapture();
+        pv_media_rect_ = {};
+        pv_ctrl_rect_ = {};
+        pv_seek_rect_ = {};
+        pv_vol_rect_ = {};
+    }
+
     void close_preview(bool restore_focus = true) {
         if (preview_ < 0) return;
         const int last = preview_;
         preview_ = -1;
-        gif_scrub_resume_ = false;
-        if (std::exchange(dragging_seek_, false) && GetCapture() == hwnd_) ReleaseCapture();
-        pv_media_rect_ = {};
-        pv_ctrl_rect_ = {};
-        pv_seek_rect_ = {};
+        reset_preview_interaction_state();
         KillTimer(hwnd_, TIMER_GIF);
         set_video_timer(false);
         gif_.close();
@@ -2000,11 +2020,7 @@ private:
             return;
         }
         index = std::clamp(index, 0, static_cast<int>(items_.size()) - 1);
-        gif_scrub_resume_ = false;
-        if (std::exchange(dragging_seek_, false) && GetCapture() == hwnd_) ReleaseCapture();
-        pv_media_rect_ = {};
-        pv_ctrl_rect_ = {};
-        pv_seek_rect_ = {};
+        reset_preview_interaction_state();
         preview_ = index;
         focus_ = index;
         selected_ = {items_[index].pt.id};
@@ -2046,7 +2062,7 @@ private:
 
         if (it.pt.p.k == 1) {
             gif_.close();
-            video_.set_muted(sh_.test_mode || video_muted_);
+            apply_video_audio(false);
             video_.open(path, sh_.gfx.d3d(), sh_.gfx.epoch());
         } else if (is_gif_path(it.name)) {
             video_.close();
@@ -2058,6 +2074,20 @@ private:
         sync_preview_timers();
     }
 
+    void draw_preview_slider(Canvas& cv, D2D1_RECT_F bar, float ratio, int id,
+                             bool active_drag, D2D1_COLOR_F fill_col, float pad_l, float pad_r) {
+        const float cy = (bar.top + bar.bottom) * 0.5f;
+        cv.fill_round(D2D1::RectF(bar.left, cy - 2.0f, bar.right, cy + 2.0f), 2.0f, color::surface_highest);
+        const float thumb_x = bar.left + ((bar.right - bar.left) * std::clamp(ratio, 0.0f, 1.0f));
+        if (thumb_x > bar.left + 0.5f) {
+            cv.fill_round(D2D1::RectF(bar.left, cy - 2.0f, thumb_x, cy + 2.0f), 2.0f, fill_col);
+        }
+        const float ha = hover_.alpha(id);
+        const float rad = (active_drag || ha > 0.05f) ? 5.5f : 4.2f;
+        cv.fill_circle({.x = thumb_x, .y = cy}, rad, lerp_color(color::on_surface, color::primary, active_drag ? 1.0f : ha * 0.5f));
+        cv.hit(D2D1::RectF(bar.left - pad_l, bar.top, bar.right + pad_r, bar.bottom), id);
+    }
+
     void draw_preview_controls(Canvas& cv, D2D1_SIZE_F sz, D2D1_RECT_F area, D2D1_RECT_F dest,
                                const Item& it, bool is_video, bool is_gif) {
         const bool is_video_ctrl = is_video && video_.active() && !video_.failed();
@@ -2065,11 +2095,13 @@ private:
         if (!is_video_ctrl && !is_gif_ctrl) {
             pv_ctrl_rect_ = {};
             pv_seek_rect_ = {};
+            pv_vol_rect_ = {};
             return;
         }
 
         const float max_bar_w = std::max(280.0f, sz.width - 140.0f);
-        const float cw = std::clamp(std::max(320.0f, width(dest)), 280.0f, max_bar_w);
+        const float min_ctrl_w = is_video_ctrl ? 380.0f : 320.0f;
+        const float cw = std::clamp(std::max(min_ctrl_w, width(dest)), 280.0f, max_bar_w);
         const float cx = (sz.width - cw) * 0.5f;
         const D2D1_RECT_F ctrl = rect(cx, area.bottom + 4.0f, cw, 34.0f);
         pv_ctrl_rect_ = ctrl;
@@ -2089,10 +2121,6 @@ private:
 
         float ratio = 0.0f;
         if (is_video_ctrl) {
-            const D2D1_RECT_F mute_r = rect(rx - 28.0f, ctrl.top + 3.0f, 28.0f, 28.0f);
-            icon_button(cv, mute_r, video_.is_muted() ? glyph::mute : glyph::volume, IdPvMute, video_.is_muted());
-            rx -= 32.0f;
-
             double dur_s = video_.duration();
             if (dur_s <= 0.0 && it.pt.p.d > 0) dur_s = static_cast<double>(it.pt.p.d) / 1000.0;
             const double cur_s = dragging_seek_ ? static_cast<double>(seek_drag_ratio_) * dur_s : video_.current_time();
@@ -2105,11 +2133,31 @@ private:
                 : L"--:--";
             const float cur_w = std::max(34.0f, cv.measure(cur_str, Font::MonoSmall) + 6.0f);
             const float dur_w = std::max(34.0f, cv.measure(dur_str, Font::MonoSmall) + 6.0f);
+
+            constexpr float vol_track_w = 50.0f;
+            const bool muted_vis = effective_video_muted();
+            const float avail_seek = (rx - lx) - cur_w - 4.0f - dur_w - 4.0f - 32.0f;
+            if (avail_seek >= (vol_track_w + 15.0f) + 76.0f) {
+                const float vx1 = rx - 7.0f;
+                const float vx0 = vx1 - vol_track_w;
+                pv_vol_rect_ = D2D1::RectF(vx0, ctrl.top, vx1, ctrl.bottom);
+                draw_preview_slider(cv, pv_vol_rect_, displayed_video_volume(), IdPvVolume,
+                                    dragging_volume_, muted_vis ? color::outline : color::primary, 4.0f, 6.0f);
+                rx = vx0 - 8.0f;
+            } else {
+                pv_vol_rect_ = {};
+            }
+
+            const D2D1_RECT_F mute_r = rect(rx - 28.0f, ctrl.top + 3.0f, 28.0f, 28.0f);
+            icon_button(cv, mute_r, muted_vis ? glyph::mute : glyph::volume, IdPvMute, muted_vis);
+            rx -= 32.0f;
+
             cv.text(cur_str, rect(lx, ctrl.top, cur_w, height(ctrl)), Font::MonoSmall, color::on_surface_variant, Align::Center);
             lx += cur_w + 4.0f;
             cv.text(dur_str, rect(rx - dur_w, ctrl.top, dur_w, height(ctrl)), Font::MonoSmall, color::outline, Align::Center);
             rx -= dur_w + 4.0f;
         } else {
+            pv_vol_rect_ = {};
             const D2D1_RECT_F badge_r = rect(lx + 2.0f, ctrl.top + 8.0f, 30.0f, 18.0f);
             cv.fill_round(badge_r, 9.0f, with_alpha(color::surface_highest, 0.95f));
             cv.text(L"GIF", badge_r, Font::Label, color::primary, Align::Center);
@@ -2132,18 +2180,7 @@ private:
         const float sx1 = rx - 6.0f;
         if (sx1 > sx0 + 16.0f) {
             pv_seek_rect_ = D2D1::RectF(sx0, ctrl.top, sx1, ctrl.bottom);
-            const float cy = (ctrl.top + ctrl.bottom) * 0.5f;
-            const D2D1_RECT_F track = D2D1::RectF(sx0, cy - 2.0f, sx1, cy + 2.0f);
-            cv.fill_round(track, 2.0f, color::surface_highest);
-
-            const float thumb_x = sx0 + ((sx1 - sx0) * std::clamp(ratio, 0.0f, 1.0f));
-            if (thumb_x > sx0 + 0.5f) {
-                cv.fill_round(D2D1::RectF(sx0, cy - 2.0f, thumb_x, cy + 2.0f), 2.0f, color::primary);
-            }
-            const float ha = hover_.alpha(IdPvSeek);
-            const float rad = (dragging_seek_ || ha > 0.05f) ? 5.5f : 4.2f;
-            cv.fill_circle({.x = thumb_x, .y = cy}, rad, lerp_color(color::on_surface, color::primary, dragging_seek_ ? 1.0f : ha * 0.5f));
-            cv.hit(D2D1::RectF(sx0 - 6.0f, ctrl.top, sx1 + 6.0f, ctrl.bottom), IdPvSeek);
+            draw_preview_slider(cv, pv_seek_rect_, ratio, IdPvSeek, dragging_seek_, color::primary, 6.0f, 6.0f);
         } else {
             pv_seek_rect_ = {};
         }
@@ -2322,6 +2359,76 @@ private:
         invalidate_preview_controls();
     }
 
+    [[nodiscard]] double normalized_video_volume() const noexcept {
+        return std::isfinite(sh_.settings.video_volume) ? std::clamp(sh_.settings.video_volume, 0.0, 1.0) : 1.0;
+    }
+
+    [[nodiscard]] bool effective_video_muted() const noexcept {
+        return sh_.test_mode || sh_.settings.video_muted || normalized_video_volume() <= 0.0;
+    }
+
+    [[nodiscard]] float displayed_video_volume() const noexcept {
+        return effective_video_muted() ? 0.0f : static_cast<float>(normalized_video_volume());
+    }
+
+    void apply_video_audio(bool persist) {
+        const double vol = normalized_video_volume();
+        sh_.settings.video_volume = vol;
+        video_.set_volume(vol);
+        video_.set_muted(sh_.test_mode || sh_.settings.video_muted);
+        if (persist && !sh_.test_mode) sh_.save();
+    }
+
+    void toggle_video_mute() {
+        if (!preview_valid() || items_[preview_].pt.p.k != 1 || video_.failed()) return;
+        if (sh_.settings.video_muted || normalized_video_volume() <= 0.0) {
+            sh_.settings.video_muted = false;
+            if (normalized_video_volume() <= 0.0) sh_.settings.video_volume = 0.5;
+        } else {
+            sh_.settings.video_muted = true;
+        }
+        apply_video_audio(true);
+        invalidate_preview_controls();
+    }
+
+    void set_video_volume(double vol, bool persist) {
+        const double clamped = std::clamp(std::isfinite(vol) ? vol : 1.0, 0.0, 1.0);
+        const double snapped = clamped <= 0.005 ? 0.0 : clamped;
+        sh_.settings.video_volume = snapped;
+        sh_.settings.video_muted = (snapped <= 0.0);
+        apply_video_audio(persist);
+    }
+
+    void nudge_video_volume(double delta) {
+        if (!preview_valid() || items_[preview_].pt.p.k != 1 || video_.failed()) return;
+        const double base = effective_video_muted() ? 0.0 : normalized_video_volume();
+        set_video_volume(base + delta, true);
+        invalidate_preview_controls();
+    }
+
+    bool apply_volume_from_x(float x, bool force = false) {
+        if (!preview_valid() || pv_vol_rect_.right <= pv_vol_rect_.left) return false;
+        const float ratio = std::clamp((x - pv_vol_rect_.left) / width(pv_vol_rect_), 0.0f, 1.0f);
+        if (!force && std::abs(ratio - displayed_video_volume()) < 1e-4f) return false;
+        set_video_volume(static_cast<double>(ratio), false);
+        return true;
+    }
+
+    void begin_volume_drag(float x) {
+        if (!preview_valid() || items_[preview_].pt.p.k != 1 || video_.failed()) return;
+        dragging_volume_ = true;
+        SetCapture(hwnd_);
+        apply_volume_from_x(x, true);
+        invalidate_preview_controls();
+    }
+
+    void end_volume_drag() {
+        if (!dragging_volume_) return;
+        dragging_volume_ = false;
+        apply_video_audio(true);
+        invalidate_preview_controls();
+    }
+
     void preview_toggle_play() {
         if (!preview_valid()) return;
         if (items_[preview_].pt.p.k == 1 && !video_.failed()) {
@@ -2380,11 +2487,10 @@ private:
                 }
                 return;
             case IdPvMute:
-                if (items_[preview_].pt.p.k == 1 && !video_.failed()) {
-                    video_muted_ = !video_muted_;
-                    video_.set_muted(sh_.test_mode || video_muted_);
-                    invalidate_preview_controls();
-                }
+                toggle_video_mute();
+                return;
+            case IdPvVolume:
+                begin_volume_drag(p.x);
                 return;
             case IdPvSeek:
                 begin_seek_drag(p.x);
@@ -2434,11 +2540,15 @@ private:
                 preview_toggle_play();
                 return true;
             case 'M':
-                if (it.pt.p.k == 1 && !video_.failed()) {
-                    video_muted_ = !video_muted_;
-                    video_.set_muted(sh_.test_mode || video_muted_);
-                    invalidate_preview_controls();
-                }
+                toggle_video_mute();
+                return true;
+            case VK_OEM_PLUS:
+            case VK_ADD:
+                if (!ctrl) nudge_video_volume(0.05);
+                return true;
+            case VK_OEM_MINUS:
+            case VK_SUBTRACT:
+                if (!ctrl) nudge_video_volume(-0.05);
                 return true;
             case 'J':
             case VK_OEM_COMMA:
@@ -2568,6 +2678,17 @@ private:
                 return;
             }
         }
+        if (dragging_volume_) {
+            if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
+                end_volume_drag();
+                ReleaseCapture();
+            } else {
+                if (apply_volume_from_x(p.x)) {
+                    invalidate_preview_controls();
+                }
+                return;
+            }
+        }
         if (dragging_scroll_) {
             if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
                 dragging_scroll_ = false;
@@ -2651,7 +2772,7 @@ private:
         }
         if (preview_valid() && !menu_open_) {
             preview_click(id, p, dbl);
-            if (id != IdPvBar && id != IdPvPlay && id != IdPvMute && id != IdPvSeek) invalidate();
+            if (id != IdPvBar && id != IdPvPlay && id != IdPvMute && id != IdPvVolume && id != IdPvSeek) invalidate();
             return;
         }
         if (drop_open_ && id != IdDrop && id != IdDropItem && id != IdTagBtn && id != IdField) {
@@ -2803,6 +2924,17 @@ private:
         clear_tooltip_now();
         if (menu_open_) return;
         if (preview_valid()) {
+            flush();
+            POINT pt{};
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd_, &pt);
+            const D2D1_POINT_2F cur_p{.x = static_cast<float>(pt.x) / target_.scale(), .y = static_cast<float>(pt.y) / target_.scale()};
+            const Hit* h = hit_test(hits_, cur_p);
+            const int id = h ? h->id : IdNone;
+            if ((id == IdPvMute || id == IdPvVolume) && items_[preview_].pt.p.k == 1 && !video_.failed()) {
+                nudge_video_volume((static_cast<double>(delta) / static_cast<double>(WHEEL_DELTA)) * 0.05);
+                return;
+            }
             // One notch per image, whatever the device's resolution
             preview_wheel_ += delta;
             while (preview_wheel_ >= WHEEL_DELTA) {
@@ -3090,6 +3222,7 @@ private:
                 selecting_text_ = false;
                 dragging_scroll_ = false;
                 end_seek_drag();
+                end_volume_drag();
                 end_drag_detect();
                 return 0;
             case WM_SETCURSOR:
@@ -3132,6 +3265,7 @@ private:
                 selecting_text_ = false;
                 if (dragging_scroll_) dragging_scroll_ = false;
                 if (dragging_seek_) end_seek_drag();
+                if (dragging_volume_) end_volume_drag();
                 end_drag_detect();
                 ReleaseCapture();
                 return 0;
@@ -3289,14 +3423,15 @@ private:
     bool swallow_dbl_ = false;
 
     uint64_t gfx_epoch_ = 0;
-    bool video_muted_ = false;
     bool video_timer_active_ = false;
     bool dragging_seek_ = false;
+    bool dragging_volume_ = false;
     bool gif_scrub_resume_ = false;
     float seek_drag_ratio_ = 0.0f;
     D2D1_RECT_F pv_media_rect_{};
     D2D1_RECT_F pv_ctrl_rect_{};
     D2D1_RECT_F pv_seek_rect_{};
+    D2D1_RECT_F pv_vol_rect_{};
     std::chrono::steady_clock::time_point last_scrubber_redraw_{};
     GifPlayer gif_;
     VideoPlayer video_;

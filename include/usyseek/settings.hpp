@@ -19,6 +19,8 @@ struct Settings {
     int32_t pill_w = 0;         // DIPs, 0 = default
     int32_t pill_h = 0;
     std::string thumb_fit = "crop"; // crop | contain
+    double video_volume = 1.0;
+    bool video_muted = false;
 
     // Indexing scope
     bool whole_pc = true;

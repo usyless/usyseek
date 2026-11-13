@@ -211,6 +211,7 @@ public:
 
         engine_->SetAutoPlay(FALSE);
         engine_->SetLoop(TRUE);
+        engine_->SetVolume(volume_);
         engine_->SetMuted(muted_ ? TRUE : FALSE);
 
         const std::wstring mf_url = normalize_mf_source_path(path);
@@ -480,6 +481,11 @@ public:
         set_muted(!muted_);
     }
 
+    void set_volume(double vol) noexcept {
+        volume_ = std::isfinite(vol) ? std::clamp(vol, 0.0, 1.0) : 1.0;
+        if (engine_) engine_->SetVolume(volume_);
+    }
+
     void seek(double target_s) noexcept {
         if (!engine_ || phase_ == LoadPhase::Idle || phase_ == LoadPhase::Failed) return;
         const double dur = duration();
@@ -514,6 +520,7 @@ public:
     }
     [[nodiscard]] bool needs_timer() const noexcept { return is_playing() || is_seeking(); }
     [[nodiscard]] bool is_muted() const noexcept { return muted_; }
+    [[nodiscard]] double volume() const noexcept { return volume_; }
     [[nodiscard]] bool audio_only() const noexcept { return audio_only_; }
     [[nodiscard]] bool has_frame() const noexcept {
         return video_bmp_ != nullptr && native_w_ > 0 && native_h_ > 0 && frame_w_ > 0 && frame_h_ > 0 && has_frame_;
@@ -691,6 +698,7 @@ private:
     UINT notify_msg_ = 0;
     bool mf_started_ = false;
     bool muted_ = false;
+    double volume_ = 1.0;
     bool want_play_ = false;
     bool scrubbing_ = false;
     bool autoplay_handled_ = false;
