@@ -79,9 +79,14 @@ template <typename T>
 inline bool save_json_file(const fs::path& p, const T& value) {
     auto out = glz::write<JSON_WRITE>(value);
     if (!out) return false;
-    const fs::path tmp = p.wstring() + L".tmp";
+    const fs::path tmp = p.wstring() + L".tmp." + std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(GetCurrentThreadId());
     if (!ulp::fs::write(tmp, std::string_view{*out})) return false;
-    return MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) return true;
+    const DWORD err = GetLastError();
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    SetLastError(err);
+    return false;
 }
 
 /// Exclusions that can never be removed (shown with a lock in settings).

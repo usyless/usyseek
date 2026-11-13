@@ -5,6 +5,8 @@
 
 #include <wil/resource.h>
 
+#include <mutex>
+
 namespace usyseek {
 
 inline fs::path notifications_path() {
@@ -31,12 +33,18 @@ namespace detail {
 
 template <typename Fn>
 inline auto with_notifications_lock(Fn&& fn) {
-    wil::unique_mutex_nothrow mu{CreateMutexW(nullptr, FALSE, NOTIFICATIONS_MUTEX)};
-    if (mu) WaitForSingleObject(mu.get(), 2000);
+    static std::mutex in_proc_mu;
+    const std::lock_guard in_proc_lk{in_proc_mu};
+    const wil::unique_mutex_nothrow mu{CreateMutexW(nullptr, FALSE, NOTIFICATIONS_MUTEX)};
+    bool owned = !mu;
+    if (mu) {
+        const DWORD wait = WaitForSingleObject(mu.get(), 5000);
+        owned = (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED);
+    }
     const auto unlock = wil::scope_exit([&] {
-        if (mu) ReleaseMutex(mu.get());
+        if (mu && owned) ReleaseMutex(mu.get());
     });
-    return fn();
+    return fn(owned);
 }
 
 } // namespace detail
@@ -48,7 +56,7 @@ inline void post_notifications_changed() noexcept {
 }
 
 /// Monotonic stamp `(mtime_ticks, file_size)` so polling detects out-of-process updates cheaply.
-inline std::pair<int64_t, uint64_t> notifications_file_stamp() noexcept {
+inline std::pair<int64_t, uint64_t> notifications_file_stamp() {
     WIN32_FILE_ATTRIBUTE_DATA fad{};
     if (!GetFileAttributesExW(notifications_path().c_str(), GetFileExInfoStandard, &fad)) {
         return {0, 0};
@@ -59,7 +67,7 @@ inline std::pair<int64_t, uint64_t> notifications_file_stamp() noexcept {
 }
 
 inline NotificationStoreData load_notification_store() {
-    return detail::with_notifications_lock([] {
+    return detail::with_notifications_lock([](bool /*locked*/) {
         return load_json_file<NotificationStoreData>(notifications_path());
     });
 }
@@ -72,33 +80,37 @@ inline std::vector<Notification> load_notifications() {
 inline std::vector<Notification> push_notification_to_disk(std::string_view severity, std::string_view source,
                                                            std::string_view title, std::string_view detail_text,
                                                            std::string_view key = {}, bool notify_ui = true) {
-    NotificationStoreData store = detail::with_notifications_lock([&] {
-        NotificationStoreData d = load_json_file<NotificationStoreData>(notifications_path());
+    bool wrote = false;
+    auto store = detail::with_notifications_lock([&](bool locked) {
+        auto d = load_json_file<NotificationStoreData>(notifications_path());
+        if (!locked) return d;
         apply_notification(d, severity, source, title, detail_text, key, unix_now());
-        (void)save_json_file(notifications_path(), d);
+        wrote = save_json_file(notifications_path(), d);
         return d;
     });
-    if (notify_ui) post_notifications_changed();
+    if (wrote && notify_ui) post_notifications_changed();
     return std::move(store.items);
 }
 
 inline std::vector<Notification> dismiss_notification_on_disk(uint64_t id, bool notify_ui = false) {
-    NotificationStoreData store = detail::with_notifications_lock([&] {
-        NotificationStoreData d = load_json_file<NotificationStoreData>(notifications_path());
-        if (dismiss_notification(d, id)) {
-            (void)save_json_file(notifications_path(), d);
+    bool wrote = false;
+    auto store = detail::with_notifications_lock([&](bool locked) {
+        auto d = load_json_file<NotificationStoreData>(notifications_path());
+        if (locked && dismiss_notification(d, id)) {
+            wrote = save_json_file(notifications_path(), d);
         }
         return d;
     });
-    if (notify_ui) post_notifications_changed();
+    if (wrote && notify_ui) post_notifications_changed();
     return std::move(store.items);
 }
 
 inline std::vector<Notification> clear_notification_key_on_disk(std::string_view source, std::string_view key,
                                                                 bool notify_ui = true) {
     bool changed = false;
-    NotificationStoreData store = detail::with_notifications_lock([&] {
-        NotificationStoreData d = load_json_file<NotificationStoreData>(notifications_path());
+    auto store = detail::with_notifications_lock([&](bool locked) {
+        auto d = load_json_file<NotificationStoreData>(notifications_path());
+        if (!locked) return d;
         changed = clear_notification_key(d, source, key);
         if (changed) (void)save_json_file(notifications_path(), d);
         return d;
@@ -108,14 +120,15 @@ inline std::vector<Notification> clear_notification_key_on_disk(std::string_view
 }
 
 inline std::vector<Notification> clear_notifications_on_disk(bool notify_ui = false) {
-    NotificationStoreData store = detail::with_notifications_lock([&] {
-        NotificationStoreData d = load_json_file<NotificationStoreData>(notifications_path());
-        if (clear_notifications(d)) {
-            (void)save_json_file(notifications_path(), d);
+    bool wrote = false;
+    auto store = detail::with_notifications_lock([&](bool locked) {
+        auto d = load_json_file<NotificationStoreData>(notifications_path());
+        if (locked && clear_notifications(d)) {
+            wrote = save_json_file(notifications_path(), d);
         }
         return d;
     });
-    if (notify_ui) post_notifications_changed();
+    if (wrote && notify_ui) post_notifications_changed();
     return std::move(store.items);
 }
 

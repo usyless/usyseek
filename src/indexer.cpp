@@ -1195,13 +1195,14 @@ int run_indexer(Settings& settings) {
     }
 
     // --- Upload (single background thread so the GPU never waits on gRPC)
+    // Declared before `upload` so `upload`'s destructor joins before destroying these shared targets.
+    std::mutex upsert_mx;
+    std::string upsert_err;
+    uint64_t upsert_failures = 0;
     std::future<void> upload;
     std::vector<uint64_t> up_ids;
     std::vector<float> up_vecs;
     std::vector<MediaPayload> up_payloads;
-    std::mutex upsert_mx;
-    std::string upsert_err;
-    uint64_t upsert_failures = 0;
     auto flush = [&](bool wait) {
         if (upload.valid()) upload.get();
         if (!up_ids.empty()) {

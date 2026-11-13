@@ -2179,13 +2179,14 @@ private:
 
         // Previous / next
         const D2D1_RECT_F nav_area = preview_media_area(sz, false);
-        auto arrow = [&](bool next) {
+        const auto arrow = [&](bool next) {
             const bool can = next ? preview_ + 1 < count : preview_ > 0;
             if (!can) return;
-            const float cx = next ? nav_area.right - 28 : nav_area.left + 28, cy = (nav_area.top + nav_area.bottom) / 2;
+            const float cx = next ? nav_area.right - 28 : nav_area.left + 28;
+            const float cy = (nav_area.top + nav_area.bottom) / 2;
             const int id = next ? IdPvNext : IdPvPrev;
             const float ha = hover_.alpha(id);
-            cv.fill_circle({cx, cy}, 22, lerp_color(hex(0x000000, 0.45f), with_alpha(color::surface_highest, 0.96f), ha));
+            cv.fill_circle({.x = cx, .y = cy}, 22, lerp_color(hex(0x000000, 0.45f), with_alpha(color::surface_highest, 0.96f), ha));
             cv.icon(next ? glyph::chevron_right : glyph::chevron_left, rect(cx - 22, cy - 22, 44, 44), lerp_color(hex(0xffffff, 0.9f), color::on_surface, ha));
             cv.hit(rect(cx - 28, cy - 44, 56, 88), id);
         };

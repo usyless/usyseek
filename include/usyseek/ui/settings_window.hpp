@@ -591,6 +591,7 @@ private:
 
     FlowResult tab_layout(float total_w) const {
         std::vector<FlowItem> items;
+        items.reserve(3);
         for (int i = 0; i < 3; ++i) {
             items.push_back({sh_.fonts.measure(tab_label(i), Font::BodySemi) + 46.0f, TABS_H - 16.0f});
         }
@@ -1815,8 +1816,8 @@ private:
 
     void notify_async(std::string level, std::string source, std::string title, std::string detail, std::string key = {}) {
         sh_.call([this, level = std::move(level), source = std::move(source), title = std::move(title),
-                  detail = std::move(detail), key = std::move(key)] {
-            sh_.notify(level.c_str(), source.c_str(), title, detail, key);
+                  detail = std::move(detail), key = std::move(key)]() mutable {
+            sh_.notify(std::move(level), std::move(source), std::move(title), std::move(detail), std::move(key));
         });
     }
 
