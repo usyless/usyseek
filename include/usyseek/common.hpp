@@ -42,6 +42,7 @@ enum class Cmd : uint32_t {
     NeedQdrant,
     Quit,
     HotkeyStatus,            // query: the reply is a HotkeyState
+    TestNotification,
 };
 
 /// Whether the launcher currently holds the global search shortcut.

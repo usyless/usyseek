@@ -204,6 +204,9 @@ private:
             case Cmd::NeedQdrant:
                 ensure_qdrant();
                 return TRUE;
+            case Cmd::TestNotification:
+                show_balloon(APP_NAME, L"Test Windows notification from usyseek. Click to open Notifications.", NIIF_INFO, true);
+                return TRUE;
             case Cmd::Quit:
                 DestroyWindow(hwnd_);
                 return TRUE;

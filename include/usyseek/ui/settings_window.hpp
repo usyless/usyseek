@@ -260,6 +260,7 @@ private:
         IdClearFailedDisabled,
         IdOpenFailedLog,
         IdFailedRow,
+        IdTestNotif,
         IdClearAllNotifs,
         IdDismissNotif,
         IdScopeAll,
@@ -710,13 +711,16 @@ private:
                 if (err_n > 0) caption += L"  •  " + format_count(err_n) + (err_n == 1 ? L" error" : L" errors");
                 if (warn_n > 0) caption += L"  •  " + format_count(warn_n) + (warn_n == 1 ? L" warning" : L" warnings");
             }
-            const float btn_w = total_n > 0 ? button_width(cv, L"Clear All", true, 124.0f) : 0.0f;
-            const CardHeader hd = make_header(cv, rw, L"Notifications", color::on_surface, caption, btn_w, total_n > 0 ? 34.0f : 0.0f);
+            const float test_w = button_width(cv, L"Test Notification", true, 154.0f);
+            const float clear_w = total_n > 0 ? button_width(cv, L"Clear All", true, 114.0f) : 0.0f;
+            const float side_w = total_n > 0 ? (test_w + 8.0f + clear_w) : test_w;
+            const CardHeader hd = make_header(cv, rw, L"Notifications", color::on_surface, caption, side_w, 34.0f);
             const float h = 16.0f + hd.h + 16.0f;
             const float next_y = card_begin(cv, x, y, w, h);
             const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
+            draw_button(cv, rect(side.left, side.top, test_w, 34.0f), glyph::warning, L"Test Notification", IdTestNotif, 0, 0);
             if (total_n > 0) {
-                draw_button(cv, rect(side.left, side.top, btn_w, 34.0f), glyph::del, L"Clear All", IdClearAllNotifs, 0, 2);
+                draw_button(cv, rect(side.left + test_w + 8.0f, side.top, clear_w, 34.0f), glyph::del, L"Clear All", IdClearAllNotifs, 0, 2);
             }
             y = next_y;
         }
@@ -2434,6 +2438,17 @@ private:
             case IdTab0: set_tab(0); return;
             case IdTab1: set_tab(1); return;
             case IdTab2: set_tab(2); return;
+            case IdTestNotif: {
+                const bool balloon_sent = send_to_launcher(Cmd::TestNotification);
+                sh_.notify(
+                    balloon_sent ? "info" : "warning", "Test",
+                    "Test notification",
+                    balloon_sent
+                        ? "Triggered both this in-UI alert and a native Windows tray balloon via usyseek.exe."
+                        : "Added this in-UI alert, but usyseek.exe is not running so no Windows tray balloon was shown.",
+                    "test-notification");
+                break;
+            }
             case IdClearAllNotifs:
                 sh_.clear_notifications();
                 break;
