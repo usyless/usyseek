@@ -182,6 +182,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.gfx.on_device_changed = [&] {
         sh.thumbs.reset_gpu();
         sh.previews.reset_gpu();
+        pill.reset_preview_gpu();
     };
     sh.thumbs.start(pill.hwnd(), WM_APP_THUMBS);
     sh.previews.start(pill.hwnd(), WM_APP_THUMBS, 1);

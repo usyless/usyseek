@@ -248,7 +248,7 @@ target_link_libraries(usyseek-ui PRIVATE
     usyseek_common
     usyseek_rust
     "${ORT_ROOT}/lib/onnxruntime.lib"
-    d2d1 dwrite d3d11 dxgi dxguid dcomp dwmapi windowscodecs
+    d2d1 dwrite d3d11 dxgi dxguid dcomp dwmapi windowscodecs mfplat mfuuid
     shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys winhttp version
 )
 add_custom_command(TARGET usyseek-ui POST_BUILD

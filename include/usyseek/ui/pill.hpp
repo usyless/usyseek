@@ -1,8 +1,10 @@
 #pragma once
 
+#include "gif_player.hpp"
 #include "pagination.hpp"
 #include "shared.hpp"
 #include "textfield.hpp"
+#include "video_player.hpp"
 
 #include <shellscalingapi.h>
 
@@ -38,6 +40,10 @@ public:
         const COLORREF border = RGB(0x44, 0x41, 0x48);
         DwmSetWindowAttribute(hwnd_, DWMWA_BORDER_COLOR, &border, sizeof(border));
         if (!target_.attach(sh_.gfx, hwnd_)) return false;
+        gfx_epoch_ = sh_.gfx.epoch();
+        gif_.set_notify(hwnd_, WM_APP_GIF);
+        video_.set_notify(hwnd_, WM_APP_VIDEO);
+        video_.set_muted(sh_.test_mode || video_muted_);
 
         field_.placeholder = L"Search images & videos";
         cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
@@ -65,12 +71,13 @@ public:
         ShowWindow(hwnd_, SW_SHOWNORMAL);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
-        field_.focused = true;
-        field_.select_all();
+        field_.focused = !preview_valid();
+        if (field_.focused) field_.select_all();
         caret_reset();
         sh_.refresh_tags();
         sh_.poll_indexer(true);
         sh_.refresh_hotkey_state();
+        if (preview_valid()) request_preview();
         SetTimer(hwnd_, TIMER_STATUS, 1000, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
         full_dirty_ = true;
@@ -96,6 +103,12 @@ public:
         KillTimer(hwnd_, TIMER_STATUS);
         KillTimer(hwnd_, TIMER_DEVICE);
         KillTimer(hwnd_, TIMER_FADE);
+        KillTimer(hwnd_, TIMER_GIF);
+        KillTimer(hwnd_, TIMER_VIDEO);
+        dragging_seek_ = false;
+        gif_.close();
+        video_.close();
+        sh_.previews.clear();
         anim_active_ = false;
         raw_hover_id_ = IdNone;
         raw_hover_index_ = 0;
@@ -113,10 +126,15 @@ public:
         if (!visible()) return;
         selecting_text_ = false;
         dragging_scroll_ = false;
+        dragging_seek_ = false;
         ReleaseCapture();
         close_popups();
         KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_STATUS);
+        KillTimer(hwnd_, TIMER_GIF);
+        KillTimer(hwnd_, TIMER_VIDEO);
+        gif_.set_playing(false);
+        video_.suspend();
         if (sh_.test_mode) {
             finish_hide();
             return;
@@ -128,10 +146,18 @@ public:
         SetTimer(hwnd_, TIMER_FADE, 15, nullptr);
     }
 
+    /// Drops GPU resources bound to preview players on D3D/D2D device reset or adapter switch.
+    void reset_preview_gpu() noexcept {
+        gif_.reset_gpu();
+        video_.reset_gpu();
+    }
+
     /// COM objects this window still holds; released before OLE is uninitialised.
     void release_com_objects() {
         async_drops_.clear();
         pending_clipboard_.reset();
+        gif_.shutdown();
+        video_.shutdown();
     }
 
     void toggle() {
@@ -171,6 +197,7 @@ public:
     void render() {
         if (rendering_ || (!visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
+        if (!prepare_preview_media()) return;
         rendering_ = true;
         dirty_ = false;
 
@@ -255,7 +282,10 @@ public:
         else open_preview(index);
     }
     [[nodiscard]] bool preview_loading() const {
-        return preview_valid() && !sh_.previews.failed(items_[preview_].pt.id) && !sh_.previews.get(items_[preview_].pt.id);
+        if (!preview_valid()) return false;
+        const Item& it = items_[preview_];
+        if (it.pt.p.k == 1) return video_.is_loading();
+        return !sh_.previews.failed(it.pt.id) && !sh_.previews.get(it.pt.id) && !gif_.has_frame();
     }
     [[nodiscard]] size_t result_count() const noexcept { return items_.size(); }
     [[nodiscard]] bool searching() const noexcept { return searching_; }
@@ -273,7 +303,7 @@ private:
     static constexpr float DEFAULT_W = 880.0f;
     static constexpr float DEFAULT_H = 640.0f;
     static constexpr float MENU_W = 256.0f;
-    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_DEBOUNCE = 2, TIMER_STATUS = 4, TIMER_DEVICE = 5, TIMER_FADE = 6, TIMER_DROP = 7, TIMER_COPY = 8, TIMER_TOOLTIP = 9;
+    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_DEBOUNCE = 2, TIMER_STATUS = 4, TIMER_DEVICE = 5, TIMER_FADE = 6, TIMER_DROP = 7, TIMER_COPY = 8, TIMER_TOOLTIP = 9, TIMER_GIF = 10, TIMER_VIDEO = 11;
     static constexpr uint64_t COPY_MAX_PIXELS = 40'000'000;
     static constexpr int CLIPBOARD_ATTEMPTS = 10;
 
@@ -308,6 +338,9 @@ private:
         IdPvPrev,
         IdPvNext,
         IdPvPlay,
+        IdPvMute,
+        IdPvSeek,
+        IdPvBar,
         IdPvOpen,
         IdPvReveal,
         IdPvCopy,
@@ -395,6 +428,7 @@ private:
             case IdPreview:
             case IdPvImage:
             case IdPvPath:
+            case IdPvBar:
             case IdMenu:
             case IdMenuField:
             case IdDrop:
@@ -553,8 +587,10 @@ private:
     // ------------------------------------------------------------------------------------------
 
     bool ensure_target() {
-        if (target_.ready()) return true;
+        if (target_.ready() && gfx_epoch_ == sh_.gfx.epoch()) return true;
+        if (target_.ready() && gfx_epoch_ != sh_.gfx.epoch()) target_.release();
         if (!sh_.gfx.ready() || sh_.gfx.device_lost()) {
+            reset_preview_gpu();
             if (!sh_.gfx.recover(hwnd_)) {
                 SetTimer(hwnd_, TIMER_DEVICE, 250, nullptr);
                 return false;
@@ -564,15 +600,17 @@ private:
             SetTimer(hwnd_, TIMER_DEVICE, 250, nullptr);
             return false;
         }
+        gfx_epoch_ = sh_.gfx.epoch();
         return true;
     }
 
     void recover() {
         // Present failed: device removed/reset or adapter gone. Rebuild everything on the next frame.
+        reset_preview_gpu();
+        target_.release();
         sh_.gfx.recover(hwnd_);
         sh_.thumbs.reset_gpu();
         sh_.previews.reset_gpu();
-        target_.release();
         full_dirty_ = true;
         pending_dirty_.clear();
         last_tooltip_dirty_.reset();
@@ -818,7 +856,23 @@ private:
                     return !title.empty();
                 }
                 return false;
-            case IdPvPlay: title = L"Open video"; return true;
+            case IdPvPlay:
+                if (preview_valid()) {
+                    const Item& it = items_[preview_];
+                    if (it.pt.p.k == 1 && !video_.failed()) {
+                        title = video_.want_play() ? L"Pause (K)" : L"Play (K)";
+                        return true;
+                    }
+                    if (gif_.has_animation()) {
+                        title = gif_.playing() ? L"Pause (K)" : L"Play (K)";
+                        return true;
+                    }
+                }
+                title = L"Open video";
+                return true;
+            case IdPvMute:
+                title = video_.is_muted() ? L"Unmute (M)" : L"Mute (M)";
+                return true;
             case IdPvPrev: title = L"Previous (Left)"; return true;
             case IdPvNext: title = L"Next (Right)"; return true;
             case IdPvOpen: title = L"Open (Enter)"; return true;
@@ -1579,8 +1633,187 @@ private:
 
     static constexpr float PV_TOP = 56.0f;
     static constexpr float PV_BOTTOM = 44.0f;
+    static constexpr float PV_CONTROLS_H = 42.0f;
 
     [[nodiscard]] bool preview_valid() const noexcept { return preview_ >= 0 && preview_ < static_cast<int>(items_.size()); }
+
+    [[nodiscard]] bool preview_has_controls() const noexcept {
+        if (!preview_valid()) return false;
+        const Item& it = items_[preview_];
+        if (it.pt.p.k == 1) return !video_.failed();
+        if (is_gif_path(it.name)) return gif_.has_animation() || (gif_.active() && !gif_.settled_static());
+        return false;
+    }
+
+    [[nodiscard]] static D2D1_RECT_F preview_media_area(D2D1_SIZE_F sz, bool has_controls) noexcept {
+        const float bottom = std::max(PV_TOP + 48.0f, sz.height - PV_BOTTOM - (has_controls ? PV_CONTROLS_H : 0.0f));
+        return D2D1::RectF(16.0f, PV_TOP, std::max(32.0f, sz.width - 16.0f), bottom);
+    }
+
+    [[nodiscard]] D2D1_RECT_F preview_dest_dims(uint32_t src_w, uint32_t src_h, uint32_t meta_w, uint32_t meta_h, D2D1_RECT_F area) const {
+        const FitBox b = compute_preview_box(src_w, src_h, meta_w, meta_h, target_.scale(),
+                                             FitBox{.left = area.left, .top = area.top, .width = width(area), .height = height(area)});
+        return rect(b.left, b.top, b.width, b.height);
+    }
+
+    [[nodiscard]] D2D1_RECT_F preview_dest(const Item& it, ID2D1Bitmap* bmp, D2D1_RECT_F area) const {
+        const D2D1_SIZE_U ps = bmp->GetPixelSize();
+        return preview_dest_dims(ps.width, ps.height, it.pt.p.w, it.pt.p.h, area);
+    }
+
+    bool prepare_preview_media() {
+        if (!preview_valid()) return true;
+        const Item& it = items_[preview_];
+        if (it.pt.p.k == 1) {
+            if (video_.needs_recover() && sh_.gfx.d3d()) {
+                video_.recover_if_needed(sh_.gfx.d3d(), sh_.gfx.epoch());
+                full_dirty_ = true;
+                sync_preview_timers();
+            }
+            if (video_.active() && !video_.failed()) {
+                const uint32_t nw = video_.native_width();
+                const uint32_t nh = video_.native_height();
+                if (nw > 0 && nh > 0) {
+                    const D2D1_RECT_F area = preview_media_area(target_.size(), preview_has_controls());
+                    const D2D1_RECT_F dest = preview_dest_dims(nw, nh, nw, nh, area);
+                    const auto px_w = static_cast<uint32_t>(std::max(1.0f, std::round(width(dest) * target_.scale())));
+                    const auto px_h = static_cast<uint32_t>(std::max(1.0f, std::round(height(dest) * target_.scale())));
+                    if (video_.set_output_size(px_w, px_h) &&
+                        video_.tick(sh_.gfx.d3d(), target_.dc()) == MediaTickStatus::DeviceLost) {
+                        recover();
+                        return false;
+                    }
+                }
+            }
+        } else if (gif_.active() && gif_.has_frame() && gif_.sync_bitmap(target_.dc()) == MediaTickStatus::DeviceLost) {
+            recover();
+            return false;
+        }
+        return true;
+    }
+
+    void sync_preview_timers() {
+        if (!hwnd_) return;
+        if (!visible() || !preview_valid()) {
+            KillTimer(hwnd_, TIMER_GIF);
+            KillTimer(hwnd_, TIMER_VIDEO);
+            return;
+        }
+        const Item& it = items_[preview_];
+        if (it.pt.p.k == 1) {
+            KillTimer(hwnd_, TIMER_GIF);
+            if (video_.active() && !video_.failed() && video_.is_playing()) {
+                SetTimer(hwnd_, TIMER_VIDEO, 16, nullptr);
+            } else {
+                KillTimer(hwnd_, TIMER_VIDEO);
+            }
+        } else {
+            KillTimer(hwnd_, TIMER_VIDEO);
+            if (gif_.has_animation() && gif_.playing()) {
+                SetTimer(hwnd_, TIMER_GIF, std::clamp(gif_.current_delay_ms(), 10u, 60000u), nullptr);
+            } else {
+                KillTimer(hwnd_, TIMER_GIF);
+            }
+        }
+    }
+
+    void invalidate_preview_controls() {
+        if (!visible()) return;
+        if (pv_ctrl_rect_.right <= pv_ctrl_rect_.left || pv_ctrl_rect_.bottom <= pv_ctrl_rect_.top) {
+            invalidate();
+            return;
+        }
+        pending_dirty_.push_back(D2D1::RectF(pv_ctrl_rect_.left - 4.0f, pv_ctrl_rect_.top - 4.0f,
+                                             pv_ctrl_rect_.right + 4.0f, pv_ctrl_rect_.bottom + 4.0f));
+        dirty_ = true;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void invalidate_preview_media() {
+        if (!visible()) return;
+        if (pv_media_rect_.right <= pv_media_rect_.left || pv_media_rect_.bottom <= pv_media_rect_.top) {
+            invalidate();
+            return;
+        }
+        pending_dirty_.push_back(D2D1::RectF(pv_media_rect_.left - 2.0f, pv_media_rect_.top - 2.0f,
+                                             pv_media_rect_.right + 2.0f, pv_media_rect_.bottom + 2.0f));
+        if (pv_ctrl_rect_.right > pv_ctrl_rect_.left && pv_ctrl_rect_.bottom > pv_ctrl_rect_.top) {
+            pending_dirty_.push_back(D2D1::RectF(pv_ctrl_rect_.left - 4.0f, pv_ctrl_rect_.top - 4.0f,
+                                                 pv_ctrl_rect_.right + 4.0f, pv_ctrl_rect_.bottom + 4.0f));
+        }
+        dirty_ = true;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void on_gif_worker() {
+        if (!preview_valid() || items_[preview_].pt.p.k == 1) return;
+        const bool had_anim = gif_.has_animation();
+        const bool had_frame = gif_.has_frame();
+        if (gif_.process_worker_signal()) {
+            sync_preview_timers();
+            if (had_anim != gif_.has_animation() || had_frame != gif_.has_frame() || gif_.settled_static()) {
+                invalidate();
+            } else {
+                invalidate_preview_media();
+            }
+        }
+    }
+
+    void on_gif_timer() {
+        KillTimer(hwnd_, TIMER_GIF);
+        if (!visible() || !preview_valid() || items_[preview_].pt.p.k == 1 || !gif_.has_animation() || !gif_.playing()) return;
+        const auto [advanced, wait_ms] = gif_.tick(std::chrono::steady_clock::now());
+        if (wait_ms > 0) SetTimer(hwnd_, TIMER_GIF, wait_ms, nullptr);
+        if (advanced) invalidate_preview_media();
+    }
+
+    void on_video_event() {
+        const bool had_frame = video_.has_frame();
+        const bool had_failed = video_.failed();
+        const bool changed = video_.process_events();
+        sync_preview_timers();
+        if (!preview_valid() || items_[preview_].pt.p.k != 1) return;
+        if (target_.ready()) {
+            const MediaTickStatus st = video_.tick(sh_.gfx.d3d(), target_.dc());
+            if (st == MediaTickStatus::DeviceLost) {
+                recover();
+                return;
+            }
+            if (had_frame != video_.has_frame() || had_failed != video_.failed()) {
+                invalidate();
+            } else if (st == MediaTickStatus::FrameReady || changed) {
+                last_scrubber_redraw_ = std::chrono::steady_clock::now();
+                invalidate_preview_media();
+            }
+        } else if (changed) {
+            invalidate();
+        }
+    }
+
+    void on_video_timer() {
+        if (!visible() || !preview_valid() || items_[preview_].pt.p.k != 1 || !video_.active() || !video_.is_playing()) {
+            KillTimer(hwnd_, TIMER_VIDEO);
+            return;
+        }
+        const bool had_frame = video_.has_frame();
+        const MediaTickStatus st = target_.ready() ? video_.tick(sh_.gfx.d3d(), target_.dc()) : MediaTickStatus::NoChange;
+        if (st == MediaTickStatus::DeviceLost) {
+            recover();
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (st == MediaTickStatus::FrameReady) {
+            last_scrubber_redraw_ = now;
+            if (!had_frame) {
+                invalidate();
+            } else {
+                invalidate_preview_media();
+            }
+        } else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_scrubber_redraw_).count() >= 200) {
+            last_scrubber_redraw_ = now;
+            invalidate_preview_controls();
+        }
+    }
 
     void open_preview(int index) {
         if (index < 0 || index >= static_cast<int>(items_.size())) return;
@@ -1596,6 +1829,14 @@ private:
         if (preview_ < 0) return;
         const int last = preview_;
         preview_ = -1;
+        dragging_seek_ = false;
+        pv_media_rect_ = {};
+        pv_ctrl_rect_ = {};
+        pv_seek_rect_ = {};
+        KillTimer(hwnd_, TIMER_GIF);
+        KillTimer(hwnd_, TIMER_VIDEO);
+        gif_.close();
+        video_.close();
         sh_.previews.clear();
         clear_hover();
         if (restore_focus && last < static_cast<int>(items_.size())) {
@@ -1611,8 +1852,15 @@ private:
     }
 
     void preview_go(int index) {
-        if (items_.empty()) return close_preview(false);
+        if (items_.empty()) {
+            close_preview(false);
+            return;
+        }
         index = std::clamp(index, 0, static_cast<int>(items_.size()) - 1);
+        dragging_seek_ = false;
+        pv_media_rect_ = {};
+        pv_ctrl_rect_ = {};
+        pv_seek_rect_ = {};
         preview_ = index;
         focus_ = index;
         selected_ = {items_[index].pt.id};
@@ -1631,7 +1879,7 @@ private:
 
     /// Decodes are bounded by the monitor, so the image is sharp even when the window goes fullscreen.
     [[nodiscard]] UINT preview_px() const {
-        MONITORINFO mi{sizeof(mi)};
+        MONITORINFO mi{.cbSize = sizeof(mi)};
         GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi);
         return static_cast<UINT>(std::max({mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, 256L}));
     }
@@ -1639,29 +1887,120 @@ private:
     void request_preview() {
         if (!preview_valid()) return;
         const UINT px = preview_px();
-        auto want = [&](int k) {
-            if (k >= 0 && k < static_cast<int>(items_.size())) sh_.previews.request(items_[k].pt.id, item_path(items_[k]), px);
+        const auto want = [&](int k) {
+            if (k >= 0 && k < static_cast<int>(items_.size())) {
+                sh_.previews.request(items_[static_cast<size_t>(k)].pt.id, item_path(items_[static_cast<size_t>(k)]), px);
+            }
         };
         // Newest requests are served first: neighbours, then the shown one
         want(preview_ + 1);
         want(preview_ - 1);
         want(preview_);
         const Item& it = items_[preview_];
-        if (thumb_px_ && !sh_.thumbs.get(it.pt.id)) sh_.thumbs.request(it.pt.id, item_path(it), thumb_px_);
+        const std::wstring path = item_path(it);
+        if (thumb_px_ && !sh_.thumbs.get(it.pt.id)) sh_.thumbs.request(it.pt.id, path, thumb_px_);
+
+        if (it.pt.p.k == 1) {
+            gif_.close();
+            video_.set_muted(sh_.test_mode || video_muted_);
+            video_.open(path, sh_.gfx.d3d(), sh_.gfx.epoch());
+        } else if (is_gif_path(it.name)) {
+            video_.close();
+            gif_.open(it.pt.id, path, px);
+        } else {
+            video_.close();
+            gif_.close();
+        }
+        sync_preview_timers();
     }
 
-    /// Where the image goes: fitted to `area`, never enlarged past its own pixel size.
-    [[nodiscard]] D2D1_RECT_F preview_dest(const Item& it, ID2D1Bitmap* bmp, D2D1_RECT_F area) const {
-        const D2D1_SIZE_U ps = bmp->GetPixelSize();
-        const float bw = static_cast<float>(std::max(1u, ps.width)), bh = static_cast<float>(std::max(1u, ps.height));
-        // A thumbnail stands in at the original's size so nothing jumps when the full decode lands
-        const float native = it.pt.p.w && it.pt.p.h ? static_cast<float>(std::max(it.pt.p.w, it.pt.p.h)) : std::max(bw, bh);
-        const float k = std::max(native, std::max(bw, bh)) / std::max(bw, bh) / target_.scale();
-        const float nw = bw * k, nh = bh * k;
-        const float s = std::min({1.0f, width(area) / nw, height(area) / nh});
-        const float w = std::round(nw * s), h = std::round(nh * s);
-        const float x = std::round((area.left + area.right - w) / 2), y = std::round((area.top + area.bottom - h) / 2);
-        return rect(x, y, w, h);
+    void draw_preview_controls(Canvas& cv, D2D1_SIZE_F sz, D2D1_RECT_F area, D2D1_RECT_F dest,
+                               const Item& it, bool is_video, bool is_gif) {
+        const bool is_video_ctrl = is_video && video_.active() && !video_.failed();
+        const bool is_gif_ctrl = is_gif && gif_.has_animation();
+        if (!is_video_ctrl && !is_gif_ctrl) {
+            pv_ctrl_rect_ = {};
+            pv_seek_rect_ = {};
+            return;
+        }
+
+        const float max_bar_w = std::max(280.0f, sz.width - 140.0f);
+        const float cw = std::clamp(std::max(320.0f, width(dest)), 280.0f, max_bar_w);
+        const float cx = (sz.width - cw) * 0.5f;
+        const D2D1_RECT_F ctrl = rect(cx, area.bottom + 4.0f, cw, 34.0f);
+        pv_ctrl_rect_ = ctrl;
+
+        cv.fill_round(ctrl, 17.0f, with_alpha(color::surface_low, 0.92f));
+        cv.stroke_round(ctrl, 17.0f, color::outline_variant, 1.0f);
+        cv.hit(ctrl, IdPvBar);
+
+        float lx = ctrl.left + 5.0f;
+        float rx = ctrl.right - 5.0f;
+        const bool playing = is_video_ctrl ? video_.is_playing() : gif_.playing();
+        const D2D1_RECT_F play_r = rect(lx, ctrl.top + 3.0f, 28.0f, 28.0f);
+        icon_button(cv, play_r, playing ? glyph::pause : glyph::play, IdPvPlay);
+        lx += 32.0f;
+
+        float ratio = 0.0f;
+        if (is_video_ctrl) {
+            const D2D1_RECT_F mute_r = rect(rx - 28.0f, ctrl.top + 3.0f, 28.0f, 28.0f);
+            icon_button(cv, mute_r, video_.is_muted() ? glyph::mute : glyph::volume, IdPvMute, video_.is_muted());
+            rx -= 32.0f;
+
+            double dur_s = video_.duration();
+            if (dur_s <= 0.0 && it.pt.p.d > 0) dur_s = static_cast<double>(it.pt.p.d) / 1000.0;
+            const double cur_s = dragging_seek_ ? static_cast<double>(seek_drag_ratio_) * dur_s : video_.current_time();
+            ratio = dragging_seek_ ? seek_drag_ratio_
+                                   : (dur_s > 0.0 ? static_cast<float>(std::clamp(cur_s / dur_s, 0.0, 1.0)) : 0.0f);
+
+            const std::wstring cur_str = format_duration_ms(static_cast<uint64_t>(std::max(0.0, cur_s * 1000.0)));
+            const std::wstring dur_str = dur_s > 0.0
+                ? format_duration_ms(static_cast<uint64_t>(dur_s * 1000.0))
+                : L"--:--";
+            const float cur_w = std::max(34.0f, cv.measure(cur_str, Font::MonoSmall) + 6.0f);
+            const float dur_w = std::max(34.0f, cv.measure(dur_str, Font::MonoSmall) + 6.0f);
+            cv.text(cur_str, rect(lx, ctrl.top, cur_w, height(ctrl)), Font::MonoSmall, color::on_surface_variant, Align::Center);
+            lx += cur_w + 4.0f;
+            cv.text(dur_str, rect(rx - dur_w, ctrl.top, dur_w, height(ctrl)), Font::MonoSmall, color::outline, Align::Center);
+            rx -= dur_w + 4.0f;
+        } else {
+            const D2D1_RECT_F badge_r = rect(lx + 2.0f, ctrl.top + 8.0f, 30.0f, 18.0f);
+            cv.fill_round(badge_r, 9.0f, with_alpha(color::surface_highest, 0.95f));
+            cv.text(L"GIF", badge_r, Font::Label, color::primary, Align::Center);
+            lx += 36.0f;
+
+            const size_t total = gif_.frame_count();
+            const size_t cur = dragging_seek_
+                ? static_cast<size_t>(std::lround(seek_drag_ratio_ * static_cast<float>(total > 0 ? total - 1 : 0)))
+                : gif_.current_frame();
+            ratio = dragging_seek_ ? seek_drag_ratio_
+                                   : (total > 1 ? static_cast<float>(cur) / static_cast<float>(total - 1) : 0.0f);
+
+            const std::wstring fstr = std::to_wstring(cur + 1) + L"/" + std::to_wstring(total);
+            const float fw = std::max(38.0f, cv.measure(fstr, Font::MonoSmall) + 8.0f);
+            cv.text(fstr, rect(rx - fw, ctrl.top, fw, height(ctrl)), Font::MonoSmall, color::outline, Align::Center);
+            rx -= fw + 4.0f;
+        }
+
+        const float sx0 = lx + 6.0f;
+        const float sx1 = rx - 6.0f;
+        if (sx1 > sx0 + 16.0f) {
+            pv_seek_rect_ = D2D1::RectF(sx0, ctrl.top, sx1, ctrl.bottom);
+            const float cy = (ctrl.top + ctrl.bottom) * 0.5f;
+            const D2D1_RECT_F track = D2D1::RectF(sx0, cy - 2.0f, sx1, cy + 2.0f);
+            cv.fill_round(track, 2.0f, color::surface_highest);
+
+            const float thumb_x = sx0 + ((sx1 - sx0) * std::clamp(ratio, 0.0f, 1.0f));
+            if (thumb_x > sx0 + 0.5f) {
+                cv.fill_round(D2D1::RectF(sx0, cy - 2.0f, thumb_x, cy + 2.0f), 2.0f, color::primary);
+            }
+            const float ha = hover_.alpha(IdPvSeek);
+            const float rad = (dragging_seek_ || ha > 0.05f) ? 5.5f : 4.2f;
+            cv.fill_circle({.x = thumb_x, .y = cy}, rad, lerp_color(color::on_surface, color::primary, dragging_seek_ ? 1.0f : ha * 0.5f));
+            cv.hit(D2D1::RectF(sx0 - 6.0f, ctrl.top, sx1 + 6.0f, ctrl.bottom), IdPvSeek);
+        } else {
+            pv_seek_rect_ = {};
+        }
     }
 
     void draw_preview(Canvas& cv, D2D1_SIZE_F sz) {
@@ -1675,31 +2014,63 @@ private:
         // Backdrop below the title bar closes the viewer; the bar itself still drags the window
         cv.hit(D2D1::RectF(0, PV_TOP, sz.width, sz.height), IdPreview);
 
-        // Image
-        const D2D1_RECT_F area = D2D1::RectF(16, PV_TOP, sz.width - 16, sz.height - PV_BOTTOM);
-        ID2D1Bitmap1* full = sh_.previews.get(it.pt.id);
-        ID2D1Bitmap1* bmp = full ? full : sh_.thumbs.get(it.pt.id);
-        const bool loading = !full && !sh_.previews.failed(it.pt.id);
+        const bool is_video = (it.pt.p.k == 1);
+        const bool is_gif_ready = !is_video && gif_.has_animation() && gif_.has_frame() && gif_.bitmap();
+        const D2D1_RECT_F area = preview_media_area(sz, preview_has_controls());
+
         D2D1_RECT_F dest = inset(area, width(area) * 0.3f, height(area) * 0.3f);
-        if (bmp) {
-            dest = preview_dest(it, bmp, area);
+        if (is_video && video_.has_frame() && video_.bitmap()) {
+            dest = preview_dest_dims(video_.native_width(), video_.native_height(), video_.native_width(), video_.native_height(), area);
             cv.shadow(dest, 4, 14, 0.35f);
-            cv.bitmap(bmp, dest);
+            const D2D1_RECT_F src = D2D1::RectF(0.0f, 0.0f, static_cast<float>(video_.frame_width()), static_cast<float>(video_.frame_height()));
+            cv.bitmap_region(video_.bitmap(), dest, src, D2D1_INTERPOLATION_MODE_LINEAR);
             cv.hit(dest, IdPvImage);
-            if (loading) draw_spinner(cv, {dest.right - 20, dest.bottom - 20});
-        } else if (loading) {
-            draw_spinner(cv, {(area.left + area.right) / 2, (area.top + area.bottom) / 2});
+        } else if (is_video && video_.audio_only() && !video_.failed()) {
+            ID2D1Bitmap1* poster = sh_.thumbs.get(it.pt.id);
+            if (poster) {
+                dest = preview_dest(it, poster, area);
+                cv.shadow(dest, 4, 14, 0.35f);
+                cv.bitmap(poster, dest);
+                cv.hit(dest, IdPvImage);
+            } else {
+                cv.icon(glyph::video, rect(area.left, ((area.top + area.bottom) / 2) - 20, width(area), 40), color::on_surface_variant, Font::IconLarge);
+            }
+        } else if (is_gif_ready) {
+            ID2D1Bitmap1* gbmp = gif_.bitmap();
+            const D2D1_SIZE_U gps = gbmp->GetPixelSize();
+            const uint32_t mw = gif_.native_width() > 0 ? gif_.native_width() : it.pt.p.w;
+            const uint32_t mh = gif_.native_height() > 0 ? gif_.native_height() : it.pt.p.h;
+            dest = preview_dest_dims(gps.width, gps.height, mw, mh, area);
+            cv.shadow(dest, 4, 14, 0.35f);
+            cv.bitmap(gbmp, dest);
+            cv.hit(dest, IdPvImage);
         } else {
-            cv.icon(it.pt.p.k == 1 ? glyph::video : glyph::photo, rect(area.left, (area.top + area.bottom) / 2 - 40, width(area), 40), color::outline, Font::IconLarge);
-            cv.text(L"No preview available", rect(area.left, (area.top + area.bottom) / 2, width(area), 24), Font::Body, color::outline, Align::Center);
+            ID2D1Bitmap1* full = sh_.previews.get(it.pt.id);
+            ID2D1Bitmap1* bmp = full ? full : sh_.thumbs.get(it.pt.id);
+            const bool loading = is_video ? video_.is_loading() : (!full && !sh_.previews.failed(it.pt.id));
+            if (bmp) {
+                dest = preview_dest(it, bmp, area);
+                cv.shadow(dest, 4, 14, 0.35f);
+                cv.bitmap(bmp, dest);
+                cv.hit(dest, IdPvImage);
+                if (loading) draw_spinner(cv, {.x = dest.right - 20, .y = dest.bottom - 20});
+            } else if (loading) {
+                draw_spinner(cv, {.x = (area.left + area.right) / 2, .y = (area.top + area.bottom) / 2});
+            } else {
+                cv.icon(is_video ? glyph::video : glyph::photo, rect(area.left, ((area.top + area.bottom) / 2) - 40, width(area), 40), color::outline, Font::IconLarge);
+                cv.text(L"No preview available", rect(area.left, (area.top + area.bottom) / 2, width(area), 24), Font::Body, color::outline, Align::Center);
+            }
+            if (is_video && video_.failed()) {
+                const D2D1_POINT_2F c{.x = (dest.left + dest.right) / 2, .y = (dest.top + dest.bottom) / 2};
+                const float ha = hover_.alpha(IdPvPlay);
+                cv.fill_circle(c, 30, hex(0x000000, lerp(0.55f, 0.75f, ha)));
+                cv.icon(glyph::play, rect(c.x - 28, c.y - 30, 60, 60), lerp_color(hex(0xffffff), color::primary, ha), Font::IconLarge);
+                cv.hit(rect(c.x - 30, c.y - 30, 60, 60), IdPvPlay);
+            }
         }
-        if (it.pt.p.k == 1) {
-            const D2D1_POINT_2F c{(dest.left + dest.right) / 2, (dest.top + dest.bottom) / 2};
-            const float ha = hover_.alpha(IdPvPlay);
-            cv.fill_circle(c, 30, hex(0x000000, lerp(0.55f, 0.75f, ha)));
-            cv.icon(glyph::play, rect(c.x - 28, c.y - 30, 60, 60), lerp_color(hex(0xffffff), color::primary, ha), Font::IconLarge);
-            cv.hit(rect(c.x - 30, c.y - 30, 60, 60), IdPvPlay);
-        }
+        pv_media_rect_ = dest;
+
+        draw_preview_controls(cv, sz, area, dest, it, is_video, is_gif_ready);
 
         // Previous / next
         auto arrow = [&](bool next) {
@@ -1745,24 +2116,73 @@ private:
 
         // Footer: size, date, duration
         std::wstring meta = it.meta;
-        if (it.pt.p.k == 1 && it.pt.p.d) meta = format_duration_ms(it.pt.p.d) + L"  •  " + meta;
+        if (is_video && it.pt.p.d) meta = format_duration_ms(it.pt.p.d) + L"  •  " + meta;
         if (!it.date.empty()) meta += L"  •  " + it.date;
         cv.text(meta, D2D1::RectF(18, sz.height - PV_BOTTOM, sz.width - 18, sz.height), Font::Caption, color::outline, Align::Center);
     }
 
-    void preview_click(int id, bool dbl) {
+    void preview_seek_to_x(float x) {
+        if (!preview_valid() || pv_seek_rect_.right <= pv_seek_rect_.left) return;
+        const float ratio = std::clamp((x - pv_seek_rect_.left) / width(pv_seek_rect_), 0.0f, 1.0f);
+        seek_drag_ratio_ = ratio;
+        if (items_[preview_].pt.p.k == 1) {
+            const double dur = video_.duration();
+            if (dur > 0.0) video_.seek(static_cast<double>(ratio) * dur);
+        } else if (gif_.has_animation()) {
+            gif_.seek_fraction(ratio);
+            sync_preview_timers();
+        }
+    }
+
+    void preview_toggle_play() {
+        if (!preview_valid()) return;
+        if (items_[preview_].pt.p.k == 1 && !video_.failed()) {
+            video_.toggle_play();
+            sync_preview_timers();
+            invalidate_preview_controls();
+        } else if (gif_.has_animation()) {
+            gif_.toggle_play();
+            sync_preview_timers();
+            invalidate_preview_controls();
+        }
+    }
+
+    void preview_click(int id, D2D1_POINT_2F p, bool dbl) {
         const std::wstring path = item_path(items_[preview_]);
         switch (id) {
             case IdPvClose: close_preview(); return;
             case IdPvPrev: preview_step(-1); return;
             case IdPvNext: preview_step(1); return;
-            case IdPvOpen:
-            case IdPvPlay: open_file(path); return;
+            case IdPvOpen: open_file(path); return;
+            case IdPvPlay:
+                if (items_[preview_].pt.p.k == 1 && video_.failed()) {
+                    open_file(path);
+                } else {
+                    preview_toggle_play();
+                }
+                return;
+            case IdPvMute:
+                if (items_[preview_].pt.p.k == 1 && !video_.failed()) {
+                    video_muted_ = !video_muted_;
+                    video_.set_muted(sh_.test_mode || video_muted_);
+                    invalidate_preview_controls();
+                }
+                return;
+            case IdPvSeek:
+                dragging_seek_ = true;
+                SetCapture(hwnd_);
+                preview_seek_to_x(p.x);
+                invalidate_preview_media();
+                return;
+            case IdPvBar: return;
             case IdPvReveal: reveal_in_explorer(path); return;
             case IdPvCopy: copy_media({&items_[preview_]}); return;
             case IdPvImage:
-                if (dbl) open_file(path);
-                else begin_drag_detect(preview_);
+                if (dbl) {
+                    open_file(path);
+                } else {
+                    begin_drag_detect(preview_);
+                }
                 return;
             case IdPreview:
                 if (!dbl) {
@@ -1776,7 +2196,8 @@ private:
     }
 
     bool preview_key(UINT vk) {
-        const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+        const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+        const bool shift = GetKeyState(VK_SHIFT) < 0;
         const Item& it = items_[preview_];
         switch (vk) {
             case VK_LEFT:
@@ -1792,11 +2213,48 @@ private:
                 close_preview();
                 return true;
             case VK_RETURN: open_file(item_path(it)); return true;
+            case 'K':
+            case 'P':
+            case VK_MEDIA_PLAY_PAUSE:
+                preview_toggle_play();
+                return true;
+            case 'M':
+                if (it.pt.p.k == 1 && !video_.failed()) {
+                    video_muted_ = !video_muted_;
+                    video_.set_muted(sh_.test_mode || video_muted_);
+                    invalidate_preview_controls();
+                }
+                return true;
+            case 'J':
+            case VK_OEM_COMMA:
+                if (it.pt.p.k == 1 && !video_.failed()) {
+                    video_.seek_relative(vk == 'J' ? -5.0 : -0.05);
+                    invalidate_preview_media();
+                } else if (gif_.has_animation()) {
+                    gif_.step_frame(-1);
+                    sync_preview_timers();
+                    invalidate_preview_media();
+                }
+                return true;
+            case 'L':
+            case VK_OEM_PERIOD:
+                if (it.pt.p.k == 1 && !video_.failed()) {
+                    video_.seek_relative(vk == 'L' ? 5.0 : 0.05);
+                    invalidate_preview_media();
+                } else if (gif_.has_animation()) {
+                    gif_.step_frame(1);
+                    sync_preview_timers();
+                    invalidate_preview_media();
+                }
+                return true;
             default: break;
         }
         if (ctrl && vk == 'C') {
-            if (shift) set_clipboard_text(hwnd_, item_path(it));
-            else copy_media({&it});
+            if (shift) {
+                set_clipboard_text(hwnd_, item_path(it));
+            } else {
+                copy_media({&it});
+            }
         } else if (ctrl && vk == 'E') {
             reveal_in_explorer(item_path(it));
         } else if (ctrl && vk == 'S') {
@@ -1894,6 +2352,16 @@ private:
                 }
             }
         }
+        if (dragging_seek_) {
+            if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
+                dragging_seek_ = false;
+                ReleaseCapture();
+            } else {
+                preview_seek_to_x(p.x);
+                invalidate_preview_media();
+                return;
+            }
+        }
         if (dragging_scroll_) {
             if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
                 dragging_scroll_ = false;
@@ -1976,8 +2444,8 @@ private:
             return;
         }
         if (preview_valid() && !menu_open_) {
-            preview_click(id, dbl);
-            invalidate();
+            preview_click(id, p, dbl);
+            if (id != IdPvBar && id != IdPvPlay && id != IdPvMute && id != IdPvSeek) invalidate();
             return;
         }
         if (drop_open_ && id != IdDrop && id != IdDropItem && id != IdTagBtn && id != IdField) {
@@ -2099,7 +2567,7 @@ private:
         clear_tooltip_now();
         const Hit* h = hit_test(hits_, p);
         if (preview_valid()) {
-            if (h && (h->id == IdPvImage || h->id == IdPvPlay)) {
+            if (h && (h->id == IdPvImage || (h->id == IdPvPlay && items_[preview_].pt.p.k == 1 && video_.failed()))) {
                 selected_ = {items_[preview_].pt.id};
                 open_menu(preview_, p);
             } else if (menu_open_) {
@@ -2210,9 +2678,9 @@ private:
             }
         }
         if (ctrl && !selected_.empty()) {
-            if (vk == 'E') return menu_action_selected(ActReveal);
-            if (vk == 'S') return menu_action_selected(ActSimilar);
-            if (vk == 'C' && !field_.focused) return menu_action_selected(shift ? ActCopyPath : ActCopy);
+            if (vk == 'E') { menu_action_selected(ActReveal); return; }
+            if (vk == 'S') { menu_action_selected(ActSimilar); return; }
+            if (vk == 'C' && !field_.focused) { menu_action_selected(shift ? ActCopyPath : ActCopy); return; }
             if (vk == 'A' && !field_.focused) {
                 for (const auto& it : items_) selected_.insert(it.pt.id);
                 invalidate();
@@ -2410,6 +2878,7 @@ private:
             case WM_CAPTURECHANGED:
                 selecting_text_ = false;
                 dragging_scroll_ = false;
+                dragging_seek_ = false;
                 end_drag_detect();
                 return 0;
             case WM_SETCURSOR:
@@ -2423,7 +2892,7 @@ private:
                     ScreenToClient(hwnd_, &pt);
                     const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
                     const int id = h ? h->id : 0;
-                    SetCursor(id == IdField || id == IdMenuField ? cursor_ibeam_ : (id == IdNone || id == IdGrid || id == IdMenu || id == IdDrop || id == IdHelp || id == IdCard || id == IdCardName || id == IdCardDir || id == IdPreview || id == IdPvImage || id == IdPvPath) ? cursor_arrow_ : cursor_hand_);
+                    SetCursor(id == IdField || id == IdMenuField ? cursor_ibeam_ : (id == IdNone || id == IdGrid || id == IdMenu || id == IdDrop || id == IdHelp || id == IdCard || id == IdCardName || id == IdCardDir || id == IdPreview || id == IdPvImage || id == IdPvPath || id == IdPvBar) ? cursor_arrow_ : cursor_hand_);
                     return TRUE;
                 }
                 break;
@@ -2451,6 +2920,7 @@ private:
             case WM_LBUTTONUP:
                 selecting_text_ = false;
                 if (dragging_scroll_) dragging_scroll_ = false;
+                if (dragging_seek_) dragging_seek_ = false;
                 end_drag_detect();
                 ReleaseCapture();
                 return 0;
@@ -2510,9 +2980,13 @@ private:
                         }
                         return 0;
                     }
+                    case TIMER_GIF: on_gif_timer(); return 0;
+                    case TIMER_VIDEO: on_video_timer(); return 0;
                 }
                 return 0;
             case WM_APP_THUMBS: on_thumbs(); return 0;
+            case WM_APP_GIF: on_gif_worker(); return 0;
+            case WM_APP_VIDEO: on_video_event(); return 0;
             case WM_APP_CALL:
                 if (wp == 1) {
                     run_search(pagination_.next_offset());
@@ -2602,6 +3076,17 @@ private:
     UINT thumb_px_ = 0;      // card thumbnail size last requested by the grid
     bool swallow_space_ = false;
     bool swallow_dbl_ = false;
+
+    uint64_t gfx_epoch_ = 0;
+    bool video_muted_ = false;
+    bool dragging_seek_ = false;
+    float seek_drag_ratio_ = 0.0f;
+    D2D1_RECT_F pv_media_rect_{};
+    D2D1_RECT_F pv_ctrl_rect_{};
+    D2D1_RECT_F pv_seek_rect_{};
+    std::chrono::steady_clock::time_point last_scrubber_redraw_{};
+    GifPlayer gif_;
+    VideoPlayer video_;
 
     bool drag_pending_ = false; // left button down on media, not yet past the drag threshold
     bool dragging_out_ = false;

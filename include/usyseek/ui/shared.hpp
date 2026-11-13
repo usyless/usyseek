@@ -19,6 +19,8 @@ inline constexpr UINT WM_APP_THUMBS = WM_APP + 10;
 inline constexpr UINT WM_APP_RESULT = WM_APP + 11;
 inline constexpr UINT WM_APP_CALL = WM_APP + 12;
 inline constexpr UINT WM_APP_REDRAW = WM_APP + 13; // coalesced "something changed" from a worker thread
+inline constexpr UINT WM_APP_GIF = WM_APP + 14;    // decoded animated GIF frame ready
+inline constexpr UINT WM_APP_VIDEO = WM_APP + 15;  // Media Foundation video event ready
 
 inline std::wstring format_hotkey(uint32_t mods, uint32_t vk) {
     std::wstring t;

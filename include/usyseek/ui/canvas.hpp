@@ -92,6 +92,8 @@ inline constexpr wchar_t zoom = 0xE8A3;
 inline constexpr wchar_t link = 0xE71B;
 inline constexpr wchar_t chevron_left = 0xE76B;
 inline constexpr wchar_t chevron_right = 0xE76C;
+inline constexpr wchar_t volume = 0xE767;
+inline constexpr wchar_t mute = 0xE74F;
 } // namespace glyph
 
 enum class Font : uint8_t {
@@ -404,6 +406,13 @@ public:
     void bitmap(ID2D1Bitmap* bmp, D2D1_RECT_F dest) {
         if (!bmp || !intersects_clip(dest, 1.0f)) return;
         dc_->DrawBitmap(bmp, &dest, opacity_, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
+    }
+
+    /// Draws `src` rectangle (in bitmap DIPs) mapped into `dest`.
+    void bitmap_region(ID2D1Bitmap* bmp, D2D1_RECT_F dest, D2D1_RECT_F src,
+                       D2D1_INTERPOLATION_MODE mode = D2D1_INTERPOLATION_MODE_LINEAR) {
+        if (!bmp || !intersects_clip(dest, 1.0f)) return;
+        dc_->DrawBitmap(bmp, &dest, opacity_, mode, &src, nullptr);
     }
 
     /// Height of wrapped text in `w` DIPs.
