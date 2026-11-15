@@ -65,6 +65,7 @@ public:
     explicit SettingsWindow(Shared& s) : sh_{s} {}
 
     bool create(HINSTANCE inst) {
+        inst_ = inst;
         WNDCLASSEXW wc{sizeof(wc)};
         wc.style = CS_DBLCLKS;
         wc.lpfnWndProc = &SettingsWindow::wndproc;
@@ -119,7 +120,7 @@ public:
 
     void show(int tab = -1) {
         if (tab >= 0) {
-            tab_ = std::clamp(tab, 0, 2);
+            tab_ = std::clamp(tab, 0, 3);
             scroll_ = target_scroll_ = 0.0f;
         }
         sync_fields();
@@ -259,6 +260,7 @@ private:
         IdTab0,
         IdTab1,
         IdTab2,
+        IdTab3,
         IdToggleIndex,
         IdOpenQdrantUi,
         IdClearDatabase,
@@ -290,6 +292,7 @@ private:
         IdToggleHideFocus,
         IdIdleStep,
         IdThumbFit,
+        IdThumbDblClick,
         IdBrowseModelDir,
         IdModelChip,
         IdModelField,
@@ -579,11 +582,12 @@ private:
         int id;
     };
 
-    static std::array<TabDef, 3> tab_defs() {
+    static std::array<TabDef, 4> tab_defs() {
         return {{
             {glyph::clock, L"Embeddings & Progress", IdTab0},
             {glyph::settings, L"Application & Venv Settings", IdTab1},
             {glyph::warning, L"Notifications", IdTab2},
+            {glyph::info, L"About", IdTab3},
         }};
     }
 
@@ -598,8 +602,8 @@ private:
 
     FlowResult tab_layout(float total_w) const {
         std::vector<FlowItem> items;
-        items.reserve(3);
-        for (int i = 0; i < 3; ++i) {
+        items.reserve(4);
+        for (int i = 0; i < 4; ++i) {
             items.push_back({sh_.fonts.measure(tab_label(i), Font::BodySemi) + 46.0f, TABS_H - 16.0f});
         }
         return flow_layout(items, 8.0f, 8.0f, total_w - PAD * 2.0f);
@@ -627,8 +631,10 @@ private:
             y = draw_tab_progress(cv, cx, y, cw);
         } else if (tab_ == 1) {
             y = draw_tab_settings(cv, cx, y, cw);
-        } else {
+        } else if (tab_ == 2) {
             y = draw_tab_notifications(cv, cx, y, cw);
+        } else {
+            y = draw_tab_about(cv, cx, y, cw);
         }
 
         content_h_ = (y + scroll_ - view.top) + PAD;
@@ -667,16 +673,16 @@ private:
         cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(color::surface_lowest, 0.75f));
         const auto tabs = tab_defs();
         const FlowResult layout = tab_layout(sz.width);
-        D2D1_RECT_F rects[3]{};
-        for (int i = 0; i < 3; ++i) {
+        D2D1_RECT_F rects[4]{};
+        for (int i = 0; i < 4; ++i) {
             const FlowPlacement& p = layout.placements[i];
             rects[i] = rect(PAD + p.x, 8.0f + p.y, p.width, TABS_H - 16.0f);
         }
-        const float t = std::clamp(tab_anim_.value, 0.0f, 2.0f);
-        const int i0 = std::clamp(static_cast<int>(std::floor(t)), 0, 2);
-        const int i1 = std::clamp(i0 + 1, 0, 2);
+        const float t = std::clamp(tab_anim_.value, 0.0f, 3.0f);
+        const int i0 = std::clamp(static_cast<int>(std::floor(t)), 0, 3);
+        const int i1 = std::clamp(i0 + 1, 0, 3);
         const float frac = t - static_cast<float>(i0);
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 4; ++i) {
             const float act = std::clamp(1.0f - std::abs(t - static_cast<float>(i)), 0.0f, 1.0f);
             if (const float ha = hover_alpha(tabs[i].id); act < 0.5f && ha > 0.002f) {
                 cv.fill_round(rects[i], 10.0f, with_alpha(color::on_surface, 0.07f * ha));
@@ -685,7 +691,7 @@ private:
         cv.fill_round(lerp_rect(rects[i0], rects[i1], frac), 10.0f, color::primary_container);
         const bool any_notifs = !sh_.notifications.empty();
         const bool has_errors = sh_.error_notification_count() > 0;
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 4; ++i) {
             const D2D1_RECT_F r = rects[i];
             const float act = std::clamp(1.0f - std::abs(t - static_cast<float>(i)), 0.0f, 1.0f);
             const std::wstring lbl = tab_label(i);
@@ -787,6 +793,70 @@ private:
             y += card_h + 10.0f;
         }
         return y;
+    }
+
+    ID2D1Bitmap1* ensure_app_icon(Canvas& cv) {
+        const uint64_t epoch = sh_.gfx.epoch();
+        if (app_icon_ && app_icon_epoch_ == epoch) return app_icon_.get();
+        app_icon_.reset();
+        app_icon_epoch_ = epoch;
+        IWICImagingFactory* wic = sh_.gfx.wic();
+        if (!wic || !inst_) return nullptr;
+        HICON hi = static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(101), IMAGE_ICON, 128, 128, LR_DEFAULTCOLOR));
+        if (!hi) hi = static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(101), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
+        if (!hi) return nullptr;
+        wil::unique_hicon own_icon{hi};
+        wil::com_ptr<IWICBitmap> wic_bmp;
+        if (FAILED(wic->CreateBitmapFromHICON(own_icon.get(), &wic_bmp))) return nullptr;
+        wil::com_ptr<IWICFormatConverter> conv;
+        if (FAILED(wic->CreateFormatConverter(&conv))) return nullptr;
+        if (FAILED(conv->Initialize(wic_bmp.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
+            return nullptr;
+        }
+        cv.dc()->CreateBitmapFromWicBitmap(conv.get(), nullptr, &app_icon_);
+        return app_icon_.get();
+    }
+
+    float draw_tab_about(Canvas& cv, float x, float y, float w) {
+        const float lx = x + 22.0f, rw = w - 44.0f;
+        const std::wstring version_line = std::wstring{L"Version "} + APP_VERSION + L"  •  by usy";
+        const std::wstring ai_title = L"AI-generated codebase";
+        const std::wstring ai_desc = L"All source code in usyseek was written by AI.";
+        const float box_pad_x = 18.0f;
+        const float box_inner_w = std::max(120.0f, rw - box_pad_x * 2.0f);
+        const float ai_title_h = text_height(cv, ai_title, Font::BodySemi, box_inner_w, 22.0f);
+        const float ai_desc_h = text_height(cv, ai_desc, Font::Small, box_inner_w, 18.0f);
+        const float box_h = 14.0f + ai_title_h + 4.0f + ai_desc_h + 14.0f;
+
+        constexpr float icon_sz = 72.0f;
+        const float icon_y = y + 32.0f;
+        const float name_y = icon_y + icon_sz + 14.0f;
+        const float ver_y = name_y + 28.0f;
+        const float line_y = ver_y + 22.0f + 18.0f;
+        const float box_y = line_y + 18.0f;
+        const float h = (box_y + box_h + 24.0f) - y;
+
+        const float next_y = card_begin(cv, x, y, w, h);
+
+        const D2D1_RECT_F icon_r = rect(std::round(x + (w - icon_sz) * 0.5f), icon_y, icon_sz, icon_sz);
+        if (ID2D1Bitmap1* bmp = ensure_app_icon(cv)) {
+            cv.bitmap(bmp, icon_r);
+        } else {
+            cv.icon(glyph::search, icon_r, color::primary, Font::IconLarge);
+        }
+        cv.text(APP_NAME, rect(lx, name_y, rw, 26.0f), Font::Title, color::on_surface, Align::Center);
+        cv.text(version_line, rect(lx, ver_y, rw, 22.0f), Font::Body, color::on_surface_variant, Align::Center);
+        cv.hline(lx, lx + rw, line_y, with_alpha(color::outline_variant, 0.5f));
+
+        const D2D1_RECT_F box_r = rect(lx, box_y, rw, box_h);
+        cv.fill_round(box_r, 12.0f, with_alpha(color::surface_high, 0.55f));
+        cv.stroke_round(box_r, 12.0f, with_alpha(color::outline_variant, 0.45f));
+        cv.text_wrap(ai_title, rect(lx + box_pad_x, box_y + 14.0f, box_inner_w, ai_title_h),
+                     Font::BodySemi, color::on_surface, Align::Center);
+        cv.text_wrap(ai_desc, rect(lx + box_pad_x, box_y + 14.0f + ai_title_h + 4.0f, box_inner_w, ai_desc_h),
+                     Font::Small, color::on_surface_variant, Align::Center);
+
+        return next_y;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1269,6 +1339,16 @@ private:
                 draw_button(cv, r, 0, L"Whole image (fit)", IdThumbFit, static_cast<int>(ThumbFit::Contain), contain ? 1 : 0);
             });
 
+            const bool dbl_preview = parse_thumb_dblclick(sh_.settings.thumb_dblclick) == ThumbDblClick::Preview;
+            Flow dblclick{8.0f, 8.0f};
+            flow_text(cv, dblclick, L"Double-click thumbnail:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
+            dblclick.add(button_width(cv, L"Open in default app", true, 160.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::open, L"Open in default app", IdThumbDblClick, static_cast<int>(ThumbDblClick::Open), !dbl_preview ? 1 : 0);
+            });
+            dblclick.add(button_width(cv, L"Open preview", true, 136.0f), 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::zoom, L"Open preview", IdThumbDblClick, static_cast<int>(ThumbDblClick::Preview), dbl_preview ? 1 : 0);
+            });
+
             // The launcher could not register the shortcut: say so here instead of leaving a dead key
             const bool hotkey_warn = sh_.hotkey_unavailable() && !recording_hotkey_;
             const std::wstring hotkey_msg = format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk) +
@@ -1280,7 +1360,8 @@ private:
             const float options_line_y = keys_y + keys.height(rw) + (hotkey_warn ? 8.0f + hotkey_msg_h : 0.0f) + 14.0f;
             const float options_y = options_line_y + 10.0f;
             const float thumbs_y = options_y + options.height(rw) + 16.0f;
-            const float h = thumbs_y + thumbs.height(rw) + 16.0f - y;
+            const float dblclick_y = thumbs_y + thumbs.height(rw) + 10.0f;
+            const float h = dblclick_y + dblclick.height(rw) + 16.0f - y;
             const float next_y = card_begin(cv, x, y, w, h);
 
             const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
@@ -1290,6 +1371,7 @@ private:
             cv.hline(lx, lx + rw, options_line_y, with_alpha(color::outline_variant, 0.5f));
             options.draw(lx, options_y, rw);
             thumbs.draw(lx, thumbs_y, rw);
+            dblclick.draw(lx, dblclick_y, rw);
             y = next_y;
         }
 
@@ -2446,6 +2528,7 @@ private:
             case IdTab0: set_tab(0); return;
             case IdTab1: set_tab(1); return;
             case IdTab2: set_tab(2); return;
+            case IdTab3: set_tab(3); return;
             case IdTestNotif: {
                 const bool balloon_sent = send_to_launcher(Cmd::TestNotification);
                 sh_.notify(
@@ -2645,6 +2728,11 @@ private:
                 break;
             case IdThumbFit:
                 sh_.settings.thumb_fit = idx == static_cast<int>(ThumbFit::Contain) ? "contain" : "crop";
+                sh_.save();
+                if (sh_.redraw_all) sh_.redraw_all();
+                break;
+            case IdThumbDblClick:
+                sh_.settings.thumb_dblclick = idx == static_cast<int>(ThumbDblClick::Preview) ? "preview" : "open";
                 sh_.save();
                 if (sh_.redraw_all) sh_.redraw_all();
                 break;
@@ -3121,8 +3209,11 @@ private:
     }
 
     Shared& sh_;
+    HINSTANCE inst_ = nullptr;
     HWND hwnd_ = nullptr;
     WindowTarget target_;
+    wil::com_ptr<ID2D1Bitmap1> app_icon_;
+    uint64_t app_icon_epoch_ = 0;
     std::vector<Hit> hits_;
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
     bool rendering_ = false;

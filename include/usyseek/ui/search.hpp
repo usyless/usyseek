@@ -358,6 +358,8 @@ private:
             const fs::path idx_exe = exe_dir() / L"usyseek-indexer.exe";
             std::wstring cmd = L"\"" + idx_exe.wstring() + L"\" --export-text";
             STARTUPINFOW si{sizeof(si)};
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
             wil::unique_handle job = make_kill_on_close_job();
             wil::unique_process_information pi;
             if (CreateProcessW(idx_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, exe_dir().c_str(), &si, &pi)) {

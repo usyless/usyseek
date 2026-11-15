@@ -116,6 +116,7 @@ public:
         raw_hover_id_ = IdNone;
         raw_hover_index_ = 0;
         hover_.set(IdNone, 0, false);
+        card_hover_.set(IdNone, 0, false);
         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
         pending_dirty_.clear();
         last_tooltip_dirty_.reset();
@@ -225,6 +226,12 @@ public:
             if (hover_.in_anim.value != hover_.in_anim.target) queue_hover_dirty(dirty_dips, hover_.id, hover_.index, full_dirty_);
             if (hover_.prev_id != IdNone && hover_.out_anim.value != hover_.out_anim.target) {
                 queue_hover_dirty(dirty_dips, hover_.prev_id, hover_.prev_index, full_dirty_);
+            }
+            if (card_hover_.in_anim.value != card_hover_.in_anim.target) {
+                queue_hover_dirty(dirty_dips, card_hover_.id, card_hover_.index, full_dirty_);
+            }
+            if (card_hover_.prev_id != IdNone && card_hover_.out_anim.value != card_hover_.out_anim.target) {
+                queue_hover_dirty(dirty_dips, card_hover_.prev_id, card_hover_.prev_index, full_dirty_);
             }
         } else {
             pending_dirty_.clear();
@@ -431,6 +438,10 @@ private:
         return help_pinned_ || raw_hover_id_ == IdHelpBtn || raw_hover_id_ == IdHelp || raw_hover_id_ == IdHelpItem;
     }
 
+    [[nodiscard]] static std::pair<int, int> card_hover_target(int id, int idx) noexcept {
+        return (id >= IdCard && id <= IdTagChip) ? std::pair<int, int>{IdCard, idx} : std::pair<int, int>{IdNone, 0};
+    }
+
     [[nodiscard]] static std::pair<int, int> visual_hover(int id, int idx) noexcept {
         switch (id) {
             case IdCardName:
@@ -533,9 +544,12 @@ private:
     void clear_hover(bool animate = false) {
         queue_hover_dirty(hover_.id, hover_.index);
         queue_hover_dirty(hover_.prev_id, hover_.prev_index);
+        queue_hover_dirty(card_hover_.id, card_hover_.index);
+        queue_hover_dirty(card_hover_.prev_id, card_hover_.prev_index);
         raw_hover_id_ = IdNone;
         raw_hover_index_ = 0;
         hover_.set(IdNone, 0, animate);
+        card_hover_.set(IdNone, 0, animate);
     }
 
     [[nodiscard]] float help_height_dip() const noexcept {
@@ -834,6 +848,7 @@ private:
         }
         if (chip_anim_.step(dt)) moving = true;
         if (hover_.step(dt)) moving = true;
+        if (card_hover_.step(dt)) moving = true;
         if (tooltip_.step(dt)) moving = true;
         return moving;
     }
@@ -857,7 +872,11 @@ private:
             case IdSettings: title = L"Settings"; return true;
             case IdFullscreen: title = fullscreen_ ? L"Exit fullscreen (Esc)" : L"Fullscreen"; return true;
             case IdClose: title = L"Hide (Esc)"; return true;
-            case IdCardPreview: title = L"Preview (Space)"; return true;
+            case IdCardPreview:
+                title = (parse_thumb_dblclick(sh_.settings.thumb_dblclick) == ThumbDblClick::Preview)
+                            ? L"Open in default app (Enter)"
+                            : L"Preview (Space)";
+                return true;
             case IdSimilar: title = L"Find similar (Ctrl+S)"; return true;
             case IdCardName:
             case IdCardDir:
@@ -1191,9 +1210,7 @@ private:
     }
 
     [[nodiscard]] float card_hover_alpha(int i) const noexcept {
-        const float a = (hover_.id >= IdCard && hover_.id <= IdTagChip && hover_.index == i) ? hover_.in_anim.value : 0.0f;
-        const float b = (hover_.prev_id >= IdCard && hover_.prev_id <= IdTagChip && hover_.prev_index == i) ? hover_.out_anim.value : 0.0f;
-        return std::clamp(a + b, 0.0f, 1.0f);
+        return card_hover_.alpha(IdCard, i);
     }
 
     void draw_card(Canvas& cv, const Grid& g, int i) {
@@ -1238,7 +1255,9 @@ private:
                 cv.hit(sb, id, i);
             };
             overlay_btn(tr.right - 36, glyph::similar, IdSimilar);
-            overlay_btn(tr.right - 70, glyph::zoom, IdCardPreview);
+            const wchar_t card_btn_glyph =
+                (parse_thumb_dblclick(sh_.settings.thumb_dblclick) == ThumbDblClick::Preview) ? glyph::open : glyph::zoom;
+            overlay_btn(tr.right - 70, card_btn_glyph, IdCardPreview);
         }
 
         float y = tr.bottom + 10.0f;
@@ -2723,12 +2742,20 @@ private:
             raw_hover_index_ = idx;
             const bool animate = visible() && !sh_.test_mode;
             const auto [vid, vidx] = visual_hover(id, idx);
+            const auto [cid, cidx] = card_hover_target(id, idx);
             if (vid != hover_.id || vidx != hover_.index) {
                 queue_hover_dirty(hover_.id, hover_.index);
                 queue_hover_dirty(hover_.prev_id, hover_.prev_index);
                 queue_hover_dirty(vid, vidx);
             }
-            const bool vis_changed = hover_.set(vid, vidx, animate);
+            if (cid != card_hover_.id || cidx != card_hover_.index) {
+                queue_hover_dirty(card_hover_.id, card_hover_.index);
+                queue_hover_dirty(card_hover_.prev_id, card_hover_.prev_index);
+                queue_hover_dirty(cid, cidx);
+            }
+            const bool item_changed = hover_.set(vid, vidx, animate);
+            const bool card_changed = card_hover_.set(cid, cidx, animate);
+            const bool vis_changed = item_changed || card_changed;
             std::wstring tt, ts;
             const bool can_tip = !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_ && tooltip_for(id, idx, tt, ts);
             tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, can_tip, animate);
@@ -2834,7 +2861,13 @@ private:
             case IdFullscreen: toggle_fullscreen(); return;
             case IdClose: hide(); return;
             case IdSimilar: find_similar(items_[idx]); return;
-            case IdCardPreview: open_preview(idx); return;
+            case IdCardPreview:
+                if (parse_thumb_dblclick(sh_.settings.thumb_dblclick) == ThumbDblClick::Preview) {
+                    open_item_file(item_path(items_[idx]));
+                } else {
+                    open_preview(idx);
+                }
+                return;
             case IdCard:
             case IdCardName:
             case IdCardDir:
@@ -2842,7 +2875,11 @@ private:
             case IdTagChip: {
                 const uint64_t cid = items_[idx].pt.id;
                 if (dbl) {
-                    open_item_file(item_path(items_[idx]));
+                    if (parse_thumb_dblclick(sh_.settings.thumb_dblclick) == ThumbDblClick::Preview) {
+                        open_preview(idx);
+                    } else {
+                        open_item_file(item_path(items_[idx]));
+                    }
                     return;
                 }
                 if (ctrl) {
@@ -3245,7 +3282,7 @@ private:
                 tracking_ = false;
                 const bool animate = visible() && !sh_.test_mode;
                 tooltip_.clear(hwnd_, TIMER_TOOLTIP, animate);
-                if (raw_hover_id_ != IdNone || hover_.id != IdNone) {
+                if (raw_hover_id_ != IdNone || hover_.id != IdNone || card_hover_.id != IdNone) {
                     const bool was_help = show_help();
                     clear_hover(animate);
                     if (show_help() != was_help) {
@@ -3381,6 +3418,7 @@ private:
     int raw_hover_id_ = IdNone;
     int raw_hover_index_ = 0;
     HoverTracker hover_;
+    HoverTracker card_hover_;
     HoverTooltip tooltip_;
     bool tracking_ = false;
     bool anim_active_ = false;

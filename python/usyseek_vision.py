@@ -459,7 +459,25 @@ def _run_worker(pipe_name, custom_script=""):
 
 
 if __name__ == "__main__":
+    import os
     import sys
+
+    if os.name == "nt":
+        import subprocess
+
+        # Python runs headless inside CREATE_NO_WINDOW; ensure child processes spawned by
+        # dependencies (e.g. torch/open_clip probes) do not flash a visible console window.
+        _orig_popen_init = subprocess.Popen.__init__
+        _no_window_mask = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+        _create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+        def _hidden_popen_init(self, *args, **kwargs):
+            flags = kwargs.get("creationflags", 0)
+            if not (flags & _no_window_mask):
+                kwargs["creationflags"] = flags | _create_no_window
+            return _orig_popen_init(self, *args, **kwargs)
+
+        subprocess.Popen.__init__ = _hidden_popen_init
 
     if len(sys.argv) >= 3 and sys.argv[1] == "--worker":
         _run_worker(sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else "")

@@ -222,6 +222,8 @@ private:
         wil::unique_process_information pi;
         std::wstring cmd = L"\"" + exe.wstring() + L"\" " + args;
         STARTUPINFOW si{sizeof(si)};
+        si.dwFlags |= STARTF_USESHOWWINDOW;
+        si.wShowWindow = no_window ? SW_HIDE : SW_SHOWNORMAL;
         BOOL inherit = FALSE;
         if (std_out && std_out != INVALID_HANDLE_VALUE) {
             si.dwFlags |= STARTF_USESTDHANDLES;
@@ -244,7 +246,7 @@ private:
         }
         AssignProcessToJobObject(job_.get(), pi.hProcess);
         ResumeThread(pi.hThread);
-        AllowSetForegroundWindow(pi.dwProcessId);
+        if (!no_window) AllowSetForegroundWindow(pi.dwProcessId);
         return pi;
     }
 

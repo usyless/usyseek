@@ -88,6 +88,7 @@ inline constexpr wchar_t download = 0xE896;
 inline constexpr wchar_t block = 0xF140;
 inline constexpr wchar_t chevron_down = 0xE70D;
 inline constexpr wchar_t help = 0xE897;
+inline constexpr wchar_t info = 0xE946;
 inline constexpr wchar_t zoom = 0xE8A3;
 inline constexpr wchar_t link = 0xE71B;
 inline constexpr wchar_t chevron_left = 0xE76B;

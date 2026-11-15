@@ -6,6 +6,12 @@
 
 namespace usyseek {
 
+enum class ThumbDblClick : uint8_t { Open, Preview };
+
+[[nodiscard]] inline ThumbDblClick parse_thumb_dblclick(std::string_view s) noexcept {
+    return s == "preview" ? ThumbDblClick::Preview : ThumbDblClick::Open;
+}
+
 struct Settings {
     // Search pill / hotkey
     bool hotkey_enabled = true;
@@ -19,6 +25,7 @@ struct Settings {
     int32_t pill_w = 0;         // DIPs, 0 = default
     int32_t pill_h = 0;
     std::string thumb_fit = "crop"; // crop | contain
+    std::string thumb_dblclick = "open"; // open | preview
     double video_volume = 1.0;
     bool video_muted = false;
 

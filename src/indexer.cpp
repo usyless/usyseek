@@ -809,6 +809,8 @@ struct PyVision {
         }
 
         STARTUPINFOW si{sizeof(si)};
+        si.dwFlags |= STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
         wil::unique_process_information pi;
         if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
                             CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr,
@@ -994,6 +996,8 @@ int export_text_only(const Settings& settings) {
     std::wstring cmd = L"\"" + venv.python_exe + L"\" -u \"" + script.wstring() + L"\" --export-text \"" + to_wide(settings.model_dir) + L"\" \"" + to_wide(settings.model_name) + L"\"";
     wil::unique_handle job = make_kill_on_close_job();
     STARTUPINFOW si{sizeof(si)};
+    si.dwFlags |= STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
     wil::unique_process_information pi;
     if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, exe_dir().c_str(), &si, &pi)) {
         return 1;

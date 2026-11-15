@@ -293,8 +293,9 @@ inline wil::unique_process_information start_qdrant(const Settings& s, HANDLE jo
 
     std::wstring cmd = L"\"" + exe.wstring() + L"\" --disable-telemetry --config-path \"" + (exe_dir() / L"config" / L"qdrant.yaml").wstring() + L"\"";
 
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
+    STARTUPINFOW si{sizeof(si)};
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
 
     const fs::path work_dir = exe.parent_path();
     if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
