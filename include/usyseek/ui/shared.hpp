@@ -90,6 +90,7 @@ struct Shared {
     }
 
     void refresh_tags(bool backfill = false) {
+        if (!engine.db_ready()) return;
         engine.post([this, backfill](Db& db) {
             std::optional<TagStoreStats> ts;
             {
@@ -108,7 +109,7 @@ struct Shared {
                 if (tags_refreshed) tags_refreshed();
                 if (redraw_all) redraw_all();
             });
-        });
+        }, false);
     }
 
     /// Asks the launcher whether it holds the global shortcut. Returns true when the answer changed.

@@ -418,7 +418,7 @@ private:
                 db_collections_ = cols ? std::move(*cols) : scan_edge_collections_on_disk(edge_data_dir());
                 invalidate();
             });
-        });
+        }, false);
     }
 
     /// Which files of the selected model are on disk. Returns true when that changed.

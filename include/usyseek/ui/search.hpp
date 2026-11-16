@@ -490,10 +490,10 @@ public:
         cv_.notify_one();
     }
 
-    void post(std::function<void(Db&)> job) {
+    void post(std::function<void(Db&)> job, bool notify_if_dropped = true) {
         {
             std::lock_guard lk{m_};
-            jobs_.push_back(std::move(job));
+            jobs_.push_back({std::move(job), notify_if_dropped});
         }
         cv_.notify_one();
     }
@@ -591,7 +591,7 @@ private:
 
         for (;;) {
             std::optional<SearchRequest> req;
-            std::function<void(Db&)> job;
+            PostedJob job;
             bool need_pause = false;
             bool need_resume = false;
             {
@@ -624,7 +624,7 @@ private:
                         job = std::move(jobs_.front());
                         jobs_.pop_front();
                     } else if (db_ready_.load(std::memory_order_acquire) && !deferred_jobs_.empty()) {
-                        job = std::move(deferred_jobs_.front());
+                        job = {std::move(deferred_jobs_.front()), true};
                         deferred_jobs_.pop_front();
                     } else if (pending_search_) {
                         req = std::move(pending_search_);
@@ -642,10 +642,10 @@ private:
                 if (!is_indexer_db_wanted()) open_db();
                 continue;
             }
-            if (job) {
+            if (job.fn) {
                 if (db_ready_) {
-                    job(db_);
-                } else if (on_job_dropped) {
+                    job.fn(db_);
+                } else if (job.notify_if_dropped && on_job_dropped) {
                     if (db_paused_for_indexing_) {
                         on_job_dropped("Database unavailable while indexing", "Database updates are paused while indexing is in progress.");
                     } else {
@@ -747,10 +747,15 @@ private:
         return res;
     }
 
+    struct PostedJob {
+        std::function<void(Db&)> fn;
+        bool notify_if_dropped = true;
+    };
+
     mutable std::mutex m_;
     std::condition_variable cv_;
     std::optional<SearchRequest> pending_search_;
-    std::deque<std::function<void(Db&)>> jobs_;
+    std::deque<PostedJob> jobs_;
     std::deque<std::function<void(Db&)>> deferred_jobs_;
     bool stopping_ = false;
     bool indexing_active_hint_ = false;
