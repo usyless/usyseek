@@ -200,7 +200,7 @@ public:
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc.BufferCount = 2;
         desc.Scaling = DXGI_SCALING_STRETCH;
-        desc.SwapEffect = liquid_glass_ ? DXGI_SWAP_EFFECT_FLIP_DISCARD : DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
         if (FAILED(gfx_->dxgi_factory()->CreateSwapChainForComposition(gfx_->d3d(), &desc, nullptr, &swap_))) return false;
         if (FAILED(DCompositionCreateDevice(gfx_->dxgi_device(), IID_PPV_ARGS(&dcomp_)))) return false;
@@ -282,7 +282,7 @@ public:
     bool render_frame(bool full_redraw, std::span<const D2D1_RECT_F> dirty_dips, bool vsync, DrawFn&& draw_fn) {
         if (!ready()) return false;
         const float s = scale();
-        if (capture_ || liquid_glass_) full_redraw = true;
+        if (capture_) full_redraw = true;
 
         std::vector<PixelRect> curr_px;
         if (!full_redraw) {
@@ -299,7 +299,7 @@ public:
         std::vector<RECT> present_rects;
         dc_->BeginDraw();
         dc_->SetTransform(D2D1::Matrix3x2F::Identity());
-        if (liquid_glass_ || p.full) {
+        if (p.full) {
             dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
             draw_fn(std::nullopt, true);
         } else {
@@ -325,27 +325,17 @@ public:
             capture_.reset();
         }
         if (SUCCEEDED(hr)) {
-            if (liquid_glass_) {
-                if (!vsync && gfx_) {
-                    gfx_->wait_gpu();
-                }
-                dc_->SetTarget(nullptr);
-                target_.reset();
-                DXGI_PRESENT_PARAMETERS params{};
-                hr = swap_->Present1(vsync ? 1 : 0, 0, &params);
-                if (SUCCEEDED(hr) && !vsync && dcomp_) {
-                    dcomp_->Commit();
-                }
-                if (!create_target() && SUCCEEDED(hr)) {
-                    hr = E_FAIL;
-                }
-            } else {
-                DXGI_PRESENT_PARAMETERS params{};
-                if (!p.full) {
-                    params.DirtyRectsCount = static_cast<UINT>(present_rects.size());
-                    params.pDirtyRects = present_rects.data();
-                }
-                hr = swap_->Present1(vsync ? 1 : 0, 0, &params);
+            if (liquid_glass_ && !vsync && gfx_) {
+                gfx_->wait_gpu();
+            }
+            DXGI_PRESENT_PARAMETERS params{};
+            if (!p.full) {
+                params.DirtyRectsCount = static_cast<UINT>(present_rects.size());
+                params.pDirtyRects = present_rects.data();
+            }
+            hr = swap_->Present1(vsync ? 1 : 0, 0, &params);
+            if (SUCCEEDED(hr) && liquid_glass_ && !vsync && dcomp_) {
+                dcomp_->Commit();
             }
         }
         if (hr == DXGI_STATUS_OCCLUDED) {
@@ -354,7 +344,7 @@ public:
         }
         if (FAILED(hr)) return false;
 
-        dirty_tracker_.commit(liquid_glass_ ? true : full_redraw, p);
+        dirty_tracker_.commit(full_redraw, p);
         return true;
     }
 

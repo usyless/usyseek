@@ -213,7 +213,11 @@ public:
         const float prev_st = sw_startup_.value;
         const float prev_hf = sw_hide_focus_.value;
         if (sh_.test_mode || dragging_scroll_ || std::abs(target_scroll_ - scroll_) >= 0.5f ||
-            tab_anim_.active() || sw_hotkey_.active() || sw_startup_.active() || sw_hide_focus_.active() || glass_active()) {
+            tab_anim_.active() || sw_hotkey_.active() || sw_startup_.active() || sw_hide_focus_.active()) {
+            full_dirty_ = true;
+        }
+        if (glass_active() && !full_dirty_ &&
+            (!glass_.has_cached_desktop_glass() || glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_))) {
             full_dirty_ = true;
         }
 
@@ -243,6 +247,15 @@ public:
             if (curr_tip_dirty) dirty_dips.push_back(*curr_tip_dirty);
             if (last_tooltip_dirty_ && (!curr_tip_dirty || !rect_equal(*last_tooltip_dirty_, *curr_tip_dirty))) {
                 dirty_dips.push_back(*last_tooltip_dirty_);
+            }
+            if (glass_active()) {
+                const float scene_guard_y = tabs_height(target_.size().width) + 32.0f;
+                for (const D2D1_RECT_F& r : dirty_dips) {
+                    if (r.top < scene_guard_y) {
+                        full_dirty_ = true;
+                        break;
+                    }
+                }
             }
         }
 
@@ -742,7 +755,9 @@ private:
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         const bool glass = glass_active();
-        const bool has_scene = glass && glass_.begin_scene(target_, sh_.gfx);
+        const float strip_h = tabs_height(sz.width);
+        const bool need_scene = glass && (!cv.dirty_clip() || cv.dirty_clip()->top < strip_h + 24.0f);
+        const bool has_scene = need_scene && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
             if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
                                            make_desktop_glass_style(cv.theme(), 0.0f, true))) {
@@ -787,8 +802,7 @@ private:
         }
 
         if (has_scene) glass_.end_scene(target_);
-        if (glass) {
-            const float strip_h = tabs_height(sz.width);
+        if (need_scene) {
             glass_.draw_scene_glass(cv, target_, sh_.gfx, D2D1::RectF(0.0f, 0.0f, sz.width, strip_h),
                                     make_overlay_glass_style(cv.theme(), 0.0f, 1.8f));
             draw_tabs(cv, sz);

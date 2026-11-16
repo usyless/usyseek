@@ -242,6 +242,7 @@ public:
     [[nodiscard]] const Theme& theme() const noexcept { return theme_; }
     [[nodiscard]] D2D1_COLOR_F tag_color(std::string_view tag) const noexcept { return usyseek::ui::tag_color(theme_, tag); }
     [[nodiscard]] bool has_dirty_clip() const noexcept { return dirty_clip_.has_value(); }
+    [[nodiscard]] const std::optional<D2D1_RECT_F>& dirty_clip() const noexcept { return dirty_clip_; }
 
     /// Returns true if `r` (expanded by `pad`) overlaps the dirty clip and active stack clip.
     [[nodiscard]] bool intersects_clip(D2D1_RECT_F r, float pad = 0.0f) const noexcept {

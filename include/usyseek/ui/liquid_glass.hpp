@@ -753,6 +753,7 @@ public:
 
     void set_origin_override(std::optional<POINT> pt) noexcept { origin_override_ = pt; }
     [[nodiscard]] POINT last_rendered_origin() const noexcept { return last_rendered_origin_; }
+    [[nodiscard]] bool has_cached_desktop_glass() const noexcept { return cached_glass_valid_ && cached_glass_bmp_ != nullptr; }
 
     bool poll_desktop(DesktopDuplicator& dupl, Gfx& gfx, HWND hwnd) {
         if (!hwnd) return false;

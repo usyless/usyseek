@@ -230,7 +230,11 @@ public:
         const float prev_scroll = scroll_;
         const float prev_chip = chip_anim_.value;
         if (sh_.test_mode || dragging_scroll_ || std::abs(target_scroll_ - scroll_) >= 0.5f ||
-            chip_anim_.active() || searching_ || loading_more_ || preview_loading() || glass_active()) {
+            chip_anim_.active() || searching_ || loading_more_ || preview_loading() || glass_scene_needed()) {
+            full_dirty_ = true;
+        }
+        if (glass_active() && !full_dirty_ &&
+            (!glass_.has_cached_desktop_glass() || glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_))) {
             full_dirty_ = true;
         }
 
@@ -1033,11 +1037,14 @@ private:
     }
 
     [[nodiscard]] bool glass_active() const noexcept { return sh_.theme.is_liquid_glass; }
+    [[nodiscard]] bool glass_scene_needed() const noexcept {
+        return glass_active() && (menu_open_ || (preview_ < 0 && (drop_open_ || show_help())));
+    }
 
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         const bool glass = glass_active();
-        const bool need_scene = glass && (menu_open_ || (preview_ < 0 && (drop_open_ || show_help())));
+        const bool need_scene = glass_scene_needed();
         const bool has_scene = need_scene && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
             const float outer_r = fullscreen_ ? 0.0f : 12.0f;
