@@ -1022,15 +1022,16 @@ private:
                 float h;
                 float content_h;
                 float path_h;
+                float reason_h;
             };
             std::vector<FailedRow> rows;
             float cy = y + 16.0f + hd.h + 10.0f;
             for (size_t i = 0; i < show_n; ++i) {
                 const auto& ff = sh_.failed_files[i];
-                FailedRow row{ff.path.empty() ? (L"ID " + std::to_wstring(ff.id)) : ff.path, cy, 0.0f, 0.0f, 0.0f};
+                FailedRow row{ff.path.empty() ? (L"ID " + std::to_wstring(ff.id)) : ff.path, cy, 0.0f, 0.0f, 0.0f, 0.0f};
                 row.path_h = cv.measure_height(row.label, Font::MonoSmall, path_w);
-                const float reason_h = cv.measure_height(ff.reason, Font::Caption, reason_w);
-                row.content_h = stacked ? row.path_h + (reason_h > 0.0f ? 2.0f + reason_h : 0.0f) : std::max(row.path_h, reason_h);
+                row.reason_h = cv.measure_height(ff.reason, Font::Caption, reason_w);
+                row.content_h = stacked ? row.path_h + (row.reason_h > 0.0f ? 2.0f + row.reason_h : 0.0f) : std::max(row.path_h, row.reason_h);
                 row.h = std::max(32.0f, row.content_h + 12.0f);
                 rows.push_back(std::move(row));
                 cy += rows.back().h + 4.0f;
@@ -1069,9 +1070,10 @@ private:
                 cv.fill_round(ir, 8.0f, lerp_color(color::surface_low, color::surface_high, ha));
                 cv.icon(glyph::warning, rect(ir.left + 8.0f, ir.top, 20.0f, row.h), color::error, Font::IconSmall);
                 const float content_top = ir.top + (row.h - row.content_h) * 0.5f;
-                cv.text_wrap(row.label, rect(ir.left + path_x, content_top, path_w, row.path_h), Font::MonoSmall, color::on_surface);
-                const float reason_y = stacked ? content_top + row.path_h + 2.0f : ir.top;
-                const float reason_h = stacked ? row.content_h - row.path_h - 2.0f : row.h;
+                const float path_y = stacked ? content_top : ir.top + (row.h - row.path_h) * 0.5f;
+                cv.text_wrap(row.label, rect(ir.left + path_x, path_y, path_w, row.path_h), Font::MonoSmall, color::on_surface);
+                const float reason_y = stacked ? content_top + row.path_h + 2.0f : ir.top + (row.h - row.reason_h) * 0.5f;
+                const float reason_h = stacked ? row.content_h - row.path_h - 2.0f : row.reason_h;
                 cv.text_wrap(ff.reason, rect(ir.left + reason_x, reason_y, reason_w, reason_h), Font::Caption, color::outline, stacked ? Align::Left : Align::Right);
                 if (!ff.path.empty()) cv.hit(ir, IdFailedRow, static_cast<int>(i));
             }
