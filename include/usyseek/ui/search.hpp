@@ -453,6 +453,7 @@ public:
     std::function<void(std::unique_ptr<SearchResult>)> on_result;
     std::function<void(std::function<void()>)> post_ui; // marshal a callback to the UI thread
     std::function<void(bool ready, std::string error)> on_db_state;
+    std::function<void(std::string coll, std::string error)> on_db_cleared;
     std::function<void(std::string title, std::string detail)> on_job_dropped;
 
     void start(const Settings& s) {
@@ -551,9 +552,18 @@ private:
             s = settings_;
         }
 
+        auto ensure_collection_healthy = [&](const std::string& coll) {
+            std::string load_err;
+            if (!db_.check_collection(coll, &load_err)) {
+                (void)db_.drop_collection(coll);
+                if (on_db_cleared) on_db_cleared(coll, load_err);
+            }
+        };
+
         auto open_db = [&] {
             std::string err;
             if (db_.open(edge_data_dir(), &err)) {
+                ensure_collection_healthy(s.model_name);
                 db_paused_for_indexing_.store(false, std::memory_order_release);
                 db_ready_.store(true, std::memory_order_release);
                 arm_db_want_wait();
@@ -644,7 +654,10 @@ private:
                 }
                 continue;
             }
-            if (req && on_result) on_result(execute(*req, s));
+            if (req && on_result) {
+                if (db_ready_) ensure_collection_healthy(s.model_name);
+                on_result(execute(*req, s));
+            }
         }
     }
 

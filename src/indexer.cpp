@@ -1190,12 +1190,22 @@ int run_indexer(Settings& settings) {
         if (coll_status != Db::CollectionStatus::Error || stopping() || std::chrono::steady_clock::now() >= lock_deadline) break;
         Sleep(50);
     }
+    bool collection_exists = (coll_status == Db::CollectionStatus::Ready);
     if (coll_status == Db::CollectionStatus::Error) {
-        loader.cancel_and_join();
-        pr.phase(Phase::Error, to_wide(err));
-        return 1;
+        std::string drop_err;
+        if (db.drop_collection(coll, &drop_err)) {
+            push_notification_to_disk(
+                "warning", "Database", "Database cleared — re-indexing required",
+                "Could not load the Qdrant Edge index for '" + coll + "' (" + err +
+                "), so it was cleared and is being rebuilt. Your manual tags are preserved.",
+                "db-cleared");
+            collection_exists = false;
+        } else {
+            loader.cancel_and_join();
+            pr.phase(Phase::Error, to_wide(err));
+            return 1;
+        }
     }
-    const bool collection_exists = (coll_status == Db::CollectionStatus::Ready);
 
     pr.phase(Phase::Scanning);
     scanner.join();

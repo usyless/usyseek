@@ -132,6 +132,12 @@ public:
     void stop() noexcept {
         venv_job_.thread = {};
         model_job_.thread = {};
+        update_job_.thread = {};
+        update_check_thread_ = {};
+    }
+
+    void maybe_auto_check_updates() {
+        start_update_check(false);
     }
 
     void show(int tab = -1) {
@@ -151,6 +157,7 @@ public:
         last_db_ready_ = sh_.engine.db_ready();
         last_indexer_running_ = sh_.indexer_running;
         sh_.refresh_hotkey_state();
+        if (!sh_.test_mode && sh_.on_ui_opened) sh_.on_ui_opened();
         full_dirty_ = true;
         pending_dirty_.clear();
         last_tooltip_dirty_.reset();
@@ -217,8 +224,9 @@ public:
         const float prev_hk = sw_hotkey_.value;
         const float prev_st = sw_startup_.value;
         const float prev_hf = sw_hide_focus_.value;
+        const float prev_au = sw_auto_update_.value;
         if (sh_.test_mode || dragging_scroll_ || std::abs(target_scroll_ - scroll_) >= 0.5f ||
-            tab_anim_.active() || sw_hotkey_.active() || sw_startup_.active() || sw_hide_focus_.active()) {
+            tab_anim_.active() || sw_hotkey_.active() || sw_startup_.active() || sw_hide_focus_.active() || sw_auto_update_.active()) {
             full_dirty_ = true;
         }
         if (glass_active() && !full_dirty_ &&
@@ -239,7 +247,7 @@ public:
 
         const bool anim = step_anim();
         if (scroll_ != prev_scroll || tab_anim_.value != prev_tab ||
-            sw_hotkey_.value != prev_hk || sw_startup_.value != prev_st || sw_hide_focus_.value != prev_hf) {
+            sw_hotkey_.value != prev_hk || sw_startup_.value != prev_st || sw_hide_focus_.value != prev_hf || sw_auto_update_.value != prev_au) {
             full_dirty_ = true;
         }
 
@@ -366,6 +374,11 @@ private:
         IdUpdateVenv,
         IdRecreateVenv,
         IdDeleteVenv,
+        IdToggleAutoUpdate,
+        IdCheckUpdates,
+        IdInstallUpdate,
+        IdInstallUpdateDisabled,
+        IdOpenReleaseUrl,
         IdScrollbar,
     };
 
@@ -911,6 +924,7 @@ private:
             case IdDeleteDbDisabled: return L"Stop indexing before deleting a database";
             case IdPruneMissingTagsDisabled: return prune_checking_ ? L"Checking files on disk…" : L"Stop indexing before pruning tags";
             case IdDeleteModelDisabled: return L"Stop indexing before deleting the active model";
+            case IdInstallUpdateDisabled: return L"Stop indexing before installing an update";
             case IdDismissNotif: return L"Dismiss notification";
             default: return nullptr;
         }
@@ -1135,8 +1149,159 @@ private:
                      Font::BodySemi, cv.theme().on_surface, Align::Center);
         cv.text_wrap(ai_desc, rect(lx + box_pad_x, box_y + 14.0f + ai_title_h + 4.0f, box_inner_w, ai_desc_h),
                      Font::Small, cv.theme().on_surface_variant, Align::Center);
+        y = next_y;
 
-        return next_y;
+        // Updates card
+        {
+            const JobView upd_view = view(update_job_);
+            const bool update_avail = sh_.has_update_available();
+            const bool can_install = update_avail && !sh_.update_state.asset_url.empty();
+
+            std::wstring caption;
+            D2D1_COLOR_F title_col = cv.theme().on_surface;
+            if (sh_.update_checking) {
+                caption = L"Checking GitHub Releases…";
+            } else if (update_avail) {
+                const std::wstring ver = sh_.update_state.latest_tag.empty()
+                    ? (L"v" + to_wide(sh_.update_state.latest_version))
+                    : to_wide(sh_.update_state.latest_tag);
+                caption = L"New version " + ver + L" is available (current: v" + APP_VERSION + L").";
+                title_col = cv.theme().primary;
+            } else if (!sh_.update_state.last_error.empty()) {
+                caption = L"Last check failed: " + to_wide(sh_.update_state.last_error);
+                if (sh_.update_state.last_check_unix > 0) {
+                    caption += L"  •  Checked " + format_ago(sh_.update_state.last_check_unix);
+                }
+            } else if (sh_.update_state.last_check_unix > 0) {
+                caption = L"Up to date  •  Last checked " + format_ago(sh_.update_state.last_check_unix);
+            } else {
+                caption = L"Checks github.com/usyless/usyseek/releases once every 24 hours when opened.";
+            }
+
+            const CardHeader hd = make_header(cv, rw, L"Software Updates", title_col, caption);
+
+            Flow auto_row{12.0f, 0.0f};
+            flow_text(cv, auto_row, L"Check automatically when opened (every 24h)", Font::Body, cv.theme().on_surface,
+                      std::max(120.0f, rw - 56.0f), 32.0f);
+            auto_row.add(44.0f, 32.0f, [&](D2D1_RECT_F r) {
+                draw_switch(cv, r.right, (r.top + r.bottom) * 0.5f, sh_.settings.auto_check_updates, IdToggleAutoUpdate);
+            });
+
+            const std::wstring check_lbl = sh_.update_checking ? L"Checking…" : L"Check Now";
+            std::wstring install_lbl = L"Download & Install";
+            if (update_job_.busy) {
+                install_lbl = upd_view.total > 0
+                    ? (L"Cancel  •  " + std::to_wstring(upd_view.done * 100 / upd_view.total) + L"%")
+                    : L"Cancel";
+            } else if (update_avail) {
+                const std::wstring ver = sh_.update_state.latest_tag.empty()
+                    ? (L"v" + to_wide(sh_.update_state.latest_version))
+                    : to_wide(sh_.update_state.latest_tag);
+                install_lbl = L"Download & Install " + ver;
+            }
+
+            Flow actions{8.0f, 8.0f};
+            actions.add(button_width(cv, check_lbl, true, 126.0f), 34.0f, [&](D2D1_RECT_F r) {
+                if (sh_.update_checking || update_job_.busy) {
+                    draw_disabled_button(cv, r, glyph::refresh, check_lbl, IdNone);
+                } else {
+                    draw_button(cv, r, glyph::refresh, check_lbl, IdCheckUpdates);
+                }
+            });
+            if (can_install || update_job_.busy) {
+                actions.add(button_width(cv, install_lbl, true, 170.0f), 34.0f, [&](D2D1_RECT_F r) {
+                    if (sh_.indexer_running && !update_job_.busy) {
+                        draw_disabled_button(cv, r, glyph::download, install_lbl, IdInstallUpdateDisabled);
+                    } else {
+                        draw_button(cv, r, update_job_.busy ? glyph::close : glyph::download, install_lbl,
+                                    IdInstallUpdate, 0, update_job_.busy ? 2 : 1);
+                    }
+                });
+            }
+            actions.add(button_width(cv, L"View Releases", true, 134.0f), 34.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::open, L"View Releases", IdOpenReleaseUrl, 0, 3);
+            });
+
+            std::wstring pkg_note;
+            if (update_avail && !sh_.update_state.asset_name.empty()) {
+                pkg_note = L"Selected package: " + to_wide(sh_.update_state.asset_name);
+                if (sh_.update_state.asset_size > 0) {
+                    pkg_note += L" (" + format_size(sh_.update_state.asset_size) + L")";
+                }
+                pkg_note += tar_supports_7z()
+                    ? L"  •  Windows tar supports .7z"
+                    : L"  •  Using .zip for Windows compatibility";
+            }
+
+            std::wstring job_note = upd_view.log;
+            if (update_job_.busy && upd_view.total > 0) {
+                job_note += L"  " + format_size(upd_view.done) + L" / " + format_size(upd_view.total);
+            }
+            const bool show_bar = update_job_.busy && upd_view.total > 0;
+            std::wstring notes_txt;
+            if (update_avail && !sh_.update_state.release_notes.empty()) {
+                notes_txt = to_wide(sh_.update_state.release_notes);
+                if (notes_txt.size() > 600) {
+                    notes_txt.resize(600);
+                    notes_txt += L"…";
+                }
+            }
+
+            const float auto_y = y + 16.0f + hd.h + 12.0f;
+            const float auto_h = auto_row.height(rw);
+            const float line2_y = auto_y + auto_h + 10.0f;
+            const float actions_y = line2_y + 12.0f;
+            const float actions_h = actions.height(rw);
+            float cy = actions_y + actions_h;
+
+            const float pkg_y = cy + 8.0f;
+            const float pkg_h = pkg_note.empty() ? 0.0f : text_height(cv, pkg_note, Font::Caption, rw, 18.0f);
+            if (pkg_h > 0.0f) cy = pkg_y + pkg_h;
+
+            const float bar_y = cy + 8.0f;
+            if (show_bar) cy = bar_y + 6.0f;
+
+            const float job_y = cy + 8.0f;
+            const float job_h = job_note.empty() ? 0.0f : text_height(cv, job_note, Font::Caption, rw, 18.0f);
+            if (job_h > 0.0f) cy = job_y + job_h;
+
+            const float notes_y = cy + 12.0f;
+            const float notes_inner_w = std::max(120.0f, rw - 24.0f);
+            const float notes_txt_h = notes_txt.empty() ? 0.0f : text_height(cv, notes_txt, Font::Small, notes_inner_w, 18.0f);
+            const float notes_h = notes_txt.empty() ? 0.0f : (20.0f + notes_txt_h);
+            if (notes_h > 0.0f) cy = notes_y + notes_h;
+
+            const float uh = cy + 18.0f - y;
+            const float u_next_y = card_begin(cv, x, y, w, uh);
+            draw_header(cv, lx, y, rw, hd);
+            auto_row.draw(lx, auto_y, rw);
+            cv.hline(lx, lx + rw, line2_y, with_alpha(cv.theme().outline_variant, 0.5f));
+            actions.draw(lx, actions_y, rw);
+            if (pkg_h > 0.0f) {
+                cv.text_wrap(pkg_note, rect(lx, pkg_y, rw, pkg_h), Font::Caption, cv.theme().on_surface_variant);
+            }
+            if (show_bar) {
+                const float pct = std::clamp(static_cast<float>(upd_view.done) / static_cast<float>(upd_view.total), 0.0f, 1.0f);
+                const D2D1_RECT_F trk = rect(lx, bar_y, rw, 6.0f);
+                cv.fill_round(trk, 3.0f, with_alpha(cv.theme().outline_variant, 0.35f));
+                if (pct > 0.0f) {
+                    cv.fill_round(rect(lx, bar_y, std::max(6.0f, rw * pct), 6.0f), 3.0f, cv.theme().primary);
+                }
+            }
+            if (job_h > 0.0f) {
+                cv.text_wrap(job_note, rect(lx, job_y, rw, job_h), Font::Caption,
+                             upd_view.failed ? cv.theme().error : cv.theme().on_surface_variant);
+            }
+            if (notes_h > 0.0f) {
+                const D2D1_RECT_F nr = rect(lx, notes_y, rw, notes_h);
+                draw_well(cv, nr, 10.0f, true);
+                cv.text_wrap(notes_txt, rect(nr.left + 12.0f, nr.top + 10.0f, notes_inner_w, notes_txt_h),
+                             Font::Small, cv.theme().on_surface_variant);
+            }
+            y = u_next_y;
+        }
+
+        return y;
     }
 
     // ------------------------------------------------------------------------------------------
@@ -2433,6 +2598,106 @@ private:
 
     void append_venv_log(std::wstring_view line) { report(venv_job_, line); }
 
+    void start_update_check(bool manual) {
+        if (sh_.test_mode || sh_.update_checking || update_job_.busy) return;
+        if (!manual && !should_auto_check_updates(sh_.settings.auto_check_updates, sh_.update_state.last_check_unix, unix_now())) {
+            return;
+        }
+        if (update_check_thread_.joinable()) update_check_thread_.join();
+        sh_.update_checking = true;
+        ++sh_.background_jobs;
+
+        UpdateState st = sh_.update_state;
+        st.last_check_unix = unix_now();
+        save_update_state(st);
+        sh_.update_state.last_check_unix = st.last_check_unix;
+        invalidate();
+
+        update_check_thread_ = std::jthread([this, st = std::move(st), manual]() mutable {
+            bool is_newer = false;
+            const bool ok = check_latest_release(st, is_newer);
+            sh_.call([this, st = std::move(st), ok, is_newer, manual]() mutable {
+                sh_.update_checking = false;
+                --sh_.background_jobs;
+                if (ok && is_newer) {
+                    const std::string ver_label = st.latest_tag.empty() ? ("v" + st.latest_version) : st.latest_tag;
+                    if (st.notified_version != st.latest_version) {
+                        st.notified_version = st.latest_version;
+                        save_update_state(st);
+                        if (HWND launcher = find_launcher()) {
+                            send_cmd(launcher, Cmd::ShowUpdateBalloon, std::as_bytes(std::span{ver_label.data(), ver_label.size()}));
+                        }
+                    }
+                    sh_.notify("info", "Updates",
+                               "Update available: " + ver_label,
+                               "usyseek " + ver_label + " is available on GitHub. Open Settings -> About to download and install it.",
+                               "app-update");
+                } else if (ok && !is_newer) {
+                    sh_.clear_notification_key("Updates", "app-update");
+                } else if (!ok && manual) {
+                    sh_.notify("warning", "Updates", "Update check failed",
+                               st.last_error.empty() ? "Could not reach GitHub releases." : st.last_error,
+                               "app-update-check");
+                }
+                sh_.update_state = std::move(st);
+                if (sh_.visibility_changed) sh_.visibility_changed();
+                if (sh_.redraw_all) sh_.redraw_all();
+            });
+        });
+    }
+
+    void start_update_install() {
+        if (update_job_.busy) {
+            update_job_.thread.request_stop();
+            return;
+        }
+        if (sh_.indexer_running || !sh_.has_update_available() || sh_.update_state.asset_url.empty()) return;
+
+        const UpdateState st = sh_.update_state;
+        auto staged_root = std::make_shared<fs::path>();
+        auto stage_ok = std::make_shared<bool>(false);
+
+        run_job(update_job_,
+                [this, st, staged_root, stage_ok](const std::stop_token& stop) {
+                    std::wstring err;
+                    *stage_ok = download_and_stage_update(
+                        st, *staged_root, err,
+                        [this](std::wstring_view msg) { report(update_job_, msg); },
+                        [this](uint64_t done, uint64_t total) { report_progress(update_job_, done, total); },
+                        stop);
+                    report_progress(update_job_, 0, 0);
+                    if (!*stage_ok) {
+                        report(update_job_, err, !stop.stop_requested());
+                    }
+                },
+                [this, staged_root, stage_ok] {
+                    if (!*stage_ok) return;
+                    const HWND launcher = find_launcher();
+                    DWORD wait_pid = GetCurrentProcessId();
+                    if (launcher) GetWindowThreadProcessId(launcher, &wait_pid);
+
+                    bool uac_cancelled = false;
+                    std::wstring err;
+                    if (!launch_staged_updater(*staged_root, exe_dir(), wait_pid, true, uac_cancelled, err)) {
+                        if (uac_cancelled) {
+                            sh_.notify("warning", "Updates", "Update requires administrator permission",
+                                       "Administrator permission (UAC) was cancelled, so the update could not be applied to " +
+                                       to_utf8(exe_dir().wstring()) + ". Accept the UAC prompt to finish installing the update.",
+                                       "app-update-uac");
+                        } else {
+                            sh_.notify("error", "Updates", "Failed to apply update", to_utf8(err), "app-update-apply");
+                        }
+                        report(update_job_, err, true);
+                        return;
+                    }
+
+                    sh_.clear_notification_key("Updates", "app-update-uac");
+                    sh_.clear_notification_key("Updates", "app-update-apply");
+                    if (launcher) send_cmd(launcher, Cmd::Quit);
+                    PostQuitMessage(0);
+                });
+    }
+
     // ------------------------------------------------------------------------------------------
     // Model download (Hugging Face)
     // ------------------------------------------------------------------------------------------
@@ -2839,6 +3104,7 @@ private:
         if (sw_hotkey_.step(dt)) moving = true;
         if (sw_startup_.step(dt)) moving = true;
         if (sw_hide_focus_.step(dt)) moving = true;
+        if (sw_auto_update_.step(dt)) moving = true;
         if (hover_.step(dt)) moving = true;
         if (tooltip_.step(dt)) moving = true;
         return moving;
@@ -2848,6 +3114,7 @@ private:
         sw_hotkey_.set(sh_.settings.hotkey_enabled ? 1.0f : 0.0f, animate);
         sw_startup_.set(sh_.settings.launch_on_startup ? 1.0f : 0.0f, animate);
         sw_hide_focus_.set(sh_.settings.hide_on_focus_loss ? 1.0f : 0.0f, animate);
+        sw_auto_update_.set(sh_.settings.auto_check_updates ? 1.0f : 0.0f, animate);
     }
 
     void update_switch_anims() noexcept {
@@ -2862,6 +3129,7 @@ private:
         sw_hotkey_.snap(sw_hotkey_.target);
         sw_startup_.snap(sw_startup_.target);
         sw_hide_focus_.snap(sw_hide_focus_.target);
+        sw_auto_update_.snap(sw_auto_update_.target);
     }
 
     [[nodiscard]] float switch_anim_value(int id, bool fallback_on) const noexcept {
@@ -2869,6 +3137,7 @@ private:
             case IdToggleHotkey: return std::clamp(sw_hotkey_.value, 0.0f, 1.0f);
             case IdToggleStartup: return std::clamp(sw_startup_.value, 0.0f, 1.0f);
             case IdToggleHideFocus: return std::clamp(sw_hide_focus_.value, 0.0f, 1.0f);
+            case IdToggleAutoUpdate: return std::clamp(sw_auto_update_.value, 0.0f, 1.0f);
             default: return fallback_on ? 1.0f : 0.0f;
         }
     }
@@ -3406,6 +3675,27 @@ private:
                 sh_.save();
                 update_switch_anims();
                 break;
+            case IdToggleAutoUpdate:
+                sh_.settings.auto_check_updates = !sh_.settings.auto_check_updates;
+                sh_.save();
+                update_switch_anims();
+                break;
+            case IdCheckUpdates:
+                start_update_check(true);
+                break;
+            case IdInstallUpdate:
+                start_update_install();
+                break;
+            case IdOpenReleaseUrl: {
+                const std::wstring url = sh_.update_state.release_url.empty()
+                    ? std::wstring{GITHUB_RELEASES_PAGE_URL}
+                    : to_wide(sh_.update_state.release_url);
+                std::string err;
+                if (!open_file(url, &err)) {
+                    sh_.notify("warning", "Updates", "Could not open releases page", err, "open-release-url");
+                }
+                break;
+            }
             case IdThumbFit:
                 sh_.settings.thumb_fit = idx == static_cast<int>(ThumbFit::Contain) ? "contain" : "crop";
                 sh_.save();
@@ -4022,6 +4312,7 @@ private:
     AnimFloat sw_hotkey_;
     AnimFloat sw_startup_;
     AnimFloat sw_hide_focus_;
+    AnimFloat sw_auto_update_;
     int raw_hover_id_ = IdNone;
     int raw_hover_index_ = 0;
     HoverTracker hover_;
@@ -4071,6 +4362,8 @@ private:
     // Last: their threads are joined before anything above is destroyed
     Job venv_job_;
     Job model_job_;
+    Job update_job_;
+    std::jthread update_check_thread_;
 };
 
 } // namespace usyseek::ui

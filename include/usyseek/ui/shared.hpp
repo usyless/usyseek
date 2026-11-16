@@ -10,6 +10,7 @@
 #include <usyseek/progress.hpp>
 #include <usyseek/status.hpp>
 #include <usyseek/tag_sync.hpp>
+#include <usyseek/updater.hpp>
 
 #include <atomic>
 #include <dwmapi.h>
@@ -58,6 +59,8 @@ struct Shared {
     std::vector<FailedFile> failed_files;
     std::vector<Notification> notifications;
     std::pair<int64_t, uint64_t> notifications_stamp_{0, 0};
+    UpdateState update_state;
+    bool update_checking = false;
     bool indexer_running = false;
     bool indexer_stopping = false;
     StatusData indexer{};
@@ -70,6 +73,7 @@ struct Shared {
 
     std::function<void()> open_settings;
     std::function<void()> open_notifications;
+    std::function<void()> on_ui_opened;
     std::function<void()> visibility_changed;
     std::function<void()> settings_changed; // repaint dependants
     std::function<void()> theme_changed;    // re-apply DWM attributes and repaint windows
@@ -233,6 +237,10 @@ struct Shared {
         return static_cast<size_t>(std::ranges::count_if(notifications, [](const Notification& n) {
             return n.severity == "error";
         }));
+    }
+
+    [[nodiscard]] bool has_update_available() const noexcept {
+        return !update_state.latest_version.empty() && is_newer_version(update_state.latest_version, to_utf8(APP_VERSION));
     }
 
     bool polled_once_ = false;

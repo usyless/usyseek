@@ -20,6 +20,7 @@ void usy_qd_free(UsyQdrant* q);
 int32_t usy_qd_flush(UsyQdrant* q, UsyStr name, UsyBuf* out);
 int32_t usy_qd_optimize(UsyQdrant* q, UsyStr name, UsyBuf* out);
 int32_t usy_qd_ensure_collection(UsyQdrant* q, UsyStr name, uint64_t dim, UsyBuf* out);
+int32_t usy_qd_check_collection(UsyQdrant* q, UsyStr name, UsyBuf* out);
 int32_t usy_qd_upsert(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, const float* vectors, size_t dim, UsyStr payloads, UsyBuf* out);
 int32_t usy_qd_query(UsyQdrant* q, UsyStr name, const float* vector, size_t dim, UsyStr request, UsyBuf* out);
 int32_t usy_qd_scroll(UsyQdrant* q, UsyStr name, UsyStr request, UsyBuf* out);
@@ -299,6 +300,19 @@ public:
         }
         RustBuf out;
         const bool ok = usy_qd_drop_collection(q_, ustr(coll), &out.b) == 0;
+        if (!ok && error) *error = out.str();
+        return ok;
+    }
+
+    /// True when `coll` is absent on disk or loads cleanly. False with `error` when loading an on-disk shard fails.
+    bool check_collection(std::string_view coll, std::string* error = nullptr) {
+        std::shared_lock lk{mx_};
+        if (!q_) {
+            if (error) *error = "database is closed";
+            return false;
+        }
+        RustBuf out;
+        const bool ok = usy_qd_check_collection(q_, ustr(coll), &out.b) == 0;
         if (!ok && error) *error = out.str();
         return ok;
     }

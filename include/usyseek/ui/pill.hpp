@@ -89,6 +89,7 @@ public:
         sh_.refresh_tags();
         sh_.poll_indexer(true);
         sh_.refresh_hotkey_state();
+        if (!sh_.test_mode && sh_.on_ui_opened) sh_.on_ui_opened();
         if (preview_valid()) request_preview();
         SetTimer(hwnd_, TIMER_STATUS, 1000, nullptr);
         if (glass_active() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);

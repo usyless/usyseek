@@ -408,6 +408,25 @@ pub unsafe extern "C" fn usy_qd_ensure_collection(q: *mut UsyQdrant, name: UsySt
     }
 }
 
+/// Verifies that collection `name` either does not exist on disk yet or loads cleanly into memory.
+///
+/// # Safety
+///
+/// `q` must be null or valid; `name`/`out` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn usy_qd_check_collection(q: *mut UsyQdrant, name: UsyStr, out: *mut UsyBuf) -> i32 {
+    let name = name.as_str().to_owned();
+    run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
+        let dir = q.collection_dir(&name)?;
+        if !shard_exists_on_disk(&dir) {
+            return Ok("missing".to_owned());
+        }
+        let _ = q.get_or_load_shard(&name)?;
+        Ok("ok".to_owned())
+    })
+}
+
 /// payloads: JSON array (one object per point, same order as ids).
 ///
 /// # Safety

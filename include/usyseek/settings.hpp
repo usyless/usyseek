@@ -56,6 +56,9 @@ struct Settings {
     std::string rocm_arch = "gfx1030";
     std::string cuda_version = "cu126";  // PyTorch CUDA wheel index, e.g. cu126 | cu130
     std::string torch_pip_args;          // optional custom pip install args for torch/torchvision
+
+    // Updates
+    bool auto_check_updates = true;
 };
 
 /// Written by the indexer only.

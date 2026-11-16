@@ -44,6 +44,7 @@ enum class Cmd : uint32_t {
     Quit,
     HotkeyStatus,            // query: the reply is a HotkeyState
     TestNotification,
+    ShowUpdateBalloon,       // payload: UTF-8 version tag (e.g. "v0.3.0")
 };
 
 /// Whether the launcher currently holds the global search shortcut.
@@ -211,6 +212,7 @@ inline const fs::path& data_dir() {
 
 inline fs::path settings_path() { return data_dir() / L"settings.json"; }
 inline fs::path state_path() { return data_dir() / L"state.json"; }
+inline fs::path update_state_path() { return data_dir() / L"update.json"; }
 inline fs::path edge_data_dir() { return data_dir() / L"qdrant_edge"; }
 inline fs::path tags_db_path() { return data_dir() / L"tags.db"; }
 

@@ -86,6 +86,8 @@ public:
         }
     }
 
+    void open_about() { open_settings(3); }
+
     void shutdown() {
         remove_tray();
         if (indexer_.hProcess) {
@@ -140,7 +142,8 @@ private:
                         show_menu();
                         break;
                     case NIN_BALLOONUSERCLICK:
-                        if (balloon_opens_notifs_) open_notifications();
+                        if (balloon_target_ == BalloonTarget::Notifications) open_notifications();
+                        else if (balloon_target_ == BalloonTarget::About) open_settings(3);
                         else open_settings();
                         break;
                 }
@@ -200,8 +203,19 @@ private:
             case Cmd::HotkeyStatus:
                 return static_cast<LRESULT>(hotkey_state_);
             case Cmd::TestNotification:
-                show_balloon(APP_NAME, L"Test Windows notification from usyseek. Click to open Notifications.", NIIF_INFO, true);
+                show_balloon(APP_NAME, L"Test Windows notification from usyseek. Click to open Notifications.", NIIF_INFO, BalloonTarget::Notifications);
                 return TRUE;
+            case Cmd::ShowUpdateBalloon: {
+                std::wstring ver;
+                if (cds->cbData > 0 && cds->lpData) {
+                    ver = to_wide(std::string_view{static_cast<const char*>(cds->lpData), cds->cbData});
+                }
+                const std::wstring body = ver.empty()
+                    ? L"A new version of usyseek is available. Click to view in About."
+                    : (L"usyseek " + ver + L" is available. Click to view in About.");
+                show_balloon(APP_NAME, body, NIIF_INFO, BalloonTarget::About);
+                return TRUE;
+            }
             case Cmd::Quit:
                 DestroyWindow(hwnd_);
                 return TRUE;
@@ -236,7 +250,7 @@ private:
             push_notification_to_disk(
                 "error", "Launcher", "Failed to start " + name,
                 win32_error_utf8(err), "spawn-" + name, true);
-            show_balloon(APP_NAME, (L"Failed to start " + exe.filename().wstring() + L": " + to_wide(win32_error_utf8(err))).c_str(), NIIF_ERROR, true);
+            show_balloon(APP_NAME, (L"Failed to start " + exe.filename().wstring() + L": " + to_wide(win32_error_utf8(err))).c_str(), NIIF_ERROR, BalloonTarget::Notifications);
             return {};
         }
         AssignProcessToJobObject(job_.get(), pi.hProcess);
@@ -278,13 +292,13 @@ private:
         }
     }
 
-    void open_settings() {
+    void open_settings(int tab = -1) {
         if (ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_)) {
             AllowSetForegroundWindow(ui_.dwProcessId);
             SetForegroundWindow(ui_hwnd_);
-            PostMessageW(ui_hwnd_, msg_open_settings(), 0, 0);
+            PostMessageW(ui_hwnd_, msg_open_settings(), tab >= 0 ? static_cast<WPARAM>(tab + 1) : 0, 0);
         } else if (!ui_.hProcess) {
-            spawn_ui(L"--settings");
+            spawn_ui(tab >= 0 ? (L"--settings-tab " + std::to_wstring(tab)) : L"--settings");
         }
     }
 
@@ -411,7 +425,7 @@ private:
                         "indexer-exit", true);
                 }
                 if (!is_ui_running()) {
-                    show_balloon(APP_NAME, msg.c_str(), NIIF_ERROR, true);
+                    show_balloon(APP_NAME, msg.c_str(), NIIF_ERROR, BalloonTarget::Notifications);
                 }
             }
             notify_ui();
@@ -429,8 +443,10 @@ private:
     // Tray / hotkey
     // ------------------------------------------------------------------------------------------
 
-    void show_balloon(const wchar_t* title, const std::wstring& body, DWORD flags, bool open_notifs) {
-        balloon_opens_notifs_ = open_notifs;
+    enum class BalloonTarget : uint8_t { Settings, Notifications, About };
+
+    void show_balloon(const wchar_t* title, const std::wstring& body, DWORD flags, BalloonTarget target) {
+        balloon_target_ = target;
         NOTIFYICONDATAW nid = tray_data();
         nid.uFlags = NIF_INFO;
         wcscpy_s(nid.szInfoTitle, title);
@@ -462,7 +478,7 @@ private:
             to_utf8(hotkey_text(settings_)) + " could not be registered because another application already owns it. Pick a different shortcut in Settings.",
             "hotkey-unavailable", true);
         if (!already_reported) {
-            show_balloon(APP_NAME, L"The search shortcut is already used by another app. Pick a different one in Settings.", NIIF_WARNING, false);
+            show_balloon(APP_NAME, L"The search shortcut is already used by another app. Pick a different one in Settings.", NIIF_WARNING, BalloonTarget::Settings);
         }
     }
 
@@ -668,14 +684,129 @@ private:
     mutable std::optional<StatusBlock> indexer_status_;
     bool stopping_index_ = false;
     bool tray_hide_on_select_ = false;
-    bool balloon_opens_notifs_ = true;
+    BalloonTarget balloon_target_ = BalloonTarget::Notifications;
     std::wstring last_tip_;
 };
+
+int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::path& target_dir, bool open_about) {
+    if (wait_pid != 0) {
+        if (wil::unique_handle proc{OpenProcess(SYNCHRONIZE, FALSE, wait_pid)}) {
+            WaitForSingleObject(proc.get(), 15'000);
+        }
+    }
+
+    std::error_code ec;
+    const auto copy_one = [&](const fs::path& src, const fs::path& dst) -> bool {
+        for (int attempt = 0; attempt < 30; ++attempt) {
+            if (CopyFileW(src.c_str(), dst.c_str(), FALSE)) return true;
+            const DWORD err = GetLastError();
+            if (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION || err == ERROR_ACCESS_DENIED) {
+                if (attempt >= 5) {
+                    const fs::path backup = dst.wstring() + L".old";
+                    if (MoveFileExW(dst.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                        MoveFileExW(backup.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+                        if (CopyFileW(src.c_str(), dst.c_str(), FALSE)) return true;
+                    }
+                }
+                Sleep(150);
+                continue;
+            }
+            return false;
+        }
+        return false;
+    };
+
+    for (const auto& entry : fs::recursive_directory_iterator(staging_root, ec)) {
+        if (ec) {
+            MessageBoxW(nullptr, (L"Failed to read update staging directory: " + to_wide(ec.message())).c_str(),
+                        APP_NAME, MB_ICONERROR | MB_OK);
+            return 1;
+        }
+        const fs::path rel = fs::relative(entry.path(), staging_root, ec);
+        if (ec || rel.empty()) continue;
+        // Never overwrite user data/
+        if (_wcsicmp(rel.begin()->c_str(), L"data") == 0) continue;
+
+        const fs::path dst = target_dir / rel;
+        if (entry.is_directory(ec)) {
+            fs::create_directories(dst, ec);
+            if (ec) {
+                MessageBoxW(nullptr, (L"Could not create directory " + dst.wstring()).c_str(), APP_NAME, MB_ICONERROR | MB_OK);
+                return 1;
+            }
+        } else if (entry.is_regular_file(ec)) {
+            fs::create_directories(dst.parent_path(), ec);
+            if (!copy_one(entry.path(), dst)) {
+                const std::wstring msg = L"Could not update " + dst.filename().wstring() +
+                                         L" (" + to_wide(win32_error_utf8(GetLastError())) + L").";
+                MessageBoxW(nullptr, msg.c_str(), APP_NAME, MB_ICONERROR | MB_OK);
+                return 1;
+            }
+        }
+    }
+
+    const fs::path next_exe = target_dir / L"usyseek.exe";
+    const fs::path update_dir = target_dir / L"data" / L"update";
+    std::wstring cmd = L"\"" + next_exe.wstring() + L"\" --cleanup-update \"" + update_dir.wstring() + L"\"";
+    if (open_about) cmd += L" --open-about";
+    STARTUPINFOW si{sizeof(si)};
+    wil::unique_process_information pi;
+    if (!CreateProcessW(next_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                        CREATE_UNICODE_ENVIRONMENT, nullptr, target_dir.c_str(), &si, &pi)) {
+        MessageBoxW(nullptr, (L"Update was installed, but usyseek.exe could not restart: " + to_wide(win32_error_utf8(GetLastError()))).c_str(),
+                    APP_NAME, MB_ICONWARNING | MB_OK);
+        return 1;
+    }
+    return 0;
+}
+
+void cleanup_update_artifacts(const fs::path& update_dir, const fs::path& target_dir) {
+    std::error_code ec;
+    for (int attempt = 0; attempt < 20 && fs::exists(update_dir, ec); ++attempt) {
+        fs::remove_all(update_dir, ec);
+        if (!fs::exists(update_dir, ec)) break;
+        Sleep(150);
+    }
+    for (const auto& entry : fs::recursive_directory_iterator(target_dir, ec)) {
+        if (ec) break;
+        if (entry.is_regular_file(ec) && entry.path().extension() == L".old") {
+            fs::remove(entry.path(), ec);
+        }
+    }
+}
 
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv && argc >= 5 && std::wstring_view{argv[1]} == L"--apply-update") {
+        const DWORD wait_pid = static_cast<DWORD>(_wtol(argv[2]));
+        const fs::path staging_root{argv[3]};
+        const fs::path target_dir{argv[4]};
+        bool open_about = false;
+        for (int i = 5; i < argc; ++i) {
+            if (std::wstring_view{argv[i]} == L"--open-about") open_about = true;
+        }
+        LocalFree(argv);
+        return run_apply_update(wait_pid, staging_root, target_dir, open_about);
+    }
+
+    fs::path cleanup_dir;
+    bool open_about = false;
+    if (argv) {
+        for (int i = 1; i < argc; ++i) {
+            const std::wstring_view a{argv[i]};
+            if (a == L"--cleanup-update" && i + 1 < argc) cleanup_dir = fs::path{argv[++i]};
+            else if (a == L"--open-about") open_about = true;
+        }
+        LocalFree(argv);
+    }
+    if (!cleanup_dir.empty()) {
+        cleanup_update_artifacts(cleanup_dir, exe_dir());
+    }
 
     wil::unique_mutex_nothrow single{CreateMutexW(nullptr, TRUE, LAUNCHER_MUTEX)};
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -694,6 +825,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
         MessageBoxW(nullptr, L"Could not initialize the background usyseek launcher window.", APP_NAME, MB_ICONERROR | MB_OK);
         return 1;
     }
+    if (open_about) launcher.open_about();
     const int code = launcher.run();
     launcher.shutdown();
     return code;

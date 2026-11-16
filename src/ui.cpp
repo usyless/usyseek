@@ -183,7 +183,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         if (HWND existing = FindWindowW(PILL_CLASS, nullptr)) {
             AllowSetForegroundWindow( ASFW_ANY );
             const UINT msg = show_notifications ? msg_open_notifications() : (show_settings ? msg_open_settings() : msg_toggle_search());
-            PostMessageW(existing, msg, 0, 0);
+            const WPARAM wp = show_settings ? static_cast<WPARAM>(settings_tab + 1) : 0;
+            PostMessageW(existing, msg, wp, 0);
             return 0;
         }
     }
@@ -194,7 +195,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     bool settings_corrupt = false;
     sh.settings = load_settings(&settings_corrupt);
     sh.refresh_theme(true, false);
-    if (!sh.test_mode) sh.reload_notifications(true);
+    if (!sh.test_mode) {
+        sh.reload_notifications(true);
+        sh.update_state = load_update_state();
+    }
     if (!sh.gfx.init()) {
         MessageBoxW(nullptr, L"Failed to initialize Direct3D / Direct2D graphics.", APP_NAME, MB_ICONERROR | MB_OK);
         return 1;
@@ -252,6 +256,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             if (sh.redraw_all) sh.redraw_all();
         });
     };
+    sh.engine.on_db_cleared = [&](std::string coll, std::string err) {
+        sh.call([&, coll = std::move(coll), err = std::move(err)] {
+            sh.notify("warning", "Database", "Database cleared — re-indexing required",
+                      "Could not load the Qdrant Edge index for '" + coll + "' (" + err +
+                      "), so it was cleared. Please run indexing again to rebuild embeddings. Your manual tags are preserved.",
+                      "db-cleared");
+            sh.refresh_tags();
+            if (sh.redraw_all) sh.redraw_all();
+        });
+    };
     sh.engine.on_job_dropped = [&](std::string title, std::string detail) {
         sh.notify("error", "Database", std::move(title), std::move(detail), "db-job-dropped");
     };
@@ -278,6 +292,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         settings_win.show(2);
         if (pill.visible()) pill.hide();
     };
+    sh.on_ui_opened = [&] { settings_win.maybe_auto_check_updates(); };
     sh.tags_refreshed = [&] { pill.on_tags_refreshed(); };
     sh.redraw_all = [&] {
         pill.invalidate();
@@ -341,7 +356,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         }
         if (msg == m_settings && m_settings) {
             done = true;
-            settings_win.show();
+            settings_win.show(wp > 0 ? static_cast<int>(wp - 1) : -1);
             if (pill.visible()) pill.hide();
             return 0;
         }
