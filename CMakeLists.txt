@@ -24,6 +24,7 @@ include(FetchContent)
 ##### Options
 option(USYSEEK_USE_MIMALLOC "Replace default allocator with mimalloc" ON)
 option(USYSEEK_USE_INTERPROCEDURAL_OPTIMIZATION "Enable FLTO/LTCG" ON)
+option(USYSEEK_BUILD_MIGRATE "Build temporary Qdrant-to-Edge migration tool (usyseek-migrate.exe)" OFF)
 cmake_dependent_option(USYSEEK_USE_STATIC_MSVCRT
     "Use the static release/debug MSVCRT - or set the flag yourself before including the project" ON
     "MSVC" OFF
@@ -108,16 +109,26 @@ find_program(CARGO_EXECUTABLE cargo REQUIRED)
 set(RUST_DIR "${PROJECT_SOURCE_DIR}/rust")
 set(RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/rust_target")
 set(RUST_STATIC_LIB "${RUST_TARGET_DIR}/release/usyseek_rust.lib")
-set(RUST_MIGRATE_EXE "${RUST_TARGET_DIR}/release/usyseek-migrate.exe")
+set(RUST_OUTPUTS "${RUST_STATIC_LIB}")
+set(RUST_DEPENDS "${RUST_DIR}/Cargo.toml" "${RUST_DIR}/Cargo.lock" "${RUST_DIR}/src/lib.rs" "${RUST_DIR}/src/svg.rs")
+set(RUST_CARGO_CMD "${CARGO_EXECUTABLE}" rustc --release --lib --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}" -- --crate-type staticlib)
+set(RUST_BUILD_COMMENT "Building usyseek_rust staticlib (qdrant-edge + tokenizers + resvg)...")
+if(USYSEEK_BUILD_MIGRATE)
+    set(RUST_MIGRATE_EXE "${RUST_TARGET_DIR}/release/usyseek-migrate.exe")
+    list(APPEND RUST_OUTPUTS "${RUST_MIGRATE_EXE}")
+    list(APPEND RUST_DEPENDS "${RUST_DIR}/src/bin/usyseek-migrate.rs")
+    set(RUST_CARGO_CMD "${CARGO_EXECUTABLE}" build --release --lib --bin usyseek-migrate --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}")
+    set(RUST_BUILD_COMMENT "Building usyseek_rust staticlib and usyseek-migrate (qdrant-edge + tokenizers + resvg)...")
+endif()
 add_custom_command(
-    OUTPUT "${RUST_STATIC_LIB}" "${RUST_MIGRATE_EXE}"
-    COMMAND "${CARGO_EXECUTABLE}" build --release --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
-    DEPENDS "${RUST_DIR}/Cargo.toml" "${RUST_DIR}/Cargo.lock" "${RUST_DIR}/src/lib.rs" "${RUST_DIR}/src/svg.rs" "${RUST_DIR}/src/bin/usyseek-migrate.rs"
+    OUTPUT ${RUST_OUTPUTS}
+    COMMAND ${RUST_CARGO_CMD}
+    DEPENDS ${RUST_DEPENDS}
     WORKING_DIRECTORY "${RUST_DIR}"
-    COMMENT "Building usyseek_rust staticlib and usyseek-migrate (qdrant-edge + tokenizers + resvg)..."
+    COMMENT "${RUST_BUILD_COMMENT}"
     VERBATIM
 )
-add_custom_target(usyseek_rust_build DEPENDS "${RUST_STATIC_LIB}")
+add_custom_target(usyseek_rust_build DEPENDS ${RUST_OUTPUTS})
 add_library(usyseek_rust STATIC IMPORTED GLOBAL)
 set_target_properties(usyseek_rust PROPERTIES IMPORTED_LOCATION "${RUST_STATIC_LIB}")
 target_link_libraries(usyseek_rust INTERFACE ws2_32 userenv ntdll bcrypt advapi32 synchronization crypt32 secur32 ncrypt)
@@ -261,10 +272,14 @@ target_link_libraries(usyseek-indexer PRIVATE
 )
 
 ##### Runtime layout next to the executables
+set(USYSEEK_MIGRATE_COPY_CMD "")
+if(USYSEEK_BUILD_MIGRATE)
+    set(USYSEEK_MIGRATE_COPY_CMD COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${RUST_MIGRATE_EXE}" "${USYSEEK_BIN_DIR}/usyseek-migrate.exe")
+endif()
 add_custom_target(usyseek_runtime ALL
     DEPENDS usyseek_rust_build
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${USYSEEK_BIN_DIR}/python"
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${RUST_MIGRATE_EXE}" "${USYSEEK_BIN_DIR}/usyseek-migrate.exe"
+    ${USYSEEK_MIGRATE_COPY_CMD}
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/python/usyseek_vision.py" "${USYSEEK_BIN_DIR}/python/usyseek_vision.py"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/python/requirements.txt" "${USYSEEK_BIN_DIR}/python/requirements.txt"
     VERBATIM
