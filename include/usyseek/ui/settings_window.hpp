@@ -741,7 +741,6 @@ private:
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         const bool glass = glass_active();
-        const bool has_scene = glass && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
             if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
                                            make_desktop_glass_style(cv.theme(), 0.0f, true))) {
@@ -751,7 +750,7 @@ private:
             cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().settings_bg_alpha));
         }
 
-        if (!glass) draw_tabs(cv, sz);
+        draw_tabs(cv, sz);
 
         const D2D1_RECT_F view = D2D1::RectF(0, tabs_height(sz.width) + 1.0f, sz.width, sz.height);
         cv.push_clip(view);
@@ -785,13 +784,6 @@ private:
             scroll_thumb_ = tr;
         }
 
-        if (has_scene) glass_.end_scene(target_);
-        if (glass) {
-            const float strip_h = tabs_height(sz.width);
-            glass_.draw_scene_glass(cv, target_, sh_.gfx, D2D1::RectF(0.0f, 0.0f, sz.width, strip_h),
-                                    make_overlay_glass_style(cv.theme(), 0.0f, 1.8f));
-            draw_tabs(cv, sz);
-        }
         draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
     }
 
@@ -3272,12 +3264,7 @@ private:
             case WM_MOVE:
                 if (glass_active() && visible()) {
                     full_dirty_ = true;
-                    if (in_sizemove_) {
-                        render();
-                        DwmFlush();
-                    } else {
-                        invalidate();
-                    }
+                    invalidate();
                 }
                 return 0;
             case WM_ENTERSIZEMOVE: in_sizemove_ = true; return 0;

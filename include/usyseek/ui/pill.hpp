@@ -3439,12 +3439,7 @@ private:
             case WM_MOVE:
                 if (glass_active() && visible()) {
                     full_dirty_ = true;
-                    if (in_sizemove_) {
-                        render();
-                        DwmFlush();
-                    } else {
-                        invalidate();
-                    }
+                    invalidate();
                 }
                 return 0;
             case WM_ENTERSIZEMOVE: in_sizemove_ = true; return 0;

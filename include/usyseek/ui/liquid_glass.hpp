@@ -106,38 +106,33 @@ float RoundedRectSDF(float2 p, float2 center, float2 half0, float cr, float n)
         float2 cornerCenter = sign(p) * (half0 - float2(cr, cr));
         return superellipseCornerSDF(p - cornerCenter, cr, n);
     }
-    if (d.x < -cr && d.y < -cr)
-    {
-        float a = d.x + cr;
-        float b = d.y + cr;
-        float k = min(8.0, max(-a, -b));
-        if (k > 1e-4)
-        {
-            float h = saturate(0.5 + 0.5 * (a - b) / k);
-            return -cr + lerp(b, a, h) + k * h * (1.0 - h);
-        }
-    }
     return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
 }
 
-float2 RoundedRectUnitNormal(float2 fragCoord, float2 center, float2 halfPx,
-                             float cr, float n, float blend)
+float2 RoundedRectUnitNormal(float2 fragCoord, float2 center, float2 halfPx, float cr, float n)
 {
     float2 p = fragCoord - center;
     cr = min(cr, min(halfPx.x, halfPx.y));
-    float2 cc = abs(p) - (halfPx - cr);
     float2 sgn = sign(p);
+    float2 ap = abs(p);
+    float2 inner = max(halfPx - cr, 0.0);
+
+    // Smoothly round the inner reference box with radius k so the normal field is C1 continuous
+    // everywhere inside the panel, completely eliminating the 45-degree ridge bisector at the corners.
+    float k = min(max(cr * 1.25, 18.0), min(inner.x, inner.y));
+    float2 innerSm = max(inner - k, 0.0);
+    float2 q = max(ap - innerSm, 0.0);
+    float2 g = pow(q, float2(n - 1.0, n - 1.0));
+    float gLen = length(g);
     float2 local;
-    if (max(cc.x, cc.y) > 0.0)
+    if (gLen > 1e-6)
     {
-        float2 g = pow(max(cc, 0.0), float2(n - 1.0, n - 1.0));
-        local = g / max(length(g), 1e-6);
+        local = g / gLen;
     }
     else
     {
-        float b = max(min(blend, max(-cc.x, -cc.y)), 1e-4);
-        float t = smoothstep(-b, b, cc.x - cc.y);
-        local = normalize(float2(t, 1.0 - t));
+        float2 d = ap - halfPx;
+        local = (d.x > d.y) ? float2(1.0, 0.0) : float2(0.0, 1.0);
     }
     return sgn * local;
 }
@@ -203,7 +198,7 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
         float edgeFactor = EdgeSlopeFactor(nmerged, refThickness, refFactor);
         float ef1 = EdgeSlopeFactor(nmerged + 1.0, refThickness, refFactor);
 
-        float2 unitN = RoundedRectUnitNormal(fragCoord, center, halfPx, cr, n, 16.0 * dpr);
+        float2 unitN = RoundedRectUnitNormal(fragCoord, center, halfPx, cr, n);
         float nLen = length(unitN);
         float2 safeN = nLen > 1e-6 ? (unitN / nLen) : float2(0.0, 0.0);
 
@@ -735,12 +730,62 @@ public:
     /// Returns false if Desktop Duplication or shader compilation is unavailable.
     bool draw_desktop_glass(DesktopDuplicator& dupl, Canvas& cv, WindowTarget& target, Gfx& gfx, HWND hwnd,
                             D2D1_RECT_F panel_rect, const GlassStyle& style) {
-        ID2D1Bitmap1* bmp = capture_window_backdrop(dupl, gfx, target, hwnd, GetTickCount64());
-        if (!bmp) return false;
-        const D2D1_SIZE_F sz = target.size();
+        if (!target.ready() || !hwnd) return false;
+        const auto* st = dupl.poll_monitor(gfx, hwnd, GetTickCount64());
+        if (st && st->has_frame) {
+            last_mon_ = st->mon;
+            last_seq_ = st->frame_seq;
+        }
+
+        const UINT pw = target.pixel_width();
+        const UINT ph = target.pixel_height();
+        if (pw == 0 || ph == 0) return false;
+
         GlassStyle s = style;
         s.force_opaque = true;
-        return draw_bitmap_glass(cv, target, gfx, bmp, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), panel_rect, s);
+
+        if (st && st->has_frame && st->desktop_tex) {
+            if (!desktop_bmp_ || desktop_bmp_tex_id_ != st->tex_id || desktop_bmp_dpi_ != target.dpi() || desktop_bmp_epoch_ != gfx.epoch()) {
+                desktop_bmp_.reset();
+                desktop_bmp_tex_id_ = 0;
+                auto surf = st->desktop_tex.try_query<IDXGISurface>();
+                if (!surf) return false;
+                const auto props = D2D1::BitmapProperties1(
+                    D2D1_BITMAP_OPTIONS_NONE,
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+                    target.dpi(), target.dpi());
+                if (FAILED(target.dc()->CreateBitmapFromDxgiSurface(surf.get(), &props, &desktop_bmp_))) {
+                    return false;
+                }
+                desktop_bmp_tex_id_ = st->tex_id;
+                desktop_bmp_dpi_ = target.dpi();
+                desktop_bmp_epoch_ = gfx.epoch();
+            }
+
+            POINT origin{0, 0};
+            ClientToScreen(hwnd, &origin);
+            const float scale = target.scale();
+            const float ox_dip = static_cast<float>(origin.x - st->mon_rect.left) / scale;
+            const float oy_dip = static_cast<float>(origin.y - st->mon_rect.top) / scale;
+            const float mon_w_dip = static_cast<float>(st->tex_w) / scale;
+            const float mon_h_dip = static_cast<float>(st->tex_h) / scale;
+            const D2D1_RECT_F src_bounds = D2D1::RectF(0.0f, 0.0f, mon_w_dip, mon_h_dip);
+            const D2D1_RECT_F mon_panel = D2D1::RectF(
+                panel_rect.left + ox_dip,
+                panel_rect.top + oy_dip,
+                panel_rect.right + ox_dip,
+                panel_rect.bottom + oy_dip);
+            return draw_bitmap_glass(
+                cv, target, gfx, desktop_bmp_.get(), src_bounds, mon_panel,
+                D2D1::Point2F(panel_rect.left, panel_rect.top), s);
+        }
+
+        ID2D1Bitmap1* bmp = capture_gdi_backdrop(gfx, target, hwnd, pw, ph);
+        if (!bmp) return false;
+        const D2D1_SIZE_F sz = target.size();
+        return draw_bitmap_glass(
+            cv, target, gfx, bmp, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
+            panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), s);
     }
 
     /// Redirects `target.dc()` into an offscreen `scene_bmp_` so floating glass panels
@@ -787,22 +832,13 @@ public:
                           D2D1_RECT_F panel_rect, const GlassStyle& style) {
         if (!scene_bmp_) return false;
         const D2D1_SIZE_F sz = target.size();
-        return draw_bitmap_glass(cv, target, gfx, scene_bmp_.get(), D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), panel_rect, style);
+        return draw_bitmap_glass(
+            cv, target, gfx, scene_bmp_.get(), D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
+            panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), style);
     }
 
 private:
-    ID2D1Bitmap1* capture_window_backdrop(DesktopDuplicator& dupl, Gfx& gfx, WindowTarget& target, HWND hwnd, ULONGLONG now_tick) {
-        if (!target.ready() || !hwnd) return nullptr;
-        const auto* st = dupl.poll_monitor(gfx, hwnd, now_tick);
-        if (st && st->has_frame) {
-            last_mon_ = st->mon;
-            last_seq_ = st->frame_seq;
-        }
-
-        const UINT pw = target.pixel_width();
-        const UINT ph = target.pixel_height();
-        if (pw == 0 || ph == 0) return nullptr;
-
+    ID2D1Bitmap1* capture_gdi_backdrop(Gfx& gfx, WindowTarget& target, HWND hwnd, UINT pw, UINT ph) {
         if (!win_bmp_ || win_bmp_w_ != pw || win_bmp_h_ != ph || win_bmp_dpi_ != target.dpi() || win_bmp_epoch_ != gfx.epoch()) {
             win_bmp_.reset();
             const auto props = D2D1::BitmapProperties1(
@@ -818,50 +854,8 @@ private:
             win_bmp_epoch_ = gfx.epoch();
             seeded_gdi_ = false;
         }
-
-        if (!st || !st->has_frame || !st->desktop_tex) {
-            if (!seeded_gdi_) seeded_gdi_ = seed_from_screen_dc(hwnd, pw, ph);
-            return seeded_gdi_ ? win_bmp_.get() : nullptr;
-        }
-
-        if (!desktop_bmp_ || desktop_bmp_tex_id_ != st->tex_id || desktop_bmp_epoch_ != gfx.epoch()) {
-            desktop_bmp_.reset();
-            desktop_bmp_tex_id_ = 0;
-            auto surf = st->desktop_tex.try_query<IDXGISurface>();
-            if (!surf) return nullptr;
-            const auto props = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_NONE,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
-                target.dpi(), target.dpi());
-            if (FAILED(target.dc()->CreateBitmapFromDxgiSurface(surf.get(), &props, &desktop_bmp_))) {
-                return nullptr;
-            }
-            desktop_bmp_tex_id_ = st->tex_id;
-            desktop_bmp_epoch_ = gfx.epoch();
-        }
-
-        POINT origin{0, 0};
-        ClientToScreen(hwnd, &origin);
-        const LONG sx = origin.x - st->mon_rect.left;
-        const LONG sy = origin.y - st->mon_rect.top;
-        const LONG clip_l = std::clamp<LONG>(sx, 0, static_cast<LONG>(st->tex_w));
-        const LONG clip_t = std::clamp<LONG>(sy, 0, static_cast<LONG>(st->tex_h));
-        const LONG clip_r = std::clamp<LONG>(sx + static_cast<LONG>(pw), 0, static_cast<LONG>(st->tex_w));
-        const LONG clip_b = std::clamp<LONG>(sy + static_cast<LONG>(ph), 0, static_cast<LONG>(st->tex_h));
-        if (clip_r <= clip_l || clip_b <= clip_t) return nullptr;
-
-        const D2D1_POINT_2U dst_pt{
-            .x = static_cast<UINT32>(clip_l - sx),
-            .y = static_cast<UINT32>(clip_t - sy),
-        };
-        const D2D1_RECT_U src_rc{
-            .left = static_cast<UINT32>(clip_l),
-            .top = static_cast<UINT32>(clip_t),
-            .right = static_cast<UINT32>(clip_r),
-            .bottom = static_cast<UINT32>(clip_b),
-        };
-        if (FAILED(win_bmp_->CopyFromBitmap(&dst_pt, desktop_bmp_.get(), &src_rc))) return nullptr;
-        return win_bmp_.get();
+        if (!seeded_gdi_) seeded_gdi_ = seed_from_screen_dc(hwnd, pw, ph);
+        return seeded_gdi_ ? win_bmp_.get() : nullptr;
     }
 
     bool seed_from_screen_dc(HWND hwnd, UINT pw, UINT ph) {
@@ -913,7 +907,8 @@ private:
     }
 
     bool draw_bitmap_glass(Canvas& cv, WindowTarget& target, Gfx& gfx, ID2D1Bitmap1* src_bmp,
-                           D2D1_RECT_F src_bounds, D2D1_RECT_F panel_rect, const GlassStyle& style) {
+                           D2D1_RECT_F src_bounds, D2D1_RECT_F panel_rect, D2D1_POINT_2F target_offset,
+                           const GlassStyle& style) {
         if (!src_bmp || width(panel_rect) <= 2.0f || height(panel_rect) <= 2.0f) return false;
         if (!ensure_effects(target, gfx)) return false;
 
@@ -938,7 +933,7 @@ private:
 
         cv.dc()->DrawImage(
             glass_effect_.get(),
-            D2D1::Point2F(panel_rect.left, panel_rect.top),
+            target_offset,
             panel_rect,
             D2D1_INTERPOLATION_MODE_LINEAR,
             D2D1_COMPOSITE_MODE_SOURCE_OVER);
@@ -947,6 +942,7 @@ private:
 
     wil::com_ptr<ID2D1Bitmap1> desktop_bmp_;
     uint64_t desktop_bmp_tex_id_ = 0;
+    float desktop_bmp_dpi_ = 0.0f;
     wil::com_ptr<ID2D1Bitmap1> win_bmp_;
     wil::com_ptr<ID2D1Bitmap1> scene_bmp_;
     wil::com_ptr<ID2D1Effect> blur_effect_;
