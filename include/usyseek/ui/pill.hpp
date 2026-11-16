@@ -1238,7 +1238,7 @@ private:
     }
 
     [[nodiscard]] D2D1_COLOR_F status_dot_color() const noexcept {
-        if (sh_.indexer_running) return sh_.theme.amber;
+        if (sh_.indexer_running || sh_.engine.db_paused_for_indexing()) return sh_.theme.amber;
         const auto st = sh_.engine.encoder().state();
         if (st == TextEncoder::State::Failed || !error_.empty() || (!sh_.engine.db_ready() && !sh_.test_mode)) return sh_.theme.error;
         if (st == TextEncoder::State::Loading || st == TextEncoder::State::Exporting) return sh_.theme.primary;
@@ -1288,6 +1288,9 @@ private:
         if (!model_error.empty()) {
             sep();
             piece(model_error, cv.theme().error);
+        } else if (sh_.engine.db_paused_for_indexing() && !sh_.test_mode) {
+            sep();
+            piece(L"Database unavailable while indexing", cv.theme().amber);
         } else if (!sh_.engine.db_ready() && !sh_.test_mode) {
             sep();
             piece(L"Database unavailable", cv.theme().error);
@@ -1754,6 +1757,11 @@ private:
                     ++fail_cnt;
                     if (first_err.empty()) first_err = std::move(err);
                 }
+            }
+            std::string flush_err;
+            if (!db.flush(coll, &flush_err) && fail_cnt == 0) {
+                fail_cnt = 1;
+                first_err = std::move(flush_err);
             }
             if (fail_cnt > 0) {
                 sh_.call([this, fail_cnt, first_err] {

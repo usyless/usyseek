@@ -1,5 +1,5 @@
 // usyseek.exe - the always-running launcher.
-// Owns the tray icon and global hotkey, supervises the search UI, indexer and qdrant processes.
+// Owns the tray icon and global hotkey, supervises the search UI and indexer processes.
 // Deliberately does nothing else so its working set stays tiny.
 
 #include <usyseek/settings.hpp>
@@ -46,6 +46,7 @@ public:
         }
         job_ = make_kill_on_close_job();
         stop_event_.reset(CreateEventW(nullptr, TRUE, FALSE, INDEXER_STOP_EVENT));
+        db_want_event_.reset(CreateEventW(nullptr, TRUE, FALSE, INDEXER_DB_WANT_EVENT));
         taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
 
         WNDCLASSEXW wc{sizeof(wc)};
@@ -66,11 +67,10 @@ public:
     int run() {
         SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
         for (;;) {
-            HANDLE handles[3];
+            HANDLE handles[2];
             DWORD n = 0;
             if (ui_.hProcess) handles[n++] = ui_.hProcess;
             if (indexer_.hProcess) handles[n++] = indexer_.hProcess;
-            if (qdrant_.hProcess) handles[n++] = qdrant_.hProcess;
 
             const DWORD r = MsgWaitForMultipleObjectsEx(n, handles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             if (r < WAIT_OBJECT_0 + n) {
@@ -93,9 +93,8 @@ public:
             if (WaitForSingleObject(indexer_.hProcess, 3000) != WAIT_OBJECT_0) TerminateProcess(indexer_.hProcess, 1);
             close_everything_instance();
         }
-        for (auto* p : {&ui_, &qdrant_}) {
-            if (p->hProcess) TerminateProcess(p->hProcess, 0);
-        }
+        if (db_want_event_) ResetEvent(db_want_event_.get());
+        if (ui_.hProcess) TerminateProcess(ui_.hProcess, 0);
     }
 
 private:
@@ -182,7 +181,6 @@ private:
         switch (static_cast<Cmd>(cds->dwData)) {
             case Cmd::UiHello:
                 ui_hwnd_ = reinterpret_cast<HWND>(static_cast<uintptr_t>(payload(uint64_t{0})));
-                ensure_qdrant();
                 return TRUE;
             case Cmd::StartIndex:
                 start_index();
@@ -201,9 +199,6 @@ private:
                 return TRUE;
             case Cmd::HotkeyStatus:
                 return static_cast<LRESULT>(hotkey_state_);
-            case Cmd::NeedQdrant:
-                ensure_qdrant();
-                return TRUE;
             case Cmd::TestNotification:
                 show_balloon(APP_NAME, L"Test Windows notification from usyseek. Click to open Notifications.", NIIF_INFO, true);
                 return TRUE;
@@ -250,29 +245,7 @@ private:
         return pi;
     }
 
-    void ensure_qdrant() {
-        if (qdrant_.hProcess) return;
-        qdrant_ = start_qdrant(settings_, job_.get());
-        if (!qdrant_.hProcess) {
-            const DWORD err = GetLastError();
-            const std::string detail = err ? win32_error_utf8(err) : "Could not launch qdrant.exe.";
-            push_notification_to_disk(
-                "error", "Database", "Failed to start Qdrant",
-                detail, "qdrant-start", true);
-            show_balloon(APP_NAME, L"Failed to start local Qdrant database. Check Notifications in Settings.", NIIF_ERROR, true);
-        }
-    }
-
-    void maybe_stop_qdrant() {
-        if (!is_ui_running() && !indexer_.hProcess && qdrant_.hProcess) {
-            TerminateProcess(qdrant_.hProcess, 0);
-            WaitForSingleObject(qdrant_.hProcess, 2000);
-            qdrant_.reset();
-        }
-    }
-
     void spawn_ui(const std::wstring& arg) {
-        ensure_qdrant();
         ui_ = spawn(exe_dir() / L"usyseek-ui.exe", arg, false);
     }
 
@@ -353,13 +326,13 @@ private:
             }
         }
         ui_hwnd_ = nullptr;
-        maybe_stop_qdrant();
     }
 
     void start_index() {
         if (indexer_.hProcess) return;
         settings_ = load_settings();
-        ensure_qdrant();
+        if (db_want_event_) SetEvent(db_want_event_.get());
+        notify_ui(true);
         ResetEvent(stop_event_.get());
 
         std::error_code ec;
@@ -371,7 +344,11 @@ private:
         indexer_ = spawn(exe_dir() / L"usyseek-indexer.exe", L"", true, log_file.get());
         stopping_index_ = false;
         indexer_status_.reset();
-        if (indexer_.hProcess) SetTimer(hwnd_, TIMER_TRAY_PROGRESS, 1000, nullptr);
+        if (indexer_.hProcess) {
+            SetTimer(hwnd_, TIMER_TRAY_PROGRESS, 1000, nullptr);
+        } else if (db_want_event_) {
+            ResetEvent(db_want_event_.get());
+        }
         notify_ui();
         update_tip();
     }
@@ -406,13 +383,13 @@ private:
                     "usyseek-ui.exe terminated with exit code " + std::to_string(code) + ".",
                     "ui-exit", false);
             }
-            maybe_stop_qdrant();
         } else if (h == indexer_.hProcess) {
             DWORD code = 0;
             GetExitCodeProcess(indexer_.hProcess, &code);
             KillTimer(hwnd_, TIMER_STOP_INDEX);
             KillTimer(hwnd_, TIMER_TRAY_PROGRESS);
             indexer_.reset();
+            if (db_want_event_) ResetEvent(db_want_event_.get());
             const bool was_stopping = stopping_index_;
             stopping_index_ = false;
             std::wstring status_msg;
@@ -438,25 +415,14 @@ private:
                 }
             }
             notify_ui();
-            maybe_stop_qdrant();
             update_tip();
-        } else if (h == qdrant_.hProcess) {
-            DWORD code = 0;
-            GetExitCodeProcess(qdrant_.hProcess, &code);
-            qdrant_.reset();
-            if (is_ui_running() || indexer_.hProcess) {
-                push_notification_to_disk(
-                    "error", "Database", "Qdrant database process exited",
-                    "qdrant.exe exited while in use (exit code " + std::to_string(code) + ").",
-                    "qdrant-exit", true);
-                show_balloon(APP_NAME, L"Qdrant database stopped unexpectedly (code " + std::to_wstring(code) + L").", NIIF_ERROR, true);
-            }
         }
         SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
     }
 
-    void notify_ui() noexcept {
-        if (ui_hwnd_ && IsWindow(ui_hwnd_)) PostMessageW(ui_hwnd_, msg_indexer_changed(), indexer_.hProcess ? 1 : 0, 0);
+    void notify_ui(std::optional<bool> force_active = std::nullopt) noexcept {
+        const bool active = force_active.value_or(indexer_.hProcess != nullptr);
+        if (ui_hwnd_ && IsWindow(ui_hwnd_)) PostMessageW(ui_hwnd_, msg_indexer_changed(), active ? 1 : 0, 0);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -695,9 +661,9 @@ private:
     uint32_t failed_mods_ = 0, failed_vk_ = 0;
     wil::unique_handle job_;
     wil::unique_event_nothrow stop_event_;
+    wil::unique_event_nothrow db_want_event_;
     wil::unique_process_information ui_;
     wil::unique_process_information indexer_;
-    wil::unique_process_information qdrant_;
     wil::unique_hicon tray_icon_;
     mutable std::optional<StatusBlock> indexer_status_;
     bool stopping_index_ = false;

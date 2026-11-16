@@ -138,6 +138,7 @@ struct Shared {
         }
 
         const bool finished = was_running && !indexer_running;
+        if (indexer_running != was_running) engine.set_indexing_active(indexer_running);
         if (finished) engine.encoder().retry(); // the indexer exports the text model when it was missing
         const bool failed_changed = indexer_running && indexer.failed != prev_failed;
         if (force || finished || failed_changed || !polled_once_) {

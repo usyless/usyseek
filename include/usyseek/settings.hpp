@@ -56,10 +56,6 @@ struct Settings {
     std::string rocm_arch = "gfx1030";
     std::string cuda_version = "cu126";  // PyTorch CUDA wheel index, e.g. cu126 | cu130
     std::string torch_pip_args;          // optional custom pip install args for torch/torchvision
-
-    // Database
-    uint16_t qdrant_http_port = 6389;
-    uint16_t qdrant_grpc_port = 6390;
 };
 
 /// Written by the indexer only.

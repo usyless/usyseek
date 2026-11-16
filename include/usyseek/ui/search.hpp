@@ -457,10 +457,13 @@ public:
 
     void start(const Settings& s) {
         settings_ = s;
+        db_want_event_.reset(CreateEventW(nullptr, TRUE, FALSE, INDEXER_DB_WANT_EVENT));
+        arm_db_want_wait();
         thread_ = std::jthread([this] { run(); });
     }
 
     void stop() noexcept {
+        disarm_db_want_wait();
         {
             std::lock_guard lk{m_};
             stopping_ = true;
@@ -468,6 +471,14 @@ public:
         cv_.notify_all();
         thread_ = {};
         encoder_.stop();
+    }
+
+    void set_indexing_active(bool active) noexcept {
+        {
+            std::lock_guard lk{m_};
+            indexing_active_hint_ = active;
+        }
+        cv_.notify_one();
     }
 
     void search(SearchRequest r) noexcept {
@@ -486,6 +497,15 @@ public:
         cv_.notify_one();
     }
 
+    /// Runs `job` as soon as the database is open (waiting through an indexing pause if needed).
+    void post_when_ready(std::function<void(Db&)> job) {
+        {
+            std::lock_guard lk{m_};
+            deferred_jobs_.push_back(std::move(job));
+        }
+        cv_.notify_one();
+    }
+
     void set_settings(const Settings& s) {
         std::lock_guard lk{m_};
         settings_ = s;
@@ -493,6 +513,7 @@ public:
 
     TextEncoder& encoder() noexcept { return encoder_; }
     [[nodiscard]] bool db_ready() const noexcept { return db_ready_.load(); }
+    [[nodiscard]] bool db_paused_for_indexing() const noexcept { return db_paused_for_indexing_.load(); }
 
     [[nodiscard]] std::string collection() const {
         std::lock_guard lk{m_};
@@ -500,6 +521,28 @@ public:
     }
 
 private:
+    static void CALLBACK on_db_want(PVOID ctx, BOOLEAN /*timed_out*/) noexcept {
+        static_cast<Engine*>(ctx)->set_indexing_active(true);
+    }
+
+    void arm_db_want_wait() noexcept {
+        if (!db_want_event_) return;
+        std::lock_guard lk{wait_mx_};
+        if (wait_handle_) {
+            UnregisterWaitEx(wait_handle_, nullptr);
+            wait_handle_ = nullptr;
+        }
+        RegisterWaitForSingleObject(&wait_handle_, db_want_event_.get(), &Engine::on_db_want, this, INFINITE, WT_EXECUTEONLYONCE);
+    }
+
+    void disarm_db_want_wait() noexcept {
+        std::lock_guard lk{wait_mx_};
+        if (wait_handle_) {
+            UnregisterWaitEx(wait_handle_, INVALID_HANDLE_VALUE);
+            wait_handle_ = nullptr;
+        }
+    }
+
     void run() {
         ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
         Settings s;
@@ -507,39 +550,97 @@ private:
             std::lock_guard lk{m_};
             s = settings_;
         }
-        if (db_.connect(s.qdrant_grpc_port)) {
-            send_to_launcher(Cmd::NeedQdrant);
-            db_ready_ = db_.wait_ready(std::chrono::seconds(30));
-            if (on_db_state) {
-                on_db_state(db_ready_.load(), db_ready_ ? std::string{} : ("Qdrant gRPC on 127.0.0.1:" + std::to_string(s.qdrant_grpc_port) + " did not become ready within 30s."));
+
+        auto open_db = [&] {
+            std::string err;
+            if (db_.open(edge_data_dir(), &err)) {
+                db_paused_for_indexing_.store(false, std::memory_order_release);
+                db_ready_.store(true, std::memory_order_release);
+                arm_db_want_wait();
+                if (on_db_state) on_db_state(true, {});
+            } else {
+                db_paused_for_indexing_.store(false, std::memory_order_release);
+                db_ready_.store(false, std::memory_order_release);
+                if (on_db_state) on_db_state(false, err);
             }
+        };
+        auto pause_db = [&] {
+            const bool already_paused = db_paused_for_indexing_.load(std::memory_order_acquire) && !db_.opened();
+            std::string err;
+            (void)db_.close(&err);
+            db_ready_.store(false, std::memory_order_release);
+            db_paused_for_indexing_.store(true, std::memory_order_release);
+            if (!already_paused && on_db_state) on_db_state(false, {});
+        };
+
+        if (is_indexer_db_wanted()) {
+            pause_db();
         } else {
-            db_ready_ = false;
-            if (on_db_state) {
-                on_db_state(false, "Could not create gRPC channel to Qdrant on 127.0.0.1:" + std::to_string(s.qdrant_grpc_port) + ".");
-            }
+            open_db();
         }
+
         for (;;) {
             std::optional<SearchRequest> req;
             std::function<void(Db&)> job;
+            bool need_pause = false;
+            bool need_resume = false;
             {
                 std::unique_lock lk{m_};
-                cv_.wait(lk, [&] { return stopping_ || pending_search_ || !jobs_.empty(); });
-                if (stopping_) return;
-                if (!jobs_.empty()) {
-                    job = std::move(jobs_.front());
-                    jobs_.pop_front();
+                const auto wake = [&] {
+                    if (stopping_) return true;
+                    const bool want = indexing_active_hint_ || is_indexer_db_wanted();
+                    if (want && !db_paused_for_indexing_.load(std::memory_order_acquire)) return true;
+                    if (!want && db_paused_for_indexing_.load(std::memory_order_acquire)) return true;
+                    if (db_ready_.load(std::memory_order_acquire) && !deferred_jobs_.empty()) return true;
+                    return pending_search_.has_value() || !jobs_.empty();
+                };
+                if (db_paused_for_indexing_.load(std::memory_order_acquire)) {
+                    cv_.wait_for(lk, std::chrono::milliseconds(250), wake);
                 } else {
-                    req = std::move(pending_search_);
-                    pending_search_.reset();
+                    cv_.wait(lk, wake);
+                }
+                if (stopping_) return;
+
+                const bool want = indexing_active_hint_ || is_indexer_db_wanted();
+                if (want) {
+                    if (!db_paused_for_indexing_.load(std::memory_order_acquire) || db_.opened()) need_pause = true;
+                } else if (db_paused_for_indexing_.load(std::memory_order_acquire)) {
+                    indexing_active_hint_ = false;
+                    need_resume = true;
+                }
+
+                if (!need_pause && !need_resume) {
+                    if (!jobs_.empty()) {
+                        job = std::move(jobs_.front());
+                        jobs_.pop_front();
+                    } else if (db_ready_.load(std::memory_order_acquire) && !deferred_jobs_.empty()) {
+                        job = std::move(deferred_jobs_.front());
+                        deferred_jobs_.pop_front();
+                    } else if (pending_search_) {
+                        req = std::move(pending_search_);
+                        pending_search_.reset();
+                    }
                 }
                 s = settings_;
+            }
+
+            if (need_pause) {
+                pause_db();
+                continue;
+            }
+            if (need_resume) {
+                if (!is_indexer_db_wanted()) open_db();
+                continue;
             }
             if (job) {
                 if (db_ready_) {
                     job(db_);
                 } else if (on_job_dropped) {
-                    on_job_dropped("Database unavailable", "Queued database update could not run because Qdrant is disconnected.");
+                    if (db_paused_for_indexing_) {
+                        on_job_dropped("Database unavailable while indexing", "Database updates are paused while indexing is in progress.");
+                    } else {
+                        on_job_dropped("Database unavailable", "Queued database update could not run because the database is closed.");
+                    }
                 }
                 continue;
             }
@@ -553,7 +654,7 @@ private:
         res->append = r.offset > 0;
         const auto t0 = std::chrono::steady_clock::now();
         if (!db_ready_) {
-            res->error = L"Database unavailable";
+            res->error = db_paused_for_indexing_ ? L"Database unavailable while indexing" : L"Database unavailable";
             return res;
         }
 
@@ -637,10 +738,16 @@ private:
     std::condition_variable cv_;
     std::optional<SearchRequest> pending_search_;
     std::deque<std::function<void(Db&)>> jobs_;
+    std::deque<std::function<void(Db&)>> deferred_jobs_;
     bool stopping_ = false;
+    bool indexing_active_hint_ = false;
     Settings settings_;
     Db db_;
     std::atomic<bool> db_ready_{false};
+    std::atomic<bool> db_paused_for_indexing_{false};
+    std::mutex wait_mx_;
+    wil::unique_event_nothrow db_want_event_;
+    HANDLE wait_handle_ = nullptr;
     TextEncoder encoder_;
     std::jthread thread_;
 };

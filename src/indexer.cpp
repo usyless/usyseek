@@ -1072,27 +1072,45 @@ int run_indexer(Settings& settings) {
     const std::string coll = settings.model_name;
     const Scope scope{settings};
 
-    // --- Database
-    pr.phase(Phase::Starting, L"Connecting to database");
-    const bool has_launcher = find_launcher() != nullptr;
-    if (has_launcher) send_to_launcher(Cmd::NeedQdrant);
-    wil::unique_handle own_job;
-    wil::unique_process_information own_qdrant;
+    // --- Database (indexer takes priority over the UI's embedded Qdrant Edge handle)
+    pr.phase(Phase::Starting, L"Opening database");
+    wil::unique_event_nothrow db_want{CreateEventW(nullptr, TRUE, FALSE, INDEXER_DB_WANT_EVENT)};
+    if (db_want) SetEvent(db_want.get());
+    if (HWND ui = FindWindowW(PILL_CLASS, nullptr)) PostMessageW(ui, msg_indexer_changed(), 1, 0);
+
     Db db;
+    bool db_modified = false;
+    auto finish_db = [&] {
+        if (db_modified) {
+            pr.phase(Phase::Cleaning, L"Optimizing database");
+            std::string opt_err;
+            if (!db.optimize(coll, &opt_err)) {
+                std::printf("optimize failed: %s\n", opt_err.c_str());
+                push_notification_to_disk("warning", "Database", "Failed to optimize database",
+                    opt_err, "indexer-optimize");
+            }
+            db_modified = false;
+        }
+        std::string close_err;
+        if (!db.close(&close_err) && !close_err.empty()) {
+            std::printf("database close failed: %s\n", close_err.c_str());
+            push_notification_to_disk("warning", "Database", "Failed to flush database",
+                close_err, "indexer-flush");
+        }
+    };
+    const auto db_cleanup = wil::scope_exit([&] {
+        std::string close_err;
+        if (!db.close(&close_err) && !close_err.empty()) {
+            std::printf("database close warning: %s\n", close_err.c_str());
+        }
+        if (db_want) ResetEvent(db_want.get());
+        if (HWND ui = FindWindowW(PILL_CLASS, nullptr)) PostMessageW(ui, msg_indexer_changed(), 0, 0);
+    });
+
     std::string err;
-    if (!db.connect(settings.qdrant_grpc_port, &err)) {
+    if (!db.open(edge_data_dir(), &err)) {
         pr.phase(Phase::Error, to_wide(err));
         return 1;
-    }
-    if (!db.wait_ready(std::chrono::milliseconds(has_launcher ? 20'000 : 500), g_stop)) {
-        if (!has_launcher) {
-            own_job = make_kill_on_close_job();
-            own_qdrant = start_qdrant(settings, own_job.get());
-        }
-        if (!db.wait_ready(std::chrono::seconds(30), g_stop)) {
-            pr.phase(Phase::Error, L"Database did not start");
-            return 1;
-        }
     }
 
     if (!scope.whole_pc && scope.includes.empty()) {
@@ -1162,8 +1180,15 @@ int run_indexer(Settings& settings) {
         }
     } loader{vision, venv, settings};
 
-    // Check collection existence without dims; if missing (NeedsDims), create it once vision finishes loading
-    const Db::CollectionStatus coll_status = db.ensure_collection_status(coll, 0, &err);
+    // Check collection existence without dims; wait briefly if the UI is releasing its EdgeShard lock.
+    Db::CollectionStatus coll_status = Db::CollectionStatus::Error;
+    const auto lock_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        err.clear();
+        coll_status = db.ensure_collection_status(coll, 0, &err);
+        if (coll_status != Db::CollectionStatus::Error || stopping() || std::chrono::steady_clock::now() >= lock_deadline) break;
+        Sleep(50);
+    }
     if (coll_status == Db::CollectionStatus::Error) {
         loader.cancel_and_join();
         pr.phase(Phase::Error, to_wide(err));
@@ -1281,6 +1306,8 @@ int run_indexer(Settings& settings) {
             if (!db.remove(coll, stale, &rm_err)) {
                 push_notification_to_disk("warning", "Database", "Failed to remove stale database entries",
                     rm_err, "indexer-remove-stale");
+            } else {
+                db_modified = true;
             }
         }
     }
@@ -1319,6 +1346,7 @@ int run_indexer(Settings& settings) {
             loader.cancel_and_join();
         }
         failures.save();
+        finish_db();
         IndexState st = load_json_file<IndexState>(state_path());
         st.last_index_unix = unix_now();
         st.last_index_found = files.size();
@@ -1439,6 +1467,7 @@ int run_indexer(Settings& settings) {
     std::mutex upsert_mx;
     std::string upsert_err;
     uint64_t upsert_failures = 0;
+    std::atomic<bool> upsert_any{false};
     std::future<void> upload;
     std::vector<uint64_t> up_ids;
     std::vector<float> up_vecs;
@@ -1446,11 +1475,13 @@ int run_indexer(Settings& settings) {
     auto flush = [&](bool wait) {
         if (upload.valid()) upload.get();
         if (!up_ids.empty()) {
-            upload = std::async(std::launch::async, [&db, &coll, &upsert_mx, &upsert_err, &upsert_failures,
+            upload = std::async(std::launch::async, [&db, &coll, &upsert_mx, &upsert_err, &upsert_failures, &upsert_any,
                                                      ids = std::move(up_ids), vecs = std::move(up_vecs),
                                                      pls = std::move(up_payloads), dim = vision.dim] {
                 std::string e;
-                if (!db.upsert(coll, ids, vecs, dim, pls, &e)) {
+                if (db.upsert(coll, ids, vecs, dim, pls, &e)) {
+                    upsert_any.store(true, std::memory_order_relaxed);
+                } else {
                     std::printf("upsert failed: %s\n", e.c_str());
                     std::lock_guard lk{upsert_mx};
                     ++upsert_failures;
@@ -1570,7 +1601,9 @@ int run_indexer(Settings& settings) {
     queue.close();
     pool.clear();
     flush(true);
+    if (upsert_any.load(std::memory_order_relaxed)) db_modified = true;
     failures.save();
+    finish_db();
 
     if (failed_this_run > 0) {
         push_notification_to_disk("warning", "Indexer",
@@ -1628,7 +1661,7 @@ int wmain(int argc, wchar_t** argv) {
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
 
     // Only one indexer at a time
-    wil::unique_mutex_nothrow single{CreateMutexW(nullptr, TRUE, L"Local\\usyseek.indexer")};
+    wil::unique_mutex_nothrow single{CreateMutexW(nullptr, TRUE, INDEXER_MUTEX)};
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 3;
 
     g_progress.block = StatusBlock::create();

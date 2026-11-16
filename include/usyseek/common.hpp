@@ -28,7 +28,9 @@ inline constexpr wchar_t LAUNCHER_MUTEX[] = L"Local\\usyseek.launcher";
 inline constexpr wchar_t PILL_CLASS[] = L"usyseek.pill";
 inline constexpr wchar_t SETTINGS_CLASS[] = L"usyseek.settings";
 inline constexpr wchar_t STATUS_SHM[] = L"Local\\usyseek.indexer.status";
+inline constexpr wchar_t INDEXER_MUTEX[] = L"Local\\usyseek.indexer";
 inline constexpr wchar_t INDEXER_STOP_EVENT[] = L"Local\\usyseek.indexer.stop";
+inline constexpr wchar_t INDEXER_DB_WANT_EVENT[] = L"Local\\usyseek.db.want";
 inline constexpr wchar_t NOTIFICATIONS_MUTEX[] = L"Local\\usyseek.notifications";
 inline constexpr wchar_t EVERYTHING_INSTANCE[] = L"uk.usyless.usyseek";
 
@@ -39,7 +41,6 @@ enum class Cmd : uint32_t {
     StopIndex,
     ReloadSettings,
     SuspendHotkey,           // payload: uint32 (1 = suspend, 0 = resume)
-    NeedQdrant,
     Quit,
     HotkeyStatus,            // query: the reply is a HotkeyState
     TestNotification,
@@ -210,6 +211,34 @@ inline const fs::path& data_dir() {
 
 inline fs::path settings_path() { return data_dir() / L"settings.json"; }
 inline fs::path state_path() { return data_dir() / L"state.json"; }
+inline fs::path edge_data_dir() { return data_dir() / L"qdrant_edge"; }
+
+/// True while an indexer process holds the indexer mutex or is being launched.
+inline bool is_indexer_db_wanted() noexcept {
+    if (HANDLE mx = OpenMutexW(SYNCHRONIZE, FALSE, INDEXER_MUTEX)) {
+        const DWORD w = WaitForSingleObject(mx, 0);
+        if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) {
+            ReleaseMutex(mx);
+            if (w == WAIT_ABANDONED) {
+                // Previous standalone indexer exited abnormally without resetting the event.
+                if (HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, INDEXER_DB_WANT_EVENT)) {
+                    ResetEvent(ev);
+                    CloseHandle(ev);
+                }
+            }
+        } else if (w == WAIT_TIMEOUT) {
+            CloseHandle(mx);
+            return true;
+        }
+        CloseHandle(mx);
+    }
+    if (HANDLE ev = OpenEventW(SYNCHRONIZE, FALSE, INDEXER_DB_WANT_EVENT)) {
+        const bool signaled = WaitForSingleObject(ev, 0) == WAIT_OBJECT_0;
+        CloseHandle(ev);
+        if (signaled) return true;
+    }
+    return false;
+}
 
 /// Looks for a relative path walking up from the executable directory.
 inline std::optional<fs::path> find_upwards(const fs::path& relative) {

@@ -292,7 +292,6 @@ private:
         IdTab2,
         IdTab3,
         IdToggleIndex,
-        IdOpenQdrantUi,
         IdClearDatabase,
         IdClearFailed,
         IdClearFailedDisabled,
@@ -1158,10 +1157,11 @@ private:
             const std::wstring cur = stopping ? L"Stopping indexer — finishing current batch…"
                                    : (running && d.current[0] ? (std::wstring{L"Processing: "} + d.current)
                                    : (running && d.message[0] ? std::wstring{d.message} : L"On-demand scanner idle — zero background GPU/RAM usage"));
+            const bool db_paused = sh_.engine.db_paused_for_indexing();
             const bool db_disconnected = !sh_.engine.db_ready() && !sh_.test_mode;
-            const std::wstring db_info = L"Qdrant collection: " + to_wide(sh_.settings.model_name) +
-                                         L"  •  127.0.0.1:" + std::to_wstring(sh_.settings.qdrant_http_port) +
-                                         (db_disconnected ? L"  •  Disconnected" : L"");
+            const std::wstring db_info = L"Qdrant Edge collection: " + to_wide(sh_.settings.model_name) +
+                                         (db_paused ? L"  •  Unavailable while indexing"
+                                                    : (db_disconnected ? L"  •  Disconnected" : L""));
 
             const wchar_t* label = L"LOCAL MEDIA EMBEDDING STATUS";
             const float label_h = text_height(cv, label, Font::Label, rw, 16.0f);
@@ -1203,10 +1203,7 @@ private:
             flow_text(cv, progress_text, cur, Font::MonoSmall, stopping ? cv.theme().amber : cv.theme().on_surface_variant, rw, 20.0f, true, Align::Right);
 
             Flow database{8.0f, 8.0f};
-            flow_text(cv, database, db_info, Font::Caption, db_disconnected ? cv.theme().error : cv.theme().outline, rw, 32.0f, true);
-            database.add(button_width(cv, L"Open Qdrant Web UI", true, 166.0f), 32.0f, [&](D2D1_RECT_F r) {
-                draw_button(cv, r, glyph::open, L"Open Qdrant Web UI", IdOpenQdrantUi);
-            });
+            flow_text(cv, database, db_info, Font::Caption, db_paused ? cv.theme().amber : (db_disconnected ? cv.theme().error : cv.theme().outline), rw, 32.0f, true);
             database.add(button_width(cv, L"Clear Database", true, 130.0f), 32.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::del, L"Clear Database", IdClearDatabase, 0, 2);
             });
@@ -2854,13 +2851,6 @@ private:
                 }
                 sh_.poll_indexer();
                 break;
-            case IdOpenQdrantUi:
-                send_launcher_or_notify(Cmd::NeedQdrant, "start Qdrant");
-                if (std::string open_err;
-                    !open_file(L"http://127.0.0.1:" + std::to_wstring(sh_.settings.qdrant_http_port) + L"/dashboard", &open_err)) {
-                    sh_.notify("error", "Browser", "Failed to open Qdrant Web UI", open_err, "open-qdrant-ui");
-                }
-                break;
             case IdClearDatabase: {
                 const std::wstring msg = L"Clear all indexed embeddings and tags in collection '" +
                                          to_wide(sh_.settings.model_name) + L"'?\n\nYour media files on disk will not be touched.";
@@ -2878,12 +2868,12 @@ private:
                         sh_.failed_files.clear();
                         sh_.db_count = 0;
                         sh_.tags.clear();
-                        sh_.engine.post([this, coll](Db& db) {
+                        sh_.engine.post_when_ready([this, coll](Db& db) {
                             std::string drop_err;
                             const bool ok = db.drop_collection(coll, &drop_err);
                             sh_.call([this, ok, drop_err, coll] {
                                 if (!ok) {
-                                    sh_.notify("error", "Database", "Failed to drop Qdrant collection '" + coll + "'", drop_err, "db-drop");
+                                    sh_.notify("error", "Database", "Failed to drop Qdrant Edge collection '" + coll + "'", drop_err, "db-drop");
                                 }
                                 sh_.poll_indexer();
                                 sh_.refresh_tags();

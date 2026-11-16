@@ -1,5 +1,5 @@
 // usyseek-ui.exe - the search pill and settings window process.
-// Runs ONNX Runtime on CPU for the text tower, talks to Qdrant over gRPC, and exits after
+// Runs ONNX Runtime on CPU for the text tower, reads the embedded Qdrant Edge database, and exits after
 // `ui_idle_timeout_s` of inactivity when hidden so idle memory drops back to zero.
 
 #include <usyseek/ui/pill.hpp>
@@ -247,7 +247,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                 sh.clear_notification_key("Database", "db-connect");
                 sh.refresh_tags();
             } else if (!err.empty()) {
-                sh.notify("error", "Database", "Could not connect to Qdrant", err, "db-connect");
+                sh.notify("error", "Database", "Could not open Qdrant Edge database", err, "db-connect");
             }
             if (sh.redraw_all) sh.redraw_all();
         });
@@ -352,6 +352,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         }
         if (msg == m_idx && m_idx) {
             done = true;
+            sh.engine.set_indexing_active(wp != 0);
             pill.on_indexer_changed();
             settings_win.invalidate();
             return 0;
@@ -403,19 +404,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     } else if (!test_dir) {
         sh.notify("warning", "Launcher", "Background launcher did not respond",
                   "usyseek.exe did not become ready in time. Starting/stopping the indexer from Settings may fail.", "launcher-missing");
-    }
-
-    wil::unique_handle own_job;
-    wil::unique_process_information own_qdrant;
-    if (!find_launcher()) {
-        // Standalone run (e.g. from IDE or --test): start qdrant ourselves if it isn't already up
-        own_job = make_kill_on_close_job();
-        own_qdrant = start_qdrant(sh.settings, own_job.get());
-        if (!own_qdrant.hProcess && !test_dir) {
-            const DWORD err = GetLastError();
-            sh.notify("error", "Database", "Failed to start local Qdrant",
-                      err ? win32_error_utf8(err) : "Could not start qdrant.exe in standalone mode.", "qdrant-start");
-        }
     }
 
     int code = 0;

@@ -1,25 +1,27 @@
-//! usyseek native bridge: qdrant gRPC client + HuggingFace tokenizer + resvg, exposed over a small C ABI.
+//! usyseek native bridge: Qdrant Edge embedded engine + HuggingFace tokenizer + resvg, exposed over a small C ABI.
 //! All structured data crosses the boundary as UTF-8 JSON; bulk numeric data (vectors, ids, pixels) as raw slices.
 
 mod svg;
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::slice;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
-use qdrant_client::qdrant::{
-    point_id::PointIdOptions, value::Kind, Condition, CountPointsBuilder, CreateCollectionBuilder,
-    CreateFieldIndexCollectionBuilder, Datatype, DeletePointsBuilder, Direction, Distance, FacetCountsBuilder,
-    FieldType, Filter, GetPointsBuilder, HnswConfigDiffBuilder, OrderByBuilder, PointId, PointStruct,
-    PointsIdsList, QueryPointsBuilder, ScrollPointsBuilder, SearchParamsBuilder, SetPayloadPointsBuilder,
-    TextIndexParamsBuilder, TokenizerType, UpsertPointsBuilder, Value, VectorInput, VectorParamsBuilder,
-    PayloadIncludeSelector, Query,
+use qdrant_edge::{
+    AnyVariants, Condition, CountRequestBuilder, Direction, Distance, EdgeConfigBuilder,
+    EdgeOptimizersConfig, EdgeShard, EdgeVectorParamsBuilder, FacetRequestBuilder, FacetValue,
+    FieldCondition, FieldIndexOperations, Filter, HnswIndexConfig, JsonPath, Match, Memory, NamedQuery,
+    OrderBy, OrderByInterface, Payload, PayloadFieldSchema, PayloadOps, PayloadSchemaParams,
+    PayloadSchemaType, PointId, PointInsertOperations, PointOperations, PointStruct,
+    PointStructPersisted, QueryEnum, QueryRequestBuilder, RetrieveRequestBuilder, ScoringQuery,
+    ScrollRequestBuilder, SearchParams, SetPayloadOp, TextIndexParamsBuilder, TokenizerType,
+    UpdateOperation, ValueVariants, VectorInternal, VectorStorageDatatype, VectorStructInternal,
+    WithPayloadInterface, WithVector, CreateIndex, DEFAULT_VECTOR_NAME,
 };
-use qdrant_client::qdrant::with_payload_selector::SelectorOptions;
-use qdrant_client::{Payload, Qdrant};
-use serde_json::{json, Map as JsonMap, Value as Json};
+use serde_json::{Map as JsonMap, Value as Json, json};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 // ---------------------------------------------------------------------------------------------
@@ -105,18 +107,6 @@ unsafe fn write_bytes(out: *mut UsyBuf, v: Vec<u8>) {
     }
 }
 
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .thread_name("usy-qdrant")
-            .enable_all()
-            .build()
-            .expect("tokio runtime")
-    })
-}
-
 /// Runs `f`, writing either its JSON result or the error message into `out`. Returns 0 on success.
 fn run<F>(out: *mut UsyBuf, f: F) -> i32
 where
@@ -139,11 +129,12 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Qdrant
+// Qdrant Edge
 // ---------------------------------------------------------------------------------------------
 
 pub struct UsyQdrant {
-    client: Qdrant,
+    root: PathBuf,
+    shards: Mutex<HashMap<String, Arc<EdgeShard>>>,
 }
 
 const F_PATH: &str = "p";
@@ -153,28 +144,98 @@ const F_TAGS: &str = "t";
 const F_KIND: &str = "k";
 const F_MTIME: &str = "m";
 
-fn qvalue_to_json(v: Value) -> Json {
-    match v.kind {
-        None | Some(Kind::NullValue(_)) => Json::Null,
-        Some(Kind::BoolValue(b)) => Json::Bool(b),
-        Some(Kind::IntegerValue(i)) => json!(i),
-        Some(Kind::DoubleValue(d)) => json!(d),
-        Some(Kind::StringValue(s)) => Json::String(s),
-        Some(Kind::ListValue(l)) => Json::Array(l.values.into_iter().map(qvalue_to_json).collect()),
-        Some(Kind::StructValue(s)) => {
-            Json::Object(s.fields.into_iter().map(|(k, v)| (k, qvalue_to_json(v))).collect())
+fn sanitize_collection_name(name: &str) -> Result<String, String> {
+    if name.is_empty() || name == "." || name == ".." {
+        return Err("invalid collection name".into());
+    }
+    let clean: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    if clean.is_empty() || clean == "." || clean == ".." {
+        return Err("invalid collection name".into());
+    }
+    Ok(clean)
+}
+
+fn shard_exists_on_disk(dir: &Path) -> bool {
+    dir.join("edge_config.json").is_file() || dir.join("segments").is_dir()
+}
+
+impl UsyQdrant {
+    fn collection_dir(&self, name: &str) -> Result<PathBuf, String> {
+        Ok(self.root.join(sanitize_collection_name(name)?))
+    }
+
+    fn get_or_load_shard(&self, name: &str) -> Result<Arc<EdgeShard>, String> {
+        let dir = self.collection_dir(name)?;
+        let mut shards = self.shards.lock().map_err(|_| "shard lock poisoned".to_string())?;
+        if let Some(shard) = shards.get(name) {
+            return Ok(Arc::clone(shard));
         }
+        if !shard_exists_on_disk(&dir) {
+            return Err(format!("collection '{name}' does not exist"));
+        }
+        // Keep at most the active model's shard mapped so switching models doesn't hold stale mmaps open.
+        shards.clear();
+        let shard = Arc::new(EdgeShard::load(&dir, None).map_err(err)?);
+        shards.insert(name.to_owned(), Arc::clone(&shard));
+        Ok(shard)
+    }
+
+    fn flush_target(&self, name: &str) -> Result<(), String> {
+        let targets: Vec<Arc<EdgeShard>> = {
+            let shards = self.shards.lock().map_err(|_| "shard lock poisoned".to_string())?;
+            if name.is_empty() {
+                shards.values().cloned().collect()
+            } else if let Some(s) = shards.get(name) {
+                vec![Arc::clone(s)]
+            } else {
+                Vec::new()
+            }
+        };
+        for shard in targets {
+            shard.flush().map_err(err)?;
+        }
+        Ok(())
+    }
+
+    fn close_all(&self) -> Result<(), String> {
+        let drained: Vec<(String, Arc<EdgeShard>)> = {
+            let mut shards = self.shards.lock().map_err(|_| "shard lock poisoned".to_string())?;
+            shards.drain().collect()
+        };
+        let mut first_err: Option<String> = None;
+        for (_, shard) in drained {
+            if let Err(e) = shard.flush()
+                && first_err.is_none()
+            {
+                first_err = Some(e.to_string());
+            }
+            drop(shard);
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
-fn payload_to_json(p: HashMap<String, Value>) -> Json {
-    Json::Object(p.into_iter().map(|(k, v)| (k, qvalue_to_json(v))).collect::<JsonMap<_, _>>())
+fn payload_to_json(p: Option<Payload>) -> Json {
+    match p {
+        Some(p) => Json::Object(p.0.into_iter().collect::<JsonMap<_, _>>()),
+        None => Json::Object(JsonMap::new()),
+    }
 }
 
-fn id_to_u64(id: Option<PointId>) -> u64 {
-    match id.and_then(|i| i.point_id_options) {
-        Some(PointIdOptions::Num(n)) => n,
-        _ => 0,
+fn id_to_u64(id: PointId) -> u64 {
+    match id {
+        PointId::NumId(n) => n,
+        PointId::Uuid(_) => 0,
     }
 }
 
@@ -184,94 +245,143 @@ fn str_list(v: Option<&Json>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn json_path(s: &str) -> Result<JsonPath, String> {
+    s.parse::<JsonPath>().map_err(|_| format!("invalid json path '{s}'"))
+}
+
+fn field_match(field: &str, m: Match) -> Result<Condition, String> {
+    Ok(Condition::Field(FieldCondition::new_match(json_path(field)?, m)))
+}
+
 /// Filter description:
 /// { "kind": 0|1, "tags_all": [..], "tags_none": [..], "dirs": [..] (any), "names": [..] (all, prefix text) }
-fn build_filter(f: Option<&Json>) -> Option<Filter> {
-    let f = f?;
+fn build_filter(f: Option<&Json>) -> Result<Option<Filter>, String> {
+    let Some(f) = f else { return Ok(None) };
     let mut must: Vec<Condition> = Vec::new();
     let mut must_not: Vec<Condition> = Vec::new();
 
     if let Some(k) = f.get("kind").and_then(|k| k.as_i64()) {
-        must.push(Condition::matches(F_KIND, k));
+        must.push(field_match(F_KIND, Match::new_value(ValueVariants::Integer(k)))?);
     }
     for t in str_list(f.get("tags_all")) {
-        must.push(Condition::matches(F_TAGS, t));
+        must.push(field_match(F_TAGS, Match::new_value(ValueVariants::String(t)))?);
     }
     let none = str_list(f.get("tags_none"));
     if !none.is_empty() {
-        must_not.push(Condition::matches(F_TAGS, none));
+        must_not.push(field_match(F_TAGS, Match::new_any(AnyVariants::Strings(none.into_iter().collect())))?);
     }
     let dirs = str_list(f.get("dirs"));
     if !dirs.is_empty() {
-        must.push(Condition::matches(F_ANCESTORS, dirs));
+        must.push(field_match(F_ANCESTORS, Match::new_any(AnyVariants::Strings(dirs.into_iter().collect())))?);
     }
     for n in str_list(f.get("names")) {
-        must.push(Condition::matches_text(F_NAME, n));
+        must.push(field_match(F_NAME, Match::new_text(&n))?);
     }
 
     if must.is_empty() && must_not.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let mut filter = Filter::must(must);
-    filter.must_not = must_not;
-    Some(filter)
+    Ok(Some(Filter {
+        should: None,
+        min_should: None,
+        must: (!must.is_empty()).then_some(must),
+        must_not: (!must_not.is_empty()).then_some(must_not),
+    }))
 }
 
-fn payload_selector(fields: &[String]) -> SelectorOptions {
+fn payload_selector(fields: &[String]) -> Result<WithPayloadInterface, String> {
     if fields.is_empty() {
-        SelectorOptions::Enable(true)
+        Ok(WithPayloadInterface::Bool(true))
     } else {
-        SelectorOptions::Include(PayloadIncludeSelector { fields: fields.to_vec() })
+        let paths = fields.iter().map(|s| json_path(s)).collect::<Result<Vec<_>, _>>()?;
+        Ok(WithPayloadInterface::Fields(paths))
     }
 }
 
-/// Connects to a Qdrant gRPC endpoint and returns an owned handle, or null with error text in `out`.
+/// Opens a local Qdrant Edge storage root directory and returns an owned handle, or null with error text in `out`.
 ///
 /// # Safety
 ///
-/// `url` (when non-empty) must point to valid readable bytes; `out` may be null or a valid writable `UsyBuf`.
+/// `dir` (when non-empty) must point to valid readable bytes; `out` may be null or a valid writable `UsyBuf`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn usy_qd_connect(url: UsyStr, out: *mut UsyBuf) -> *mut UsyQdrant {
-    let url = url.as_str().to_owned();
-    let res = Qdrant::from_url(&url)
-        .timeout(Duration::from_secs(60))
-        .connect_timeout(Duration::from_secs(2))
-        .skip_compatibility_check()
-        .build();
-    match res {
-        Ok(client) => Box::into_raw(Box::new(UsyQdrant { client })),
-        Err(e) => {
-            unsafe { write_out(out, e.to_string()) };
-            ptr::null_mut()
-        }
+pub unsafe extern "C" fn usy_qd_open(dir: UsyStr, out: *mut UsyBuf) -> *mut UsyQdrant {
+    let dir = dir.as_str();
+    if dir.is_empty() {
+        unsafe { write_out(out, "empty database directory".into()) };
+        return ptr::null_mut();
     }
+    let root = PathBuf::from(dir);
+    if let Err(e) = fs::create_dir_all(&root) {
+        unsafe { write_out(out, e.to_string()) };
+        return ptr::null_mut();
+    }
+    Box::into_raw(Box::new(UsyQdrant {
+        root,
+        shards: Mutex::new(HashMap::new()),
+    }))
 }
 
-/// Frees a `UsyQdrant` handle returned by `usy_qd_connect`.
+/// Flushes and closes all open edge shards, releasing file locks without freeing the `UsyQdrant` handle itself.
 ///
 /// # Safety
 ///
-/// `q` must be null or a live pointer returned by `usy_qd_connect` that has not yet been freed or used concurrently.
+/// `q` must be null or valid; `out` must be null or uniquely writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn usy_qd_close_all(q: *mut UsyQdrant, out: *mut UsyBuf) -> i32 {
+    run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
+        q.close_all()?;
+        Ok("ok".to_owned())
+    })
+}
+
+/// Frees a `UsyQdrant` handle returned by `usy_qd_open` (flushing any still-open shards first).
+///
+/// # Safety
+///
+/// `q` must be null or a live pointer returned by `usy_qd_open` that has not yet been freed or used concurrently.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn usy_qd_free(q: *mut UsyQdrant) {
     if !q.is_null() {
-        drop(unsafe { Box::from_raw(q) });
+        let boxed = unsafe { Box::from_raw(q) };
+        let _ = boxed.close_all();
+        drop(boxed);
     }
 }
 
-/// Returns 0 when the server answers a health check.
+/// Flushes WAL and segments to disk for `name` (or all open shards when `name` is empty).
 ///
 /// # Safety
 ///
-/// `q` must be null or a valid `UsyQdrant` pointer; `out` must be null or uniquely writable.
+/// `q` must be null or valid; `name`/`out` must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn usy_qd_health(q: *mut UsyQdrant, out: *mut UsyBuf) -> i32 {
+pub unsafe extern "C" fn usy_qd_flush(q: *mut UsyQdrant, name: UsyStr, out: *mut UsyBuf) -> i32 {
+    let name = name.as_str().to_owned();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        runtime()
-            .block_on(q.client.health_check())
-            .map(|r| r.version)
-            .map_err(err)
+        q.flush_target(&name)?;
+        Ok("ok".to_owned())
+    })
+}
+
+/// Synchronously runs Qdrant Edge optimizers and flushes the shard for `name`.
+///
+/// # Safety
+///
+/// `q` must be null or valid; `name`/`out` must be valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn usy_qd_optimize(q: *mut UsyQdrant, name: UsyStr, out: *mut UsyBuf) -> i32 {
+    let name = name.as_str().to_owned();
+    run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
+        let dir = q.collection_dir(&name)?;
+        if !shard_exists_on_disk(&dir) {
+            return Ok("ok".to_owned());
+        }
+        let shard = q.get_or_load_shard(&name)?;
+        shard.optimize().map_err(err)?;
+        shard.flush().map_err(err)?;
+        Ok("ok".to_owned())
     })
 }
 
@@ -287,46 +397,85 @@ pub unsafe extern "C" fn usy_qd_ensure_collection(q: *mut UsyQdrant, name: UsySt
         return 1;
     };
     let name = name.as_str().to_owned();
-    let res: Result<String, (i32, String)> = runtime().block_on(async {
-        if q.client.collection_exists(&name).await.map_err(|e| (1, err(e)))? {
+    let res: Result<String, (i32, String)> = (|| {
+        let dir = q.collection_dir(&name).map_err(|e| (1, e))?;
+        let mut shards = q.shards.lock().map_err(|_| (1, "shard lock poisoned".to_owned()))?;
+        if shards.contains_key(&name) {
+            return Ok("exists".to_owned());
+        }
+        if shard_exists_on_disk(&dir) {
+            shards.clear();
+            let shard = Arc::new(EdgeShard::load(&dir, None).map_err(|e| (1, err(e)))?);
+            shards.insert(name, shard);
             return Ok("exists".to_owned());
         }
         if dim == 0 {
             return Err((2, "collection does not exist and requires dims".to_owned()));
         }
-        q.client
-            .create_collection(
-                CreateCollectionBuilder::new(&name)
-                    .vectors_config(
-                        VectorParamsBuilder::new(dim, Distance::Cosine)
-                            .on_disk(true)
-                            .datatype(Datatype::Float16),
-                    )
-                    .hnsw_config(HnswConfigDiffBuilder::default().m(0))
-                    .on_disk_payload(true),
-            )
-            .await
-            .map_err(|e| (1, err(e)))?;
 
-        let idx = |field: &str, ty: FieldType| CreateFieldIndexCollectionBuilder::new(&name, field, ty).wait(true);
-        q.client.create_field_index(idx(F_TAGS, FieldType::Keyword)).await.map_err(|e| (1, err(e)))?;
-        q.client.create_field_index(idx(F_ANCESTORS, FieldType::Keyword)).await.map_err(|e| (1, err(e)))?;
-        q.client.create_field_index(idx(F_KIND, FieldType::Integer)).await.map_err(|e| (1, err(e)))?;
-        q.client.create_field_index(idx(F_MTIME, FieldType::Integer)).await.map_err(|e| (1, err(e)))?;
-        q.client
-            .create_field_index(
-                idx(F_NAME, FieldType::Text).field_index_params(
-                    TextIndexParamsBuilder::new(TokenizerType::Prefix)
-                        .lowercase(true)
-                        .min_token_len(1)
-                        .max_token_len(32),
-                ),
+        shards.clear();
+        let cfg = EdgeConfigBuilder::new()
+            .vector(
+                DEFAULT_VECTOR_NAME,
+                EdgeVectorParamsBuilder::new(dim as usize, Distance::Cosine)
+                    .memory(Memory::Cold)
+                    .datatype(VectorStorageDatatype::Float16)
+                    .build(),
             )
-            .await
-            .map_err(|e| (1, err(e)))?;
+            .payload_memory(Memory::Cold)
+            .hnsw_config({
+                #[allow(deprecated)]
+                HnswIndexConfig {
+                    m: 0,
+                    ef_construct: 100,
+                    full_scan_threshold: 10000,
+                    max_indexing_threads: 0,
+                    on_disk: None,
+                    memory: Some(Memory::Cold),
+                    payload_m: None,
+                    inline_storage: None,
+                }
+            })
+            .optimizers(EdgeOptimizersConfig {
+                deleted_threshold: Some(0.2),
+                vacuum_min_vector_number: Some(1000),
+                default_segment_number: Some(0),
+                max_segment_size: None,
+                indexing_threshold: Some(10000),
+                prevent_unoptimized: None,
+            })
+            .build();
+
+        let shard = EdgeShard::new(&dir, cfg).map_err(|e| (1, err(e)))?;
+        let create_idx = |field: &str, schema: PayloadFieldSchema| -> Result<(), (i32, String)> {
+            let field_name = json_path(field).map_err(|e| (1, e))?;
+            shard
+                .update(UpdateOperation::FieldIndexOperation(FieldIndexOperations::CreateIndex(
+                    CreateIndex { field_name, field_schema: Some(schema) },
+                )))
+                .map_err(|e| (1, err(e)))
+        };
+        create_idx(F_TAGS, PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword))?;
+        create_idx(F_ANCESTORS, PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword))?;
+        create_idx(F_KIND, PayloadFieldSchema::FieldType(PayloadSchemaType::Integer))?;
+        create_idx(F_MTIME, PayloadFieldSchema::FieldType(PayloadSchemaType::Integer))?;
+        create_idx(
+            F_NAME,
+            PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(
+                TextIndexParamsBuilder::new()
+                    .tokenizer(TokenizerType::Prefix)
+                    .lowercase(true)
+                    .min_token_len(1)
+                    .max_token_len(32)
+                    .build(),
+            )),
+        )?;
+        shard.flush().map_err(|e| (1, err(e)))?;
         let _ = F_PATH;
+
+        shards.insert(name, Arc::new(shard));
         Ok("created".to_owned())
-    });
+    })();
     match res {
         Ok(s) => {
             unsafe { write_out(out, s) };
@@ -362,22 +511,28 @@ pub unsafe extern "C" fn usy_qd_upsert(
         let total_floats = count.checked_mul(dim).ok_or_else(|| "vector slice size overflow".to_string())?;
         let ids = unsafe { slice_from(ids, count) }?;
         let vectors = unsafe { slice_from(vectors, total_floats) }?;
+        if count == 0 {
+            return Ok("ok".to_owned());
+        }
         let arr: Vec<Json> = serde_json::from_str(payloads).map_err(err)?;
         if arr.len() != count {
             return Err("payload count mismatch".into());
         }
-        let points: Vec<PointStruct> = arr
+        let shard = q.get_or_load_shard(&name)?;
+        let points: Vec<PointStructPersisted> = arr
             .into_iter()
             .enumerate()
             .map(|(i, p)| {
-                let payload = Payload::try_from(p).unwrap_or_default();
-                PointStruct::new(ids[i], vectors[i * dim..(i + 1) * dim].to_vec(), payload)
+                let obj = if p.is_object() { p } else { Json::Object(JsonMap::new()) };
+                PointStruct::new(ids[i], vectors[i * dim..(i + 1) * dim].to_vec(), obj).into()
             })
             .collect();
-        runtime()
-            .block_on(q.client.upsert_points(UpsertPointsBuilder::new(&name, points).wait(true)))
-            .map(|_| "ok".to_owned())
-            .map_err(err)
+        shard
+            .update(UpdateOperation::PointOperation(PointOperations::UpsertPoints(
+                PointInsertOperations::PointsList(points),
+            )))
+            .map_err(err)?;
+        Ok("ok".to_owned())
     })
 }
 
@@ -400,40 +555,55 @@ pub unsafe extern "C" fn usy_qd_query(
     let request = request.as_str();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let vector: Vec<f32> = if dim > 0 && !vector.is_null() {
+        let mut vector: Vec<f32> = if dim > 0 && !vector.is_null() {
             unsafe { slice_from(vector, dim) }?.to_vec()
         } else {
             Vec::new()
         };
         let req: Json = serde_json::from_str(request).map_err(err)?;
-        let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(100);
-        let offset = req.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
+        let offset = req.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let fields = str_list(req.get("fields"));
 
-        let query = if !vector.is_empty() {
-            Query::new_nearest(vector)
-        } else if let Some(id) = req.get("id").and_then(|v| v.as_u64()) {
-            Query::new_nearest(VectorInput::new_id(id))
-        } else {
-            return Err("no query vector".into());
-        };
+        let shard = q.get_or_load_shard(&name)?;
+        if vector.is_empty() {
+            if let Some(id) = req.get("id").and_then(|v| v.as_u64()) {
+                let records = shard
+                    .retrieve(
+                        RetrieveRequestBuilder::new(vec![PointId::NumId(id)])
+                            .with_payload(WithPayloadInterface::Bool(false))
+                            .with_vector(WithVector::Bool(true))
+                            .build(),
+                    )
+                    .map_err(err)?;
+                let rec = records.into_iter().next().ok_or_else(|| "query point not found".to_string())?;
+                vector = match rec.vector {
+                    Some(VectorStructInternal::Single(v)) => v,
+                    Some(VectorStructInternal::Named(mut m)) => match m.remove(DEFAULT_VECTOR_NAME) {
+                        Some(VectorInternal::Dense(v)) => v,
+                        _ => return Err("query point has no dense vector".into()),
+                    },
+                    _ => return Err("query point has no dense vector".into()),
+                };
+            } else {
+                return Err("no query vector".into());
+            }
+        }
 
-        let mut b = QueryPointsBuilder::new(&name)
-            .query(query)
-            .limit(limit)
+        let mut b = QueryRequestBuilder::new(limit)
             .offset(offset)
-            .with_payload(payload_selector(&fields))
-            .with_vectors(false)
-            .params(SearchParamsBuilder::default().exact(true));
+            .query(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery::default_dense(vector))))
+            .with_payload(payload_selector(&fields)?)
+            .with_vector(WithVector::Bool(false))
+            .params(SearchParams { exact: true, ..Default::default() });
         if let Some(t) = req.get("threshold").and_then(|v| v.as_f64()) {
             b = b.score_threshold(t as f32);
         }
-        if let Some(f) = build_filter(req.get("filter")) {
+        if let Some(f) = build_filter(req.get("filter"))? {
             b = b.filter(f);
         }
-        let res = runtime().block_on(q.client.query(b)).map_err(err)?;
+        let res = shard.query(b.build()).map_err(err)?;
         let pts: Vec<Json> = res
-            .result
             .into_iter()
             .map(|p| json!({ "id": id_to_u64(p.id), "s": p.score, "p": payload_to_json(p.payload) }))
             .collect();
@@ -453,27 +623,31 @@ pub unsafe extern "C" fn usy_qd_scroll(q: *mut UsyQdrant, name: UsyStr, request:
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
         let req: Json = serde_json::from_str(request).map_err(err)?;
-        let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+        let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
         let fields = str_list(req.get("fields"));
-        let mut b = ScrollPointsBuilder::new(&name)
+        let mut b = ScrollRequestBuilder::new()
             .limit(limit)
-            .with_payload(payload_selector(&fields))
-            .with_vectors(false);
-        if let Some(f) = build_filter(req.get("filter")) {
+            .with_payload(payload_selector(&fields)?)
+            .with_vector(WithVector::Bool(false));
+        if let Some(f) = build_filter(req.get("filter"))? {
             b = b.filter(f);
         }
         if req.get("order_mtime").and_then(|v| v.as_bool()).unwrap_or(false) {
-            b = b.order_by(OrderByBuilder::new(F_MTIME).direction(Direction::Desc as i32));
+            b = b.order_by(OrderByInterface::Struct(OrderBy {
+                key: json_path(F_MTIME)?,
+                direction: Some(Direction::Desc),
+                start_from: None,
+            }));
         } else if let Some(off) = req.get("offset").and_then(|v| v.as_u64()) {
-            b = b.offset(off);
+            b = b.offset(PointId::NumId(off));
         }
-        let res = runtime().block_on(q.client.scroll(b)).map_err(err)?;
-        let pts: Vec<Json> = res
-            .result
+        let shard = q.get_or_load_shard(&name)?;
+        let (records, next_id) = shard.scroll(b.build()).map_err(err)?;
+        let pts: Vec<Json> = records
             .into_iter()
             .map(|p| json!({ "id": id_to_u64(p.id), "p": payload_to_json(p.payload) }))
             .collect();
-        let next = res.next_page_offset.map(|n| id_to_u64(Some(n)));
+        let next = next_id.map(id_to_u64);
         Ok(json!({ "points": pts, "next": next }).to_string())
     })
 }
@@ -496,18 +670,22 @@ pub unsafe extern "C" fn usy_qd_retrieve(
     let request = request.as_str();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| i.into()).collect();
+        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| PointId::NumId(i)).collect();
+        if ids.is_empty() {
+            return Ok(json!({ "points": [] }).to_string());
+        }
         let req: Json = serde_json::from_str(request).unwrap_or(Json::Null);
         let fields = str_list(req.get("fields"));
-        let res = runtime()
-            .block_on(q.client.get_points(
-                GetPointsBuilder::new(&name, ids)
-                    .with_payload(payload_selector(&fields))
-                    .with_vectors(false),
-            ))
+        let shard = q.get_or_load_shard(&name)?;
+        let records = shard
+            .retrieve(
+                RetrieveRequestBuilder::new(ids)
+                    .with_payload(payload_selector(&fields)?)
+                    .with_vector(WithVector::Bool(false))
+                    .build(),
+            )
             .map_err(err)?;
-        let pts: Vec<Json> = res
-            .result
+        let pts: Vec<Json> = records
             .into_iter()
             .map(|p| json!({ "id": id_to_u64(p.id), "p": payload_to_json(p.payload) }))
             .collect();
@@ -533,17 +711,24 @@ pub unsafe extern "C" fn usy_qd_set_payload(
     let payload = payload.as_str();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| i.into()).collect();
+        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| PointId::NumId(i)).collect();
+        if ids.is_empty() {
+            return Ok("ok".to_owned());
+        }
         let p: Json = serde_json::from_str(payload).map_err(err)?;
-        let p = Payload::try_from(p).map_err(err)?;
-        runtime()
-            .block_on(q.client.set_payload(
-                SetPayloadPointsBuilder::new(&name, p)
-                    .points_selector(PointsIdsList { ids })
-                    .wait(true),
-            ))
-            .map(|_| "ok".to_owned())
-            .map_err(err)
+        let Json::Object(map) = p else {
+            return Err("payload must be a JSON object".into());
+        };
+        let shard = q.get_or_load_shard(&name)?;
+        shard
+            .update(UpdateOperation::PayloadOperation(PayloadOps::SetPayload(SetPayloadOp {
+                payload: Payload(map.into_iter().collect()),
+                points: Some(ids),
+                filter: None,
+                key: None,
+            })))
+            .map_err(err)?;
+        Ok("ok".to_owned())
     })
 }
 
@@ -557,13 +742,15 @@ pub unsafe extern "C" fn usy_qd_delete(q: *mut UsyQdrant, name: UsyStr, ids: *co
     let name = name.as_str().to_owned();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| i.into()).collect();
-        runtime()
-            .block_on(q.client.delete_points(
-                DeletePointsBuilder::new(&name).points(PointsIdsList { ids }).wait(true),
-            ))
-            .map(|_| "ok".to_owned())
-            .map_err(err)
+        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| PointId::NumId(i)).collect();
+        if ids.is_empty() {
+            return Ok("ok".to_owned());
+        }
+        let shard = q.get_or_load_shard(&name)?;
+        shard
+            .update(UpdateOperation::PointOperation(PointOperations::DeletePoints { ids }))
+            .map_err(err)?;
+        Ok("ok".to_owned())
     })
 }
 
@@ -577,12 +764,17 @@ pub unsafe extern "C" fn usy_qd_drop_collection(q: *mut UsyQdrant, name: UsyStr,
     let name = name.as_str().to_owned();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        runtime().block_on(async {
-            if q.client.collection_exists(&name).await.map_err(err)? {
-                q.client.delete_collection(&name).await.map_err(err)?;
+        let dir = q.collection_dir(&name)?;
+        {
+            let mut shards = q.shards.lock().map_err(|_| "shard lock poisoned".to_string())?;
+            if let Some(shard) = shards.remove(&name) {
+                drop(shard);
             }
-            Ok("dropped".to_owned())
-        })
+            if dir.exists() {
+                fs::remove_dir_all(&dir).map_err(err)?;
+            }
+        }
+        Ok("dropped".to_owned())
     })
 }
 
@@ -596,13 +788,13 @@ pub unsafe extern "C" fn usy_qd_count(q: *mut UsyQdrant, name: UsyStr, out: *mut
     let name = name.as_str().to_owned();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        runtime().block_on(async {
-            if !q.client.collection_exists(&name).await.map_err(err)? {
-                return Ok("0".to_owned());
-            }
-            let r = q.client.count(CountPointsBuilder::new(&name).exact(true)).await.map_err(err)?;
-            Ok(r.result.map(|c| c.count).unwrap_or(0).to_string())
-        })
+        let dir = q.collection_dir(&name)?;
+        if !shard_exists_on_disk(&dir) {
+            return Ok("0".to_owned());
+        }
+        let shard = q.get_or_load_shard(&name)?;
+        let count = shard.count(CountRequestBuilder::new().exact(true).build()).map_err(err)?;
+        Ok(count.to_string())
     })
 }
 
@@ -616,18 +808,20 @@ pub unsafe extern "C" fn usy_qd_facet_tags(q: *mut UsyQdrant, name: UsyStr, limi
     let name = name.as_str().to_owned();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let res = runtime()
-            .block_on(q.client.facet(FacetCountsBuilder::new(&name, F_TAGS).limit(limit).exact(true)))
+        let dir = q.collection_dir(&name)?;
+        if !shard_exists_on_disk(&dir) {
+            return Ok("[]".to_owned());
+        }
+        let shard = q.get_or_load_shard(&name)?;
+        let res = shard
+            .facet(FacetRequestBuilder::new(json_path(F_TAGS)?).limit(limit as usize).exact(true).build())
             .map_err(err)?;
         let hits: Vec<Json> = res
             .hits
             .into_iter()
-            .filter_map(|h| {
-                use qdrant_client::qdrant::facet_value::Variant;
-                match h.value.and_then(|v| v.variant) {
-                    Some(Variant::StringValue(s)) => Some(json!({ "v": s, "c": h.count })),
-                    _ => None,
-                }
+            .filter_map(|h| match h.value {
+                FacetValue::Keyword(s) => Some(json!({ "v": s, "c": h.count })),
+                _ => None,
             })
             .collect();
         Ok(Json::Array(hits).to_string())
@@ -718,7 +912,7 @@ mod tests {
     fn null_qdrant_and_empty_slices_fail_safely() {
         let empty = || UsyStr { ptr: ptr::null(), len: 0 };
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_health(ptr::null_mut(), &mut buf) }, 1);
+        assert_eq!(unsafe { usy_qd_flush(ptr::null_mut(), empty(), &mut buf) }, 1);
         unsafe { usy_buf_free(buf) };
 
         let mut buf2 = usy_buf_empty();
@@ -735,5 +929,100 @@ mod tests {
         assert_eq!(unsafe { slice_from::<u64>(ptr::null(), 0).unwrap().len() }, 0);
         assert!(unsafe { slice_from::<u64>(ptr::null(), 2) }.is_err());
         assert_eq!(unsafe { usy_tok_encode(ptr::null_mut(), empty(), ptr::null_mut()) }, 0);
+    }
+
+    #[test]
+    fn edge_shard_roundtrip_crud_query_scroll_facet() {
+        let root = std::env::temp_dir().join(format!("usyseek_edge_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let root_str = root.to_string_lossy().into_owned();
+        let ustr = |s: &str| UsyStr { ptr: s.as_ptr(), len: s.len() };
+
+        let mut buf = usy_buf_empty();
+        let q = unsafe { usy_qd_open(ustr(&root_str), &mut buf) };
+        unsafe { usy_buf_free(buf) };
+        assert!(!q.is_null());
+
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_ensure_collection(q, ustr("test_model"), 0, &mut buf) }, 2);
+        unsafe { usy_buf_free(buf) };
+
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_ensure_collection(q, ustr("test_model"), 4, &mut buf) }, 0);
+        unsafe { usy_buf_free(buf) };
+
+        let ids = [10u64, 20u64];
+        let vecs = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let payloads = r#"[{"p":"C:/a.jpg","n":"alpha_cat.jpg","k":0,"m":100,"s":10,"w":1,"h":1,"d":0,"t":["fav"],"a":["C:"]},{"p":"C:/b.mp4","n":"beta_dog.mp4","k":1,"m":200,"s":20,"w":1,"h":1,"d":500,"t":["fav","clip"],"a":["C:"]}]"#;
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_upsert(q, ustr("test_model"), ids.as_ptr(), 2, vecs.as_ptr(), 4, ustr(payloads), &mut buf) }, 0);
+        unsafe { usy_buf_free(buf) };
+
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_optimize(q, ustr("test_model"), &mut buf) }, 0);
+        unsafe { usy_buf_free(buf) };
+
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_count(q, ustr("test_model"), &mut buf) }, 0);
+        let cnt = unsafe { std::str::from_utf8(slice::from_raw_parts(buf.ptr, buf.len)).unwrap().to_owned() };
+        unsafe { usy_buf_free(buf) };
+        assert_eq!(cnt, "2");
+
+        // Query by vector + prefix name filter
+        let qvec = [0.9f32, 0.1, 0.0, 0.0];
+        let qreq = r#"{"limit":10,"offset":0,"filter":{"names":["alpha"]},"fields":["p","n","t"]}"#;
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_query(q, ustr("test_model"), qvec.as_ptr(), 4, ustr(qreq), &mut buf) }, 0);
+        let qjson: Json = serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        unsafe { usy_buf_free(buf) };
+        assert_eq!(qjson["points"].as_array().unwrap().len(), 1);
+        assert_eq!(qjson["points"][0]["id"], 10);
+
+        // Query by stored point ID
+        let idreq = r#"{"limit":10,"offset":0,"id":20,"fields":["p"]}"#;
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_query(q, ustr("test_model"), ptr::null(), 0, ustr(idreq), &mut buf) }, 0);
+        let idjson: Json = serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        unsafe { usy_buf_free(buf) };
+        assert_eq!(idjson["points"][0]["id"], 20);
+
+        // Scroll ordered by mtime desc
+        let sreq = r#"{"limit":10,"order_mtime":true,"fields":["m"]}"#;
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_scroll(q, ustr("test_model"), ustr(sreq), &mut buf) }, 0);
+        let sjson: Json = serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        unsafe { usy_buf_free(buf) };
+        assert_eq!(sjson["points"][0]["id"], 20);
+        assert_eq!(sjson["points"][1]["id"], 10);
+
+        // Facet tags
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_facet_tags(q, ustr("test_model"), 100, &mut buf) }, 0);
+        let fjson: Json = serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        unsafe { usy_buf_free(buf) };
+        assert_eq!(fjson.as_array().unwrap().len(), 2);
+
+        // Close and reopen to verify persistence + lock release
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_close_all(q, &mut buf) }, 0);
+        unsafe { usy_buf_free(buf) };
+        unsafe { usy_qd_free(q) };
+
+        let mut buf = usy_buf_empty();
+        let q2 = unsafe { usy_qd_open(ustr(&root_str), &mut buf) };
+        unsafe { usy_buf_free(buf) };
+        assert!(!q2.is_null());
+
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_count(q2, ustr("test_model"), &mut buf) }, 0);
+        let cnt2 = unsafe { std::str::from_utf8(slice::from_raw_parts(buf.ptr, buf.len)).unwrap().to_owned() };
+        unsafe { usy_buf_free(buf) };
+        assert_eq!(cnt2, "2");
+
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_drop_collection(q2, ustr("test_model"), &mut buf) }, 0);
+        unsafe { usy_buf_free(buf) };
+        unsafe { usy_qd_free(q2) };
+        let _ = fs::remove_dir_all(&root);
     }
 }

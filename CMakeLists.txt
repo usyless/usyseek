@@ -43,8 +43,6 @@ set_tracked_cache_version(USYSEEK_GLAZE_VERSION "v9.1.0" "glaze git tag")
 set_tracked_cache_version(USYSEEK_PYBIND11_VERSION "v3.1.0" "pybind11 git tag")
 set_tracked_cache_version(USYSEEK_MIMALLOC_VERSION "v3.5.3" "Version (git tag/branch) to use for mimalloc")
 set_tracked_cache_version(USYSEEK_ORT_VERSION "1.31.1" "onnxruntime release")
-set_tracked_cache_version(USYSEEK_QDRANT_VERSION "v1.20.1" "qdrant release")
-set_tracked_cache_version(USYSEEK_QDRANT_WEB_UI_VERSION "v0.2.20" "qdrant-web-ui release")
 set_tracked_cache_version(USYSEEK_EVERYTHING_VERSION "1.5.0.1424b" "Voidtools Everything release")
 
 # Status Reports
@@ -105,17 +103,7 @@ usyseek_fetch_archive(everything-${USYSEEK_EVERYTHING_VERSION}
 file(GLOB EVERYTHING_EXE "${EVERYTHING_DIR}/Everything*.exe")
 list(GET EVERYTHING_EXE 0 EVERYTHING_EXE)
 
-# Qdrant server & static Web UI
-usyseek_fetch_archive(qdrant-${USYSEEK_QDRANT_VERSION}
-    "https://github.com/qdrant/qdrant/releases/download/${USYSEEK_QDRANT_VERSION}/qdrant-x86_64-pc-windows-msvc.zip"
-    QDRANT_DIR)
-file(GLOB_RECURSE USYSEEK_QDRANT_EXE "${QDRANT_DIR}/qdrant.exe")
-
-usyseek_fetch_archive(qdrant-web-ui-${USYSEEK_QDRANT_WEB_UI_VERSION}
-    "https://github.com/qdrant/qdrant-web-ui/releases/download/${USYSEEK_QDRANT_WEB_UI_VERSION}/dist-qdrant.zip"
-    QDRANT_WEB_UI_DIR)
-
-##### Rust staticlib (qdrant gRPC client + tokenizers + resvg)
+##### Rust staticlib (qdrant-edge + tokenizers + resvg)
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
 set(RUST_DIR "${PROJECT_SOURCE_DIR}/rust")
 set(RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/rust_target")
@@ -125,7 +113,7 @@ add_custom_command(
     COMMAND "${CARGO_EXECUTABLE}" build --release --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
     DEPENDS "${RUST_DIR}/Cargo.toml" "${RUST_DIR}/Cargo.lock" "${RUST_DIR}/src/lib.rs" "${RUST_DIR}/src/svg.rs"
     WORKING_DIRECTORY "${RUST_DIR}"
-    COMMENT "Building usyseek_rust staticlib (qdrant-client + tokenizers + resvg)..."
+    COMMENT "Building usyseek_rust staticlib (qdrant-edge + tokenizers + resvg)..."
     VERBATIM
 )
 add_custom_target(usyseek_rust_build DEPENDS "${RUST_STATIC_LIB}")
@@ -273,10 +261,7 @@ target_link_libraries(usyseek-indexer PRIVATE
 
 ##### Runtime layout next to the executables
 add_custom_target(usyseek_runtime ALL
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${USYSEEK_BIN_DIR}/qdrant" "${USYSEEK_BIN_DIR}/config" "${USYSEEK_BIN_DIR}/python"
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${USYSEEK_QDRANT_EXE}" "${USYSEEK_BIN_DIR}/qdrant/qdrant.exe"
-    COMMAND "${CMAKE_COMMAND}" -E copy_directory_if_different "${QDRANT_WEB_UI_DIR}/dist" "${USYSEEK_BIN_DIR}/qdrant/static"
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/config/qdrant.yaml" "${USYSEEK_BIN_DIR}/config/qdrant.yaml"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${USYSEEK_BIN_DIR}/python"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/python/usyseek_vision.py" "${USYSEEK_BIN_DIR}/python/usyseek_vision.py"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/python/requirements.txt" "${USYSEEK_BIN_DIR}/python/requirements.txt"
     VERBATIM

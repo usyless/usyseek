@@ -6,15 +6,18 @@
 #include <glaze/glaze.hpp>
 #include <wil/resource.h>
 
-#include <thread>
+#include <mutex>
+#include <shared_mutex>
 
 extern "C" {
 struct UsyQdrant;
 struct UsyTokenizer;
 
-UsyQdrant* usy_qd_connect(UsyStr url, UsyBuf* out);
+UsyQdrant* usy_qd_open(UsyStr dir, UsyBuf* out);
+int32_t usy_qd_close_all(UsyQdrant* q, UsyBuf* out);
 void usy_qd_free(UsyQdrant* q);
-int32_t usy_qd_health(UsyQdrant* q, UsyBuf* out);
+int32_t usy_qd_flush(UsyQdrant* q, UsyStr name, UsyBuf* out);
+int32_t usy_qd_optimize(UsyQdrant* q, UsyStr name, UsyBuf* out);
 int32_t usy_qd_ensure_collection(UsyQdrant* q, UsyStr name, uint64_t dim, UsyBuf* out);
 int32_t usy_qd_upsert(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, const float* vectors, size_t dim, UsyStr payloads, UsyBuf* out);
 int32_t usy_qd_query(UsyQdrant* q, UsyStr name, const float* vector, size_t dim, UsyStr request, UsyBuf* out);
@@ -93,7 +96,7 @@ struct FieldsRequest {
 
 inline constexpr auto JSON_SKIP_NULL = glz::opts{.skip_null_members = true};
 
-/// Thread-safe (the Rust client multiplexes over one gRPC channel).
+/// Thread-safe handle to an embedded Qdrant Edge storage root.
 class Db {
 public:
     Db() = default;
@@ -102,29 +105,59 @@ public:
     Db(Db&&) = delete;
     Db& operator=(Db&&) = delete;
     ~Db() {
-        if (q_) usy_qd_free(q_);
+        std::unique_lock lk{mx_};
+        if (q_) {
+            usy_qd_free(q_);
+            q_ = nullptr;
+        }
     }
 
-    bool connect(uint16_t grpc_port, std::string* error = nullptr) {
-        const std::string url = "http://127.0.0.1:" + std::to_string(grpc_port);
+    bool open(const fs::path& dir, std::string* error = nullptr) {
+        std::unique_lock lk{mx_};
+        if (q_) {
+            usy_qd_free(q_);
+            q_ = nullptr;
+        }
+        const std::string utf8 = to_utf8(dir.wstring());
         RustBuf out;
-        q_ = usy_qd_connect(ustr(url), &out.b);
+        q_ = usy_qd_open(ustr(utf8), &out.b);
         if (!q_ && error) *error = out.str();
         return q_ != nullptr;
     }
 
-    [[nodiscard]] bool connected() const noexcept { return q_ != nullptr; }
+    /// Flushes and closes all open edge shards, releasing file locks.
+    bool close(std::string* error = nullptr) {
+        std::unique_lock lk{mx_};
+        if (!q_) return true;
+        RustBuf out;
+        const bool ok = usy_qd_close_all(q_, &out.b) == 0;
+        if (!ok && error) *error = out.str();
+        usy_qd_free(q_);
+        q_ = nullptr;
+        return ok;
+    }
 
-    /// Polls the health endpoint until the server answers or the timeout elapses.
-    bool wait_ready(std::chrono::milliseconds timeout, HANDLE abort_event = nullptr) {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < deadline) {
-            RustBuf out;
-            if (usy_qd_health(q_, &out.b) == 0) return true;
-            if (abort_event && WaitForSingleObject(abort_event, 0) == WAIT_OBJECT_0) return false;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        return false;
+    [[nodiscard]] bool opened() const noexcept {
+        std::shared_lock lk{mx_};
+        return q_ != nullptr;
+    }
+
+    bool flush(std::string_view coll = {}, std::string* error = nullptr) {
+        std::shared_lock lk{mx_};
+        if (!q_) return true;
+        RustBuf out;
+        const bool ok = usy_qd_flush(q_, ustr(coll), &out.b) == 0;
+        if (!ok && error) *error = out.str();
+        return ok;
+    }
+
+    bool optimize(std::string_view coll, std::string* error = nullptr) {
+        std::shared_lock lk{mx_};
+        if (!q_) return false;
+        RustBuf out;
+        const bool ok = usy_qd_optimize(q_, ustr(coll), &out.b) == 0;
+        if (!ok && error) *error = out.str();
+        return ok;
     }
 
     enum class CollectionStatus : uint8_t {
@@ -135,6 +168,11 @@ public:
 
     /// Checks or creates `name`. Pass `dim == 0` to check existence without requiring dimensions.
     CollectionStatus ensure_collection_status(std::string_view name, uint64_t dim = 0, std::string* error = nullptr) {
+        std::shared_lock lk{mx_};
+        if (!q_) {
+            if (error) *error = "database is closed";
+            return CollectionStatus::Error;
+        }
         RustBuf out;
         const int32_t rc = usy_qd_ensure_collection(q_, ustr(name), dim, &out.b);
         if (rc == 0) return CollectionStatus::Ready;
@@ -150,6 +188,11 @@ public:
                 std::span<const MediaPayload> payloads, std::string* error = nullptr) {
         auto json = glz::write<JSON_SKIP_NULL>(payloads);
         if (!json) return false;
+        std::shared_lock lk{mx_};
+        if (!q_) {
+            if (error) *error = "database is closed";
+            return false;
+        }
         RustBuf out;
         const bool ok = usy_qd_upsert(q_, ustr(coll), ids.data(), ids.size(), vectors.data(), dim, ustr(*json), &out.b) == 0;
         if (!ok && error) *error = out.str();
@@ -160,6 +203,11 @@ public:
         auto json = glz::write<JSON_SKIP_NULL>(req);
         if (!json) {
             if (error) *error = "Failed to serialize query request";
+            return std::nullopt;
+        }
+        std::shared_lock lk{mx_};
+        if (!q_) {
+            if (error) *error = "database is closed";
             return std::nullopt;
         }
         RustBuf out;
@@ -176,6 +224,11 @@ public:
             if (error) *error = "Failed to serialize scroll request";
             return std::nullopt;
         }
+        std::shared_lock lk{mx_};
+        if (!q_) {
+            if (error) *error = "database is closed";
+            return std::nullopt;
+        }
         RustBuf out;
         if (usy_qd_scroll(q_, ustr(coll), ustr(*json), &out.b) != 0) {
             if (error) *error = out.str();
@@ -188,6 +241,11 @@ public:
         auto json = glz::write<JSON_SKIP_NULL>(FieldsRequest{fields});
         if (!json) {
             if (error) *error = "Failed to serialize retrieve request";
+            return std::nullopt;
+        }
+        std::shared_lock lk{mx_};
+        if (!q_) {
+            if (error) *error = "database is closed";
             return std::nullopt;
         }
         RustBuf out;
@@ -207,6 +265,11 @@ public:
             if (error) *error = "Failed to serialize tags payload";
             return false;
         }
+        std::shared_lock lk{mx_};
+        if (!q_) {
+            if (error) *error = "database is closed";
+            return false;
+        }
         RustBuf out;
         const bool ok = usy_qd_set_payload(q_, ustr(coll), ids.data(), ids.size(), ustr(*json), &out.b) == 0;
         if (!ok && error) *error = out.str();
@@ -215,6 +278,11 @@ public:
 
     bool remove(std::string_view coll, std::span<const uint64_t> ids, std::string* error = nullptr) {
         if (ids.empty()) return true;
+        std::shared_lock lk{mx_};
+        if (!q_) {
+            if (error) *error = "database is closed";
+            return false;
+        }
         RustBuf out;
         const bool ok = usy_qd_delete(q_, ustr(coll), ids.data(), ids.size(), &out.b) == 0;
         if (!ok && error) *error = out.str();
@@ -222,6 +290,11 @@ public:
     }
 
     bool drop_collection(std::string_view coll, std::string* error = nullptr) {
+        std::shared_lock lk{mx_};
+        if (!q_) {
+            if (error) *error = "database is closed";
+            return false;
+        }
         RustBuf out;
         const bool ok = usy_qd_drop_collection(q_, ustr(coll), &out.b) == 0;
         if (!ok && error) *error = out.str();
@@ -229,14 +302,18 @@ public:
     }
 
     std::optional<uint64_t> count(std::string_view coll) {
+        std::shared_lock lk{mx_};
+        if (!q_) return std::nullopt;
         RustBuf out;
         if (usy_qd_count(q_, ustr(coll), &out.b) != 0) return std::nullopt;
         return std::strtoull(out.str().c_str(), nullptr, 10);
     }
 
     std::vector<TagCount> tags(std::string_view coll, uint64_t limit = 2000) {
-        RustBuf out;
+        std::shared_lock lk{mx_};
         std::vector<TagCount> v;
+        if (!q_) return v;
+        RustBuf out;
         if (usy_qd_facet_tags(q_, ustr(coll), limit, &out.b) == 0) {
             (void)glz::read<JSON_READ>(v, out.view());
         }
@@ -253,60 +330,9 @@ private:
         return pts;
     }
 
+    mutable std::shared_mutex mx_;
     UsyQdrant* q_ = nullptr;
 };
-
-// ---------------------------------------------------------------------------------------------
-// qdrant.exe lifecycle
-// ---------------------------------------------------------------------------------------------
-
-inline fs::path qdrant_exe() { return exe_dir() / L"qdrant" / L"qdrant.exe"; }
-
-/// Starts qdrant.exe bound to localhost. The process is put in `job` (kill-on-close) when given.
-inline wil::unique_process_information start_qdrant(const Settings& s, HANDLE job) {
-    wil::unique_process_information pi;
-    const fs::path exe = qdrant_exe();
-    const fs::path storage = data_dir() / L"qdrant";
-    std::error_code ec;
-    fs::create_directories(storage / L"storage", ec);
-
-    std::wstring env;
-    auto add_env = [&env](std::wstring_view kv) {
-        env += kv;
-        env.push_back(L'\0');
-    };
-    // Inherit the current environment, then override qdrant specifics
-    if (wchar_t* block = GetEnvironmentStringsW()) {
-        for (const wchar_t* p = block; *p; p += wcslen(p) + 1) {
-            if (_wcsnicmp(p, L"QDRANT__", 8) != 0) add_env(p);
-        }
-        FreeEnvironmentStringsW(block);
-    }
-    add_env(L"QDRANT__TELEMETRY_DISABLED=true");
-    add_env(L"QDRANT__STORAGE__STORAGE_PATH=" + (storage / L"storage").wstring());
-    add_env(L"QDRANT__STORAGE__SNAPSHOTS_PATH=" + (storage / L"snapshots").wstring());
-    add_env(L"QDRANT__SERVICE__HOST=127.0.0.1");
-    add_env(L"QDRANT__SERVICE__HTTP_PORT=" + std::to_wstring(s.qdrant_http_port));
-    add_env(L"QDRANT__SERVICE__GRPC_PORT=" + std::to_wstring(s.qdrant_grpc_port));
-    add_env(L"QDRANT__SERVICE__STATIC_CONTENT_DIR=" + (exe.parent_path() / L"static").wstring());
-    env.push_back(L'\0');
-
-    std::wstring cmd = L"\"" + exe.wstring() + L"\" --disable-telemetry --config-path \"" + (exe_dir() / L"config" / L"qdrant.yaml").wstring() + L"\"";
-
-    STARTUPINFOW si{sizeof(si)};
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    const fs::path work_dir = exe.parent_path();
-    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
-                        env.data(), work_dir.c_str(), &si, &pi)) {
-        return {};
-    }
-    if (job) AssignProcessToJobObject(job, pi.hProcess);
-    ResumeThread(pi.hThread);
-    return pi;
-}
 
 /// Job object that kills every assigned process when the last handle closes.
 inline wil::unique_handle make_kill_on_close_job() {
