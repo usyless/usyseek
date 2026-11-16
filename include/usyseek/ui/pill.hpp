@@ -37,7 +37,7 @@ public:
         if (!hwnd_) return false;
         SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
         apply_window_theme(hwnd_, sh_.theme, true, true);
-        if (!target_.attach(sh_.gfx, hwnd_)) return false;
+        if (!target_.attach(sh_.gfx, hwnd_, glass_active())) return false;
         gfx_epoch_ = sh_.gfx.epoch();
         gif_.set_notify(hwnd_, WM_APP_GIF);
         video_.set_notify(hwnd_, WM_APP_VIDEO);
@@ -56,6 +56,7 @@ public:
 
     void apply_theme() {
         apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
+        target_.set_liquid_glass(glass_active());
         if (glass_active()) {
             if (visible() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
         } else {

@@ -87,7 +87,7 @@ public:
                                 nullptr, nullptr, inst, this);
         if (!hwnd_) return false;
         apply_window_theme(hwnd_, sh_.theme, false, true);
-        if (!target_.attach(sh_.gfx, hwnd_)) return false;
+        if (!target_.attach(sh_.gfx, hwnd_, glass_active())) return false;
 
         cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
         cursor_hand_ = LoadCursorW(nullptr, IDC_HAND);
@@ -114,6 +114,7 @@ public:
 
     void apply_theme() {
         apply_window_theme(hwnd_, sh_.theme, false, true);
+        target_.set_liquid_glass(glass_active());
         if (glass_active()) {
             if (visible() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
         } else {
