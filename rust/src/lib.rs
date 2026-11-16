@@ -698,6 +698,87 @@ pub unsafe extern "C" fn usy_qd_drop_collection(q: *mut UsyQdrant, name: UsyStr,
     })
 }
 
+fn dir_bytes(root: &PathBuf) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file()
+                && let Ok(meta) = entry.metadata()
+            {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+/// Lists Qdrant Edge collections on disk with exact point count and disk usage:
+/// `[{ "name": string, "count": u64 | null, "bytes": u64 }]`.
+///
+/// # Safety
+///
+/// `q` must be null or valid; `out` must be null or uniquely writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn usy_qd_list_collections(q: *mut UsyQdrant, out: *mut UsyBuf) -> i32 {
+    run(out, || {
+        let q = unsafe { qdrant_ref(q) }?;
+        let mut entries: Vec<(String, PathBuf)> = Vec::new();
+        let read = fs::read_dir(&q.root).map_err(err)?;
+        for item in read.flatten() {
+            let Ok(ft) = item.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() || ft.is_symlink() {
+                continue;
+            }
+            let path = item.path();
+            if !shard_exists_on_disk(&path) {
+                continue;
+            }
+            let name = item.file_name().to_string_lossy().into_owned();
+            if name.is_empty() || name == "." || name == ".." {
+                continue;
+            }
+            entries.push((name, path));
+        }
+        entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()).then_with(|| a.0.cmp(&b.0)));
+
+        let mut list = Vec::with_capacity(entries.len());
+        for (name, path) in entries {
+            let bytes = dir_bytes(&path);
+            let loaded = {
+                let shards = q.shards.lock().map_err(|_| "shard lock poisoned".to_string())?;
+                shards.get(&name).cloned()
+            };
+            let count = if let Some(shard) = loaded {
+                shard.count(CountRequestBuilder::new().exact(true).build()).ok()
+            } else if let Ok(shard) = EdgeShard::load(&path, None) {
+                shard.count(CountRequestBuilder::new().exact(true).build()).ok()
+            } else {
+                None
+            };
+            list.push(json!({
+                "name": name,
+                "count": count,
+                "bytes": bytes,
+            }));
+        }
+        Ok(Json::Array(list).to_string())
+    })
+}
+
 /// Exact count; result is the number as a string. Missing collection counts as 0.
 ///
 /// # Safety
@@ -938,6 +1019,28 @@ mod tests {
         let cnt2 = unsafe { std::str::from_utf8(slice::from_raw_parts(buf.ptr, buf.len)).unwrap().to_owned() };
         unsafe { usy_buf_free(buf) };
         assert_eq!(cnt2, "2");
+
+        // Second collection for list_collections test
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_ensure_collection(q2, ustr("alpha_model"), 4, &mut buf) }, 0);
+        unsafe { usy_buf_free(buf) };
+
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_list_collections(q2, &mut buf) }, 0);
+        let cols: Json = serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        unsafe { usy_buf_free(buf) };
+        let arr = cols.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["name"], "alpha_model");
+        assert_eq!(arr[0]["count"], 0);
+        assert!(arr[0]["bytes"].as_u64().unwrap() > 0);
+        assert_eq!(arr[1]["name"], "test_model");
+        assert_eq!(arr[1]["count"], 2);
+        assert!(arr[1]["bytes"].as_u64().unwrap() > 0);
+
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_drop_collection(q2, ustr("alpha_model"), &mut buf) }, 0);
+        unsafe { usy_buf_free(buf) };
 
         let mut buf = usy_buf_empty();
         assert_eq!(unsafe { usy_qd_drop_collection(q2, ustr("test_model"), &mut buf) }, 0);

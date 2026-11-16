@@ -2,6 +2,7 @@
 
 #include "rust_bridge.hpp"
 #include "settings.hpp"
+#include "storage_info.hpp"
 
 #include <glaze/glaze.hpp>
 #include <wil/resource.h>
@@ -27,6 +28,7 @@ int32_t usy_qd_set_payload(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_
 int32_t usy_qd_delete(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, UsyBuf* out);
 int32_t usy_qd_drop_collection(UsyQdrant* q, UsyStr name, UsyBuf* out);
 int32_t usy_qd_count(UsyQdrant* q, UsyStr name, UsyBuf* out);
+int32_t usy_qd_list_collections(UsyQdrant* q, UsyBuf* out);
 int32_t usy_qd_facet_tags(UsyQdrant* q, UsyStr name, uint64_t limit, UsyBuf* out);
 
 UsyTokenizer* usy_tok_load(UsyStr path, size_t context_length, UsyBuf* out);
@@ -307,6 +309,25 @@ public:
         RustBuf out;
         if (usy_qd_count(q_, ustr(coll), &out.b) != 0) return std::nullopt;
         return std::strtoull(out.str().c_str(), nullptr, 10);
+    }
+
+    std::optional<std::vector<DbCollectionInfo>> list_collections(std::string* error = nullptr) {
+        std::shared_lock lk{mx_};
+        if (!q_) {
+            if (error) *error = "database is closed";
+            return std::nullopt;
+        }
+        RustBuf out;
+        if (usy_qd_list_collections(q_, &out.b) != 0) {
+            if (error) *error = out.str();
+            return std::nullopt;
+        }
+        std::vector<DbCollectionInfo> list;
+        if (const auto err = glz::read<JSON_READ>(list, out.view())) {
+            if (error) *error = "Failed to parse collections list: " + glz::format_error(err, out.view());
+            return std::nullopt;
+        }
+        return list;
     }
 
     std::vector<TagCount> tags(std::string_view coll, uint64_t limit = 2000) {

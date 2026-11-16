@@ -5,6 +5,7 @@
 #include "textfield.hpp"
 #include "../http.hpp"
 #include "../path_rules.hpp"
+#include "../storage_info.hpp"
 #include "../torch_index.hpp"
 
 #include <shobjidl.h>
@@ -105,6 +106,7 @@ public:
         sync_switch_targets(false);
         probe_venv();
         scan_models();
+        refresh_db_collections();
         return true;
     }
 
@@ -145,6 +147,9 @@ public:
         sh_.poll_indexer(true);
         sh_.reload_notifications();
         sh_.refresh_tags();
+        refresh_db_collections();
+        last_db_ready_ = sh_.engine.db_ready();
+        last_indexer_running_ = sh_.indexer_running;
         sh_.refresh_hotkey_state();
         full_dirty_ = true;
         pending_dirty_.clear();
@@ -293,6 +298,10 @@ private:
         IdTab3,
         IdToggleIndex,
         IdClearDatabase,
+        IdRefreshDbs,
+        IdUseDbModel,
+        IdDeleteDb,
+        IdDeleteDbDisabled,
         IdClearFailed,
         IdClearFailedDisabled,
         IdOpenFailedLog,
@@ -327,6 +336,10 @@ private:
         IdReloadThemes,
         IdBrowseModelDir,
         IdModelChip,
+        IdRefreshModels,
+        IdUseDownloadedModel,
+        IdDeleteModel,
+        IdDeleteModelDisabled,
         IdModelField,
         IdRepoField,
         IdDownloadModel,
@@ -366,19 +379,31 @@ private:
 
     void scan_models() {
         models_.clear();
-        std::error_code ec;
         const fs::path dir = to_wide(sh_.settings.model_dir);
-        if (fs::exists(dir, ec)) {
-            for (const auto& e : fs::directory_iterator(dir, ec)) {
-                if (e.path().extension() == L".safetensors") {
-                    models_.push_back(to_utf8(e.path().stem().wstring()));
-                }
-            }
+        downloaded_models_ = scan_downloaded_models(dir);
+        for (const auto& m : downloaded_models_) {
+            if (m.weights) models_.push_back(m.name);
         }
         if (std::find(models_.begin(), models_.end(), sh_.settings.model_name) == models_.end()) {
             models_.insert(models_.begin(), sh_.settings.model_name);
         }
         refresh_model_files();
+    }
+
+    void refresh_db_collections() {
+        const uint64_t seq = ++db_collections_seq_;
+        if (!sh_.engine.db_ready()) {
+            db_collections_ = scan_edge_collections_on_disk(edge_data_dir());
+            return;
+        }
+        sh_.engine.post([this, seq](Db& db) {
+            auto cols = db.list_collections();
+            sh_.call([this, seq, cols = std::move(cols)]() mutable {
+                if (seq != db_collections_seq_) return;
+                db_collections_ = cols ? std::move(*cols) : scan_edge_collections_on_disk(edge_data_dir());
+                invalidate();
+            });
+        });
     }
 
     /// Which files of the selected model are on disk. Returns true when that changed.
@@ -536,6 +561,23 @@ private:
             cv.text(label, rect(sx + 24.0f, r.top, tw + 4.0f, height(r)), Font::SmallSemi, fg);
         } else {
             cv.text(label, r, Font::SmallSemi, fg, Align::Center);
+        }
+        cv.hit(r, id, idx);
+    }
+
+    void draw_disabled_button(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, int id, int idx = 0) {
+        const float rad = std::min(10.0f, height(r) * 0.5f);
+        cv.fill_round(r, rad, with_alpha(cv.theme().surface_high, 0.45f));
+        cv.stroke_round(r, rad, with_alpha(cv.theme().outline_variant, 0.40f));
+        const D2D1_COLOR_F dfg = with_alpha(cv.theme().on_surface_variant, 0.45f);
+        if (icon_g) {
+            const float tw = cv.measure(label, Font::SmallSemi);
+            const float total = 18.0f + 6.0f + tw;
+            const float sx = r.left + (width(r) - total) * 0.5f;
+            cv.icon(icon_g, rect(sx, r.top, 18.0f, height(r)), dfg, Font::IconSmall);
+            cv.text(label, rect(sx + 24.0f, r.top, tw + 4.0f, height(r)), Font::SmallSemi, dfg);
+        } else {
+            cv.text(label, r, Font::SmallSemi, dfg, Align::Center);
         }
         cv.hit(r, id, idx);
     }
@@ -864,6 +906,8 @@ private:
             case IdLockedExclude: return L"System exclusion (cannot be removed)";
             case IdClearFailed: return L"Clear failed list and retry indexing";
             case IdClearFailedDisabled: return L"Stop indexing before retrying failed files";
+            case IdDeleteDbDisabled: return L"Stop indexing before deleting a database";
+            case IdDeleteModelDisabled: return L"Stop indexing before deleting the active model";
             case IdDismissNotif: return L"Dismiss notification";
             default: return nullptr;
         }
@@ -1093,6 +1137,107 @@ private:
     }
 
     // ------------------------------------------------------------------------------------------
+    // Storage management cards (Indexed Databases & Downloaded Models)
+    // ------------------------------------------------------------------------------------------
+
+    struct StorageRow {
+        std::wstring title;
+        std::wstring subtitle;
+        bool active = false;
+        bool can_use = false;
+        bool delete_disabled = false;
+    };
+
+    float draw_storage_list_card(Canvas& cv, float x, float y, float w, const wchar_t* title, const wchar_t* caption,
+                                 const wchar_t* empty_msg, const std::vector<StorageRow>& rows, int refresh_id,
+                                 int use_id, int delete_id, int delete_disabled_id) {
+        const float lx = x + 22.0f, rw = w - 44.0f;
+        const float refresh_w = button_width(cv, L"Refresh", true, 96.0f);
+        const CardHeader hd = make_header(cv, rw, title, cv.theme().on_surface, caption, refresh_w, 32.0f);
+        const float use_w = button_width(cv, L"Use", false, 58.0f);
+        const float del_w = button_width(cv, L"Delete", true, 84.0f);
+        const float badge_w = cv.measure(L"Active", Font::Caption) + 18.0f;
+
+        struct LayoutRow {
+            float y;
+            float h;
+            float title_w;
+            float title_h;
+            float sub_h;
+            float text_w;
+            float actions_w;
+            bool beside;
+            bool badge_inline;
+        };
+        std::vector<LayoutRow> lay;
+        lay.reserve(rows.size());
+        float cy = y + 16.0f + hd.h + 10.0f;
+        const float empty_h = rows.empty() ? text_height(cv, empty_msg, Font::Small, rw, 24.0f) : 0.0f;
+        for (const StorageRow& r : rows) {
+            const float actions_w = (r.can_use ? use_w + 8.0f : 0.0f) + del_w;
+            const bool beside = (rw - 24.0f - actions_w - 12.0f) >= 210.0f;
+            const float text_w = beside ? (rw - 24.0f - actions_w - 12.0f) : (rw - 24.0f);
+            const float title_nat_w = cv.measure(r.title, Font::BodySemi) + 2.0f;
+            const bool badge_inline = r.active && (title_nat_w + 8.0f + badge_w <= text_w);
+            const float title_w = badge_inline ? title_nat_w : text_w;
+            const float title_h = text_height(cv, r.title, Font::BodySemi, title_w, 20.0f);
+            const float sub_h = text_height(cv, r.subtitle, Font::Caption, text_w, 16.0f);
+            const float badge_extra = (r.active && !badge_inline) ? 24.0f : 0.0f;
+            const float text_h = title_h + badge_extra + 2.0f + sub_h;
+            const float row_h = beside ? std::max(50.0f, 16.0f + text_h) : (16.0f + text_h + 8.0f + 30.0f);
+            lay.push_back({cy, row_h, title_w, title_h, sub_h, text_w, actions_w, beside, badge_inline});
+            cy += row_h + 6.0f;
+        }
+
+        const float body_bottom = rows.empty() ? (cy + empty_h) : (cy - 6.0f);
+        const float h = body_bottom + 16.0f - y;
+        const float next_y = card_begin(cv, x, y, w, h);
+
+        const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
+        draw_button(cv, side, glyph::refresh, L"Refresh", refresh_id);
+
+        if (rows.empty()) {
+            cv.text_wrap(empty_msg, rect(lx, y + 16.0f + hd.h + 10.0f, rw, empty_h), Font::Small, cv.theme().outline);
+            return next_y;
+        }
+
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const StorageRow& r = rows[i];
+            const LayoutRow& lr = lay[i];
+            const D2D1_RECT_F ir = rect(lx, lr.y, rw, lr.h);
+            draw_well(cv, ir, 10.0f, r.active, r.active);
+
+            const float tx = ir.left + 12.0f;
+            const float ty = ir.top + 8.0f;
+            cv.text_wrap(r.title, rect(tx, ty, lr.title_w, lr.title_h), Font::BodySemi, cv.theme().on_surface);
+            float sub_y = ty + lr.title_h + 2.0f;
+            if (r.active) {
+                const D2D1_RECT_F br = lr.badge_inline
+                    ? rect(tx + lr.title_w + 8.0f, ty + std::max(0.0f, (lr.title_h - 18.0f) * 0.5f), badge_w, 18.0f)
+                    : rect(tx, ty + lr.title_h + 3.0f, badge_w, 18.0f);
+                if (!lr.badge_inline) sub_y += 24.0f;
+                cv.fill_round(br, 9.0f, with_alpha(cv.theme().mint, 0.16f));
+                cv.text(L"Active", br, Font::Caption, cv.theme().mint, Align::Center);
+            }
+            cv.text_wrap(r.subtitle, rect(tx, sub_y, lr.text_w, lr.sub_h), Font::Caption, cv.theme().on_surface_variant);
+
+            float bx = lr.beside ? (ir.right - 12.0f - lr.actions_w) : tx;
+            const float by = lr.beside ? (ir.top + (lr.h - 30.0f) * 0.5f) : (ir.bottom - 38.0f);
+            const int idx = static_cast<int>(i);
+            if (r.can_use) {
+                draw_button(cv, rect(bx, by, use_w, 30.0f), 0, L"Use", use_id, idx, 0);
+                bx += use_w + 8.0f;
+            }
+            if (r.delete_disabled) {
+                draw_disabled_button(cv, rect(bx, by, del_w, 30.0f), glyph::del, L"Delete", delete_disabled_id, idx);
+            } else {
+                draw_button(cv, rect(bx, by, del_w, 30.0f), glyph::del, L"Delete", delete_id, idx, 2);
+            }
+        }
+        return next_y;
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Tab 1: Embeddings & Progress
     // ------------------------------------------------------------------------------------------
 
@@ -1318,6 +1463,34 @@ private:
                 cv.text_wrap(more, rect(lx, cy, rw, more_h), Font::Caption, cv.theme().outline);
             }
             y = next_y;
+        }
+
+        // 1c. Indexed Databases card
+        {
+            std::vector<StorageRow> rows;
+            rows.reserve(db_collections_.size());
+            for (const DbCollectionInfo& col : db_collections_) {
+                const bool is_active = col.name == sh_.settings.model_name;
+                const auto mit = std::find_if(downloaded_models_.begin(), downloaded_models_.end(),
+                                              [&](const ModelStorageInfo& m) { return m.name == col.name && m.weights; });
+                std::wstring sub = col.count
+                    ? (format_count(*col.count) + (*col.count == 1 ? L" file" : L" files"))
+                    : (sh_.indexer_running ? L"Counts paused while indexing" : L"Count unavailable");
+                sub += L"  •  " + format_size(col.bytes);
+                if (mit == downloaded_models_.end()) sub += L"  •  Weights not downloaded";
+                rows.push_back({
+                    .title = to_wide(col.name),
+                    .subtitle = std::move(sub),
+                    .active = is_active,
+                    .can_use = !is_active,
+                    .delete_disabled = sh_.indexer_running,
+                });
+            }
+            y = draw_storage_list_card(
+                cv, x, y, w, L"Indexed Databases (Qdrant Edge)",
+                L"Per-model collections in data\\qdrant_edge — switch to search or delete unused databases",
+                L"No Qdrant Edge collections found on disk yet.", rows,
+                IdRefreshDbs, IdUseDbModel, IdDeleteDb, IdDeleteDbDisabled);
         }
 
         // 2. Indexing Scope Card
@@ -1857,6 +2030,38 @@ private:
             note.draw(lx + note_x, note_y, rw - note_x);
             script.draw(lx, script_y, rw);
             y = next_y;
+        }
+
+        // 2b. Downloaded Models Card
+        {
+            std::vector<StorageRow> rows;
+            rows.reserve(downloaded_models_.size());
+            for (const ModelStorageInfo& m : downloaded_models_) {
+                const bool is_active = m.name == sh_.settings.model_name;
+                std::wstring sub;
+                auto add_part = [&](std::wstring_view part) {
+                    if (!sub.empty()) sub += L"  •  ";
+                    sub += part;
+                };
+                if (m.weights) add_part(L"Weights");
+                if (m.tokenizer) add_part(L"Tokenizer");
+                if (m.onnx) add_part(L"Text ONNX");
+                if (m.partial) add_part(L"Partial download");
+                if (!m.weights) add_part(L"Missing weights");
+                add_part(format_size(m.bytes));
+                rows.push_back({
+                    .title = to_wide(m.name),
+                    .subtitle = std::move(sub),
+                    .active = is_active,
+                    .can_use = !is_active && m.weights,
+                    .delete_disabled = is_active && sh_.indexer_running,
+                });
+            }
+            y = draw_storage_list_card(
+                cv, x, y, w, L"Downloaded Models",
+                L"Model files found in the configured model folder — switch or delete unused models",
+                L"No downloaded model files found in this folder.", rows,
+                IdRefreshModels, IdUseDownloadedModel, IdDeleteModel, IdDeleteModelDisabled);
         }
 
         // 3. Python Environment Card (.venv or portable NuGet Python)
@@ -2668,6 +2873,7 @@ private:
         scan_models();
         sh_.save();
         if (sh_.settings_changed) sh_.settings_changed();
+        refresh_db_collections();
         return true;
     }
 
@@ -2877,6 +3083,58 @@ private:
                                 }
                                 sh_.poll_indexer();
                                 sh_.refresh_tags();
+                                refresh_db_collections();
+                                if (sh_.redraw_all) sh_.redraw_all();
+                            });
+                        });
+                    }
+                }
+                break;
+            }
+            case IdRefreshDbs:
+                refresh_db_collections();
+                break;
+            case IdUseDbModel:
+                if (idx >= 0 && idx < static_cast<int>(db_collections_.size())) {
+                    confirm_and_set_model(db_collections_[idx].name);
+                }
+                break;
+            case IdDeleteDb: {
+                if (sh_.indexer_running || idx < 0 || idx >= static_cast<int>(db_collections_.size())) break;
+                const DbCollectionInfo col = db_collections_[idx];
+                const std::wstring count_line = col.count
+                    ? (format_count(*col.count) + (*col.count == 1 ? L" indexed file" : L" indexed files"))
+                    : L"unknown file count";
+                const std::wstring msg = L"Delete Qdrant Edge database '" + to_wide(col.name) + L"' (" +
+                                         count_line + L", " + format_size(col.bytes) + L")?\n\n"
+                                         L"This removes all indexed embeddings and tags in that collection. Your media files and downloaded models will not be touched.";
+                if (!in_modal_) {
+                    in_modal_ = true;
+                    const bool confirmed = confirm_box(hwnd_, L"Delete Database Collection", msg);
+                    in_modal_ = false;
+                    if (confirmed) {
+                        const bool is_active = col.name == sh_.settings.model_name;
+                        std::error_code ec;
+                        fs::remove(failed_path(col.name), ec);
+                        if (is_active) {
+                            fs::remove(state_path(), ec);
+                            sh_.index_state = {};
+                            sh_.failed_files.clear();
+                            sh_.db_count = 0;
+                            sh_.tags.clear();
+                        }
+                        sh_.engine.post_when_ready([this, coll = col.name, is_active](Db& db) {
+                            std::string drop_err;
+                            const bool ok = db.drop_collection(coll, &drop_err);
+                            sh_.call([this, ok, drop_err, coll, is_active] {
+                                if (!ok) {
+                                    sh_.notify("error", "Database", "Failed to drop Qdrant Edge collection '" + coll + "'", drop_err, "db-drop");
+                                }
+                                if (is_active) {
+                                    sh_.poll_indexer();
+                                    sh_.refresh_tags();
+                                }
+                                refresh_db_collections();
                                 if (sh_.redraw_all) sh_.redraw_all();
                             });
                         });
@@ -3067,6 +3325,40 @@ private:
                     confirm_and_set_model(models_[idx]);
                 }
                 break;
+            case IdRefreshModels:
+                scan_models();
+                break;
+            case IdUseDownloadedModel:
+                if (idx >= 0 && idx < static_cast<int>(downloaded_models_.size())) {
+                    confirm_and_set_model(downloaded_models_[idx].name);
+                }
+                break;
+            case IdDeleteModel: {
+                if (idx < 0 || idx >= static_cast<int>(downloaded_models_.size())) break;
+                const ModelStorageInfo m = downloaded_models_[idx];
+                const bool is_active = m.name == sh_.settings.model_name;
+                if (is_active && sh_.indexer_running) break;
+                const std::wstring msg = L"Delete downloaded model files for '" + to_wide(m.name) + L"' (" +
+                                         format_size(m.bytes) + L")?\n\n"
+                                         L"Your indexed Qdrant database collections and tags will not be touched.";
+                if (!in_modal_) {
+                    in_modal_ = true;
+                    const bool confirmed = confirm_box(hwnd_, L"Delete Model Files", msg);
+                    in_modal_ = false;
+                    if (confirmed) {
+                        std::string del_err;
+                        const fs::path dir = to_wide(sh_.settings.model_dir);
+                        if (!delete_downloaded_model(dir, m.name, &del_err)) {
+                            sh_.notify("error", "Model", "Failed to delete model files for '" + m.name + "'", del_err, "model-delete");
+                        }
+                        scan_models();
+                        if (is_active) {
+                            sh_.engine.encoder().load_async(dir, sh_.settings.model_name);
+                        }
+                    }
+                }
+                break;
+            }
             case IdModelField: focus_field(model_field_); break;
             case IdRepoField: focus_field(repo_field_); break;
             case IdDownloadModel:
@@ -3528,6 +3820,13 @@ private:
                             scan_models(); // a model was added to or removed from the folder
                             changed = true;
                         }
+                        const bool db_ready = sh_.engine.db_ready();
+                        if (db_ready != last_db_ready_ || sh_.indexer_running != last_indexer_running_) {
+                            last_db_ready_ = db_ready;
+                            last_indexer_running_ = sh_.indexer_running;
+                            refresh_db_collections();
+                            changed = true;
+                        }
                         if (changed) invalidate();
                         return 0;
                     }
@@ -3621,6 +3920,11 @@ private:
     };
 
     std::vector<std::string> models_;
+    std::vector<ModelStorageInfo> downloaded_models_;
+    std::vector<DbCollectionInfo> db_collections_;
+    uint64_t db_collections_seq_ = 0;
+    bool last_db_ready_ = false;
+    bool last_indexer_running_ = false;
     ModelFiles model_files_;
     VenvInfo venv_;
     std::wstring venv_pkgs_;
