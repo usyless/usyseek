@@ -36,9 +36,7 @@ public:
                                 WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN, 0, 0, 100, 100, nullptr, nullptr, inst, this);
         if (!hwnd_) return false;
         SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
-        style_window(hwnd_, DWMSBT_TRANSIENTWINDOW);
-        const COLORREF border = RGB(0x44, 0x41, 0x48);
-        DwmSetWindowAttribute(hwnd_, DWMWA_BORDER_COLOR, &border, sizeof(border));
+        apply_window_theme(hwnd_, sh_.theme, true, true);
         if (!target_.attach(sh_.gfx, hwnd_)) return false;
         gfx_epoch_ = sh_.gfx.epoch();
         gif_.set_notify(hwnd_, WM_APP_GIF);
@@ -55,6 +53,12 @@ public:
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
     [[nodiscard]] bool visible() const noexcept { return IsWindowVisible(hwnd_) != FALSE; }
     WindowTarget& target() noexcept { return target_; }
+
+    void apply_theme() {
+        apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
+        full_dirty_ = true;
+        invalidate();
+    }
 
     void show() {
         blur_hide_tick_ = 0;
@@ -262,10 +266,10 @@ public:
             if (full_frame) {
                 drew_full = true;
                 hits_.clear();
-                Canvas cv{target_, sh_.fonts, hits_, clip};
+                Canvas cv{target_, sh_.fonts, hits_, sh_.theme, clip};
                 draw(cv);
             } else {
-                Canvas cv{target_, sh_.fonts, partial_hits, clip};
+                Canvas cv{target_, sh_.fonts, partial_hits, sh_.theme, clip};
                 draw(cv);
             }
         });
@@ -597,14 +601,12 @@ private:
             MONITORINFO mi{sizeof(mi)};
             GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi);
             fullscreen_ = true;
-            const DWM_WINDOW_CORNER_PREFERENCE c = DWMWCP_DONOTROUND;
-            DwmSetWindowAttribute(hwnd_, DWMWA_WINDOW_CORNER_PREFERENCE, &c, sizeof(c));
+            apply_window_theme(hwnd_, sh_.theme, true, false);
             const RECT& r = mi.rcMonitor;
             SetWindowPos(hwnd_, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED);
         } else {
             fullscreen_ = false;
-            const DWM_WINDOW_CORNER_PREFERENCE c = DWMWCP_ROUND;
-            DwmSetWindowAttribute(hwnd_, DWMWA_WINDOW_CORNER_PREFERENCE, &c, sizeof(c));
+            apply_window_theme(hwnd_, sh_.theme, true, true);
             const RECT& r = restore_rect_;
             SetWindowPos(hwnd_, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED);
             apply_height();
@@ -1020,7 +1022,7 @@ private:
 
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
-        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(color::bg, 0.80f));
+        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
         if (preview_ >= 0) {
             draw_preview(cv, sz);
             if (menu_open_) draw_menu(cv);
@@ -1038,9 +1040,9 @@ private:
 
     void icon_button(Canvas& cv, D2D1_RECT_F r, wchar_t g, int id, bool active = false) {
         const float ha = hover_.alpha(id);
-        if (active) cv.fill_round(r, height(r) / 2, with_alpha(color::primary, 0.16f));
-        else if (ha > 0.002f) cv.fill_round(r, height(r) / 2, with_alpha(color::on_surface, 0.08f * ha));
-        cv.icon(g, r, active ? color::primary : lerp_color(color::on_surface_variant, color::on_surface, ha));
+        if (active) cv.fill_round(r, height(r) / 2, with_alpha(cv.theme().primary, 0.16f));
+        else if (ha > 0.002f) cv.fill_round(r, height(r) / 2, with_alpha(cv.theme().on_surface, 0.08f * ha));
+        cv.icon(g, r, active ? cv.theme().primary : lerp_color(cv.theme().on_surface_variant, cv.theme().on_surface, ha));
         cv.hit(r, id);
     }
 
@@ -1048,9 +1050,9 @@ private:
         const float cy = HEADER_H / 2;
         // Search glyph with a status dot
         const D2D1_RECT_F ic = rect(16, cy - 12, 24, 24);
-        cv.icon(glyph::search, ic, color::on_surface_variant, Font::IconLarge);
+        cv.icon(glyph::search, ic, cv.theme().on_surface_variant, Font::IconLarge);
         const D2D1_COLOR_F dot = status_dot_color();
-        cv.fill_circle({ic.left + 20, ic.top + 20}, 4.5f, color::bg);
+        cv.fill_circle({ic.left + 20, ic.top + 20}, 4.5f, cv.theme().bg);
         cv.fill_circle({ic.left + 20, ic.top + 20}, 3.0f, dot);
 
         // Right cluster: close, fullscreen, settings | tag, chips
@@ -1064,7 +1066,7 @@ private:
         btn(glyph::settings, IdSettings);
         if (!sh_.notifications.empty()) {
             const bool has_err = sh_.error_notification_count() > 0;
-            const D2D1_COLOR_F ncol = has_err ? color::error : color::amber;
+            const D2D1_COLOR_F ncol = has_err ? cv.theme().error : cv.theme().amber;
             const std::wstring cnt = format_count(sh_.notifications.size());
             const float bw = std::max(44.0f, 26.0f + cv.measure(cnt, Font::Caption) + 12.0f);
             x -= bw + 4;
@@ -1077,7 +1079,7 @@ private:
             cv.hit(nr, IdNotifyBtn);
         }
         x -= 8;
-        cv.vline(x, cy - 12, cy + 12, color::outline_variant);
+        cv.vline(x, cy - 12, cy + 12, cv.theme().outline_variant);
         x -= 4;
         btn(glyph::help, IdHelpBtn, show_help());
         help_btn_x_ = x;
@@ -1094,7 +1096,7 @@ private:
         }
         x -= total;
         const D2D1_RECT_F seg = rect(x, cy - 17, total, 34);
-        cv.fill_round(seg, 17, with_alpha(color::surface_highest, 0.85f));
+        cv.fill_round(seg, 17, with_alpha(cv.theme().surface_highest, 0.85f));
         D2D1_RECT_F chip_rects[3]{};
         float cx = x + 3;
         for (int i = 0; i < 3; ++i) {
@@ -1106,32 +1108,32 @@ private:
             const float act = std::max(0.0f, 1.0f - std::abs(ct - static_cast<float>(i)));
             const float ha = hover_.alpha(IdChip, i);
             if (act < 0.5f && ha > 0.002f) {
-                cv.fill_round(chip_rects[i], 14, with_alpha(color::on_surface, 0.07f * ha));
+                cv.fill_round(chip_rects[i], 14, with_alpha(cv.theme().on_surface, 0.07f * ha));
             }
         }
         const int lo = std::clamp(static_cast<int>(std::floor(ct)), 0, 1);
         const float frac = ct - static_cast<float>(lo);
-        cv.fill_round(lerp_rect(chip_rects[lo], chip_rects[lo + 1], frac), 14, color::primary_container);
+        cv.fill_round(lerp_rect(chip_rects[lo], chip_rects[lo + 1], frac), 14, cv.theme().primary_container);
         for (int i = 0; i < 3; ++i) {
             const float act = std::max(0.0f, 1.0f - std::abs(ct - static_cast<float>(i)));
             cv.text(labels[i], chip_rects[i], Font::SmallSemi,
-                    lerp_color(color::on_surface_variant, color::on_primary_container, act), Align::Center);
+                    lerp_color(cv.theme().on_surface_variant, cv.theme().on_primary_container, act), Align::Center);
             cv.hit(chip_rects[i], IdChip, i);
         }
 
         // Text field
         const D2D1_RECT_F fr = D2D1::RectF(52, 8, x - 14, HEADER_H - 8);
         cv.hit(fr, IdField);
-        field_.draw(cv, D2D1::RectF(fr.left, fr.top, fr.right, fr.bottom), Font::Input, color::on_surface, color::outline);
-        cv.hline(0, sz.width, HEADER_H, with_alpha(color::outline_variant, 0.7f));
+        field_.draw(cv, D2D1::RectF(fr.left, fr.top, fr.right, fr.bottom), Font::Input, cv.theme().on_surface, cv.theme().outline);
+        cv.hline(0, sz.width, HEADER_H, with_alpha(cv.theme().outline_variant, 0.7f));
     }
 
     [[nodiscard]] D2D1_COLOR_F status_dot_color() const {
-        if (sh_.indexer_running) return color::amber;
+        if (sh_.indexer_running) return sh_.theme.amber;
         const auto st = sh_.engine.encoder().state();
-        if (st == TextEncoder::State::Failed || !error_.empty() || (!sh_.engine.db_ready() && !sh_.test_mode)) return color::error;
-        if (st == TextEncoder::State::Loading || st == TextEncoder::State::Exporting) return color::primary;
-        return color::mint;
+        if (st == TextEncoder::State::Failed || !error_.empty() || (!sh_.engine.db_ready() && !sh_.test_mode)) return sh_.theme.error;
+        if (st == TextEncoder::State::Loading || st == TextEncoder::State::Exporting) return sh_.theme.primary;
+        return sh_.theme.mint;
     }
 
     void draw_status(Canvas& cv, D2D1_SIZE_F sz) {
@@ -1143,63 +1145,63 @@ private:
             cv.text(s, rect(x, y, w + 2, STATUS_H), f, c);
             x += w;
         };
-        auto sep = [&] { piece(L"   •   ", color::outline_variant); };
+        auto sep = [&] { piece(L"   •   ", cv.theme().outline_variant); };
 
-        cv.icon(glyph::clock, rect(x - 2, y + 8, 14, 14), color::outline, Font::IconSmall);
+        cv.icon(glyph::clock, rect(x - 2, y + 8, 14, 14), cv.theme().outline, Font::IconSmall);
         x += 16;
         if (sh_.indexer_running) {
             const auto& d = sh_.indexer;
             if (sh_.indexer_stopping) {
-                piece(L"Stopping indexer…", color::amber, Font::SmallSemi);
+                piece(L"Stopping indexer…", cv.theme().amber, Font::SmallSemi);
             } else {
-                piece(L"Indexing ", color::outline);
-                if (d.phase == Phase::Embedding) piece(format_count(d.embedded) + L" / " + format_count(d.found), color::amber, Font::SmallSemi);
-                else piece(phase_label(d.phase), color::amber, Font::SmallSemi);
+                piece(L"Indexing ", cv.theme().outline);
+                if (d.phase == Phase::Embedding) piece(format_count(d.embedded) + L" / " + format_count(d.found), cv.theme().amber, Font::SmallSemi);
+                else piece(phase_label(d.phase), cv.theme().amber, Font::SmallSemi);
             }
         } else {
-            piece(L"Last indexed ", color::outline);
-            piece(format_ago(sh_.index_state.last_index_unix), color::on_surface_variant, Font::SmallSemi);
+            piece(L"Last indexed ", cv.theme().outline);
+            piece(format_ago(sh_.index_state.last_index_unix), cv.theme().on_surface_variant, Font::SmallSemi);
         }
         if (sh_.db_count) {
             sep();
-            piece(format_count(*sh_.db_count) + L" files", color::outline);
+            piece(format_count(*sh_.db_count) + L" files", cv.theme().outline);
         }
         const auto enc = sh_.engine.encoder().state();
         if (enc == TextEncoder::State::Exporting) {
             sep();
-            piece(L"Exporting text ONNX…", color::primary);
+            piece(L"Exporting text ONNX…", cv.theme().primary);
         } else if (enc == TextEncoder::State::Loading) {
             sep();
-            piece(L"Loading model…", color::primary);
+            piece(L"Loading model…", cv.theme().primary);
         }
         // A search fails with the model's own error while there is no model: show it once
         const std::wstring model_error = enc == TextEncoder::State::Failed ? sh_.engine.encoder().error() : std::wstring{};
         if (!model_error.empty()) {
             sep();
-            piece(model_error, color::error);
+            piece(model_error, cv.theme().error);
         } else if (!sh_.engine.db_ready() && !sh_.test_mode) {
             sep();
-            piece(L"Database unavailable", color::error);
+            piece(L"Database unavailable", cv.theme().error);
         }
         if (!error_.empty() && error_ != model_error) {
             sep();
-            piece(error_, color::error);
+            piece(error_, cv.theme().error);
         } else if (last_ms_ > 0 && expanded()) {
             sep();
             wchar_t buf[48];
             swprintf_s(buf, L"%.0f ms", last_ms_);
-            piece(buf, color::outline);
+            piece(buf, cv.theme().outline);
         }
         sep();
-        piece(to_wide(sh_.settings.model_name), color::outline);
+        piece(to_wide(sh_.settings.model_name), cv.theme().outline);
         if (sh_.hotkey_unavailable()) {
             sep();
-            piece(format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk) + L" is taken by another app", color::amber);
+            piece(format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk) + L" is taken by another app", cv.theme().amber);
         }
         if (!sh_.notifications.empty()) {
             sep();
             const bool has_err = sh_.error_notification_count() > 0;
-            const D2D1_COLOR_F nc = has_err ? color::error : color::amber;
+            const D2D1_COLOR_F nc = has_err ? cv.theme().error : cv.theme().amber;
             const std::wstring ntxt = format_count(sh_.notifications.size()) +
                                       (sh_.notifications.size() == 1 ? L" alert" : L" alerts");
             const float nw = cv.measure(ntxt, Font::SmallSemi);
@@ -1216,17 +1218,17 @@ private:
         if (is_grid_zoomed()) {
             const D2D1_RECT_F zr = rect(right_edge - 24.0f, y + 3.0f, 24.0f, STATUS_H - 6.0f);
             const float ha = hover_.alpha(IdZoomReset);
-            cv.fill_round(zr, 6.0f, lerp_color(with_alpha(color::primary, 0.14f), with_alpha(color::primary, 0.26f), ha));
-            cv.icon(glyph::search, zr, lerp_color(color::primary, color::on_primary_container, ha * 0.35f), Font::IconSmall);
+            cv.fill_round(zr, 6.0f, lerp_color(with_alpha(cv.theme().primary, 0.14f), with_alpha(cv.theme().primary, 0.26f), ha));
+            cv.icon(glyph::search, zr, lerp_color(cv.theme().primary, cv.theme().on_primary_container, ha * 0.35f), Font::IconSmall);
             cv.hit(zr, IdZoomReset);
             right_edge -= 32.0f;
         }
         if (expanded() && !items_.empty()) {
             std::wstring right = format_count(items_.size()) + (has_more_ ? L"+" : L"") + L" results";
             if (selected_.size() > 1) right = format_count(selected_.size()) + L" selected  •  " + right;
-            cv.text(right, D2D1::RectF(x + 12, y, right_edge, y + STATUS_H), Font::Caption, color::outline, Align::Right);
+            cv.text(right, D2D1::RectF(x + 12, y, right_edge, y + STATUS_H), Font::Caption, cv.theme().outline, Align::Right);
         }
-        if (expanded()) cv.hline(0, sz.width, HEADER_H + STATUS_H, with_alpha(color::outline_variant, 0.5f));
+        if (expanded()) cv.hline(0, sz.width, HEADER_H + STATUS_H, with_alpha(cv.theme().outline_variant, 0.5f));
     }
 
     void draw_grid(Canvas& cv) {
@@ -1236,7 +1238,7 @@ private:
 
         if (items_.empty()) {
             const wchar_t* msg = (searching_ || debounce_pending_) ? L"" : (error_.empty() ? L"No matches" : L"");
-            cv.text(msg, D2D1::RectF(g.view.left, g.view.top, g.view.right, g.view.top + 120), Font::Body, color::outline, Align::Center);
+            cv.text(msg, D2D1::RectF(g.view.left, g.view.top, g.view.right, g.view.top + 120), Font::Body, cv.theme().outline, Align::Center);
             if (searching_) draw_spinner(cv, {(g.view.left + g.view.right) / 2, g.view.top + 60});
         }
 
@@ -1281,7 +1283,7 @@ private:
             const float ty = g.view.top + 4 + (track_h - thumb_h) * (scroll_ / ms);
             const float ha = dragging_scroll_ ? 1.0f : hover_.alpha(IdScrollbar);
             const D2D1_RECT_F tr = D2D1::RectF(g.view.right - lerp(7.0f, 9.0f, ha), ty, g.view.right - 3, ty + thumb_h);
-            cv.fill_round(tr, 3, with_alpha(color::on_surface_variant, lerp(0.28f, 0.55f, ha)));
+            cv.fill_round(tr, 3, with_alpha(cv.theme().on_surface_variant, lerp(0.28f, 0.55f, ha)));
             cv.hit(D2D1::RectF(g.view.right - 12, g.view.top, g.view.right, g.view.bottom), IdScrollbar);
             scroll_thumb_ = tr;
         }
@@ -1292,7 +1294,7 @@ private:
         for (int i = 0; i < 8; ++i) {
             const float a = (i / 8.0f + t) * 6.2831853f;
             const float alpha = 0.15f + 0.85f * (i / 8.0f);
-            cv.fill_circle({c.x + std::cos(a) * 9, c.y + std::sin(a) * 9}, 2.0f, with_alpha(color::primary, alpha));
+            cv.fill_circle({c.x + std::cos(a) * 9, c.y + std::sin(a) * 9}, 2.0f, with_alpha(cv.theme().primary, alpha));
         }
         start_anim();
     }
@@ -1308,21 +1310,21 @@ private:
         const bool sel = selected_.contains(it.pt.id);
         const bool focus = focus_ == i;
 
-        cv.fill_round(r, 14, with_alpha(lerp_color(color::surface_low, color::surface_high, ha), 0.92f));
-        if (sel) cv.stroke_round(r, 14, color::primary, 2.0f);
-        else if (focus) cv.stroke_round(r, 14, with_alpha(color::primary, 0.6f), 1.0f);
-        else cv.stroke_round(r, 14, with_alpha(color::outline_variant, lerp(0.45f, 0.9f, ha)));
+        cv.fill_round(r, 14, with_alpha(lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha), 0.92f));
+        if (sel) cv.stroke_round(r, 14, cv.theme().primary, 2.0f);
+        else if (focus) cv.stroke_round(r, 14, with_alpha(cv.theme().primary, 0.6f), 1.0f);
+        else cv.stroke_round(r, 14, with_alpha(cv.theme().outline_variant, lerp(0.45f, 0.9f, ha)));
         cv.hit(r, IdCard, i);
 
         // Thumbnail (cropped or letterboxed through a reusable bitmap brush so the corners stay rounded)
         const D2D1_RECT_F tr = rect(r.left + 6, r.top + 6, g.card_w - 12, g.thumb_h);
         if (ID2D1Bitmap1* bmp = sh_.thumbs.get(it.pt.id)) {
             const ThumbFit fit = parse_thumb_fit(sh_.settings.thumb_fit);
-            if (fit == ThumbFit::Contain) cv.fill_round(tr, 10, color::surface_lowest);
+            if (fit == ThumbFit::Contain) cv.fill_round(tr, 10, cv.theme().surface_lowest);
             cv.fill_bitmap_round(bmp, tr, 10.0f, fit);
         } else {
-            cv.fill_round(tr, 10, with_alpha(color::surface_highest, 0.6f));
-            cv.icon(it.pt.p.k == 1 ? glyph::video : glyph::photo, tr, with_alpha(color::outline, 0.6f), Font::IconLarge);
+            cv.fill_round(tr, 10, with_alpha(cv.theme().surface_highest, 0.6f));
+            cv.icon(it.pt.p.k == 1 ? glyph::video : glyph::photo, tr, with_alpha(cv.theme().outline, 0.6f), Font::IconLarge);
         }
 
         if (it.pt.p.k == 1) {
@@ -1338,8 +1340,8 @@ private:
             auto overlay_btn = [&](float x, wchar_t g, int id) {
                 const D2D1_RECT_F sb = rect(x, tr.top + 8, 28, 28);
                 const float ba = hover_.alpha(id, i);
-                cv.fill_circle({sb.left + 14, sb.top + 14}, 14, lerp_color(hex(0x000000, 0.55f), hex(0x2b2930, 0.95f), ba));
-                cv.icon(g, sb, lerp_color(hex(0xffffff), color::primary, ba), Font::IconSmall);
+                cv.fill_circle({sb.left + 14, sb.top + 14}, 14, lerp_color(hex(0x000000, 0.55f), with_alpha(cv.theme().surface_high, 0.95f), ba));
+                cv.icon(g, sb, lerp_color(hex(0xffffff), cv.theme().primary, ba), Font::IconSmall);
                 cv.hit(sb, id, i);
             };
             overlay_btn(tr.right - 36, glyph::similar, IdSimilar);
@@ -1351,12 +1353,12 @@ private:
         float y = tr.bottom + 10.0f;
         const float lx = r.left + 12.0f, rw = g.card_w - 24.0f;
         const D2D1_RECT_F name_r = rect(lx, y, rw, 18.0f);
-        cv.text(it.name, name_r, Font::BodySemi, color::on_surface);
+        cv.text(it.name, name_r, Font::BodySemi, cv.theme().on_surface);
         if (cv.measure(it.name, Font::BodySemi) > rw) cv.hit(name_r, IdCardName, i);
         y += 20.0f;
         const D2D1_RECT_F dir_r = rect(lx, y, rw, 16.0f);
         const std::wstring dir_disp = middle_truncate_dir(cv, it.dir, Font::MonoSmall, rw);
-        cv.text(dir_disp, dir_r, Font::MonoSmall, color::outline);
+        cv.text(dir_disp, dir_r, Font::MonoSmall, cv.theme().outline);
         if (cv.measure(it.dir, Font::MonoSmall) > rw) cv.hit(dir_r, IdCardDir, i);
         y += 22.0f;
 
@@ -1366,7 +1368,7 @@ private:
         for (const auto& t : it.tags_w) {
             const float w = cv.measure(t, Font::Caption) + 23.0f;
             if (tx + w > lx + rw - 34.0f && shown < it.tags_w.size()) break;
-            draw_tag_chip(cv, tx, y, t, tag_color(it.pt.p.t[shown]));
+            draw_tag_chip(cv, tx, y, t, cv.tag_color(it.pt.p.t[shown]));
             cv.hit(rect(tx, y, w, 20.0f), IdTagChip, i);
             tx += w + 5.0f;
             ++shown;
@@ -1375,15 +1377,15 @@ private:
             const std::wstring more = L"+" + std::to_wstring(it.tags_w.size() - shown);
             const float w = cv.measure(more, Font::Caption) + 12.0f;
             const D2D1_RECT_F mr = rect(tx, y, w, 20.0f);
-            cv.fill_round(mr, 10.0f, with_alpha(color::on_surface, 0.08f));
-            cv.text(more, mr, Font::Caption, color::on_surface_variant, Align::Center);
+            cv.fill_round(mr, 10.0f, with_alpha(cv.theme().on_surface, 0.08f));
+            cv.text(more, mr, Font::Caption, cv.theme().on_surface_variant, Align::Center);
             cv.hit(mr, IdCardMoreTags, i);
         }
         y += 28.0f;
-        cv.hline(lx, lx + rw, y, with_alpha(color::outline_variant, 0.6f));
+        cv.hline(lx, lx + rw, y, with_alpha(cv.theme().outline_variant, 0.6f));
         y += 8.0f;
-        cv.text(it.meta, rect(lx, y, rw * 0.62f, 18.0f), Font::MonoSmall, color::on_surface_variant);
-        cv.text(it.date, rect(lx + rw * 0.5f, y, rw * 0.5f, 18.0f), Font::Caption, color::outline, Align::Right);
+        cv.text(it.meta, rect(lx, y, rw * 0.62f, 18.0f), Font::MonoSmall, cv.theme().on_surface_variant);
+        cv.text(it.date, rect(lx + rw * 0.5f, y, rw * 0.5f, 18.0f), Font::Caption, cv.theme().outline, Align::Right);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1456,21 +1458,21 @@ private:
         const float h = drop_items_.empty() ? 44.0f : 8.0f + row * static_cast<float>(drop_items_.size());
         const D2D1_RECT_F r = rect(x, y, w, h);
         cv.shadow(r, 12);
-        cv.fill_round(r, 12, color::surface_high);
-        cv.stroke_round(r, 12, color::outline_variant);
+        cv.fill_round(r, 12, cv.theme().surface_high);
+        cv.stroke_round(r, 12, cv.theme().outline_variant);
         cv.hit(r, IdDrop);
         if (drop_items_.empty()) {
-            cv.text(L"No tags yet", inset(r, 14, 0), Font::Small, color::outline);
+            cv.text(L"No tags yet", inset(r, 14, 0), Font::Small, cv.theme().outline);
             return;
         }
         for (size_t i = 0; i < drop_items_.size(); ++i) {
             const auto& t = drop_items_[i];
             const D2D1_RECT_F rr = rect(x + 4, y + 4 + row * i, w - 8, row);
-            if (static_cast<int>(i) == drop_sel_) cv.fill_round(rr, 8, with_alpha(color::primary, 0.14f));
-            const D2D1_COLOR_F c = tag_color(t.v);
+            if (static_cast<int>(i) == drop_sel_) cv.fill_round(rr, 8, with_alpha(cv.theme().primary, 0.14f));
+            const D2D1_COLOR_F c = cv.tag_color(t.v);
             cv.fill_circle({rr.left + 14, (rr.top + rr.bottom) / 2}, 4, c);
-            cv.text(to_wide(t.v), D2D1::RectF(rr.left + 28, rr.top, rr.right - 60, rr.bottom), Font::Body, color::on_surface);
-            cv.text(format_count(t.c), D2D1::RectF(rr.right - 70, rr.top, rr.right - 12, rr.bottom), Font::Caption, color::outline, Align::Right);
+            cv.text(to_wide(t.v), D2D1::RectF(rr.left + 28, rr.top, rr.right - 60, rr.bottom), Font::Body, cv.theme().on_surface);
+            cv.text(format_count(t.c), D2D1::RectF(rr.right - 70, rr.top, rr.right - 12, rr.bottom), Font::Caption, cv.theme().outline, Align::Right);
             cv.hit(rr, IdDropItem, static_cast<int>(i));
         }
     }
@@ -1495,21 +1497,21 @@ private:
         const float y = HEADER_H - 4.0f;
         const D2D1_RECT_F r = rect(x, y, HELP_W, HELP_H);
         cv.shadow(r, 12, 12, 0.35f);
-        cv.fill_round(r, 12, color::surface_high);
-        cv.stroke_round(r, 12, color::outline_variant);
+        cv.fill_round(r, 12, cv.theme().surface_high);
+        cv.stroke_round(r, 12, cv.theme().outline_variant);
         cv.hit(rect(x, HEADER_H - 18.0f, HELP_W, HELP_H + 14.0f), IdHelp);
 
-        cv.text(L"SEARCH SYNTAX  ·  CLICK TO INSERT", rect(x + 14.0f, y + 8.0f, HELP_W - 28.0f, 22.0f), Font::Label, color::primary);
+        cv.text(L"SEARCH SYNTAX  ·  CLICK TO INSERT", rect(x + 14.0f, y + 8.0f, HELP_W - 28.0f, 22.0f), Font::Label, cv.theme().primary);
         float ry = y + 34.0f;
         for (int i = 0; i < static_cast<int>(std::size(HELP_ROWS)); ++i) {
             const D2D1_RECT_F rr = rect(x + 6.0f, ry, HELP_W - 12.0f, 28.0f);
             if (const float ha = hover_.alpha(IdHelpItem, i); ha > 0.002f && HELP_ROWS[i].insert[0] != 0) {
-                cv.fill_round(rr, 8.0f, with_alpha(color::primary, 0.12f * ha));
+                cv.fill_round(rr, 8.0f, with_alpha(cv.theme().primary, 0.12f * ha));
             }
             const D2D1_RECT_F badge = rect(rr.left + 6.0f, rr.top + 3.0f, 114.0f, 22.0f);
-            cv.fill_round(badge, 6.0f, with_alpha(color::surface_highest, 0.9f));
-            cv.text(HELP_ROWS[i].syntax, inset(badge, 8.0f, 0.0f), Font::MonoSmall, color::primary);
-            cv.text(HELP_ROWS[i].desc, D2D1::RectF(rr.left + 130.0f, rr.top, rr.right - 8.0f, rr.bottom), Font::Small, color::on_surface_variant);
+            cv.fill_round(badge, 6.0f, with_alpha(cv.theme().surface_highest, 0.9f));
+            cv.text(HELP_ROWS[i].syntax, inset(badge, 8.0f, 0.0f), Font::MonoSmall, cv.theme().primary);
+            cv.text(HELP_ROWS[i].desc, D2D1::RectF(rr.left + 130.0f, rr.top, rr.right - 8.0f, rr.bottom), Font::Small, cv.theme().on_surface_variant);
             if (HELP_ROWS[i].insert[0] != 0) cv.hit(rr, IdHelpItem, i);
             ry += 28.0f;
         }
@@ -1661,8 +1663,8 @@ private:
     void draw_menu(Canvas& cv) {
         const D2D1_RECT_F r = menu_rect();
         cv.shadow(r, 14, 14, 0.4f);
-        cv.fill_round(r, 14, color::surface_high);
-        cv.stroke_round(r, 14, color::outline_variant);
+        cv.fill_round(r, 14, cv.theme().surface_high);
+        cv.stroke_round(r, 14, cv.theme().outline_variant);
         cv.hit(r, IdMenu);
 
         struct Act {
@@ -1681,44 +1683,44 @@ private:
         float y = r.top + 6;
         for (int i = 0; i < ActCount; ++i) {
             const D2D1_RECT_F rr = rect(r.left + 6, y, MENU_W - 12, 36);
-            if (const float ha = hover_.alpha(IdMenuItem, i); ha > 0.002f) cv.fill_round(rr, 8, with_alpha(color::on_surface, 0.08f * ha));
-            cv.icon(acts[i].g, rect(rr.left + 8, rr.top, 20, 36), color::on_surface_variant);
-            cv.text(acts[i].label, D2D1::RectF(rr.left + 38, rr.top, rr.right - 86, rr.bottom), Font::Body, color::on_surface);
-            cv.text(acts[i].key, D2D1::RectF(rr.right - 96, rr.top, rr.right - 10, rr.bottom), Font::Caption, color::outline, Align::Right);
+            if (const float ha = hover_.alpha(IdMenuItem, i); ha > 0.002f) cv.fill_round(rr, 8, with_alpha(cv.theme().on_surface, 0.08f * ha));
+            cv.icon(acts[i].g, rect(rr.left + 8, rr.top, 20, 36), cv.theme().on_surface_variant);
+            cv.text(acts[i].label, D2D1::RectF(rr.left + 38, rr.top, rr.right - 86, rr.bottom), Font::Body, cv.theme().on_surface);
+            cv.text(acts[i].key, D2D1::RectF(rr.right - 96, rr.top, rr.right - 10, rr.bottom), Font::Caption, cv.theme().outline, Align::Right);
             cv.hit(rr, IdMenuItem, i);
             y += 36;
         }
         y += 4;
-        cv.hline(r.left + 12, r.right - 12, y, color::outline_variant);
+        cv.hline(r.left + 12, r.right - 12, y, cv.theme().outline_variant);
         y += 6;
         std::wstring label = L"TAGS";
         if (selected_.size() > 1) label += L"  ·  " + std::to_wstring(selected_.size()) + L" ITEMS";
-        cv.text(label, rect(r.left + 16, y, MENU_W - 32, 24), Font::Label, color::primary);
+        cv.text(label, rect(r.left + 16, y, MENU_W - 32, 24), Font::Label, cv.theme().primary);
         y += 26;
         for (size_t i = 0; i < menu_tags_.size() && i < 10; ++i) {
             const auto& t = menu_tags_[i];
             const D2D1_RECT_F rr = rect(r.left + 6, y, MENU_W - 12, 32);
-            if (const float ha = hover_.alpha(IdMenuTag, static_cast<int>(i)); ha > 0.002f) cv.fill_round(rr, 8, with_alpha(color::on_surface, 0.08f * ha));
+            if (const float ha = hover_.alpha(IdMenuTag, static_cast<int>(i)); ha > 0.002f) cv.fill_round(rr, 8, with_alpha(cv.theme().on_surface, 0.08f * ha));
             const int st = tag_state(t);
             const D2D1_RECT_F box = rect(rr.left + 10, rr.top + 8, 16, 16);
             if (st == 2) {
-                cv.fill_round(box, 4, color::primary);
-                cv.icon(glyph::check, box, color::on_primary, Font::IconSmall);
+                cv.fill_round(box, 4, cv.theme().primary);
+                cv.icon(glyph::check, box, cv.theme().on_primary, Font::IconSmall);
             } else {
-                cv.stroke_round(box, 4, st == 1 ? color::primary : color::outline, 1.5f);
-                if (st == 1) cv.fill(rect(box.left + 4, box.top + 7, 8, 2), color::primary);
+                cv.stroke_round(box, 4, st == 1 ? cv.theme().primary : cv.theme().outline, 1.5f);
+                if (st == 1) cv.fill(rect(box.left + 4, box.top + 7, 8, 2), cv.theme().primary);
             }
-            const D2D1_COLOR_F c = tag_color(t);
+            const D2D1_COLOR_F c = cv.tag_color(t);
             cv.fill_circle({rr.left + 40, (rr.top + rr.bottom) / 2}, 3.5f, c);
-            cv.text(to_wide(t), D2D1::RectF(rr.left + 50, rr.top, rr.right - 10, rr.bottom), Font::Body, color::on_surface);
+            cv.text(to_wide(t), D2D1::RectF(rr.left + 50, rr.top, rr.right - 10, rr.bottom), Font::Body, cv.theme().on_surface);
             cv.hit(rr, IdMenuTag, static_cast<int>(i));
             y += 32;
         }
         const D2D1_RECT_F fr = rect(r.left + 10, y + 6, MENU_W - 20, 34);
-        cv.fill_round(fr, 8, color::surface_highest);
-        if (menu_field_.focused) cv.stroke_round(fr, 8, color::primary, 1.5f);
-        cv.icon(glyph::add, rect(fr.left + 4, fr.top, 24, 34), color::outline, Font::IconSmall);
-        menu_field_.draw(cv, D2D1::RectF(fr.left + 30, fr.top, fr.right - 10, fr.bottom), Font::Body, color::on_surface, color::outline);
+        cv.fill_round(fr, 8, cv.theme().surface_highest);
+        if (menu_field_.focused) cv.stroke_round(fr, 8, cv.theme().primary, 1.5f);
+        cv.icon(glyph::add, rect(fr.left + 4, fr.top, 24, 34), cv.theme().outline, Font::IconSmall);
+        menu_field_.draw(cv, D2D1::RectF(fr.left + 30, fr.top, fr.right - 10, fr.bottom), Font::Body, cv.theme().on_surface, cv.theme().outline);
         cv.hit(fr, IdMenuField);
     }
 
@@ -2184,14 +2186,14 @@ private:
     void draw_preview_slider(Canvas& cv, D2D1_RECT_F bar, float ratio, int id,
                              bool active_drag, D2D1_COLOR_F fill_col, float pad_l, float pad_r) {
         const float cy = (bar.top + bar.bottom) * 0.5f;
-        cv.fill_round(D2D1::RectF(bar.left, cy - 2.0f, bar.right, cy + 2.0f), 2.0f, color::surface_highest);
+        cv.fill_round(D2D1::RectF(bar.left, cy - 2.0f, bar.right, cy + 2.0f), 2.0f, cv.theme().surface_highest);
         const float thumb_x = bar.left + ((bar.right - bar.left) * std::clamp(ratio, 0.0f, 1.0f));
         if (thumb_x > bar.left + 0.5f) {
             cv.fill_round(D2D1::RectF(bar.left, cy - 2.0f, thumb_x, cy + 2.0f), 2.0f, fill_col);
         }
         const float ha = hover_.alpha(id);
         const float rad = (active_drag || ha > 0.05f) ? 5.5f : 4.2f;
-        cv.fill_circle({.x = thumb_x, .y = cy}, rad, lerp_color(color::on_surface, color::primary, active_drag ? 1.0f : ha * 0.5f));
+        cv.fill_circle({.x = thumb_x, .y = cy}, rad, lerp_color(cv.theme().on_surface, cv.theme().primary, active_drag ? 1.0f : ha * 0.5f));
         cv.hit(D2D1::RectF(bar.left - pad_l, bar.top, bar.right + pad_r, bar.bottom), id);
     }
 
@@ -2213,8 +2215,8 @@ private:
         const D2D1_RECT_F ctrl = rect(cx, area.bottom + 4.0f, cw, 34.0f);
         pv_ctrl_rect_ = ctrl;
 
-        cv.fill_round(ctrl, 17.0f, with_alpha(color::surface_low, 0.92f));
-        cv.stroke_round(ctrl, 17.0f, color::outline_variant, 1.0f);
+        cv.fill_round(ctrl, 17.0f, with_alpha(cv.theme().surface_low, 0.92f));
+        cv.stroke_round(ctrl, 17.0f, cv.theme().outline_variant, 1.0f);
         cv.hit(ctrl, IdPvBar);
 
         float lx = ctrl.left + 5.0f;
@@ -2249,7 +2251,7 @@ private:
                 const float vx0 = vx1 - vol_track_w;
                 pv_vol_rect_ = D2D1::RectF(vx0, ctrl.top, vx1, ctrl.bottom);
                 draw_preview_slider(cv, pv_vol_rect_, displayed_video_volume(), IdPvVolume,
-                                    dragging_volume_, muted_vis ? color::outline : color::primary, 4.0f, 6.0f);
+                                    dragging_volume_, muted_vis ? cv.theme().outline : cv.theme().primary, 4.0f, 6.0f);
                 rx = vx0 - 8.0f;
             } else {
                 pv_vol_rect_ = {};
@@ -2259,15 +2261,15 @@ private:
             icon_button(cv, mute_r, muted_vis ? glyph::mute : glyph::volume, IdPvMute, muted_vis);
             rx -= 32.0f;
 
-            cv.text(cur_str, rect(lx, ctrl.top, cur_w, height(ctrl)), Font::MonoSmall, color::on_surface_variant, Align::Center);
+            cv.text(cur_str, rect(lx, ctrl.top, cur_w, height(ctrl)), Font::MonoSmall, cv.theme().on_surface_variant, Align::Center);
             lx += cur_w + 4.0f;
-            cv.text(dur_str, rect(rx - dur_w, ctrl.top, dur_w, height(ctrl)), Font::MonoSmall, color::outline, Align::Center);
+            cv.text(dur_str, rect(rx - dur_w, ctrl.top, dur_w, height(ctrl)), Font::MonoSmall, cv.theme().outline, Align::Center);
             rx -= dur_w + 4.0f;
         } else {
             pv_vol_rect_ = {};
             const D2D1_RECT_F badge_r = rect(lx + 2.0f, ctrl.top + 8.0f, 30.0f, 18.0f);
-            cv.fill_round(badge_r, 9.0f, with_alpha(color::surface_highest, 0.95f));
-            cv.text(L"GIF", badge_r, Font::Label, color::primary, Align::Center);
+            cv.fill_round(badge_r, 9.0f, with_alpha(cv.theme().surface_highest, 0.95f));
+            cv.text(L"GIF", badge_r, Font::Label, cv.theme().primary, Align::Center);
             lx += 36.0f;
 
             const size_t total = gif_.frame_count();
@@ -2279,7 +2281,7 @@ private:
 
             const std::wstring fstr = std::to_wstring(cur + 1) + L"/" + std::to_wstring(total);
             const float fw = std::max(38.0f, cv.measure(fstr, Font::MonoSmall) + 8.0f);
-            cv.text(fstr, rect(rx - fw, ctrl.top, fw, height(ctrl)), Font::MonoSmall, color::outline, Align::Center);
+            cv.text(fstr, rect(rx - fw, ctrl.top, fw, height(ctrl)), Font::MonoSmall, cv.theme().outline, Align::Center);
             rx -= fw + 4.0f;
         }
 
@@ -2287,7 +2289,7 @@ private:
         const float sx1 = rx - 6.0f;
         if (sx1 > sx0 + 16.0f) {
             pv_seek_rect_ = D2D1::RectF(sx0, ctrl.top, sx1, ctrl.bottom);
-            draw_preview_slider(cv, pv_seek_rect_, ratio, IdPvSeek, dragging_seek_, color::primary, 6.0f, 6.0f);
+            draw_preview_slider(cv, pv_seek_rect_, ratio, IdPvSeek, dragging_seek_, cv.theme().primary, 6.0f, 6.0f);
         } else {
             pv_seek_rect_ = {};
         }
@@ -2300,7 +2302,7 @@ private:
         }
         const Item& it = items_[preview_];
         const int count = static_cast<int>(items_.size());
-        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(color::surface_lowest, 0.94f));
+        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().surface_lowest, 0.94f));
         // Backdrop below the title bar closes the viewer; the bar itself still drags the window
         cv.hit(D2D1::RectF(0, PV_TOP, sz.width, sz.height), IdPreview);
 
@@ -2323,7 +2325,7 @@ private:
                 cv.bitmap(poster, dest);
                 cv.hit(dest, IdPvImage);
             } else {
-                cv.icon(glyph::video, rect(area.left, ((area.top + area.bottom) / 2) - 20, width(area), 40), color::on_surface_variant, Font::IconLarge);
+                cv.icon(glyph::video, rect(area.left, ((area.top + area.bottom) / 2) - 20, width(area), 40), cv.theme().on_surface_variant, Font::IconLarge);
             }
         } else if (is_gif_ready) {
             ID2D1Bitmap1* gbmp = gif_.bitmap();
@@ -2347,20 +2349,20 @@ private:
             } else if (loading) {
                 draw_spinner(cv, {.x = (area.left + area.right) / 2, .y = (area.top + area.bottom) / 2});
             } else {
-                cv.icon(is_video ? glyph::video : glyph::photo, rect(area.left, ((area.top + area.bottom) / 2) - 40, width(area), 40), color::outline, Font::IconLarge);
-                cv.text(L"No preview available", rect(area.left, (area.top + area.bottom) / 2, width(area), 24), Font::Body, color::outline, Align::Center);
+                cv.icon(is_video ? glyph::video : glyph::photo, rect(area.left, ((area.top + area.bottom) / 2) - 40, width(area), 40), cv.theme().outline, Font::IconLarge);
+                cv.text(L"No preview available", rect(area.left, (area.top + area.bottom) / 2, width(area), 24), Font::Body, cv.theme().outline, Align::Center);
             }
             if (is_video && video_.failed()) {
                 const D2D1_POINT_2F c{.x = (dest.left + dest.right) / 2, .y = (dest.top + dest.bottom) / 2};
                 const float ha = hover_.alpha(IdPvPlay);
-                cv.fill_circle(c, 30, hex(0x000000, lerp(0.55f, 0.75f, ha)));
-                cv.icon(glyph::play, rect(c.x - 28, c.y - 30, 60, 60), lerp_color(hex(0xffffff), color::primary, ha), Font::IconLarge);
+                cv.fill_circle(c, 30, lerp_color(hex(0x000000, 0.55f), with_alpha(cv.theme().surface_highest, 0.92f), ha));
+                cv.icon(glyph::play, rect(c.x - 28, c.y - 30, 60, 60), lerp_color(hex(0xffffff), cv.theme().primary, ha), Font::IconLarge);
                 cv.hit(rect(c.x - 30, c.y - 30, 60, 60), IdPvPlay);
                 const wchar_t* msg = L"Video playback failed — click Play to open externally";
                 const float mw = cv.measure(msg, Font::Caption) + 20.0f;
                 const D2D1_RECT_F badge = rect(c.x - mw * 0.5f, c.y + 38.0f, mw, 24.0f);
                 cv.fill_round(badge, 12.0f, hex(0x000000, 0.72f));
-                cv.text(msg, badge, Font::Caption, color::amber, Align::Center);
+                cv.text(msg, badge, Font::Caption, cv.theme().amber, Align::Center);
             }
         }
         pv_media_rect_ = dest;
@@ -2376,8 +2378,8 @@ private:
             const float cy = (nav_area.top + nav_area.bottom) / 2;
             const int id = next ? IdPvNext : IdPvPrev;
             const float ha = hover_.alpha(id);
-            cv.fill_circle({.x = cx, .y = cy}, 22, lerp_color(hex(0x000000, 0.45f), with_alpha(color::surface_highest, 0.96f), ha));
-            cv.icon(next ? glyph::chevron_right : glyph::chevron_left, rect(cx - 22, cy - 22, 44, 44), lerp_color(hex(0xffffff, 0.9f), color::on_surface, ha));
+            cv.fill_circle({.x = cx, .y = cy}, 22, lerp_color(hex(0x000000, 0.45f), with_alpha(cv.theme().surface_highest, 0.96f), ha));
+            cv.icon(next ? glyph::chevron_right : glyph::chevron_left, rect(cx - 22, cy - 22, 44, 44), lerp_color(hex(0xffffff, 0.9f), cv.theme().on_surface, ha));
             cv.hit(rect(cx - 28, cy - 44, 56, 88), id);
         };
         arrow(false);
@@ -2392,7 +2394,7 @@ private:
         };
         btn(glyph::close, IdPvClose);
         x -= 8;
-        cv.vline(x, cy - 12, cy + 12, color::outline_variant);
+        cv.vline(x, cy - 12, cy + 12, cv.theme().outline_variant);
         x -= 4;
         btn(glyph::copy, IdPvCopy);
         btn(glyph::folder, IdPvReveal);
@@ -2401,12 +2403,12 @@ private:
         const float pw = cv.measure(pos, Font::SmallSemi) + 24;
         x -= pw + 6;
         const D2D1_RECT_F pr = rect(x, cy - 13, pw, 26);
-        cv.fill_round(pr, 13, with_alpha(color::surface_highest, 0.85f));
-        cv.text(pos, pr, Font::SmallSemi, color::on_surface_variant, Align::Center);
+        cv.fill_round(pr, 13, with_alpha(cv.theme().surface_highest, 0.85f));
+        cv.text(pos, pr, Font::SmallSemi, cv.theme().on_surface_variant, Align::Center);
         const float path_w = std::max(40.0f, x - 34.0f);
         const std::wstring dir_disp = middle_truncate_dir(cv, it.dir, Font::MonoSmall, path_w);
-        cv.text(it.name, D2D1::RectF(18, 9, x - 16, 29), Font::BodySemi, color::on_surface);
-        cv.text(dir_disp, D2D1::RectF(18, 29, x - 16, 46), Font::MonoSmall, color::outline);
+        cv.text(it.name, D2D1::RectF(18, 9, x - 16, 29), Font::BodySemi, cv.theme().on_surface);
+        cv.text(dir_disp, D2D1::RectF(18, 29, x - 16, 46), Font::MonoSmall, cv.theme().outline);
         if (cv.measure(it.name, Font::BodySemi) > path_w || cv.measure(it.dir, Font::MonoSmall) > path_w) {
             cv.hit(D2D1::RectF(18, 9, x - 16, 46), IdPvPath, preview_);
         }
@@ -2415,7 +2417,7 @@ private:
         std::wstring meta = it.meta;
         if (is_video && it.pt.p.d) meta = format_duration_ms(it.pt.p.d) + L"  •  " + meta;
         if (!it.date.empty()) meta += L"  •  " + it.date;
-        cv.text(meta, D2D1::RectF(18, sz.height - PV_BOTTOM, sz.width - 18, sz.height), Font::Caption, color::outline, Align::Center);
+        cv.text(meta, D2D1::RectF(18, sz.height - PV_BOTTOM, sz.width - 18, sz.height), Font::Caption, cv.theme().outline, Align::Center);
     }
 
     bool preview_seek_to_x(float x, bool force = false) {
@@ -2815,7 +2817,7 @@ private:
                 selecting_text_ = false;
                 ReleaseCapture();
             } else {
-                Canvas cv{target_, sh_.fonts, hits_};
+                Canvas cv{target_, sh_.fonts, hits_, sh_.theme};
                 field_.click(cv, p.x, true);
                 invalidate();
                 return;
@@ -2902,7 +2904,7 @@ private:
         switch (id) {
             case IdField: {
                 field_.focused = true;
-                Canvas cv{target_, sh_.fonts, hits_};
+                Canvas cv{target_, sh_.fonts, hits_, sh_.theme};
                 field_.click(cv, p.x, shift);
                 if (dbl) field_.select_word_at_caret();
                 selecting_text_ = !dbl;
@@ -3006,7 +3008,7 @@ private:
             }
             case IdMenuField: {
                 menu_field_.focused = true;
-                Canvas cv{target_, sh_.fonts, hits_};
+                Canvas cv{target_, sh_.fonts, hits_, sh_.theme};
                 menu_field_.click(cv, p.x, shift);
                 break;
             }
@@ -3337,6 +3339,14 @@ private:
             case WM_DISPLAYCHANGE:
                 if (sh_.gfx.adapter_stale(hwnd_)) recover();
                 invalidate();
+                return 0;
+            case WM_SETTINGCHANGE:
+                if (!lp || _wcsicmp(reinterpret_cast<const wchar_t*>(lp), L"ImmersiveColorSet") == 0) {
+                    sh_.on_windows_theme_changed();
+                }
+                return 0;
+            case WM_DWMCOLORIZATIONCOLORCHANGED:
+                sh_.on_windows_theme_changed();
                 return 0;
             case WM_DPICHANGED: {
                 full_dirty_ = true;

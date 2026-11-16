@@ -2,6 +2,7 @@
 
 #include "canvas.hpp"
 #include "search.hpp"
+#include "theme_loader.hpp"
 #include "thumbs.hpp"
 
 #include <usyseek/notifications.hpp>
@@ -40,6 +41,9 @@ struct Shared {
     Gfx gfx;
     Fonts fonts;
     Settings settings;
+    ThemeCatalog themes;
+    Theme theme = theme_dark();
+    std::optional<std::string> theme_override;
     Engine engine;
     Thumbs thumbs;
     Thumbs previews{4, true}; // full-size viewer images: the shown one and its neighbours
@@ -64,6 +68,7 @@ struct Shared {
     std::function<void()> open_notifications;
     std::function<void()> visibility_changed;
     std::function<void()> settings_changed; // repaint dependants
+    std::function<void()> theme_changed;    // re-apply DWM attributes and repaint windows
     std::function<void()> tags_refreshed;
     std::function<void()> redraw_all;
 
@@ -219,6 +224,34 @@ struct Shared {
     bool polled_once_ = false;
     uint64_t test_next_notif_id_ = 1;
 
+    void refresh_theme(bool reload_catalog = false, bool report_errors = false) {
+        if (reload_catalog || themes.entries().empty()) {
+            std::vector<std::string> errors;
+            themes.reload(&errors);
+            if (report_errors && !test_mode && !errors.empty()) {
+                std::string detail;
+                for (size_t i = 0; i < errors.size(); ++i) {
+                    if (i > 0) detail += '\n';
+                    detail += errors[i];
+                }
+                notify("warning", "Themes", "Failed to load one or more custom themes", detail, "theme-load");
+            } else if (reload_catalog && errors.empty()) {
+                clear_notification_key("Themes", "theme-load");
+            }
+        } else {
+            themes.refresh_dynamic_swatches();
+        }
+        const std::string& wanted = theme_override ? *theme_override : settings.theme;
+        theme = themes.resolve(wanted);
+        if (theme_changed) theme_changed();
+        else if (redraw_all) redraw_all();
+    }
+
+    void on_windows_theme_changed() {
+        if (!theme.follows_system_mode && !theme.follows_windows_accent) return;
+        refresh_theme(false, false);
+    }
+
     void save() {
         if (!test_mode && !save_settings(settings)) {
             notify("error", "Settings", "Failed to save settings", "Could not write settings.json (" + win32_error_utf8(GetLastError()) + ").", "save-settings");
@@ -232,16 +265,30 @@ inline bool confirm_box(HWND owner, const wchar_t* title, const std::wstring& me
     return MessageBoxW(owner, message.c_str(), title, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES;
 }
 
-/// Applies the dark immersive frame + backdrop attributes used by both windows.
-inline void style_window(HWND hwnd, int backdrop, bool round = true) {
-    ulp::win::dark::allow_dark_mode_for_window(hwnd, true);
-    BOOL dark = TRUE;
+/// Applies theme-driven immersive dark/light mode, corner preference, backdrop, and border to a window.
+inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool round = true) {
+    if (!hwnd) return;
+    ulp::win::dark::allow_dark_mode_for_window(hwnd, theme.dark_mode);
+    const BOOL dark = theme.dark_mode ? TRUE : FALSE;
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
-    const DWM_WINDOW_CORNER_PREFERENCE corner = round ? DWMWCP_ROUND : DWMWCP_DONOTROUND;
+    const DWM_WINDOW_CORNER_PREFERENCE corner = (round && theme.round_corners) ? DWMWCP_ROUND : DWMWCP_DONOTROUND;
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+    const int backdrop = is_pill ? theme.pill_backdrop : theme.settings_backdrop;
     DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
+    if (is_pill) {
+        const COLORREF border = to_colorref(theme.pill_border);
+        DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border, sizeof(border));
+    }
     const MARGINS m{-1, -1, -1, -1};
     DwmExtendFrameIntoClientArea(hwnd, &m);
+}
+
+/// Applies the dark immersive frame + backdrop attributes used by both windows.
+inline void style_window(HWND hwnd, int backdrop, bool round = true) {
+    Theme t = theme_dark();
+    t.pill_backdrop = backdrop;
+    t.settings_backdrop = backdrop;
+    apply_window_theme(hwnd, t, false, round);
 }
 
 inline bool open_file(const std::wstring& path, std::string* error = nullptr) {

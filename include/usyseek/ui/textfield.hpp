@@ -126,7 +126,7 @@ public:
             std::vector<DWRITE_HIT_TEST_METRICS> ranges(count);
             if (count && SUCCEEDED(layout->HitTestTextRange(static_cast<UINT32>(a), static_cast<UINT32>(b - a), 0, 0, ranges.data(), count, &count))) {
                 for (const auto& m : ranges) {
-                    cv.fill(D2D1::RectF(r.left + m.left - scroll_, r.top + m.top, r.left + m.left + m.width - scroll_, r.top + m.top + m.height), with_alpha(color::primary, 0.35f));
+                    cv.fill(D2D1::RectF(r.left + m.left - scroll_, r.top + m.top, r.left + m.left + m.width - scroll_, r.top + m.top + m.height), with_alpha(cv.theme().primary, 0.35f));
                 }
             }
         }
@@ -135,7 +135,7 @@ public:
             const float x = std::round(r.left + caret_x - scroll_);
             const float cy0 = r.top + hm.top + 1.0f;
             const float cy1 = r.top + hm.top + hm.height - 1.0f;
-            cv.fill(D2D1::RectF(x, cy0, x + 1.5f, cy1), color::primary);
+            cv.fill(D2D1::RectF(x, cy0, x + 1.5f, cy1), cv.theme().primary);
         }
         cv.pop_clip();
     }

@@ -153,6 +153,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     bool show_settings = false;
     bool show_notifications = false;
     std::optional<fs::path> test_dir;
+    std::optional<std::string> theme_arg;
     for (int i = 1; i < argc; ++i) {
         const std::wstring_view a{argv[i]};
         if (a == L"--settings") {
@@ -163,6 +164,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             show_pill = false;
         } else if (a == L"--show") {
             show_pill = true;
+        } else if (a == L"--theme" && i + 1 < argc) {
+            theme_arg = to_utf8(argv[++i]);
         } else if (a == L"--test" && i + 1 < argc) {
             test_dir = fs::path{argv[++i]};
         }
@@ -181,8 +184,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     Shared sh;
     sh.test_mode = test_dir.has_value();
+    sh.theme_override = std::move(theme_arg);
     bool settings_corrupt = false;
     sh.settings = load_settings(&settings_corrupt);
+    sh.refresh_theme(true, false);
     if (!sh.test_mode) sh.reload_notifications(true);
     if (!sh.gfx.init()) {
         MessageBoxW(nullptr, L"Failed to initialize Direct3D / Direct2D graphics.", APP_NAME, MB_ICONERROR | MB_OK);
@@ -205,6 +210,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     }
 
     sh.call_hwnd.store(pill.hwnd(), std::memory_order_release);
+    sh.refresh_theme(true, true);
     if (settings_corrupt && !sh.test_mode) {
         sh.notify("warning", "Settings", "Corrupted settings.json reset to defaults",
                   "settings.json could not be parsed cleanly. Default settings are in use until saved.", "settings-corrupt");
@@ -269,6 +275,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.redraw_all = [&] {
         pill.invalidate();
         settings_win.invalidate();
+    };
+    sh.theme_changed = [&] {
+        pill.apply_theme();
+        settings_win.apply_theme();
     };
     sh.settings_changed = [&] {
         sh.engine.encoder().load_async(to_wide(sh.settings.model_dir), sh.settings.model_name);

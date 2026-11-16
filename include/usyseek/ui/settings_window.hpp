@@ -86,7 +86,7 @@ public:
                                 style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
                                 nullptr, nullptr, inst, this);
         if (!hwnd_) return false;
-        style_window(hwnd_, DWMSBT_MAINWINDOW, true);
+        apply_window_theme(hwnd_, sh_.theme, false, true);
         if (!target_.attach(sh_.gfx, hwnd_)) return false;
 
         cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
@@ -111,6 +111,12 @@ public:
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
     [[nodiscard]] bool visible() const noexcept { return IsWindowVisible(hwnd_) != FALSE; }
     WindowTarget& target() noexcept { return target_; }
+
+    void apply_theme() {
+        apply_window_theme(hwnd_, sh_.theme, false, true);
+        full_dirty_ = true;
+        invalidate();
+    }
 
     /// Cancels and joins background download/install jobs before tearing down the window.
     void stop() {
@@ -235,11 +241,11 @@ public:
         const bool ok = target_.render_frame(request_full, dirty_dips, !in_sizemove_, [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
             if (full_frame) {
                 hits_.clear();
-                Canvas cv{target_, sh_.fonts, hits_, clip};
+                Canvas cv{target_, sh_.fonts, hits_, sh_.theme, clip};
                 draw(cv);
             } else {
                 scratch_hits.clear();
-                Canvas cv{target_, sh_.fonts, scratch_hits, clip};
+                Canvas cv{target_, sh_.fonts, scratch_hits, sh_.theme, clip};
                 draw(cv);
             }
         });
@@ -293,6 +299,9 @@ private:
         IdIdleStep,
         IdThumbFit,
         IdThumbDblClick,
+        IdThemeChip,
+        IdOpenThemesDir,
+        IdReloadThemes,
         IdBrowseModelDir,
         IdModelChip,
         IdModelField,
@@ -434,20 +443,20 @@ private:
     void draw_button(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, int id, int idx = 0,
                      int style = 0 /* 0=secondary, 1=primary, 2=danger, 3=ghost */) {
         const float ha = hover_alpha(id, idx);
-        D2D1_COLOR_F bg = lerp_color(color::surface_high, color::surface_highest, ha);
-        D2D1_COLOR_F fg = color::on_surface;
-        D2D1_COLOR_F border = color::outline_variant;
+        D2D1_COLOR_F bg = lerp_color(cv.theme().surface_high, cv.theme().surface_highest, ha);
+        D2D1_COLOR_F fg = cv.theme().on_surface;
+        D2D1_COLOR_F border = cv.theme().outline_variant;
         if (style == 1) {
-            bg = lerp_color(color::primary, hex(0xb8d4ff), ha);
-            fg = color::on_primary;
+            bg = lerp_color(cv.theme().primary, cv.theme().primary_hover, ha);
+            fg = cv.theme().on_primary;
             border = bg;
         } else if (style == 2) {
-            bg = lerp_color(with_alpha(color::error_container, 0.45f), with_alpha(color::error, 0.22f), ha);
-            fg = color::error;
-            border = with_alpha(color::error, 0.45f);
+            bg = lerp_color(with_alpha(cv.theme().error_container, 0.45f), with_alpha(cv.theme().error, 0.22f), ha);
+            fg = cv.theme().error;
+            border = with_alpha(cv.theme().error, 0.45f);
         } else if (style == 3) {
-            bg = with_alpha(color::on_surface, 0.08f * ha);
-            fg = lerp_color(color::on_surface_variant, color::on_surface, ha);
+            bg = with_alpha(cv.theme().on_surface, 0.08f * ha);
+            fg = lerp_color(cv.theme().on_surface_variant, cv.theme().on_surface, ha);
             border = hex(0, 0.0f);
         }
         const float rad = std::min(10.0f, height(r) * 0.5f);
@@ -469,12 +478,12 @@ private:
         const D2D1_RECT_F r = rect(right_x - 44.0f, cy - 12.0f, 44.0f, 24.0f);
         const float ha = hover_alpha(id, idx);
         const float t = switch_anim_value(id, on);
-        const D2D1_COLOR_F off_track = lerp_color(color::surface_high, color::surface_highest, ha);
-        cv.fill_round(r, 12.0f, lerp_color(off_track, color::primary, t));
-        if (t < 1.0f) cv.stroke_round(r, 12.0f, with_alpha(color::outline, 1.0f - t));
+        const D2D1_COLOR_F off_track = lerp_color(cv.theme().surface_high, cv.theme().surface_highest, ha);
+        cv.fill_round(r, 12.0f, lerp_color(off_track, cv.theme().primary, t));
+        if (t < 1.0f) cv.stroke_round(r, 12.0f, with_alpha(cv.theme().outline, 1.0f - t));
         const float kx = lerp(r.left + 12.0f, r.right - 12.0f, t);
         const float kr = lerp(7.0f, 8.0f, t);
-        cv.fill_circle({kx, cy}, kr, lerp_color(color::outline, color::on_primary, t));
+        cv.fill_circle({kx, cy}, kr, lerp_color(cv.theme().outline, cv.theme().on_primary, t));
         cv.hit(r, id, idx);
     }
 
@@ -487,8 +496,8 @@ private:
     }
 
     void draw_error_row(Canvas& cv, std::wstring_view message, float x, float y, float row_w, float h) {
-        cv.icon(glyph::warning, rect(x, y, 18.0f, 20.0f), color::error, Font::IconSmall);
-        cv.text_wrap(message, rect(x + 22.0f, y, row_w - 22.0f, h), Font::Caption, color::error);
+        cv.icon(glyph::warning, rect(x, y, 18.0f, 20.0f), cv.theme().error, Font::IconSmall);
+        cv.text_wrap(message, rect(x + 22.0f, y, row_w - 22.0f, h), Font::Caption, cv.theme().error);
     }
 
     float mono_row_height(Canvas& cv, std::wstring_view s, float text_w, float min_h) {
@@ -542,7 +551,7 @@ private:
 
     D2D1_RECT_F draw_header(Canvas& cv, float lx, float y, float rw, const CardHeader& hd) {
         cv.text_wrap(hd.title, rect(lx, y + 16.0f, hd.text_w, hd.title_h), Font::Large, hd.title_color);
-        cv.text_wrap(hd.caption, rect(lx, y + 16.0f + hd.title_h, hd.text_w, hd.caption_h), Font::Small, color::on_surface_variant);
+        cv.text_wrap(hd.caption, rect(lx, y + 16.0f + hd.title_h, hd.text_w, hd.caption_h), Font::Small, cv.theme().on_surface_variant);
         if (hd.beside) return rect(lx + rw - hd.side_w, y + 18.0f, hd.side_w, hd.side_h);
         return rect(lx, y + 16.0f + hd.title_h + hd.caption_h + 8.0f, hd.side_w, hd.side_h);
     }
@@ -553,22 +562,40 @@ private:
 
     void draw_radio(Canvas& cv, D2D1_RECT_F r, bool on, std::wstring_view title, std::wstring_view desc, int id) {
         const float ha = hover_alpha(id);
-        cv.fill_round(r, 12.0f, on ? with_alpha(color::primary_container, 0.32f) : lerp_color(color::surface_low, color::surface_high, ha));
-        cv.stroke_round(r, 12.0f, on ? color::primary : color::outline_variant, on ? 1.5f : 1.0f);
+        cv.fill_round(r, 12.0f, on ? with_alpha(cv.theme().primary_container, 0.32f) : lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha));
+        cv.stroke_round(r, 12.0f, on ? cv.theme().primary : cv.theme().outline_variant, on ? 1.5f : 1.0f);
         const D2D1_POINT_2F c{r.left + 22.0f, (r.top + r.bottom) * 0.5f};
-        cv.stroke_circle(c, 8.0f, on ? color::primary : color::outline, 1.8f);
-        if (on) cv.fill_circle(c, 4.5f, color::primary);
+        cv.stroke_circle(c, 8.0f, on ? cv.theme().primary : cv.theme().outline, 1.8f);
+        if (on) cv.fill_circle(c, 4.5f, cv.theme().primary);
         const float title_h = text_height(cv, title, Font::BodySemi, width(r) - 54.0f, 20.0f);
         const float desc_h = text_height(cv, desc, Font::Caption, width(r) - 54.0f, 18.0f);
-        cv.text_wrap(title, rect(r.left + 42.0f, r.top + 8.0f, width(r) - 54.0f, title_h), Font::BodySemi, color::on_surface);
-        cv.text_wrap(desc, rect(r.left + 42.0f, r.top + 8.0f + title_h, width(r) - 54.0f, desc_h), Font::Caption, color::on_surface_variant);
+        cv.text_wrap(title, rect(r.left + 42.0f, r.top + 8.0f, width(r) - 54.0f, title_h), Font::BodySemi, cv.theme().on_surface);
+        cv.text_wrap(desc, rect(r.left + 42.0f, r.top + 8.0f + title_h, width(r) - 54.0f, desc_h), Font::Caption, cv.theme().on_surface_variant);
         cv.hit(r, id);
+    }
+
+    void draw_theme_chip(Canvas& cv, D2D1_RECT_F r, const ThemeEntry& te, bool selected, int idx) {
+        const float ha = hover_alpha(IdThemeChip, idx);
+        const D2D1_COLOR_F bg = selected
+            ? lerp_color(with_alpha(cv.theme().primary_container, 0.55f), with_alpha(cv.theme().primary_container, 0.78f), ha)
+            : lerp_color(cv.theme().surface_high, cv.theme().surface_highest, ha);
+        const D2D1_COLOR_F fg = selected ? cv.theme().on_primary_container : cv.theme().on_surface;
+        const D2D1_COLOR_F border = selected ? cv.theme().primary : cv.theme().outline_variant;
+        const float rad = std::min(10.0f, height(r) * 0.5f);
+        cv.fill_round(r, rad, bg);
+        cv.stroke_round(r, rad, border, selected ? 1.5f : 1.0f);
+        const D2D1_POINT_2F dot{r.left + 15.0f, (r.top + r.bottom) * 0.5f};
+        cv.fill_circle(dot, 5.0f, te.swatch);
+        cv.stroke_circle(dot, 5.0f, with_alpha(cv.theme().on_surface, 0.25f), 1.0f);
+        const std::wstring wname = to_wide(te.name);
+        cv.text(wname, rect(r.left + 26.0f, r.top, width(r) - 34.0f, height(r)), Font::SmallSemi, fg);
+        cv.hit(r, IdThemeChip, idx);
     }
 
     float card_begin(Canvas& cv, float x, float y, float w, float h) {
         const D2D1_RECT_F r = rect(x, y, w, h);
-        cv.fill_round(r, 16.0f, with_alpha(color::surface, 0.90f));
-        cv.stroke_round(r, 16.0f, with_alpha(color::outline_variant, 0.65f));
+        cv.fill_round(r, 16.0f, with_alpha(cv.theme().surface, cv.theme().card_alpha));
+        cv.stroke_round(r, 16.0f, with_alpha(cv.theme().outline_variant, 0.65f));
         return y + h + CARD_GAP;
     }
 
@@ -615,7 +642,7 @@ private:
 
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
-        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(color::bg, 0.88f));
+        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().settings_bg_alpha));
 
         // Top tab bar
         draw_tabs(cv, sz);
@@ -648,7 +675,7 @@ private:
             const float ty = view.top + 4.0f + (track_h - thumb_h) * (scroll_ / ms);
             const float ha = dragging_scroll_ ? 1.0f : hover_alpha(IdScrollbar);
             const D2D1_RECT_F tr = D2D1::RectF(view.right - lerp(7.0f, 9.0f, ha), ty, view.right - 3.0f, ty + thumb_h);
-            cv.fill_round(tr, 3.0f, with_alpha(color::on_surface_variant, lerp(0.28f, 0.55f, ha)));
+            cv.fill_round(tr, 3.0f, with_alpha(cv.theme().on_surface_variant, lerp(0.28f, 0.55f, ha)));
             cv.hit(D2D1::RectF(view.right - 12.0f, view.top, view.right, view.bottom), IdScrollbar);
             scroll_thumb_ = tr;
         }
@@ -670,7 +697,7 @@ private:
 
     void draw_tabs(Canvas& cv, D2D1_SIZE_F sz) {
         const float strip_h = tabs_height(sz.width);
-        cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(color::surface_lowest, 0.75f));
+        cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(cv.theme().surface_lowest, 0.75f));
         const auto tabs = tab_defs();
         const FlowResult layout = tab_layout(sz.width);
         D2D1_RECT_F rects[4]{};
@@ -685,10 +712,10 @@ private:
         for (int i = 0; i < 4; ++i) {
             const float act = std::clamp(1.0f - std::abs(t - static_cast<float>(i)), 0.0f, 1.0f);
             if (const float ha = hover_alpha(tabs[i].id); act < 0.5f && ha > 0.002f) {
-                cv.fill_round(rects[i], 10.0f, with_alpha(color::on_surface, 0.07f * ha));
+                cv.fill_round(rects[i], 10.0f, with_alpha(cv.theme().on_surface, 0.07f * ha));
             }
         }
-        cv.fill_round(lerp_rect(rects[i0], rects[i1], frac), 10.0f, color::primary_container);
+        cv.fill_round(lerp_rect(rects[i0], rects[i1], frac), 10.0f, cv.theme().primary_container);
         const bool any_notifs = !sh_.notifications.empty();
         const bool has_errors = sh_.error_notification_count() > 0;
         for (int i = 0; i < 4; ++i) {
@@ -697,14 +724,14 @@ private:
             const std::wstring lbl = tab_label(i);
             const float tw = cv.measure(lbl, Font::BodySemi);
             const D2D1_COLOR_F base_fg = (i == 2 && any_notifs)
-                ? (has_errors ? color::error : color::amber)
-                : color::on_surface_variant;
-            const D2D1_COLOR_F fg = lerp_color(base_fg, color::on_primary_container, act);
+                ? (has_errors ? cv.theme().error : cv.theme().amber)
+                : cv.theme().on_surface_variant;
+            const D2D1_COLOR_F fg = lerp_color(base_fg, cv.theme().on_primary_container, act);
             cv.icon(tabs[i].g, rect(r.left + 12.0f, r.top, 18.0f, height(r)), fg, Font::IconSmall);
             cv.text(lbl, rect(r.left + 34.0f, r.top, tw + 4.0f, height(r)), Font::BodySemi, fg);
             cv.hit(r, tabs[i].id);
         }
-        cv.hline(0, sz.width, strip_h, with_alpha(color::outline_variant, 0.65f));
+        cv.hline(0, sz.width, strip_h, with_alpha(cv.theme().outline_variant, 0.65f));
     }
 
     float draw_tab_notifications(Canvas& cv, float x, float y, float w) {
@@ -726,7 +753,7 @@ private:
             const float test_w = button_width(cv, L"Test Notification", true, 154.0f);
             const float clear_w = total_n > 0 ? button_width(cv, L"Clear All", true, 114.0f) : 0.0f;
             const float side_w = total_n > 0 ? (test_w + 8.0f + clear_w) : test_w;
-            const CardHeader hd = make_header(cv, rw, L"Notifications", color::on_surface, caption, side_w, 34.0f);
+            const CardHeader hd = make_header(cv, rw, L"Notifications", cv.theme().on_surface, caption, side_w, 34.0f);
             const float h = 16.0f + hd.h + 16.0f;
             const float next_y = card_begin(cv, x, y, w, h);
             const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
@@ -740,10 +767,10 @@ private:
         if (total_n == 0) {
             const float h = 112.0f;
             const float next_y = card_begin(cv, x, y, w, h);
-            cv.icon(glyph::check, rect(lx, y + 24.0f, rw, 28.0f), color::mint, Font::Icon);
-            cv.text(L"All clear", rect(lx, y + 54.0f, rw, 24.0f), Font::BodySemi, color::on_surface, Align::Center);
+            cv.icon(glyph::check, rect(lx, y + 24.0f, rw, 28.0f), cv.theme().mint, Font::Icon);
+            cv.text(L"All clear", rect(lx, y + 54.0f, rw, 24.0f), Font::BodySemi, cv.theme().on_surface, Align::Center);
             cv.text(L"Everything is running without warnings or errors.", rect(lx, y + 78.0f, rw, 20.0f),
-                    Font::Caption, color::outline, Align::Center);
+                    Font::Caption, cv.theme().outline, Align::Center);
             return next_y;
         }
 
@@ -752,7 +779,7 @@ private:
             const Notification& n = sh_.notifications[i];
             const bool is_err = n.severity == "error";
             const bool is_info = n.severity == "info";
-            const D2D1_COLOR_F col = is_err ? color::error : (is_info ? color::primary : color::amber);
+            const D2D1_COLOR_F col = is_err ? cv.theme().error : (is_info ? cv.theme().primary : cv.theme().amber);
             const std::wstring sev = is_err ? L"Error" : (is_info ? L"Info" : L"Warning");
             std::wstring meta = sev;
             if (!n.source.empty()) meta += L"  •  " + to_wide(n.source);
@@ -770,7 +797,7 @@ private:
             const float card_h = std::max(64.0f, 14.0f + body_h + 14.0f);
 
             const D2D1_RECT_F r = rect(x, y, w, card_h);
-            cv.fill_round(r, 14.0f, with_alpha(is_err ? color::error_container : color::surface, is_err ? 0.20f : 0.90f));
+            cv.fill_round(r, 14.0f, with_alpha(is_err ? cv.theme().error_container : cv.theme().surface, is_err ? 0.20f : 0.90f));
             cv.stroke_round(r, 14.0f, with_alpha(col, is_err ? 0.45f : 0.35f));
 
             cv.icon(is_err ? glyph::warning : (is_info ? glyph::tag : glyph::warning),
@@ -778,16 +805,16 @@ private:
             float ty = y + 14.0f;
             cv.text_wrap(meta, rect(text_x, ty, text_w, meta_h), Font::Caption, col);
             ty += meta_h + 2.0f;
-            cv.text_wrap(title, rect(text_x, ty, text_w, title_h), Font::BodySemi, color::on_surface);
+            cv.text_wrap(title, rect(text_x, ty, text_w, title_h), Font::BodySemi, cv.theme().on_surface);
             if (detail_h > 0.0f) {
                 ty += title_h + 4.0f;
-                cv.text_wrap(detail, rect(text_x, ty, text_w, detail_h), Font::Small, color::on_surface_variant);
+                cv.text_wrap(detail, rect(text_x, ty, text_w, detail_h), Font::Small, cv.theme().on_surface_variant);
             }
 
             const D2D1_RECT_F dr = rect(lx + rw - 32.0f, y + 12.0f, 32.0f, 32.0f);
             const float ha = hover_alpha(IdDismissNotif, static_cast<int>(i));
-            if (ha > 0.002f) cv.fill_round(dr, 8.0f, with_alpha(color::on_surface, 0.10f * ha));
-            cv.icon(glyph::close, dr, lerp_color(color::outline, color::on_surface, ha), Font::IconSmall);
+            if (ha > 0.002f) cv.fill_round(dr, 8.0f, with_alpha(cv.theme().on_surface, 0.10f * ha));
+            cv.icon(glyph::close, dr, lerp_color(cv.theme().outline, cv.theme().on_surface, ha), Font::IconSmall);
             cv.hit(dr, IdDismissNotif, static_cast<int>(i));
 
             y += card_h + 10.0f;
@@ -842,19 +869,19 @@ private:
         if (ID2D1Bitmap1* bmp = ensure_app_icon(cv)) {
             cv.bitmap(bmp, icon_r);
         } else {
-            cv.icon(glyph::search, icon_r, color::primary, Font::IconLarge);
+            cv.icon(glyph::search, icon_r, cv.theme().primary, Font::IconLarge);
         }
-        cv.text(APP_NAME, rect(lx, name_y, rw, 26.0f), Font::Title, color::on_surface, Align::Center);
-        cv.text(version_line, rect(lx, ver_y, rw, 22.0f), Font::Body, color::on_surface_variant, Align::Center);
-        cv.hline(lx, lx + rw, line_y, with_alpha(color::outline_variant, 0.5f));
+        cv.text(APP_NAME, rect(lx, name_y, rw, 26.0f), Font::Title, cv.theme().on_surface, Align::Center);
+        cv.text(version_line, rect(lx, ver_y, rw, 22.0f), Font::Body, cv.theme().on_surface_variant, Align::Center);
+        cv.hline(lx, lx + rw, line_y, with_alpha(cv.theme().outline_variant, 0.5f));
 
         const D2D1_RECT_F box_r = rect(lx, box_y, rw, box_h);
-        cv.fill_round(box_r, 12.0f, with_alpha(color::surface_high, 0.55f));
-        cv.stroke_round(box_r, 12.0f, with_alpha(color::outline_variant, 0.45f));
+        cv.fill_round(box_r, 12.0f, with_alpha(cv.theme().surface_high, 0.55f));
+        cv.stroke_round(box_r, 12.0f, with_alpha(cv.theme().outline_variant, 0.45f));
         cv.text_wrap(ai_title, rect(lx + box_pad_x, box_y + 14.0f, box_inner_w, ai_title_h),
-                     Font::BodySemi, color::on_surface, Align::Center);
+                     Font::BodySemi, cv.theme().on_surface, Align::Center);
         cv.text_wrap(ai_desc, rect(lx + box_pad_x, box_y + 14.0f + ai_title_h + 4.0f, box_inner_w, ai_desc_h),
-                     Font::Small, color::on_surface_variant, Align::Center);
+                     Font::Small, cv.theme().on_surface_variant, Align::Center);
 
         return next_y;
     }
@@ -882,13 +909,13 @@ private:
             const float wb = cv.measure(num_b, Font::Title);
 
             std::wstring status_txt = stopping ? L"Stopping…" : (running ? phase_label(d.phase) : (sh_.index_state.last_error.empty() ? L"Up to date" : L"Error"));
-            D2D1_COLOR_F badge_col = running ? color::amber : (sh_.index_state.last_error.empty() ? color::mint : color::error);
+            D2D1_COLOR_F badge_col = running ? cv.theme().amber : (sh_.index_state.last_error.empty() ? cv.theme().mint : cv.theme().error);
             if (!running && d.phase == Phase::Stopped && sh_.index_state.last_error.empty()) {
                 status_txt = L"Stopped";
-                badge_col = color::amber;
+                badge_col = cv.theme().amber;
             } else if (!running && sh_.index_state.last_index_unix == 0) {
                 status_txt = L"Never indexed";
-                badge_col = color::outline;
+                badge_col = cv.theme().outline;
             }
             const float bw = cv.measure(status_txt, Font::Caption) + 28.0f;
             const uint64_t fail_cnt = running ? d.failed : sh_.failed_files.size();
@@ -934,13 +961,13 @@ private:
 
             Flow numbers{0.0f, 0.0f};
             numbers.add(wa + 4.0f, 40.0f, [&](D2D1_RECT_F r) {
-                cv.text(num_a, rect(r.left, r.top, width(r), 40.0f), Font::Hero, color::on_surface);
+                cv.text(num_a, rect(r.left, r.top, width(r), 40.0f), Font::Hero, cv.theme().on_surface);
             });
             numbers.add(wb + 8.0f, 40.0f, [&](D2D1_RECT_F r) {
-                cv.text(num_b, rect(r.left, r.top + 8.0f, width(r), 32.0f), Font::Title, color::outline);
+                cv.text(num_b, rect(r.left, r.top + 8.0f, width(r), 32.0f), Font::Title, cv.theme().outline);
             });
             numbers.add(cv.measure(L"files embedded", Font::Body) + 4.0f, 40.0f, [&](D2D1_RECT_F r) {
-                cv.text(L"files embedded", rect(r.left, r.top + 12.0f, width(r), 28.0f), Font::Body, color::on_surface_variant);
+                cv.text(L"files embedded", rect(r.left, r.top + 12.0f, width(r), 28.0f), Font::Body, cv.theme().on_surface_variant);
             });
 
             const wchar_t* start_label = stopping ? L"Stopping…" : (running ? L"Stop Indexing" : L"Start Indexing");
@@ -958,18 +985,18 @@ private:
             });
             if (fail_cnt > 0) {
                 status.add(fw, 22.0f, [&](D2D1_RECT_F fr) {
-                    cv.fill_round(fr, 11.0f, with_alpha(color::error, 0.14f));
-                    cv.text(ftxt, fr, Font::Caption, color::error, Align::Center);
+                    cv.fill_round(fr, 11.0f, with_alpha(cv.theme().error, 0.14f));
+                    cv.text(ftxt, fr, Font::Caption, cv.theme().error, Align::Center);
                 });
             }
-            flow_text(cv, status, sub, Font::Caption, color::on_surface_variant, rw, 22.0f);
+            flow_text(cv, status, sub, Font::Caption, cv.theme().on_surface_variant, rw, 22.0f);
 
             Flow progress_text{8.0f, 4.0f};
-            flow_text(cv, progress_text, pbuf, Font::Caption, color::outline, rw, 20.0f);
-            flow_text(cv, progress_text, cur, Font::MonoSmall, stopping ? color::amber : color::on_surface_variant, rw, 20.0f, true, Align::Right);
+            flow_text(cv, progress_text, pbuf, Font::Caption, cv.theme().outline, rw, 20.0f);
+            flow_text(cv, progress_text, cur, Font::MonoSmall, stopping ? cv.theme().amber : cv.theme().on_surface_variant, rw, 20.0f, true, Align::Right);
 
             Flow database{8.0f, 8.0f};
-            flow_text(cv, database, db_info, Font::Caption, db_disconnected ? color::error : color::outline, rw, 32.0f, true);
+            flow_text(cv, database, db_info, Font::Caption, db_disconnected ? cv.theme().error : cv.theme().outline, rw, 32.0f, true);
             database.add(button_width(cv, L"Open Qdrant Web UI", true, 166.0f), 32.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::open, L"Open Qdrant Web UI", IdOpenQdrantUi);
             });
@@ -986,18 +1013,18 @@ private:
             const float h = database_y + database.height(rw) + 11.0f - y;
             const float next_y = card_begin(cv, x, y, w, h);
 
-            cv.text_wrap(label, rect(lx, y + 16.0f, rw, label_h), Font::Label, color::primary);
+            cv.text_wrap(label, rect(lx, y + 16.0f, rw, label_h), Font::Label, cv.theme().primary);
             headline.draw(lx, headline_y, rw);
             status.draw(lx, status_y, rw);
 
             const D2D1_RECT_F track = rect(lx, track_y, rw, 8.0f);
-            cv.fill_round(track, 4.0f, color::surface_highest);
+            cv.fill_round(track, 4.0f, cv.theme().surface_highest);
             if (pct > 0.0f) {
-                cv.fill_round(rect(track.left, track.top, std::max(8.0f, width(track) * pct), 8.0f), 4.0f, running ? color::amber : color::primary);
+                cv.fill_round(rect(track.left, track.top, std::max(8.0f, width(track) * pct), 8.0f), 4.0f, running ? cv.theme().amber : cv.theme().primary);
             }
             progress_text.draw(lx, progress_y, rw);
 
-            cv.hline(lx, lx + rw, database_line_y, with_alpha(color::outline_variant, 0.5f));
+            cv.hline(lx, lx + rw, database_line_y, with_alpha(cv.theme().outline_variant, 0.5f));
             database.draw(lx, database_y, rw);
             y = next_y;
         }
@@ -1013,7 +1040,7 @@ private:
             const float reason_w = stacked ? rw - 40.0f : rw * 0.36f - 10.0f;
 
             const std::wstring title = L"Failed Media Files (" + format_count(sh_.failed_files.size()) + L")";
-            const CardHeader hd = make_header(cv, rw, title, color::error,
+            const CardHeader hd = make_header(cv, rw, title, cv.theme().error,
                                               L"Skipped until modified — click a file to reveal in Explorer, or retry all", 266.0f, 32.0f);
 
             struct FailedRow {
@@ -1049,12 +1076,12 @@ private:
             draw_button(cv, rect(side.left, side.top, 126.0f, 32.0f), glyph::open, L"Open Log File", IdOpenFailedLog);
             const D2D1_RECT_F retry_r = rect(side.left + 134.0f, side.top, 132.0f, 32.0f);
             if (sh_.indexer_running) {
-                cv.fill_round(retry_r, 10.0f, with_alpha(color::surface_high, 0.45f));
-                cv.stroke_round(retry_r, 10.0f, with_alpha(color::outline_variant, 0.40f));
+                cv.fill_round(retry_r, 10.0f, with_alpha(cv.theme().surface_high, 0.45f));
+                cv.stroke_round(retry_r, 10.0f, with_alpha(cv.theme().outline_variant, 0.40f));
                 const float tw = cv.measure(L"Retry Failed", Font::SmallSemi);
                 const float total = 24.0f + tw;
                 const float sx = retry_r.left + (width(retry_r) - total) * 0.5f;
-                const D2D1_COLOR_F dfg = with_alpha(color::on_surface_variant, 0.45f);
+                const D2D1_COLOR_F dfg = with_alpha(cv.theme().on_surface_variant, 0.45f);
                 cv.icon(glyph::refresh, rect(sx, retry_r.top, 18.0f, height(retry_r)), dfg, Font::IconSmall);
                 cv.text(L"Retry Failed", rect(sx + 24.0f, retry_r.top, tw + 4.0f, height(retry_r)), Font::SmallSemi, dfg);
                 cv.hit(retry_r, IdClearFailedDisabled);
@@ -1067,18 +1094,18 @@ private:
                 const FailedRow& row = rows[i];
                 const D2D1_RECT_F ir = rect(lx, row.y, rw, row.h);
                 const float ha = hover_alpha(IdFailedRow, static_cast<int>(i));
-                cv.fill_round(ir, 8.0f, lerp_color(color::surface_low, color::surface_high, ha));
-                cv.icon(glyph::warning, rect(ir.left + 8.0f, ir.top, 20.0f, row.h), color::error, Font::IconSmall);
+                cv.fill_round(ir, 8.0f, lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha));
+                cv.icon(glyph::warning, rect(ir.left + 8.0f, ir.top, 20.0f, row.h), cv.theme().error, Font::IconSmall);
                 const float content_top = ir.top + (row.h - row.content_h) * 0.5f;
                 const float path_y = stacked ? content_top : ir.top + (row.h - row.path_h) * 0.5f;
-                cv.text_wrap(row.label, rect(ir.left + path_x, path_y, path_w, row.path_h), Font::MonoSmall, color::on_surface);
+                cv.text_wrap(row.label, rect(ir.left + path_x, path_y, path_w, row.path_h), Font::MonoSmall, cv.theme().on_surface);
                 const float reason_y = stacked ? content_top + row.path_h + 2.0f : ir.top + (row.h - row.reason_h) * 0.5f;
                 const float reason_h = stacked ? row.content_h - row.path_h - 2.0f : row.reason_h;
-                cv.text_wrap(ff.reason, rect(ir.left + reason_x, reason_y, reason_w, reason_h), Font::Caption, color::outline, stacked ? Align::Left : Align::Right);
+                cv.text_wrap(ff.reason, rect(ir.left + reason_x, reason_y, reason_w, reason_h), Font::Caption, cv.theme().outline, stacked ? Align::Left : Align::Right);
                 if (!ff.path.empty()) cv.hit(ir, IdFailedRow, static_cast<int>(i));
             }
             if (has_more) {
-                cv.text_wrap(more, rect(lx, cy, rw, more_h), Font::Caption, color::outline);
+                cv.text_wrap(more, rect(lx, cy, rw, more_h), Font::Caption, cv.theme().outline);
             }
             y = next_y;
         }
@@ -1089,7 +1116,7 @@ private:
             const size_t inc_n = sh_.settings.include_dirs.size();
             const float lx = x + 22.0f, rw = w - 44.0f;
 
-            const CardHeader hd = make_header(cv, rw, L"Indexing Scope", color::on_surface,
+            const CardHeader hd = make_header(cv, rw, L"Indexing Scope", cv.theme().on_surface,
                                               L"Scan the whole PC with Voidtools Everything, or restrict indexing to specific folders");
 
             struct Radio {
@@ -1113,7 +1140,7 @@ private:
             }
 
             Flow include_head{8.0f, 8.0f};
-            flow_text(cv, include_head, L"INCLUDED FOLDERS", Font::Label, color::primary, rw, 30.0f, true);
+            flow_text(cv, include_head, L"INCLUDED FOLDERS", Font::Label, cv.theme().primary, rw, 30.0f, true);
             include_head.add(button_width(cv, L"Add Directory", true, 134.0f), 30.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::add, L"Add Directory", IdAddInclude);
             });
@@ -1183,21 +1210,21 @@ private:
                 }
                 if (inc_n == 0) {
                     const D2D1_RECT_F er = rect(lx, empty_y, rw, empty_h);
-                    cv.fill_round(er, 8.0f, color::surface_low);
-                    text_middle(cv, empty_msg, inset(er, 12.0f, 0.0f), Font::Small, color::outline);
+                    cv.fill_round(er, 8.0f, cv.theme().surface_low);
+                    text_middle(cv, empty_msg, inset(er, 12.0f, 0.0f), Font::Small, cv.theme().outline);
                 }
                 for (size_t i = 0; i < inc_n; ++i) {
                     const D2D1_RECT_F ir = rect(lx, include_y[i], rw, include_h[i]);
-                    cv.fill_round(ir, 8.0f, color::surface_low);
-                    cv.icon(glyph::folder, rect(ir.left + 8.0f, ir.top, 22.0f, include_h[i]), color::primary, Font::IconSmall);
-                    text_middle(cv, include_paths[i], rect(ir.left + 34.0f, ir.top, rw - 72.0f, include_h[i]), Font::MonoSmall, color::on_surface);
+                    cv.fill_round(ir, 8.0f, cv.theme().surface_low);
+                    cv.icon(glyph::folder, rect(ir.left + 8.0f, ir.top, 22.0f, include_h[i]), cv.theme().primary, Font::IconSmall);
+                    text_middle(cv, include_paths[i], rect(ir.left + 34.0f, ir.top, rw - 72.0f, include_h[i]), Font::MonoSmall, cv.theme().on_surface);
                     draw_button(cv, rect(ir.right - 32.0f, ir.top + (include_h[i] - 28.0f) * 0.5f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveInclude, static_cast<int>(i), 3);
                 }
             }
 
-            cv.hline(lx, lx + rw, line_y, with_alpha(color::outline_variant, 0.5f));
+            cv.hline(lx, lx + rw, line_y, with_alpha(cv.theme().outline_variant, 0.5f));
             media.draw(lx, media_y, rw);
-            cv.text_wrap(limits_note, rect(lx, limits_note_y, rw, limits_note_h), Font::Caption, color::outline);
+            cv.text_wrap(limits_note, rect(lx, limits_note_y, rw, limits_note_h), Font::Caption, cv.theme().outline);
             y = next_y;
         }
 
@@ -1207,14 +1234,14 @@ private:
             const bool show_exclude_error = !exclude_error_.empty() && exclude_field_.text == exclude_error_for_text_;
             const float lx = x + 22.0f, rw = w - 44.0f;
 
-            const CardHeader hd = make_header(cv, rw, L"Excluded Directories & Patterns", color::on_surface,
+            const CardHeader hd = make_header(cv, rw, L"Excluded Directories & Patterns", cv.theme().on_surface,
                                               L"Skipped in both Whole PC and Custom Folder modes", 142.0f, 32.0f);
 
             Flow input{8.0f, 8.0f};
             input.add(180.0f, 34.0f, [&](D2D1_RECT_F fr) {
-                cv.fill_round(fr, 8.0f, color::surface_low);
-                cv.stroke_round(fr, 8.0f, active_field_ == &exclude_field_ ? color::primary : color::outline_variant);
-                exclude_field_.draw(cv, inset(fr, 10.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                cv.fill_round(fr, 8.0f, cv.theme().surface_low);
+                cv.stroke_round(fr, 8.0f, active_field_ == &exclude_field_ ? cv.theme().primary : cv.theme().outline_variant);
+                exclude_field_.draw(cv, inset(fr, 10.0f, 2.0f), Font::Mono, cv.theme().on_surface, cv.theme().outline);
                 cv.hit(fr, IdExcludeField);
             }, true);
             input.add(button_width(cv, L"Add Rule", true, 100.0f), 34.0f, [&](D2D1_RECT_F r) {
@@ -1263,13 +1290,13 @@ private:
 
             for (const ExcludeRow& row : rows) {
                 const D2D1_RECT_F ir = rect(lx, row.y, rw, row.h);
-                cv.fill_round(ir, 8.0f, row.locked ? with_alpha(color::surface_lowest, 0.7f) : color::surface_low);
-                cv.icon(glyph::block, rect(ir.left + 8.0f, ir.top, 20.0f, row.h), row.locked ? color::outline : color::error, Font::IconSmall);
-                text_middle(cv, row.text, rect(ir.left + 32.0f, ir.top, rw - 120.0f, row.h), Font::MonoSmall, row.locked ? color::outline : color::on_surface);
-                cv.text(row.tag, rect(ir.right - 92.0f, ir.top, 56.0f, row.h), Font::Caption, row.locked ? color::outline : color::on_surface_variant, Align::Right);
+                cv.fill_round(ir, 8.0f, row.locked ? with_alpha(cv.theme().surface_lowest, 0.7f) : cv.theme().surface_low);
+                cv.icon(glyph::block, rect(ir.left + 8.0f, ir.top, 20.0f, row.h), row.locked ? cv.theme().outline : cv.theme().error, Font::IconSmall);
+                text_middle(cv, row.text, rect(ir.left + 32.0f, ir.top, rw - 120.0f, row.h), Font::MonoSmall, row.locked ? cv.theme().outline : cv.theme().on_surface);
+                cv.text(row.tag, rect(ir.right - 92.0f, ir.top, 56.0f, row.h), Font::Caption, row.locked ? cv.theme().outline : cv.theme().on_surface_variant, Align::Right);
                 if (row.locked) {
                     const D2D1_RECT_F lr = rect(ir.right - 30.0f, ir.top, 24.0f, row.h);
-                    cv.icon(glyph::lock, lr, color::outline, Font::IconSmall);
+                    cv.icon(glyph::lock, lr, cv.theme().outline, Font::IconSmall);
                     cv.hit(lr, IdLockedExclude, row.index);
                 } else {
                     draw_button(cv, rect(ir.right - 30.0f, ir.top + (row.h - 28.0f) * 0.5f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveExclude, row.index, 3);
@@ -1285,20 +1312,69 @@ private:
     // ------------------------------------------------------------------------------------------
 
     float draw_tab_settings(Canvas& cv, float x, float y, float w) {
+        // 0. Appearance & Theme card
+        {
+            const float lx = x + 22.0f, rw = w - 44.0f;
+            const CardHeader hd = make_header(cv, rw, L"Appearance & Theme", cv.theme().on_surface,
+                                              L"Built-in palettes, Windows light/dark & accent sync, and custom JSON themes");
+
+            const auto& entries = sh_.themes.entries();
+            const std::string& active_id = sh_.theme.id;
+            Flow chips{8.0f, 8.0f};
+            for (size_t i = 0; i < entries.size(); ++i) {
+                const ThemeEntry& te = entries[i];
+                const std::wstring lbl = to_wide(te.name);
+                const float chip_w = cv.measure(lbl, Font::SmallSemi) + 38.0f;
+                const bool on = te.id == active_id;
+                chips.add(chip_w, 32.0f, [&, i, on](D2D1_RECT_F r) {
+                    draw_theme_chip(cv, r, entries[i], on, static_cast<int>(i));
+                });
+            }
+
+            const std::wstring tdir = themes_dir().wstring();
+            const float open_w = button_width(cv, L"Open Folder", true, 122.0f);
+            const float reload_w = button_width(cv, L"Reload", true, 92.0f);
+            const float btns_w = open_w + 8.0f + reload_w;
+            const bool dir_beside = rw - btns_w - 8.0f >= 200.0f;
+            const float dir_w = dir_beside ? rw - btns_w - 8.0f : rw;
+            const float dir_h = mono_row_height(cv, tdir, dir_w - 20.0f, 32.0f);
+            Flow dir_row{8.0f, 8.0f};
+            dir_row.add(dir_w, dir_h, [&](D2D1_RECT_F dr) {
+                cv.fill_round(dr, 8.0f, cv.theme().surface_lowest);
+                text_middle(cv, tdir, inset(dr, 10.0f, 0.0f), Font::MonoSmall, cv.theme().on_surface_variant);
+            });
+            dir_row.add(open_w, 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::folder, L"Open Folder", IdOpenThemesDir);
+            });
+            dir_row.add(reload_w, 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::refresh, L"Reload", IdReloadThemes);
+            });
+
+            const float chips_y = y + 16.0f + hd.h + 12.0f;
+            const float dir_y = chips_y + chips.height(rw) + 12.0f;
+            const float h = dir_y + dir_row.height(rw) + 16.0f - y;
+            const float next_y = card_begin(cv, x, y, w, h);
+
+            draw_header(cv, lx, y, rw, hd);
+            chips.draw(lx, chips_y, rw);
+            dir_row.draw(lx, dir_y, rw);
+            y = next_y;
+        }
+
         // 1. Keybind & Pill behaviour card
         {
             const float lx = x + 22.0f, rw = w - 44.0f;
 
-            const CardHeader hd = make_header(cv, rw, L"Spotlight Invocation Keybind", color::on_surface,
+            const CardHeader hd = make_header(cv, rw, L"Spotlight Invocation Keybind", cv.theme().on_surface,
                                               L"Global desktop shortcut registered by the lightweight tray launcher", 44.0f, 24.0f);
 
             const std::wstring hk = recording_hotkey_ ? L"Press shortcut…" : format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk);
             const wchar_t* record_label = recording_hotkey_ ? L"Cancel Recording" : L"Record Keybind";
             Flow keys{8.0f, 8.0f};
             keys.add(240.0f, 40.0f, [&](D2D1_RECT_F kr) {
-                cv.fill_round(kr, 10.0f, color::surface_lowest);
-                cv.stroke_round(kr, 10.0f, recording_hotkey_ ? color::amber : color::outline_variant, recording_hotkey_ ? 1.5f : 1.0f);
-                cv.text(hk, kr, Font::BodySemi, recording_hotkey_ ? color::amber : color::primary, Align::Center);
+                cv.fill_round(kr, 10.0f, cv.theme().surface_lowest);
+                cv.stroke_round(kr, 10.0f, recording_hotkey_ ? cv.theme().amber : cv.theme().outline_variant, recording_hotkey_ ? 1.5f : 1.0f);
+                cv.text(hk, kr, Font::BodySemi, recording_hotkey_ ? cv.theme().amber : cv.theme().primary, Align::Center);
             });
             keys.add(button_width(cv, record_label, true, 160.0f), 40.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::keyboard, record_label, IdRecordHotkey, 0, recording_hotkey_ ? 1 : 0);
@@ -1308,12 +1384,12 @@ private:
             });
 
             Flow startup{12.0f, 0.0f};
-            flow_text(cv, startup, L"Open on PC startup", Font::Body, color::on_surface, rw, 32.0f);
+            flow_text(cv, startup, L"Open on PC startup", Font::Body, cv.theme().on_surface, rw, 32.0f);
             startup.add(44.0f, 32.0f, [&](D2D1_RECT_F r) {
                 draw_switch(cv, r.right, (r.top + r.bottom) * 0.5f, sh_.settings.launch_on_startup, IdToggleStartup);
             });
             Flow hide_on_blur{12.0f, 0.0f};
-            flow_text(cv, hide_on_blur, L"Hide pill when clicking outside", Font::Body, color::on_surface, rw, 32.0f);
+            flow_text(cv, hide_on_blur, L"Hide pill when clicking outside", Font::Body, cv.theme().on_surface, rw, 32.0f);
             hide_on_blur.add(44.0f, 32.0f, [&](D2D1_RECT_F r) {
                 draw_switch(cv, r.right, (r.top + r.bottom) * 0.5f, sh_.settings.hide_on_focus_loss, IdToggleHideFocus);
             });
@@ -1333,7 +1409,7 @@ private:
 
             const bool contain = parse_thumb_fit(sh_.settings.thumb_fit) == ThumbFit::Contain;
             Flow thumbs{8.0f, 8.0f};
-            flow_text(cv, thumbs, L"Image thumbnails:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
+            flow_text(cv, thumbs, L"Image thumbnails:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 32.0f);
             thumbs.add(button_width(cv, L"Fill tile (crop)", false, 120.0f), 32.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, 0, L"Fill tile (crop)", IdThumbFit, static_cast<int>(ThumbFit::Crop), !contain ? 1 : 0);
             });
@@ -1343,7 +1419,7 @@ private:
 
             const bool dbl_preview = parse_thumb_dblclick(sh_.settings.thumb_dblclick) == ThumbDblClick::Preview;
             Flow dblclick{8.0f, 8.0f};
-            flow_text(cv, dblclick, L"Double-click thumbnail:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
+            flow_text(cv, dblclick, L"Double-click thumbnail:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 32.0f);
             dblclick.add(button_width(cv, L"Open in default app", true, 160.0f), 32.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::open, L"Open in default app", IdThumbDblClick, static_cast<int>(ThumbDblClick::Open), !dbl_preview ? 1 : 0);
             });
@@ -1370,7 +1446,7 @@ private:
             draw_switch(cv, side.right, side.top + 12.0f, sh_.settings.hotkey_enabled, IdToggleHotkey);
             keys.draw(lx, keys_y, rw);
             if (hotkey_warn) draw_error_row(cv, hotkey_msg, lx, hotkey_msg_y, rw, hotkey_msg_h);
-            cv.hline(lx, lx + rw, options_line_y, with_alpha(color::outline_variant, 0.5f));
+            cv.hline(lx, lx + rw, options_line_y, with_alpha(cv.theme().outline_variant, 0.5f));
             options.draw(lx, options_y, rw);
             thumbs.draw(lx, thumbs_y, rw);
             dblclick.draw(lx, dblclick_y, rw);
@@ -1381,7 +1457,7 @@ private:
         {
             const float lx = x + 22.0f, rw = w - 44.0f;
 
-            const CardHeader hd = make_header(cv, rw, L"Embeddings AI Model & Compute", color::on_surface,
+            const CardHeader hd = make_header(cv, rw, L"Embeddings AI Model & Compute", cv.theme().on_surface,
                                               L"Vision weights (.safetensors) and text ONNX / tokenizer directory");
 
             // Model dir row
@@ -1391,8 +1467,8 @@ private:
             const float dir_h = mono_row_height(cv, model_dir, dir_w - 20.0f, 32.0f);
             Flow dir_row{8.0f, 8.0f};
             dir_row.add(dir_w, dir_h, [&](D2D1_RECT_F dr) {
-                cv.fill_round(dr, 8.0f, color::surface_lowest);
-                text_middle(cv, model_dir, inset(dr, 10.0f, 0.0f), Font::MonoSmall, color::on_surface_variant);
+                cv.fill_round(dr, 8.0f, cv.theme().surface_lowest);
+                text_middle(cv, model_dir, inset(dr, 10.0f, 0.0f), Font::MonoSmall, cv.theme().on_surface_variant);
             });
             dir_row.add(button_width(cv, L"Browse…", true, 108.0f), 32.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::folder, L"Browse…", IdBrowseModelDir);
@@ -1400,7 +1476,7 @@ private:
 
             // Model name chips + custom field
             Flow chips{8.0f, 8.0f};
-            flow_text(cv, chips, L"Model:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
+            flow_text(cv, chips, L"Model:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 32.0f);
             for (size_t i = 0; i < models_.size() && i < 3; ++i) {
                 const std::wstring wm = to_wide(models_[i]);
                 const bool on = models_[i] == sh_.settings.model_name;
@@ -1409,9 +1485,9 @@ private:
                 });
             }
             chips.add(140.0f, 32.0f, [&](D2D1_RECT_F mfr) {
-                cv.fill_round(mfr, 8.0f, color::surface_low);
-                cv.stroke_round(mfr, 8.0f, active_field_ == &model_field_ ? color::primary : color::outline_variant);
-                model_field_.draw(cv, inset(mfr, 10.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                cv.fill_round(mfr, 8.0f, cv.theme().surface_low);
+                cv.stroke_round(mfr, 8.0f, active_field_ == &model_field_ ? cv.theme().primary : cv.theme().outline_variant);
+                model_field_.draw(cv, inset(mfr, 10.0f, 2.0f), Font::Mono, cv.theme().on_surface, cv.theme().outline);
                 cv.hit(mfr, IdModelField);
             }, true);
 
@@ -1427,13 +1503,13 @@ private:
                 });
             };
             Flow files{8.0f, 6.0f};
-            badge(files, mf.weights ? L"Weights  " + format_size(mf.weights_bytes) : L"Weights missing", mf.weights ? color::mint : color::error);
-            badge(files, mf.tokenizer ? L"Tokenizer" : L"Tokenizer missing", mf.tokenizer ? color::mint : color::error);
-            badge(files, mf.onnx ? L"Text ONNX" : L"Text ONNX not exported yet", mf.onnx ? color::mint : color::amber);
+            badge(files, mf.weights ? L"Weights  " + format_size(mf.weights_bytes) : L"Weights missing", mf.weights ? cv.theme().mint : cv.theme().error);
+            badge(files, mf.tokenizer ? L"Tokenizer" : L"Tokenizer missing", mf.tokenizer ? cv.theme().mint : cv.theme().error);
+            badge(files, mf.onnx ? L"Text ONNX" : L"Text ONNX not exported yet", mf.onnx ? cv.theme().mint : cv.theme().amber);
             const auto enc_state = sh_.engine.encoder().state();
-            if (enc_state == TextEncoder::State::Ready) badge(files, L"Search model loaded", color::mint);
-            else if (enc_state == TextEncoder::State::Exporting) badge(files, L"Exporting text ONNX…", color::primary);
-            else if (enc_state == TextEncoder::State::Loading) badge(files, L"Loading search model…", color::primary);
+            if (enc_state == TextEncoder::State::Ready) badge(files, L"Search model loaded", cv.theme().mint);
+            else if (enc_state == TextEncoder::State::Exporting) badge(files, L"Exporting text ONNX…", cv.theme().primary);
+            else if (enc_state == TextEncoder::State::Loading) badge(files, L"Loading search model…", cv.theme().primary);
             const std::wstring enc_error = enc_state == TextEncoder::State::Failed ? sh_.engine.encoder().error() : std::wstring{};
             const float enc_error_h = enc_error.empty() ? 0.0f : error_row_height(cv, enc_error, rw);
 
@@ -1442,11 +1518,11 @@ private:
             const std::wstring fetch_label = !model_job_.busy ? L"Download Model"
                 : (fetch_view.total > 0 ? L"Cancel  •  " + std::to_wstring(fetch_view.done * 100 / fetch_view.total) + L"%" : L"Cancel");
             Flow fetch{8.0f, 8.0f};
-            flow_text(cv, fetch, L"Hugging Face repo:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
+            flow_text(cv, fetch, L"Hugging Face repo:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 32.0f);
             fetch.add(200.0f, 32.0f, [&](D2D1_RECT_F fr) {
-                cv.fill_round(fr, 8.0f, color::surface_low);
-                cv.stroke_round(fr, 8.0f, active_field_ == &repo_field_ ? color::primary : color::outline_variant);
-                repo_field_.draw(cv, inset(fr, 10.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                cv.fill_round(fr, 8.0f, cv.theme().surface_low);
+                cv.stroke_round(fr, 8.0f, active_field_ == &repo_field_ ? cv.theme().primary : cv.theme().outline_variant);
+                repo_field_.draw(cv, inset(fr, 10.0f, 2.0f), Font::Mono, cv.theme().on_surface, cv.theme().outline);
                 cv.hit(fr, IdRepoField);
             }, true);
             fetch.add(button_width(cv, fetch_label, true, 170.0f), 32.0f, [&](D2D1_RECT_F r) {
@@ -1461,7 +1537,7 @@ private:
             // Device & VRAM Batch size
             const bool is_cpu = sh_.settings.device == "cpu";
             Flow device{6.0f, 0.0f};
-            flow_text(cv, device, L"Device:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
+            flow_text(cv, device, L"Device:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 32.0f);
             device.add(button_width(cv, L"GPU (ROCm / CUDA)", true, 138.0f), 32.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::chip, L"GPU (ROCm / CUDA)", IdDeviceAuto, 0, !is_cpu ? 1 : 0);
             });
@@ -1470,7 +1546,7 @@ private:
             });
 
             Flow batch{5.0f, 8.0f};
-            flow_text(cv, batch, L"Batch size:", Font::SmallSemi, color::on_surface_variant, rw, 32.0f);
+            flow_text(cv, batch, L"Batch size:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 32.0f);
             static constexpr uint32_t batches[] = {0, 32, 64, 128, 256};
             for (const uint32_t b : batches) {
                 const std::wstring bl = b == 0 ? L"Auto (VRAM)" : std::to_wstring(b);
@@ -1482,10 +1558,10 @@ private:
                 sh_.settings.batch_size != 32 && sh_.settings.batch_size != 64 &&
                 sh_.settings.batch_size != 128 && sh_.settings.batch_size != 256;
             batch.add(64.0f, 32.0f, [&](D2D1_RECT_F bfr) {
-                cv.fill_round(bfr, 8.0f, color::surface_low);
-                cv.stroke_round(bfr, 8.0f, (active_field_ == &batch_field_ || custom_batch) ? color::primary : color::outline_variant,
+                cv.fill_round(bfr, 8.0f, cv.theme().surface_low);
+                cv.stroke_round(bfr, 8.0f, (active_field_ == &batch_field_ || custom_batch) ? cv.theme().primary : cv.theme().outline_variant,
                                 (active_field_ == &batch_field_ || custom_batch) ? 1.5f : 1.0f);
-                batch_field_.draw(cv, inset(bfr, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                batch_field_.draw(cv, inset(bfr, 8.0f, 2.0f), Font::Mono, cv.theme().on_surface, cv.theme().outline);
                 cv.hit(bfr, IdBatchField);
             }, true);
 
@@ -1509,7 +1585,7 @@ private:
             const bool can_reset_batch = sh_.settings.batch_size == 0 && sh_.index_state.auto_batch > 0;
             const float note_x = batch_warn ? 22.0f : 0.0f;
             Flow note{10.0f, 4.0f};
-            flow_text(cv, note, batch_note, Font::Caption, batch_warn ? color::amber : color::outline, rw - note_x, 24.0f, true);
+            flow_text(cv, note, batch_note, Font::Caption, batch_warn ? cv.theme().amber : cv.theme().outline, rw - note_x, 24.0f, true);
             if (can_reset_batch) {
                 note.add(button_width(cv, L"Reset learnt size", false, 0.0f), 24.0f, [&](D2D1_RECT_F r) {
                     draw_button(cv, r, 0, L"Reset learnt size", IdResetAutoBatch);
@@ -1527,10 +1603,10 @@ private:
             const float script_box_w = script_beside ? beside_box_w : rw;
             const float script_box_h = mono_row_height(cv, scr, script_box_w - 20.0f, 30.0f);
             Flow script{8.0f, 8.0f};
-            flow_text(cv, script, L"Vision script:", Font::SmallSemi, color::on_surface_variant, rw, 30.0f);
+            flow_text(cv, script, L"Vision script:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 30.0f);
             script.add(script_box_w, script_box_h, [&](D2D1_RECT_F sr) {
-                cv.fill_round(sr, 8.0f, color::surface_lowest);
-                text_middle(cv, scr, inset(sr, 10.0f, 0.0f), Font::MonoSmall, color::on_surface_variant);
+                cv.fill_round(sr, 8.0f, cv.theme().surface_lowest);
+                text_middle(cv, scr, inset(sr, 10.0f, 0.0f), Font::MonoSmall, cv.theme().on_surface_variant);
             });
             script.add(custom_w, 30.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::code, L"Custom…", IdBrowseScript);
@@ -1558,11 +1634,11 @@ private:
             if (!enc_error.empty()) draw_error_row(cv, enc_error, lx, enc_error_y, rw, enc_error_h);
             if (show_fetch) fetch.draw(lx, fetch_y, rw);
             if (!fetch_note.empty()) {
-                cv.text_wrap(fetch_note, rect(lx, fetch_note_y, rw, fetch_note_h), Font::Caption, fetch_view.failed ? color::error : color::outline);
+                cv.text_wrap(fetch_note, rect(lx, fetch_note_y, rw, fetch_note_h), Font::Caption, fetch_view.failed ? cv.theme().error : cv.theme().outline);
             }
             compute.draw(lx, compute_y, rw);
             if (batch_warn) {
-                cv.icon(glyph::warning, rect(lx, note_y + 2.0f, 18.0f, 20.0f), color::amber, Font::IconSmall);
+                cv.icon(glyph::warning, rect(lx, note_y + 2.0f, 18.0f, 20.0f), cv.theme().amber, Font::IconSmall);
             }
             note.draw(lx + note_x, note_y, rw - note_x);
             script.draw(lx, script_y, rw);
@@ -1581,10 +1657,10 @@ private:
             const bool ver_ok = venv_.exists && fs::exists(venv_.python_exe, ec);
             const std::wstring ready_txt = venv_.portable ? L"Portable Ready" : L".venv Ready";
             const std::wstring st_txt = venv_busy ? L"Running task…" : (ver_ok ? ready_txt : (venv_.exists ? L"Missing python.exe" : L"Not found"));
-            const D2D1_COLOR_F st_col = venv_busy ? color::amber : (ver_ok ? color::mint : color::error);
+            const D2D1_COLOR_F st_col = venv_busy ? cv.theme().amber : (ver_ok ? cv.theme().mint : cv.theme().error);
             const float sw = cv.measure(st_txt, Font::Caption) + 26.0f;
 
-            const CardHeader hd = make_header(cv, rw, L"Python Environment", color::on_surface,
+            const CardHeader hd = make_header(cv, rw, L"Python Environment", cv.theme().on_surface,
                                               L"Any Python 3.10+ .venv or portable Python folder with PyTorch & open-clip (runs out-of-process)", sw, 24.0f);
 
             // Details box
@@ -1608,7 +1684,7 @@ private:
                 ? (L"Downloading " + std::to_wstring(venv_view.done * 100 / venv_view.total) + L"%")
                 : L"Download & Use";
             Flow portable{8.0f, 8.0f};
-            flow_text(cv, portable, L"Portable Python:", Font::SmallSemi, color::on_surface_variant, rw, 30.0f);
+            flow_text(cv, portable, L"Portable Python:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 30.0f);
             for (int i = 0; i < 4; ++i) {
                 const bool on = sh_.settings.python_version == versions[i];
                 portable.add(52.0f, 30.0f, [&, i, on](D2D1_RECT_F r) {
@@ -1616,9 +1692,9 @@ private:
                 });
             }
             portable.add(78.0f, 30.0f, [&](D2D1_RECT_F pvr) {
-                cv.fill_round(pvr, 8.0f, color::surface_low);
-                cv.stroke_round(pvr, 8.0f, active_field_ == &py_ver_field_ ? color::primary : color::outline_variant);
-                py_ver_field_.draw(cv, inset(pvr, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                cv.fill_round(pvr, 8.0f, cv.theme().surface_low);
+                cv.stroke_round(pvr, 8.0f, active_field_ == &py_ver_field_ ? cv.theme().primary : cv.theme().outline_variant);
+                py_ver_field_.draw(cv, inset(pvr, 8.0f, 2.0f), Font::Mono, cv.theme().on_surface, cv.theme().outline);
                 cv.hit(pvr, IdPyVerField);
             });
             portable.add(0.0f, 30.0f, [](D2D1_RECT_F) {}, true);
@@ -1630,7 +1706,7 @@ private:
             const char* backends[4] = {"rocm", "cuda", "cpu", "manual"};
             const wchar_t* blabels[4] = {L"AMD ROCm", L"NVIDIA CUDA", L"CPU", L"Manual"};
             Flow backend{8.0f, 8.0f};
-            flow_text(cv, backend, L"PyTorch stack:", Font::SmallSemi, color::on_surface_variant, rw, 30.0f);
+            flow_text(cv, backend, L"PyTorch stack:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 30.0f);
             for (int i = 0; i < 4; ++i) {
                 const bool on = sh_.settings.torch_backend == backends[i];
                 const wchar_t* blabel = blabels[i];
@@ -1640,17 +1716,17 @@ private:
             }
             if (sh_.settings.torch_backend == "rocm") {
                 Flow arch{4.0f, 0.0f};
-                flow_text(cv, arch, L"Arch:", Font::Small, color::outline, rw, 30.0f);
+                flow_text(cv, arch, L"Arch:", Font::Small, cv.theme().outline, rw, 30.0f);
                 arch.add(86.0f, 30.0f, [&](D2D1_RECT_F ar) {
-                    cv.fill_round(ar, 8.0f, color::surface_low);
-                    cv.stroke_round(ar, 8.0f, active_field_ == &arch_field_ ? color::primary : color::outline_variant);
-                    arch_field_.draw(cv, inset(ar, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                    cv.fill_round(ar, 8.0f, cv.theme().surface_low);
+                    cv.stroke_round(ar, 8.0f, active_field_ == &arch_field_ ? cv.theme().primary : cv.theme().outline_variant);
+                    arch_field_.draw(cv, inset(ar, 8.0f, 2.0f), Font::Mono, cv.theme().on_surface, cv.theme().outline);
                     cv.hit(ar, IdArchField);
                 });
                 backend.add_group(arch, rw);
             } else if (sh_.settings.torch_backend == "cuda") {
                 Flow cuda{4.0f, 0.0f};
-                flow_text(cv, cuda, L"CUDA:", Font::Small, color::outline, rw, 30.0f);
+                flow_text(cv, cuda, L"CUDA:", Font::Small, cv.theme().outline, rw, 30.0f);
                 for (size_t i = 0; i < cuda_versions.size(); ++i) {
                     const std::wstring vl = to_wide(cuda_versions[i]);
                     const bool on = sh_.settings.cuda_version == cuda_versions[i];
@@ -1660,12 +1736,12 @@ private:
                 }
                 const bool custom_cuda = std::ranges::find(cuda_versions, sh_.settings.cuda_version) == cuda_versions.end();
                 cuda.add(72.0f, 30.0f, [&, custom_cuda](D2D1_RECT_F cr) {
-                    cv.fill_round(cr, 8.0f, color::surface_low);
-                    cv.stroke_round(cr, 8.0f, (active_field_ == &cuda_field_ || custom_cuda) ? color::primary : color::outline_variant);
-                    cuda_field_.draw(cv, inset(cr, 8.0f, 2.0f), Font::Mono, color::on_surface, color::outline);
+                    cv.fill_round(cr, 8.0f, cv.theme().surface_low);
+                    cv.stroke_round(cr, 8.0f, (active_field_ == &cuda_field_ || custom_cuda) ? cv.theme().primary : cv.theme().outline_variant);
+                    cuda_field_.draw(cv, inset(cr, 8.0f, 2.0f), Font::Mono, cv.theme().on_surface, cv.theme().outline);
                     cv.hit(cr, IdCudaField);
                 });
-                flow_text(cv, cuda, L"Pick the newest version your NVIDIA driver supports.", Font::Caption, color::outline, rw, 30.0f);
+                flow_text(cv, cuda, L"Pick the newest version your NVIDIA driver supports.", Font::Caption, cv.theme().outline, rw, 30.0f);
                 backend.add_group(cuda, rw);
             }
             backend.add(0.0f, 30.0f, [](D2D1_RECT_F) {}, true);
@@ -1675,11 +1751,11 @@ private:
 
             // Optional custom Torch pip args row
             Flow torch{8.0f, 8.0f};
-            flow_text(cv, torch, L"Torch pip args:", Font::SmallSemi, color::on_surface_variant, rw, 30.0f);
+            flow_text(cv, torch, L"Torch pip args:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 30.0f);
             torch.add(200.0f, 30.0f, [&](D2D1_RECT_F tfr) {
-                cv.fill_round(tfr, 8.0f, color::surface_low);
-                cv.stroke_round(tfr, 8.0f, active_field_ == &torch_field_ ? color::primary : color::outline_variant);
-                torch_field_.draw(cv, inset(tfr, 10.0f, 2.0f), Font::MonoSmall, color::on_surface, color::outline);
+                cv.fill_round(tfr, 8.0f, cv.theme().surface_low);
+                cv.stroke_round(tfr, 8.0f, active_field_ == &torch_field_ ? cv.theme().primary : cv.theme().outline_variant);
+                torch_field_.draw(cv, inset(tfr, 10.0f, 2.0f), Font::MonoSmall, cv.theme().on_surface, cv.theme().outline);
                 cv.hit(tfr, IdTorchField);
             }, true);
 
@@ -1715,22 +1791,22 @@ private:
             cv.text(st_txt, rect(sbr.left + 20.0f, sbr.top, sw - 22.0f, 24.0f), Font::Caption, st_col);
 
             const D2D1_RECT_F box = rect(lx, box_y, rw, box_h);
-            cv.fill_round(box, 10.0f, color::surface_lowest);
-            cv.stroke_round(box, 10.0f, color::outline_variant);
+            cv.fill_round(box, 10.0f, cv.theme().surface_lowest);
+            cv.stroke_round(box, 10.0f, cv.theme().outline_variant);
             float ry = box_y + 8.0f;
-            cv.text(L"Env Path:", rect(lx + 14.0f, ry, 96.0f, 22.0f), Font::Caption, color::outline);
-            text_middle(cv, env_path, rect(lx + 110.0f, ry, env_w, env_text_h), Font::MonoSmall, color::primary);
+            cv.text(L"Env Path:", rect(lx + 14.0f, ry, 96.0f, 22.0f), Font::Caption, cv.theme().outline);
+            text_middle(cv, env_path, rect(lx + 110.0f, ry, env_w, env_text_h), Font::MonoSmall, cv.theme().primary);
             const D2D1_RECT_F select_r = select_beside ? rect(lx + rw - 92.0f, ry - 2.0f, 84.0f, 24.0f)
                                                        : rect(lx + 110.0f, ry + env_text_h + 4.0f, 84.0f, 24.0f);
             draw_button(cv, select_r, glyph::folder, L"Select…", IdBrowseVenv);
 
             ry += env_h + 2.0f;
-            cv.text(L"Interpreter:", rect(lx + 14.0f, ry, 96.0f, 22.0f), Font::Caption, color::outline);
-            text_middle(cv, py_info, rect(lx + 110.0f, ry, value_w, py_h), Font::Small, color::on_surface);
+            cv.text(L"Interpreter:", rect(lx + 14.0f, ry, 96.0f, 22.0f), Font::Caption, cv.theme().outline);
+            text_middle(cv, py_info, rect(lx + 110.0f, ry, value_w, py_h), Font::Small, cv.theme().on_surface);
 
             ry += py_h + 2.0f;
-            cv.text(L"Packages:", rect(lx + 14.0f, ry, 96.0f, 22.0f), Font::Caption, color::outline);
-            text_middle(cv, pkgs, rect(lx + 110.0f, ry, value_w, pkgs_h), Font::Caption, color::on_surface_variant);
+            cv.text(L"Packages:", rect(lx + 14.0f, ry, 96.0f, 22.0f), Font::Caption, cv.theme().outline);
+            text_middle(cv, pkgs, rect(lx + 110.0f, ry, value_w, pkgs_h), Font::Caption, cv.theme().on_surface_variant);
 
             portable.draw(lx, portable_y, rw);
             backend.draw(lx, backend_y, rw);
@@ -1739,10 +1815,10 @@ private:
 
             if (has_log) {
                 const D2D1_RECT_F lr = rect(lx, log_y, rw, log_h);
-                cv.fill_round(lr, 8.0f, venv_view.failed ? with_alpha(color::error_container, 0.35f) : color::surface_lowest);
-                if (venv_view.failed) cv.stroke_round(lr, 8.0f, with_alpha(color::error, 0.45f));
+                cv.fill_round(lr, 8.0f, venv_view.failed ? with_alpha(cv.theme().error_container, 0.35f) : cv.theme().surface_lowest);
+                if (venv_view.failed) cv.stroke_round(lr, 8.0f, with_alpha(cv.theme().error, 0.45f));
                 cv.text_wrap(venv_log, inset(lr, 10.0f, 6.0f), Font::MonoSmall,
-                             venv_view.failed ? color::error : color::on_surface_variant);
+                             venv_view.failed ? cv.theme().error : cv.theme().on_surface_variant);
             }
             y = next_y;
         }
@@ -2520,7 +2596,7 @@ private:
             active_field_ = &tf;
             tf.focused = true;
             tf.caret_on = true;
-            Canvas cv{target_, sh_.fonts, hits_};
+            Canvas cv{target_, sh_.fonts, hits_, sh_.theme};
             tf.click(cv, p.x, shift);
             if (dbl) tf.select_word_at_caret();
             SetTimer(hwnd_, TIMER_CARET, GetCaretBlinkTime(), nullptr);
@@ -2737,6 +2813,27 @@ private:
                 sh_.settings.thumb_dblclick = idx == static_cast<int>(ThumbDblClick::Preview) ? "preview" : "open";
                 sh_.save();
                 if (sh_.redraw_all) sh_.redraw_all();
+                break;
+            case IdThemeChip: {
+                const auto& entries = sh_.themes.entries();
+                if (idx >= 0 && idx < static_cast<int>(entries.size())) {
+                    sh_.theme_override.reset();
+                    sh_.settings.theme = entries[static_cast<size_t>(idx)].id;
+                    sh_.refresh_theme(false, false);
+                    sh_.save();
+                }
+                break;
+            }
+            case IdOpenThemesDir: {
+                ensure_themes_dir();
+                std::string err;
+                if (!open_file(themes_dir().wstring(), &err)) {
+                    sh_.notify("warning", "Themes", "Could not open themes folder", err, "open-themes-dir");
+                }
+                break;
+            }
+            case IdReloadThemes:
+                sh_.refresh_theme(true, true);
                 break;
             case IdIdleStep: {
                 static constexpr int32_t steps[] = {0, 60, 180, 600, 1800, -1};
@@ -3041,6 +3138,14 @@ private:
             case WM_DISPLAYCHANGE:
                 if (sh_.gfx.adapter_stale(hwnd_)) recover();
                 invalidate();
+                return 0;
+            case WM_SETTINGCHANGE:
+                if (!lp || _wcsicmp(reinterpret_cast<const wchar_t*>(lp), L"ImmersiveColorSet") == 0) {
+                    sh_.on_windows_theme_changed();
+                }
+                return 0;
+            case WM_DWMCOLORIZATIONCOLORCHANGED:
+                sh_.on_windows_theme_changed();
                 return 0;
             case WM_DPICHANGED: {
                 full_dirty_ = true;

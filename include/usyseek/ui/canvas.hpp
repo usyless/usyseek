@@ -3,6 +3,7 @@
 #include "anim.hpp"
 #include "fit.hpp"
 #include "gfx.hpp"
+#include "theme.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,50 +12,13 @@
 
 namespace usyseek::ui {
 
-inline D2D1_COLOR_F hex(uint32_t rgb, float a = 1.0f) noexcept {
-    return D2D1::ColorF(((rgb >> 16) & 0xFF) / 255.0f, ((rgb >> 8) & 0xFF) / 255.0f, (rgb & 0xFF) / 255.0f, a);
+/// Stable per-tag accent colour from the active theme.
+[[nodiscard]] inline D2D1_COLOR_F tag_color(const Theme& t, std::string_view tag) noexcept {
+    return t.tag_palette[rapidhash(tag.data(), tag.size()) % t.tag_palette.size()];
 }
-inline D2D1_COLOR_F with_alpha(D2D1_COLOR_F c, float a) noexcept {
-    c.a = a;
-    return c;
-}
-[[nodiscard]] inline D2D1_COLOR_F lerp_color(D2D1_COLOR_F a, D2D1_COLOR_F b, float t) noexcept {
-    const float k = std::clamp(t, 0.0f, 1.0f);
-    return {lerp(a.r, b.r, k), lerp(a.g, b.g, k), lerp(a.b, b.b, k), lerp(a.a, b.a, k)};
-}
+
 [[nodiscard]] inline D2D1_RECT_F lerp_rect(D2D1_RECT_F a, D2D1_RECT_F b, float t) noexcept {
     return {lerp(a.left, b.left, t), lerp(a.top, b.top, t), lerp(a.right, b.right, t), lerp(a.bottom, b.bottom, t)};
-}
-
-// Material 3 dark tokens (from the mockup)
-namespace color {
-inline const D2D1_COLOR_F bg = hex(0x141218);
-inline const D2D1_COLOR_F surface_lowest = hex(0x0f0d13);
-inline const D2D1_COLOR_F surface_low = hex(0x1d1b20);
-inline const D2D1_COLOR_F surface = hex(0x211f26);
-inline const D2D1_COLOR_F surface_high = hex(0x2b2930);
-inline const D2D1_COLOR_F surface_highest = hex(0x36343b);
-inline const D2D1_COLOR_F on_surface = hex(0xe6e1e5);
-inline const D2D1_COLOR_F on_surface_variant = hex(0xcac4d0);
-inline const D2D1_COLOR_F outline = hex(0x938f99);
-inline const D2D1_COLOR_F outline_variant = hex(0x444148);
-inline const D2D1_COLOR_F primary = hex(0xa8c7fa);
-inline const D2D1_COLOR_F on_primary = hex(0x062e6f);
-inline const D2D1_COLOR_F primary_container = hex(0x0842a0);
-inline const D2D1_COLOR_F on_primary_container = hex(0xd3e3fd);
-inline const D2D1_COLOR_F secondary_container = hex(0x004d67);
-inline const D2D1_COLOR_F on_secondary_container = hex(0xc2e7ff);
-inline const D2D1_COLOR_F error = hex(0xf2b8b5);
-inline const D2D1_COLOR_F error_container = hex(0x8c1d18);
-inline const D2D1_COLOR_F mint = hex(0x70d6b6);
-inline const D2D1_COLOR_F amber = hex(0xffb951);
-inline const D2D1_COLOR_F scrim = hex(0x000000, 0.5f);
-} // namespace color
-
-/// Stable per-tag accent colour.
-inline D2D1_COLOR_F tag_color(std::string_view tag) noexcept {
-    static constexpr uint32_t palette[] = {0xffb1c8, 0xa8c7fa, 0x70d6b6, 0xffb951, 0xd0bcff, 0xffb4ab, 0x4fd8eb, 0xb4d273};
-    return hex(palette[rapidhash(tag.data(), tag.size()) % std::size(palette)]);
 }
 
 namespace glyph {
@@ -268,13 +232,15 @@ inline D2D1_RECT_F snap(D2D1_RECT_F r) noexcept { return D2D1::RectF(std::round(
 /// Immediate-mode drawing helpers over one device context, plus hit-region recording.
 class Canvas {
 public:
-    Canvas(WindowTarget& target, Fonts& fonts, std::vector<Hit>& hits,
+    Canvas(WindowTarget& target, Fonts& fonts, std::vector<Hit>& hits, const Theme& theme,
            std::optional<D2D1_RECT_F> dirty_clip = std::nullopt, float opacity = 1.0f)
-        : target_{target}, dc_{target.dc()}, fonts_{fonts}, hits_{hits},
+        : target_{target}, dc_{target.dc()}, fonts_{fonts}, hits_{hits}, theme_{theme},
           dirty_clip_{dirty_clip}, opacity_{std::clamp(opacity, 0.0f, 1.0f)} {}
 
     [[nodiscard]] ID2D1DeviceContext6* dc() const noexcept { return dc_; }
     [[nodiscard]] Fonts& fonts() const noexcept { return fonts_; }
+    [[nodiscard]] const Theme& theme() const noexcept { return theme_; }
+    [[nodiscard]] D2D1_COLOR_F tag_color(std::string_view tag) const noexcept { return usyseek::ui::tag_color(theme_, tag); }
     [[nodiscard]] bool has_dirty_clip() const noexcept { return dirty_clip_.has_value(); }
 
     /// Returns true if `r` (expanded by `pad`) overlaps the dirty clip and active stack clip.
@@ -446,13 +412,15 @@ public:
 
     /// Soft drop shadow approximated with stacked translucent rounded rects (cheap, no effects).
     void shadow(D2D1_RECT_F r, float radius, float spread = 10.0f, float alpha = 0.28f) {
+        const float scaled = alpha * theme_.shadow_alpha_scale;
+        if (scaled <= 0.002f) return;
         const D2D1_RECT_F bounds = D2D1::RectF(r.left - (spread * 0.6f), r.top - (spread * 0.2f), r.right + (spread * 0.6f), r.bottom + spread);
         if (!intersects_clip(bounds, 1.0f)) return;
         constexpr int steps = 5;
         for (int i = steps; i >= 1; --i) {
             const float t = static_cast<float>(i) / steps;
             const float g = spread * t;
-            fill_round(D2D1::RectF(r.left - g * 0.6f, r.top - g * 0.2f, r.right + g * 0.6f, r.bottom + g), radius + g, hex(0x000000, alpha / steps * (1.2f - t)));
+            fill_round(D2D1::RectF(r.left - g * 0.6f, r.top - g * 0.2f, r.right + g * 0.6f, r.bottom + g), radius + g, hex(0x000000, scaled / steps * (1.2f - t)));
         }
     }
 
@@ -465,6 +433,7 @@ private:
     ID2D1DeviceContext6* dc_;
     Fonts& fonts_;
     std::vector<Hit>& hits_;
+    const Theme& theme_;
     std::optional<D2D1_RECT_F> dirty_clip_;
     float opacity_ = 1.0f;
     D2D1_COLOR_F last_color_{};
@@ -679,17 +648,18 @@ inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std
     constexpr float pad_y = 6.0f;
     constexpr float gap = 2.0f;
     const D2D1_RECT_F r = tl.box;
+    const Theme& t = cv.theme();
     cv.shadow(r, 8.0f, 10.0f, 0.38f);
-    cv.fill_round(r, 8.0f, color::surface_highest);
-    cv.stroke_round(r, 8.0f, with_alpha(color::outline_variant, 0.85f));
+    cv.fill_round(r, 8.0f, t.surface_highest);
+    cv.stroke_round(r, 8.0f, with_alpha(t.outline_variant, 0.85f));
 
     float ty = r.top + pad_y;
     if (!title.empty()) {
-        cv.text_wrap(title, rect(r.left + pad_x, ty, tl.text_max_w, tl.title_sz.height + 2.0f), tl.title_font, color::on_surface);
+        cv.text_wrap(title, rect(r.left + pad_x, ty, tl.text_max_w, tl.title_sz.height + 2.0f), tl.title_font, t.on_surface);
         ty += tl.title_sz.height + gap;
     }
     if (!subtitle.empty()) {
-        cv.text_wrap(subtitle, rect(r.left + pad_x, ty, tl.text_max_w, tl.sub_sz.height + 2.0f), Font::MonoSmall, color::on_surface_variant);
+        cv.text_wrap(subtitle, rect(r.left + pad_x, ty, tl.text_max_w, tl.sub_sz.height + 2.0f), Font::MonoSmall, t.on_surface_variant);
     }
 }
 
