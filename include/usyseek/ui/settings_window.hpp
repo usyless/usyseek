@@ -1471,10 +1471,12 @@ private:
                                    : (running && d.current[0] ? (std::wstring{L"Processing: "} + d.current)
                                    : (running && d.message[0] ? std::wstring{d.message} : L"On-demand scanner idle — zero background GPU/RAM usage"));
             const bool db_paused = sh_.engine.db_paused_for_indexing();
+            const bool db_loading = sh_.engine.db_loading() && !sh_.test_mode;
             const bool db_disconnected = !sh_.engine.db_ready() && !sh_.test_mode;
             const std::wstring db_info = L"Qdrant Edge collection: " + to_wide(sh_.settings.model_name) +
                                          (db_paused ? L"  •  Unavailable while indexing"
-                                                    : (db_disconnected ? L"  •  Disconnected" : L""));
+                                                    : (db_loading ? L"  •  Loading…"
+                                                                  : (db_disconnected ? L"  •  Disconnected" : L"")));
 
             const wchar_t* label = L"LOCAL MEDIA EMBEDDING STATUS";
             const float label_h = text_height(cv, label, Font::Label, rw, 16.0f);

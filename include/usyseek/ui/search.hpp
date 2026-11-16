@@ -512,9 +512,13 @@ public:
         settings_ = s;
     }
 
+    enum class DbState : uint8_t { Loading, Ready, PausedForIndexing, Failed };
+
     TextEncoder& encoder() noexcept { return encoder_; }
-    [[nodiscard]] bool db_ready() const noexcept { return db_ready_.load(); }
-    [[nodiscard]] bool db_paused_for_indexing() const noexcept { return db_paused_for_indexing_.load(); }
+    [[nodiscard]] DbState db_state() const noexcept { return db_state_.load(std::memory_order_acquire); }
+    [[nodiscard]] bool db_ready() const noexcept { return db_state() == DbState::Ready; }
+    [[nodiscard]] bool db_loading() const noexcept { return db_state() == DbState::Loading; }
+    [[nodiscard]] bool db_paused_for_indexing() const noexcept { return db_state() == DbState::PausedForIndexing; }
 
     [[nodiscard]] std::string collection() const {
         std::lock_guard lk{m_};
@@ -561,25 +565,24 @@ private:
         };
 
         auto open_db = [&] {
+            db_state_.store(DbState::Loading, std::memory_order_release);
+            if (on_db_state) on_db_state(false, {});
             std::string err;
             if (db_.open(edge_data_dir(), &err)) {
                 ensure_collection_healthy(s.model_name);
-                db_paused_for_indexing_.store(false, std::memory_order_release);
-                db_ready_.store(true, std::memory_order_release);
+                db_state_.store(DbState::Ready, std::memory_order_release);
                 arm_db_want_wait();
                 if (on_db_state) on_db_state(true, {});
             } else {
-                db_paused_for_indexing_.store(false, std::memory_order_release);
-                db_ready_.store(false, std::memory_order_release);
+                db_state_.store(DbState::Failed, std::memory_order_release);
                 if (on_db_state) on_db_state(false, err);
             }
         };
         auto pause_db = [&] {
-            const bool already_paused = db_paused_for_indexing_.load(std::memory_order_acquire) && !db_.opened();
+            const bool already_paused = db_paused_for_indexing() && !db_.opened();
             std::string err;
             (void)db_.close(&err);
-            db_ready_.store(false, std::memory_order_release);
-            db_paused_for_indexing_.store(true, std::memory_order_release);
+            db_state_.store(DbState::PausedForIndexing, std::memory_order_release);
             if (!already_paused && on_db_state) on_db_state(false, {});
         };
 
@@ -599,12 +602,13 @@ private:
                 const auto wake = [&] {
                     if (stopping_) return true;
                     const bool want = indexing_active_hint_ || is_indexer_db_wanted();
-                    if (want && !db_paused_for_indexing_.load(std::memory_order_acquire)) return true;
-                    if (!want && db_paused_for_indexing_.load(std::memory_order_acquire)) return true;
-                    if (db_ready_.load(std::memory_order_acquire) && !deferred_jobs_.empty()) return true;
+                    const bool paused = db_paused_for_indexing();
+                    if (want && !paused) return true;
+                    if (!want && paused) return true;
+                    if (db_ready() && !deferred_jobs_.empty()) return true;
                     return pending_search_.has_value() || !jobs_.empty();
                 };
-                if (db_paused_for_indexing_.load(std::memory_order_acquire)) {
+                if (db_paused_for_indexing()) {
                     cv_.wait_for(lk, std::chrono::milliseconds(250), wake);
                 } else {
                     cv_.wait(lk, wake);
@@ -613,8 +617,8 @@ private:
 
                 const bool want = indexing_active_hint_ || is_indexer_db_wanted();
                 if (want) {
-                    if (!db_paused_for_indexing_.load(std::memory_order_acquire) || db_.opened()) need_pause = true;
-                } else if (db_paused_for_indexing_.load(std::memory_order_acquire)) {
+                    if (!db_paused_for_indexing() || db_.opened()) need_pause = true;
+                } else if (db_paused_for_indexing()) {
                     indexing_active_hint_ = false;
                     need_resume = true;
                 }
@@ -623,7 +627,7 @@ private:
                     if (!jobs_.empty()) {
                         job = std::move(jobs_.front());
                         jobs_.pop_front();
-                    } else if (db_ready_.load(std::memory_order_acquire) && !deferred_jobs_.empty()) {
+                    } else if (db_ready() && !deferred_jobs_.empty()) {
                         job = {std::move(deferred_jobs_.front()), true};
                         deferred_jobs_.pop_front();
                     } else if (pending_search_) {
@@ -643,11 +647,13 @@ private:
                 continue;
             }
             if (job.fn) {
-                if (db_ready_) {
+                if (db_ready()) {
                     job.fn(db_);
                 } else if (job.notify_if_dropped && on_job_dropped) {
-                    if (db_paused_for_indexing_) {
+                    if (db_paused_for_indexing()) {
                         on_job_dropped("Database unavailable while indexing", "Database updates are paused while indexing is in progress.");
+                    } else if (db_loading()) {
+                        on_job_dropped("Database is loading", "Database update could not run because the database is still opening.");
                     } else {
                         on_job_dropped("Database unavailable", "Queued database update could not run because the database is closed.");
                     }
@@ -655,7 +661,7 @@ private:
                 continue;
             }
             if (req && on_result) {
-                if (db_ready_) ensure_collection_healthy(s.model_name);
+                if (db_ready()) ensure_collection_healthy(s.model_name);
                 on_result(execute(*req, s));
             }
         }
@@ -666,8 +672,10 @@ private:
         res->seq = r.seq;
         res->append = r.offset > 0;
         const auto t0 = std::chrono::steady_clock::now();
-        if (!db_ready_) {
-            res->error = db_paused_for_indexing_ ? L"Database unavailable while indexing" : L"Database unavailable";
+        if (!db_ready()) {
+            res->error = db_paused_for_indexing()
+                ? L"Database unavailable while indexing"
+                : (db_loading() ? L"Database loading…" : L"Database unavailable");
             return res;
         }
 
@@ -761,8 +769,7 @@ private:
     bool indexing_active_hint_ = false;
     Settings settings_;
     Db db_;
-    std::atomic<bool> db_ready_{false};
-    std::atomic<bool> db_paused_for_indexing_{false};
+    std::atomic<DbState> db_state_{DbState::Loading};
     std::mutex wait_mx_;
     wil::unique_event_nothrow db_want_event_;
     HANDLE wait_handle_ = nullptr;

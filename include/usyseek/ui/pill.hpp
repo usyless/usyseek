@@ -1241,8 +1241,11 @@ private:
     [[nodiscard]] D2D1_COLOR_F status_dot_color() const noexcept {
         if (sh_.indexer_running || sh_.engine.db_paused_for_indexing()) return sh_.theme.amber;
         const auto st = sh_.engine.encoder().state();
-        if (st == TextEncoder::State::Failed || !error_.empty() || (!sh_.engine.db_ready() && !sh_.test_mode)) return sh_.theme.error;
-        if (st == TextEncoder::State::Loading || st == TextEncoder::State::Exporting) return sh_.theme.primary;
+        const auto db = sh_.engine.db_state();
+        if (st == TextEncoder::State::Failed || !error_.empty() || (db == Engine::DbState::Failed && !sh_.test_mode)) return sh_.theme.error;
+        if (st == TextEncoder::State::Loading || st == TextEncoder::State::Exporting || (db == Engine::DbState::Loading && !sh_.test_mode)) {
+            return sh_.theme.primary;
+        }
         return sh_.theme.mint;
     }
 
@@ -1292,6 +1295,9 @@ private:
         } else if (sh_.engine.db_paused_for_indexing() && !sh_.test_mode) {
             sep();
             piece(L"Database unavailable while indexing", cv.theme().amber);
+        } else if (sh_.engine.db_loading() && !sh_.test_mode) {
+            sep();
+            piece(L"Database loading…", cv.theme().primary);
         } else if (!sh_.engine.db_ready() && !sh_.test_mode) {
             sep();
             piece(L"Database unavailable", cv.theme().error);
