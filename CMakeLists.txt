@@ -108,12 +108,13 @@ find_program(CARGO_EXECUTABLE cargo REQUIRED)
 set(RUST_DIR "${PROJECT_SOURCE_DIR}/rust")
 set(RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/rust_target")
 set(RUST_STATIC_LIB "${RUST_TARGET_DIR}/release/usyseek_rust.lib")
+set(RUST_MIGRATE_EXE "${RUST_TARGET_DIR}/release/usyseek-migrate.exe")
 add_custom_command(
-    OUTPUT "${RUST_STATIC_LIB}"
+    OUTPUT "${RUST_STATIC_LIB}" "${RUST_MIGRATE_EXE}"
     COMMAND "${CARGO_EXECUTABLE}" build --release --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
-    DEPENDS "${RUST_DIR}/Cargo.toml" "${RUST_DIR}/Cargo.lock" "${RUST_DIR}/src/lib.rs" "${RUST_DIR}/src/svg.rs"
+    DEPENDS "${RUST_DIR}/Cargo.toml" "${RUST_DIR}/Cargo.lock" "${RUST_DIR}/src/lib.rs" "${RUST_DIR}/src/svg.rs" "${RUST_DIR}/src/bin/usyseek-migrate.rs"
     WORKING_DIRECTORY "${RUST_DIR}"
-    COMMENT "Building usyseek_rust staticlib (qdrant-edge + tokenizers + resvg)..."
+    COMMENT "Building usyseek_rust staticlib and usyseek-migrate (qdrant-edge + tokenizers + resvg)..."
     VERBATIM
 )
 add_custom_target(usyseek_rust_build DEPENDS "${RUST_STATIC_LIB}")
@@ -261,7 +262,9 @@ target_link_libraries(usyseek-indexer PRIVATE
 
 ##### Runtime layout next to the executables
 add_custom_target(usyseek_runtime ALL
+    DEPENDS usyseek_rust_build
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${USYSEEK_BIN_DIR}/python"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${RUST_MIGRATE_EXE}" "${USYSEEK_BIN_DIR}/usyseek-migrate.exe"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/python/usyseek_vision.py" "${USYSEEK_BIN_DIR}/python/usyseek_vision.py"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/python/requirements.txt" "${USYSEEK_BIN_DIR}/python/requirements.txt"
     VERBATIM

@@ -144,7 +144,7 @@ const F_TAGS: &str = "t";
 const F_KIND: &str = "k";
 const F_MTIME: &str = "m";
 
-fn sanitize_collection_name(name: &str) -> Result<String, String> {
+pub fn sanitize_collection_name(name: &str) -> Result<String, String> {
     if name.is_empty() || name == "." || name == ".." {
         return Err("invalid collection name".into());
     }
@@ -162,8 +162,70 @@ fn sanitize_collection_name(name: &str) -> Result<String, String> {
     Ok(clean)
 }
 
-fn shard_exists_on_disk(dir: &Path) -> bool {
+pub fn shard_exists_on_disk(dir: &Path) -> bool {
     dir.join("edge_config.json").is_file() || dir.join("segments").is_dir()
+}
+
+pub fn create_edge_shard(dir: &Path, dim: usize) -> Result<EdgeShard, String> {
+    let cfg = EdgeConfigBuilder::new()
+        .vector(
+            DEFAULT_VECTOR_NAME,
+            EdgeVectorParamsBuilder::new(dim, Distance::Cosine)
+                .memory(Memory::Cold)
+                .datatype(VectorStorageDatatype::Float16)
+                .build(),
+        )
+        .payload_memory(Memory::Cold)
+        .hnsw_config({
+            #[allow(deprecated)]
+            HnswIndexConfig {
+                m: 0,
+                ef_construct: 100,
+                full_scan_threshold: 10000,
+                max_indexing_threads: 0,
+                on_disk: None,
+                memory: Some(Memory::Cold),
+                payload_m: None,
+                inline_storage: None,
+            }
+        })
+        .optimizers(EdgeOptimizersConfig {
+            deleted_threshold: Some(0.2),
+            vacuum_min_vector_number: Some(1000),
+            default_segment_number: Some(0),
+            max_segment_size: None,
+            indexing_threshold: Some(10000),
+            prevent_unoptimized: None,
+        })
+        .build();
+
+    let shard = EdgeShard::new(dir, cfg).map_err(err)?;
+    let create_idx = |field: &str, schema: PayloadFieldSchema| -> Result<(), String> {
+        let field_name = json_path(field)?;
+        shard
+            .update(UpdateOperation::FieldIndexOperation(FieldIndexOperations::CreateIndex(
+                CreateIndex { field_name, field_schema: Some(schema) },
+            )))
+            .map_err(err)
+    };
+    create_idx(F_TAGS, PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword))?;
+    create_idx(F_ANCESTORS, PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword))?;
+    create_idx(F_KIND, PayloadFieldSchema::FieldType(PayloadSchemaType::Integer))?;
+    create_idx(F_MTIME, PayloadFieldSchema::FieldType(PayloadSchemaType::Integer))?;
+    create_idx(
+        F_NAME,
+        PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(
+            TextIndexParamsBuilder::new()
+                .tokenizer(TokenizerType::Prefix)
+                .lowercase(true)
+                .min_token_len(1)
+                .max_token_len(32)
+                .build(),
+        )),
+    )?;
+    shard.flush().map_err(err)?;
+    let _ = F_PATH;
+    Ok(shard)
 }
 
 impl UsyQdrant {
@@ -414,64 +476,7 @@ pub unsafe extern "C" fn usy_qd_ensure_collection(q: *mut UsyQdrant, name: UsySt
         }
 
         shards.clear();
-        let cfg = EdgeConfigBuilder::new()
-            .vector(
-                DEFAULT_VECTOR_NAME,
-                EdgeVectorParamsBuilder::new(dim as usize, Distance::Cosine)
-                    .memory(Memory::Cold)
-                    .datatype(VectorStorageDatatype::Float16)
-                    .build(),
-            )
-            .payload_memory(Memory::Cold)
-            .hnsw_config({
-                #[allow(deprecated)]
-                HnswIndexConfig {
-                    m: 0,
-                    ef_construct: 100,
-                    full_scan_threshold: 10000,
-                    max_indexing_threads: 0,
-                    on_disk: None,
-                    memory: Some(Memory::Cold),
-                    payload_m: None,
-                    inline_storage: None,
-                }
-            })
-            .optimizers(EdgeOptimizersConfig {
-                deleted_threshold: Some(0.2),
-                vacuum_min_vector_number: Some(1000),
-                default_segment_number: Some(0),
-                max_segment_size: None,
-                indexing_threshold: Some(10000),
-                prevent_unoptimized: None,
-            })
-            .build();
-
-        let shard = EdgeShard::new(&dir, cfg).map_err(|e| (1, err(e)))?;
-        let create_idx = |field: &str, schema: PayloadFieldSchema| -> Result<(), (i32, String)> {
-            let field_name = json_path(field).map_err(|e| (1, e))?;
-            shard
-                .update(UpdateOperation::FieldIndexOperation(FieldIndexOperations::CreateIndex(
-                    CreateIndex { field_name, field_schema: Some(schema) },
-                )))
-                .map_err(|e| (1, err(e)))
-        };
-        create_idx(F_TAGS, PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword))?;
-        create_idx(F_ANCESTORS, PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword))?;
-        create_idx(F_KIND, PayloadFieldSchema::FieldType(PayloadSchemaType::Integer))?;
-        create_idx(F_MTIME, PayloadFieldSchema::FieldType(PayloadSchemaType::Integer))?;
-        create_idx(
-            F_NAME,
-            PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(
-                TextIndexParamsBuilder::new()
-                    .tokenizer(TokenizerType::Prefix)
-                    .lowercase(true)
-                    .min_token_len(1)
-                    .max_token_len(32)
-                    .build(),
-            )),
-        )?;
-        shard.flush().map_err(|e| (1, err(e)))?;
-        let _ = F_PATH;
+        let shard = create_edge_shard(&dir, dim as usize).map_err(|e| (1, e))?;
 
         shards.insert(name, Arc::new(shard));
         Ok("created".to_owned())
