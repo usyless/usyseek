@@ -5,7 +5,7 @@ set(CMAKE_FIND_USE_PACKAGE_REGISTRY OFF CACHE BOOL "" FORCE)
 
 project(
     usyseek
-    VERSION 0.3.1
+    VERSION 0.3.2
     LANGUAGES C CXX RC
 )
 
