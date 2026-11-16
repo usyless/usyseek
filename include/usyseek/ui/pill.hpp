@@ -287,6 +287,7 @@ public:
                 draw(cv);
             }
         });
+        glass_.end_frame();
         if (!ok) recover();
         if (!drew_full && !partial_hits.empty()) sync_card_overlay_hits(hits_, partial_hits);
         last_tooltip_dirty_ = curr_tip_dirty;
@@ -1038,7 +1039,7 @@ private:
 
     [[nodiscard]] bool glass_active() const noexcept { return sh_.theme.is_liquid_glass; }
     [[nodiscard]] bool glass_scene_needed() const noexcept {
-        return glass_active() && (menu_open_ || (preview_ < 0 && (drop_open_ || show_help())));
+        return glass_active() && (preview_ >= 0 || menu_open_ || drop_open_ || show_help());
     }
 
     void draw(Canvas& cv) {
@@ -1076,15 +1077,29 @@ private:
         const float rad = height(r) * 0.5f;
         if (is_liquid_glass(cv.theme())) {
             const bool dark = cv.theme().dark_mode;
-            if (active) {
-                draw_glass_box(cv, r, rad,
-                               with_alpha(cv.theme().primary, dark ? 0.24f : 0.20f),
-                               with_alpha(cv.theme().primary, dark ? 0.62f : 0.55f));
-            } else if (ha > 0.002f) {
-                draw_glass_box(cv, r, rad,
-                               with_alpha(hex(0xffffff), (dark ? 0.14f : 0.40f) * ha),
-                               with_alpha(hex(0xffffff), (dark ? 0.28f : 0.68f) * ha),
-                               1.0f, (dark ? 0.08f : 0.30f) * ha);
+            if (active || ha > 0.002f) {
+                const float op = active ? 1.0f : ha;
+                const D2D1_COLOR_F tint = active
+                    ? with_alpha(cv.theme().primary, dark ? 0.28f : 0.24f)
+                    : with_alpha(cv.theme().surface_high, dark ? 0.30f : 0.42f);
+                const bool use_scene = (preview_ >= 0);
+                const GlassStyle gs = make_control_glass_style(
+                    cv.theme(), rad, tint, op, use_scene ? 1.2f : 0.0f, 8.0f, 1.10f);
+                const bool drew = use_scene
+                    ? glass_.draw_scene_glass(cv, target_, sh_.gfx, r, gs)
+                    : glass_.draw_cached_glass(cv, target_, sh_.gfx, r, gs);
+                if (!drew) {
+                    const D2D1_COLOR_F border = active
+                        ? with_alpha(cv.theme().primary, dark ? 0.62f : 0.55f)
+                        : with_alpha(hex(0xffffff), (dark ? 0.28f : 0.68f) * op);
+                    draw_glass_box(cv, r, rad, tint, border, 1.0f, (dark ? 0.08f : 0.30f) * op);
+                } else {
+                    cv.stroke_round(inset(r, -0.5f, -0.5f), rad + 0.5f,
+                                    with_alpha(hex(0x000000), (dark ? 0.28f : 0.10f) * op), 1.0f);
+                    if (active) {
+                        cv.stroke_round(r, rad, with_alpha(cv.theme().primary, dark ? 0.58f : 0.52f), 1.0f);
+                    }
+                }
             }
         } else {
             if (active) cv.fill_round(r, rad, with_alpha(cv.theme().primary, 0.16f));
@@ -1120,8 +1135,19 @@ private:
             x -= bw + 4;
             const D2D1_RECT_F nr = rect(x, cy - 15, bw, 30);
             const float ha = hover_.alpha(IdNotifyBtn);
-            cv.fill_round(nr, 15, lerp_color(with_alpha(ncol, 0.16f), with_alpha(ncol, 0.28f), ha));
-            cv.stroke_round(nr, 15, with_alpha(ncol, lerp(0.45f, 0.75f, ha)));
+            if (is_liquid_glass(cv.theme())) {
+                const GlassStyle gs = make_control_glass_style(
+                    cv.theme(), 15.0f, with_alpha(ncol, lerp(0.20f, 0.34f, ha)), 1.0f, 0.0f, 8.0f, 1.08f);
+                if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, nr, gs)) {
+                    draw_glass_box(cv, nr, 15.0f, with_alpha(ncol, lerp(0.18f, 0.30f, ha)),
+                                   with_alpha(ncol, lerp(0.45f, 0.75f, ha)));
+                } else {
+                    cv.stroke_round(nr, 15.0f, with_alpha(ncol, lerp(0.40f, 0.70f, ha)), 1.0f);
+                }
+            } else {
+                cv.fill_round(nr, 15, lerp_color(with_alpha(ncol, 0.16f), with_alpha(ncol, 0.28f), ha));
+                cv.stroke_round(nr, 15, with_alpha(ncol, lerp(0.45f, 0.75f, ha)));
+            }
             cv.icon(glyph::warning, rect(nr.left + 8, nr.top, 16, 30), ncol, Font::IconSmall);
             cv.text(cnt, rect(nr.left + 25, nr.top, bw - 31, 30), Font::Caption, ncol);
             cv.hit(nr, IdNotifyBtn);
@@ -1147,9 +1173,15 @@ private:
         const bool glass_ui = is_liquid_glass(cv.theme());
         const bool dark = cv.theme().dark_mode;
         if (glass_ui) {
-            draw_glass_box(cv, seg, 17,
-                           with_alpha(cv.theme().surface_high, dark ? 0.26f : 0.36f),
-                           with_alpha(hex(0xffffff), dark ? 0.20f : 0.62f));
+            const GlassStyle seg_gs = make_control_glass_style(
+                cv.theme(), 17.0f, with_alpha(cv.theme().surface_high, dark ? 0.24f : 0.34f), 1.0f, 0.0f, 10.0f, 1.05f);
+            if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, seg, seg_gs)) {
+                draw_glass_box(cv, seg, 17,
+                               with_alpha(cv.theme().surface_high, dark ? 0.26f : 0.36f),
+                               with_alpha(hex(0xffffff), dark ? 0.20f : 0.62f));
+            } else {
+                cv.stroke_round(inset(seg, -0.5f, -0.5f), 17.5f, with_alpha(hex(0x000000), dark ? 0.24f : 0.08f), 1.0f);
+            }
         } else {
             cv.fill_round(seg, 17, with_alpha(cv.theme().surface_highest, 0.85f));
         }
@@ -1164,18 +1196,30 @@ private:
             const float act = std::max(0.0f, 1.0f - std::abs(ct - static_cast<float>(i)));
             const float ha = hover_.alpha(IdChip, i);
             if (act < 0.5f && ha > 0.002f) {
-                cv.fill_round(chip_rects[i], 14,
-                              glass_ui ? with_alpha(hex(0xffffff), (dark ? 0.10f : 0.32f) * ha)
-                                       : with_alpha(cv.theme().on_surface, 0.07f * ha));
+                if (glass_ui) {
+                    const GlassStyle h_gs = make_control_glass_style(
+                        cv.theme(), 14.0f, with_alpha(hex(0xffffff), dark ? 0.12f : 0.34f), ha, 0.0f, 7.0f, 1.06f);
+                    if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, chip_rects[i], h_gs)) {
+                        cv.fill_round(chip_rects[i], 14, with_alpha(hex(0xffffff), (dark ? 0.10f : 0.32f) * ha));
+                    }
+                } else {
+                    cv.fill_round(chip_rects[i], 14, with_alpha(cv.theme().on_surface, 0.07f * ha));
+                }
             }
         }
         const int lo = std::clamp(static_cast<int>(std::floor(ct)), 0, 1);
         const float frac = ct - static_cast<float>(lo);
         const D2D1_RECT_F active_chip = lerp_rect(chip_rects[lo], chip_rects[lo + 1], frac);
         if (glass_ui) {
-            draw_glass_box(cv, active_chip, 14,
-                           with_alpha(cv.theme().primary, dark ? 0.28f : 0.22f),
-                           with_alpha(cv.theme().primary, dark ? 0.65f : 0.58f));
+            const GlassStyle act_gs = make_control_glass_style(
+                cv.theme(), 14.0f, with_alpha(cv.theme().primary, dark ? 0.34f : 0.28f), 1.0f, 0.0f, 9.0f, 1.12f);
+            if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, active_chip, act_gs)) {
+                draw_glass_box(cv, active_chip, 14,
+                               with_alpha(cv.theme().primary, dark ? 0.28f : 0.22f),
+                               with_alpha(cv.theme().primary, dark ? 0.65f : 0.58f));
+            } else {
+                cv.stroke_round(active_chip, 14, with_alpha(cv.theme().primary, dark ? 0.55f : 0.50f), 1.0f);
+            }
         } else {
             cv.fill_round(active_chip, 14, cv.theme().primary_container);
         }
@@ -1419,8 +1463,17 @@ private:
             auto overlay_btn = [&](float x, wchar_t g, int id) {
                 const D2D1_RECT_F sb = rect(x, tr.top + 8, 28, 28);
                 const float ba = hover_.alpha(id, i);
-                cv.fill_circle({sb.left + 14, sb.top + 14}, 14, lerp_color(hex(0x000000, 0.55f), with_alpha(cv.theme().surface_high, 0.95f), ba));
-                cv.icon(g, sb, lerp_color(hex(0xffffff), cv.theme().primary, ba), Font::IconSmall);
+                if (glass_ui) {
+                    const D2D1_COLOR_F obg = lerp_color(hex(0x000000, 0.36f),
+                                                        with_alpha(cv.theme().surface_high, dark ? 0.56f : 0.74f), ba);
+                    const D2D1_COLOR_F obd = lerp_color(with_alpha(hex(0xffffff), 0.38f),
+                                                        with_alpha(cv.theme().primary, 0.72f), ba);
+                    draw_glass_box(cv, sb, 14.0f, obg, obd, 1.0f, dark ? 0.24f : 0.44f);
+                    cv.icon(g, sb, lerp_color(hex(0xffffff), cv.theme().primary, ba), Font::IconSmall);
+                } else {
+                    cv.fill_circle({sb.left + 14, sb.top + 14}, 14, lerp_color(hex(0x000000, 0.55f), with_alpha(cv.theme().surface_high, 0.95f), ba));
+                    cv.icon(g, sb, lerp_color(hex(0xffffff), cv.theme().primary, ba), Font::IconSmall);
+                }
                 cv.hit(sb, id, i);
             };
             overlay_btn(tr.right - 36, glyph::similar, IdSimilar);
@@ -2271,14 +2324,44 @@ private:
     void draw_preview_slider(Canvas& cv, D2D1_RECT_F bar, float ratio, int id,
                              bool active_drag, D2D1_COLOR_F fill_col, float pad_l, float pad_r) {
         const float cy = (bar.top + bar.bottom) * 0.5f;
-        cv.fill_round(D2D1::RectF(bar.left, cy - 2.0f, bar.right, cy + 2.0f), 2.0f, cv.theme().surface_highest);
         const float thumb_x = bar.left + ((bar.right - bar.left) * std::clamp(ratio, 0.0f, 1.0f));
-        if (thumb_x > bar.left + 0.5f) {
-            cv.fill_round(D2D1::RectF(bar.left, cy - 2.0f, thumb_x, cy + 2.0f), 2.0f, fill_col);
-        }
         const float ha = hover_.alpha(id);
-        const float rad = (active_drag || ha > 0.05f) ? 5.5f : 4.2f;
-        cv.fill_circle({.x = thumb_x, .y = cy}, rad, lerp_color(cv.theme().on_surface, cv.theme().primary, active_drag ? 1.0f : ha * 0.5f));
+        if (is_liquid_glass(cv.theme())) {
+            const bool dark = cv.theme().dark_mode;
+            const D2D1_RECT_F track = D2D1::RectF(bar.left, cy - 2.5f, bar.right, cy + 2.5f);
+            draw_glass_box(cv, track, 2.5f,
+                           with_alpha(hex(0xffffff), dark ? 0.16f : 0.28f),
+                           with_alpha(hex(0xffffff), dark ? 0.22f : 0.48f), 1.0f, dark ? 0.12f : 0.28f);
+            if (thumb_x > bar.left + 0.5f) {
+                const D2D1_RECT_F filled = D2D1::RectF(bar.left, cy - 2.5f, thumb_x, cy + 2.5f);
+                cv.fill_round(filled, 2.5f, with_alpha(fill_col, 0.90f));
+                if (width(filled) > 4.0f) {
+                    cv.hline(filled.left + 2.0f, filled.right - 2.0f, filled.top + 0.5f, with_alpha(hex(0xffffff), 0.40f));
+                }
+            }
+            const bool expanded_knob = active_drag || ha > 0.05f;
+            const float kw = expanded_knob ? 20.0f : 15.0f;
+            const float kh = expanded_knob ? 13.0f : 11.0f;
+            const float krad = kh * 0.5f;
+            const D2D1_RECT_F knob = rect(thumb_x - kw * 0.5f, cy - kh * 0.5f, kw, kh);
+            cv.shadow(knob, krad, 5.0f, 0.34f);
+            const D2D1_COLOR_F knob_tint = active_drag
+                ? with_alpha(cv.theme().primary, dark ? 0.36f : 0.30f)
+                : with_alpha(hex(0xffffff), dark ? lerp(0.38f, 0.52f, ha) : lerp(0.68f, 0.82f, ha));
+            const GlassStyle gs = make_control_glass_style(cv.theme(), krad, knob_tint, 1.0f, 0.4f, 5.5f, 1.16f);
+            if (!glass_.draw_scene_glass(cv, target_, sh_.gfx, knob, gs)) {
+                draw_glass_box(cv, knob, krad, knob_tint, with_alpha(hex(0xffffff), 0.78f));
+            } else {
+                cv.stroke_round(inset(knob, -0.4f, -0.4f), krad + 0.4f, with_alpha(hex(0x000000), dark ? 0.30f : 0.16f), 0.8f);
+            }
+        } else {
+            cv.fill_round(D2D1::RectF(bar.left, cy - 2.0f, bar.right, cy + 2.0f), 2.0f, cv.theme().surface_highest);
+            if (thumb_x > bar.left + 0.5f) {
+                cv.fill_round(D2D1::RectF(bar.left, cy - 2.0f, thumb_x, cy + 2.0f), 2.0f, fill_col);
+            }
+            const float rad = (active_drag || ha > 0.05f) ? 5.5f : 4.2f;
+            cv.fill_circle({.x = thumb_x, .y = cy}, rad, lerp_color(cv.theme().on_surface, cv.theme().primary, active_drag ? 1.0f : ha * 0.5f));
+        }
         cv.hit(D2D1::RectF(bar.left - pad_l, bar.top, bar.right + pad_r, bar.bottom), id);
     }
 
@@ -2302,9 +2385,15 @@ private:
 
         if (is_liquid_glass(cv.theme())) {
             const bool dark = cv.theme().dark_mode;
-            draw_glass_box(cv, ctrl, 17.0f,
-                           with_alpha(cv.theme().surface_high, dark ? 0.36f : 0.50f),
-                           with_alpha(hex(0xffffff), dark ? 0.24f : 0.64f));
+            const GlassStyle bar_gs = make_control_glass_style(
+                cv.theme(), 17.0f, with_alpha(cv.theme().surface_high, dark ? 0.30f : 0.42f), 1.0f, 1.6f, 12.0f, 1.06f);
+            if (!glass_.draw_scene_glass(cv, target_, sh_.gfx, ctrl, bar_gs)) {
+                draw_glass_box(cv, ctrl, 17.0f,
+                               with_alpha(cv.theme().surface_high, dark ? 0.36f : 0.50f),
+                               with_alpha(hex(0xffffff), dark ? 0.24f : 0.64f));
+            } else {
+                cv.stroke_round(inset(ctrl, -0.5f, -0.5f), 17.5f, with_alpha(hex(0x000000), dark ? 0.28f : 0.10f), 1.0f);
+            }
         } else {
             cv.fill_round(ctrl, 17.0f, with_alpha(cv.theme().surface_low, 0.92f));
             cv.stroke_round(ctrl, 17.0f, cv.theme().outline_variant, 1.0f);
@@ -2480,11 +2569,21 @@ private:
             const float ha = hover_.alpha(id);
             if (is_liquid_glass(cv.theme())) {
                 const bool dark = cv.theme().dark_mode;
-                cv.fill_circle({.x = cx, .y = cy}, 22,
-                               with_alpha(cv.theme().surface_high, dark ? lerp(0.32f, 0.52f, ha) : lerp(0.46f, 0.68f, ha)));
-                cv.stroke_circle({.x = cx, .y = cy}, 22,
-                                 with_alpha(hex(0xffffff), dark ? lerp(0.22f, 0.42f, ha) : lerp(0.55f, 0.85f, ha)), 1.0f);
-                cv.icon(next ? glyph::chevron_right : glyph::chevron_left, rect(cx - 22, cy - 22, 44, 44),
+                const D2D1_RECT_F ar = rect(cx - 22.0f, cy - 22.0f, 44.0f, 44.0f);
+                cv.shadow(ar, 22.0f, 8.0f, 0.28f);
+                const GlassStyle ags = make_control_glass_style(
+                    cv.theme(), 22.0f,
+                    with_alpha(cv.theme().surface_high, dark ? lerp(0.28f, 0.46f, ha) : lerp(0.42f, 0.64f, ha)),
+                    1.0f, 1.4f, 11.0f, 1.12f);
+                if (!glass_.draw_scene_glass(cv, target_, sh_.gfx, ar, ags)) {
+                    cv.fill_circle({.x = cx, .y = cy}, 22,
+                                   with_alpha(cv.theme().surface_high, dark ? lerp(0.32f, 0.52f, ha) : lerp(0.46f, 0.68f, ha)));
+                    cv.stroke_circle({.x = cx, .y = cy}, 22,
+                                     with_alpha(hex(0xffffff), dark ? lerp(0.22f, 0.42f, ha) : lerp(0.55f, 0.85f, ha)), 1.0f);
+                } else {
+                    cv.stroke_circle({.x = cx, .y = cy}, 22.5f, with_alpha(hex(0x000000), dark ? 0.26f : 0.12f), 1.0f);
+                }
+                cv.icon(next ? glyph::chevron_right : glyph::chevron_left, ar,
                         lerp_color(with_alpha(cv.theme().on_surface, 0.85f), cv.theme().on_surface, ha));
             } else {
                 cv.fill_circle({.x = cx, .y = cy}, 22, lerp_color(hex(0x000000, 0.45f), with_alpha(cv.theme().surface_highest, 0.96f), ha));
@@ -2514,9 +2613,13 @@ private:
         x -= pw + 6;
         const D2D1_RECT_F pr = rect(x, cy - 13, pw, 26);
         if (is_liquid_glass(cv.theme())) {
-            draw_glass_box(cv, pr, 13,
-                           with_alpha(cv.theme().surface_high, dark ? 0.30f : 0.44f),
-                           with_alpha(hex(0xffffff), dark ? 0.20f : 0.58f));
+            const GlassStyle pgs = make_control_glass_style(
+                cv.theme(), 13.0f, with_alpha(cv.theme().surface_high, dark ? 0.28f : 0.40f), 1.0f, 1.2f, 8.0f, 1.08f);
+            if (!glass_.draw_scene_glass(cv, target_, sh_.gfx, pr, pgs)) {
+                draw_glass_box(cv, pr, 13,
+                               with_alpha(cv.theme().surface_high, dark ? 0.30f : 0.44f),
+                               with_alpha(hex(0xffffff), dark ? 0.20f : 0.58f));
+            }
         } else {
             cv.fill_round(pr, 13, with_alpha(cv.theme().surface_highest, 0.85f));
         }

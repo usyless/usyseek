@@ -40,8 +40,9 @@ struct alignas(16) LiquidGlassShaderParams {
     float glare_params[4]{};   // glareRange, glareHardness, glareFactor, glareAngleDeg
     float shape_params[4]{};   // glareConvergence, glareOppositeFactor, cornerRadiusDip, roundnessN
     float misc_params[4]{};    // dpr, forceOpaque, edgeAaPx, shapeMarginDip
+    float extra_params[4]{};   // opacity, reserved, reserved, reserved
 };
-static_assert(sizeof(LiquidGlassShaderParams) == 128);
+static_assert(sizeof(LiquidGlassShaderParams) == 144);
 
 /// High-level material configuration for one Liquid Glass panel.
 struct GlassStyle {
@@ -65,6 +66,7 @@ struct GlassStyle {
     float glare_angle_deg = -45.0f;
     D2D1_COLOR_F tint{};
     bool force_opaque = false;
+    float opacity = 1.0f;
 };
 
 namespace detail {
@@ -88,12 +90,17 @@ cbuffer LiquidGlassParams : register(b0)
     float4 glareParams;   // x=glareRange, y=glareHardness, z=glareFactor, w=glareAngleDeg
     float4 shapeParams;   // x=glareConvergence, y=glareOppositeFactor, z=cornerRadiusDip, w=roundnessN
     float4 miscParams;    // x=dpr, y=forceOpaque, z=edgeAaPx, w=shapeMarginDip
+    float4 extraParams;   // x=opacity, yzw=reserved
 };
 
 float superellipseCornerSDF(float2 p, float r, float n)
 {
     p = abs(p);
-    return pow(pow(p.x, n) + pow(p.y, n), 1.0 / n) - r;
+    if (n <= 2.01)
+    {
+        return length(p) - r;
+    }
+    return pow(pow(max(p.x, 1e-6), n) + pow(max(p.y, 1e-6), n), 1.0 / n) - r;
 }
 
 float RoundedRectSDF(float2 p, float2 center, float2 half0, float cr, float n)
@@ -122,7 +129,7 @@ float2 RoundedRectUnitNormal(float2 fragCoord, float2 center, float2 halfPx, flo
     float k = min(max(cr * 1.25, 18.0), min(inner.x, inner.y));
     float2 innerSm = max(inner - k, 0.0);
     float2 q = max(ap - innerSm, 0.0);
-    float2 g = pow(q, float2(n - 1.0, n - 1.0));
+    float2 g = (n <= 2.01) ? q : float2(q.x > 1e-6 ? pow(q.x, n - 1.0) : 0.0, q.y > 1e-6 ? pow(q.y, n - 1.0) : 0.0);
     float gLen = length(g);
     float2 local;
     if (gLen > 1e-6)
@@ -316,7 +323,7 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
         }
     }
 
-    float alpha = 1.0 - saturate(distPx / aaWidthPx);
+    float alpha = (1.0 - saturate(distPx / aaWidthPx)) * saturate(extraParams.x);
     return float4(outColor.rgb * alpha, alpha);
 }
 )hlsl";
@@ -723,8 +730,8 @@ public:
         scene_bmp_.reset();
         blur_effect_.reset();
         glass_effect_.reset();
-        scene_blur_effect_.reset();
-        scene_glass_effect_.reset();
+        lens_pool_.clear();
+        lens_cursor_ = 0;
         probe_tex_.reset();
         last_probe_px_.clear();
         last_probe_valid_ = false;
@@ -859,9 +866,10 @@ public:
         }
 
         if (!ensure_cached_glass_bmp(gfx, target, pw, ph)) {
-            return draw_bitmap_glass(
-                cv, target, gfx, src_bmp, full_dest,
-                panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), s, false);
+            if (!ensure_effects(target, gfx)) return false;
+            return draw_bitmap_glass_with(
+                cv, target, src_bmp, full_dest,
+                panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), s, blur_effect_.get(), glass_effect_.get());
         }
 
         wil::com_ptr<ID2D1Image> prev_target;
@@ -871,9 +879,9 @@ public:
         cv.dc()->SetTransform(D2D1::Matrix3x2F::Identity());
         cv.dc()->SetTarget(cached_glass_bmp_.get());
         cv.dc()->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
-        const bool ok = draw_bitmap_glass(
-            cv, target, gfx, src_bmp, full_dest,
-            panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), s, false);
+        const bool ok = ensure_effects(target, gfx) && draw_bitmap_glass_with(
+            cv, target, src_bmp, full_dest,
+            panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), s, blur_effect_.get(), glass_effect_.get());
         cv.dc()->SetTarget(prev_target.get());
         cv.dc()->SetTransform(prev_xf);
         if (!ok) {
@@ -926,14 +934,28 @@ public:
         dc->DrawBitmap(scene_bmp_.get(), nullptr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
     }
 
+    void end_frame() noexcept { lens_cursor_ = 0; }
+
     /// Draws a floating Liquid Glass panel refracting the captured in-app scene (`scene_bmp_`).
     bool draw_scene_glass(Canvas& cv, WindowTarget& target, Gfx& gfx,
                           D2D1_RECT_F panel_rect, const GlassStyle& style) {
-        if (!scene_bmp_) return false;
+        if (!scene_bmp_ || style.opacity <= 0.002f) return false;
+        if (!cv.intersects_clip(panel_rect, 2.0f)) return true;
         const D2D1_SIZE_F sz = target.size();
-        return draw_bitmap_glass(
+        return draw_bitmap_glass_pooled(
             cv, target, gfx, scene_bmp_.get(), D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
-            panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), style, true);
+            panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), style);
+    }
+
+    /// Draws a Liquid Glass control lens refracting the cached desktop glass backdrop (`cached_glass_bmp_`).
+    bool draw_cached_glass(Canvas& cv, WindowTarget& target, Gfx& gfx,
+                           D2D1_RECT_F panel_rect, const GlassStyle& style) {
+        if (!cached_glass_valid_ || !cached_glass_bmp_ || style.opacity <= 0.002f) return false;
+        if (!cv.intersects_clip(panel_rect, 2.0f)) return true;
+        const D2D1_SIZE_F sz = target.size();
+        return draw_bitmap_glass_pooled(
+            cv, target, gfx, cached_glass_bmp_.get(), D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
+            panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), style);
     }
 
 private:
@@ -1246,12 +1268,17 @@ private:
         return SUCCEEDED(dst_bmp->CopyFromMemory(&dst_rc, bits, pw * 4));
     }
 
+    struct LensFx {
+        wil::com_ptr<ID2D1Effect> blur;
+        wil::com_ptr<ID2D1Effect> glass;
+    };
+
     bool ensure_effects(WindowTarget& target, Gfx& gfx) {
-        if (blur_effect_ && glass_effect_ && scene_blur_effect_ && scene_glass_effect_ && epoch_ == gfx.epoch()) return true;
+        if (blur_effect_ && glass_effect_ && epoch_ == gfx.epoch()) return true;
         blur_effect_.reset();
         glass_effect_.reset();
-        scene_blur_effect_.reset();
-        scene_glass_effect_.reset();
+        lens_pool_.clear();
+        lens_cursor_ = 0;
         if (!target.ready() || !gfx.ready()) return false;
         if (!LiquidGlassEffectImpl::register_once(gfx.d2d_factory())) return false;
         if (FAILED(target.dc()->CreateEffect(CLSID_D2D1GaussianBlur, &blur_effect_))) return false;
@@ -1259,26 +1286,35 @@ private:
             blur_effect_.reset();
             return false;
         }
-        if (FAILED(target.dc()->CreateEffect(CLSID_D2D1GaussianBlur, &scene_blur_effect_)) ||
-            FAILED(target.dc()->CreateEffect(CLSID_UsyseekLiquidGlass, &scene_glass_effect_))) {
-            blur_effect_.reset();
-            glass_effect_.reset();
-            scene_blur_effect_.reset();
-            scene_glass_effect_.reset();
-            return false;
-        }
         epoch_ = gfx.epoch();
         return true;
     }
 
-    bool draw_bitmap_glass(Canvas& cv, WindowTarget& target, Gfx& gfx, ID2D1Bitmap1* src_bmp,
-                           D2D1_RECT_F src_bounds, D2D1_RECT_F panel_rect, D2D1_POINT_2F target_offset,
-                           const GlassStyle& style, bool use_scene_effect) {
+    bool draw_bitmap_glass_pooled(Canvas& cv, WindowTarget& target, Gfx& gfx, ID2D1Bitmap1* src_bmp,
+                                  D2D1_RECT_F src_bounds, D2D1_RECT_F panel_rect, D2D1_POINT_2F target_offset,
+                                  const GlassStyle& style) {
         if (!src_bmp || width(panel_rect) <= 2.0f || height(panel_rect) <= 2.0f) return false;
         if (!ensure_effects(target, gfx)) return false;
 
-        ID2D1Effect* blur_fx = use_scene_effect ? scene_blur_effect_.get() : blur_effect_.get();
-        ID2D1Effect* glass_fx = use_scene_effect ? scene_glass_effect_.get() : glass_effect_.get();
+        if (lens_cursor_ >= lens_pool_.size()) {
+            LensFx fx;
+            if (FAILED(target.dc()->CreateEffect(CLSID_UsyseekLiquidGlass, &fx.glass))) return false;
+            lens_pool_.push_back(std::move(fx));
+        }
+        LensFx& slot = lens_pool_[lens_cursor_];
+        ID2D1Effect* blur_fx = nullptr;
+        if (style.blur_std_dev > 0.05f) {
+            if (!slot.blur && FAILED(target.dc()->CreateEffect(CLSID_D2D1GaussianBlur, &slot.blur))) return false;
+            blur_fx = slot.blur.get();
+        }
+        ++lens_cursor_;
+        return draw_bitmap_glass_with(cv, target, src_bmp, src_bounds, panel_rect, target_offset, style, blur_fx, slot.glass.get());
+    }
+
+    static bool draw_bitmap_glass_with(Canvas& cv, WindowTarget& target, ID2D1Bitmap1* src_bmp,
+                                       D2D1_RECT_F src_bounds, D2D1_RECT_F panel_rect, D2D1_POINT_2F target_offset,
+                                       const GlassStyle& style, ID2D1Effect* blur_fx, ID2D1Effect* glass_fx) {
+        if (!src_bmp || !glass_fx || width(panel_rect) <= 2.0f || height(panel_rect) <= 2.0f) return false;
 
         const LiquidGlassShaderParams params{
             .panel_rect = {panel_rect.left, panel_rect.top, width(panel_rect), height(panel_rect)},
@@ -1289,21 +1325,29 @@ private:
             .glare_params = {style.glare_range, style.glare_hardness, style.glare_factor, style.glare_angle_deg},
             .shape_params = {style.glare_convergence, style.glare_opposite_factor, style.corner_radius, style.roundness},
             .misc_params = {target.scale(), style.force_opaque ? 1.0f : 0.0f, 1.5f, style.margin_dip},
+            .extra_params = {std::clamp(style.opacity, 0.0f, 1.0f), 0.0f, 0.0f, 0.0f},
         };
 
-        blur_fx->SetInput(0, nullptr);
-        blur_fx->SetInput(0, src_bmp);
-        blur_fx->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, std::max(0.0f, style.blur_std_dev));
-        blur_fx->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
-        blur_fx->SetValue(D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED);
-
-        glass_fx->SetInputEffect(0, blur_fx);
+        if (blur_fx && style.blur_std_dev > 0.05f) {
+            blur_fx->SetInput(0, nullptr);
+            blur_fx->SetInput(0, src_bmp);
+            blur_fx->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, std::max(0.0f, style.blur_std_dev));
+            blur_fx->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
+            blur_fx->SetValue(D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED);
+            glass_fx->SetInputEffect(0, blur_fx);
+        } else {
+            glass_fx->SetInput(0, nullptr);
+            glass_fx->SetInput(0, src_bmp);
+        }
         if (FAILED(glass_fx->SetValue(0, reinterpret_cast<const BYTE*>(&params), sizeof(params)))) return false;
 
+        const float pad = (style.margin_dip < 1.5f && !style.force_opaque) ? 2.5f : 0.0f;
+        const D2D1_RECT_F draw_rect = (pad > 0.0f) ? inset(panel_rect, -pad, -pad) : panel_rect;
+        const D2D1_POINT_2F draw_offset{.x = target_offset.x - pad, .y = target_offset.y - pad};
         cv.dc()->DrawImage(
             glass_fx,
-            target_offset,
-            panel_rect,
+            draw_offset,
+            draw_rect,
             D2D1_INTERPOLATION_MODE_LINEAR,
             D2D1_COMPOSITE_MODE_SOURCE_OVER);
         return true;
@@ -1323,8 +1367,8 @@ private:
     wil::com_ptr<ID2D1Bitmap1> scene_bmp_;
     wil::com_ptr<ID2D1Effect> blur_effect_;
     wil::com_ptr<ID2D1Effect> glass_effect_;
-    wil::com_ptr<ID2D1Effect> scene_blur_effect_;
-    wil::com_ptr<ID2D1Effect> scene_glass_effect_;
+    std::vector<LensFx> lens_pool_;
+    size_t lens_cursor_ = 0;
     wil::com_ptr<ID3D11Texture2D> probe_tex_;
     std::vector<uint8_t> last_probe_px_;
     bool last_probe_valid_ = false;
@@ -1399,6 +1443,33 @@ private:
     s.glare_opposite_factor = 74.0f;
     s.glare_angle_deg = -45.0f;
     s.tint = with_alpha(t.surface_high, t.dark_mode ? 0.28f : 0.36f);
+    return s;
+}
+
+[[nodiscard]] inline GlassStyle make_control_glass_style(const Theme& t, float corner_radius, D2D1_COLOR_F tint,
+                                                        float opacity = 1.0f, float blur_std = 0.0f,
+                                                        float thickness = 8.0f, float mag = 1.06f) noexcept {
+    GlassStyle s;
+    s.blur_std_dev = blur_std;
+    s.corner_radius = corner_radius;
+    s.roundness = 2.0f;
+    s.margin_dip = 0.0f;
+    s.ref_thickness = thickness;
+    s.ref_factor = 1.48f;
+    s.ref_dispersion = 3.0f;
+    s.dispersion_range = 0.65f;
+    s.fresnel_range = 13.0f;
+    s.fresnel_hardness = 0.0f;
+    s.fresnel_factor = t.dark_mode ? 24.0f : 32.0f;
+    s.magnification = mag;
+    s.glare_range = 12.0f;
+    s.glare_hardness = 0.0f;
+    s.glare_factor = t.dark_mode ? 42.0f : 56.0f;
+    s.glare_convergence = 75.0f;
+    s.glare_opposite_factor = 48.0f;
+    s.glare_angle_deg = -45.0f;
+    s.tint = tint;
+    s.opacity = opacity;
     return s;
 }
 

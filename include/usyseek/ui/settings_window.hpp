@@ -272,6 +272,7 @@ public:
                 draw(cv);
             }
         });
+        glass_.end_frame();
         if (!ok) recover();
         last_tooltip_dirty_ = curr_tip_dirty;
         rendering_ = false;
@@ -475,26 +476,40 @@ private:
             D2D1_COLOR_F bg{};
             D2D1_COLOR_F border{};
             float sheen = dark ? 0.08f : 0.28f;
+            float op = 1.0f;
             if (style == 1) {
                 bg = with_alpha(lerp_color(cv.theme().primary, cv.theme().primary_hover, ha),
-                                dark ? lerp(0.32f, 0.46f, ha) : lerp(0.76f, 0.88f, ha));
+                                dark ? lerp(0.34f, 0.48f, ha) : lerp(0.76f, 0.88f, ha));
                 fg = dark ? cv.theme().on_primary_container : cv.theme().on_primary;
-                border = with_alpha(cv.theme().primary_hover, dark ? 0.72f : 0.90f);
+                border = with_alpha(cv.theme().primary_hover, dark ? 0.65f : 0.82f);
                 sheen = dark ? 0.14f : 0.24f;
             } else if (style == 2) {
-                bg = lerp_color(with_alpha(cv.theme().error, 0.16f), with_alpha(cv.theme().error, 0.28f), ha);
+                bg = lerp_color(with_alpha(cv.theme().error, 0.18f), with_alpha(cv.theme().error, 0.30f), ha);
                 fg = cv.theme().error;
-                border = with_alpha(cv.theme().error, 0.55f);
+                border = with_alpha(cv.theme().error, 0.50f);
             } else if (style == 3) {
-                bg = with_alpha(hex(0xffffff), (dark ? 0.10f : 0.34f) * ha);
+                op = ha;
+                bg = with_alpha(cv.theme().surface_high, dark ? 0.26f : 0.38f);
                 fg = lerp_color(cv.theme().on_surface_variant, cv.theme().on_surface, ha);
                 border = with_alpha(hex(0xffffff), (dark ? 0.20f : 0.55f) * ha);
                 sheen = (dark ? 0.06f : 0.20f) * ha;
             } else {
-                bg = with_alpha(cv.theme().surface_high, dark ? lerp(0.28f, 0.44f, ha) : lerp(0.42f, 0.62f, ha));
-                border = with_alpha(hex(0xffffff), dark ? lerp(0.20f, 0.36f, ha) : lerp(0.55f, 0.82f, ha));
+                bg = with_alpha(cv.theme().surface_high, dark ? lerp(0.26f, 0.42f, ha) : lerp(0.38f, 0.56f, ha));
+                border = with_alpha(hex(0xffffff), dark ? lerp(0.16f, 0.32f, ha) : lerp(0.50f, 0.78f, ha));
             }
-            draw_glass_box(cv, r, rad, bg, border, 1.0f, sheen);
+            if (op > 0.002f) {
+                const GlassStyle gs = make_control_glass_style(cv.theme(), rad, bg, op, 0.0f, 9.0f, lerp(1.07f, 1.12f, ha));
+                if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, r, gs)) {
+                    draw_glass_box(cv, r, rad, style == 3 ? with_alpha(hex(0xffffff), (dark ? 0.10f : 0.34f) * ha) : bg,
+                                   border, 1.0f, sheen);
+                } else {
+                    cv.stroke_round(inset(r, -0.5f, -0.5f), rad + 0.5f,
+                                    with_alpha(hex(0x000000), (dark ? 0.28f : 0.09f) * op), 1.0f);
+                    if (style == 1 || style == 2) {
+                        cv.stroke_round(r, rad, border, 1.0f);
+                    }
+                }
+            }
         } else {
             D2D1_COLOR_F bg = lerp_color(cv.theme().surface_high, cv.theme().surface_highest, ha);
             D2D1_COLOR_F border = cv.theme().outline_variant;
@@ -535,13 +550,34 @@ private:
         if (is_liquid_glass(cv.theme())) {
             const bool dark = cv.theme().dark_mode;
             const D2D1_COLOR_F off_track = with_alpha(cv.theme().surface_high,
-                                                      dark ? lerp(0.28f, 0.44f, ha) : lerp(0.42f, 0.58f, ha));
-            const D2D1_COLOR_F on_track = with_alpha(cv.theme().primary, dark ? 0.46f : 0.72f);
+                                                      dark ? lerp(0.26f, 0.40f, ha) : lerp(0.38f, 0.52f, ha));
+            const D2D1_COLOR_F on_track = with_alpha(cv.theme().primary, dark ? 0.48f : 0.72f);
             const D2D1_COLOR_F off_bd = with_alpha(hex(0xffffff), dark ? lerp(0.22f, 0.36f, ha) : lerp(0.58f, 0.80f, ha));
-            const D2D1_COLOR_F on_bd = with_alpha(cv.theme().primary_hover, 0.85f);
-            draw_glass_box(cv, r, 12.0f, lerp_color(off_track, on_track, t), lerp_color(off_bd, on_bd, t));
-            cv.fill_circle({kx, cy}, kr, with_alpha(hex(0xffffff), lerp(dark ? 0.84f : 0.94f, 1.0f, t)));
-            cv.stroke_circle({kx, cy}, kr, with_alpha(hex(0x000000), dark ? 0.16f : 0.12f), 1.0f);
+            const D2D1_COLOR_F on_bd = with_alpha(cv.theme().primary_hover, 0.80f);
+            const D2D1_COLOR_F trk_col = lerp_color(off_track, on_track, t);
+            const D2D1_COLOR_F trk_bd = lerp_color(off_bd, on_bd, t);
+            const GlassStyle trk_gs = make_control_glass_style(cv.theme(), 12.0f, trk_col, 1.0f, 0.0f, 8.0f, 1.06f);
+            if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, r, trk_gs)) {
+                draw_glass_box(cv, r, 12.0f, trk_col, trk_bd);
+            } else {
+                cv.stroke_round(inset(r, -0.5f, -0.5f), 12.5f, with_alpha(hex(0x000000), dark ? 0.28f : 0.10f), 1.0f);
+                if (t > 0.05f) cv.stroke_round(r, 12.0f, with_alpha(cv.theme().primary_hover, 0.55f * t), 1.0f);
+            }
+
+            const float stretch = 4.0f * t * (1.0f - t);
+            const float kw = lerp(16.0f, 22.0f, stretch);
+            const float kh = 16.0f;
+            const float krad = kh * 0.5f;
+            const D2D1_RECT_F thumb_r = rect(kx - kw * 0.5f, cy - kh * 0.5f, kw, kh);
+            cv.shadow(thumb_r, krad, 4.0f, 0.28f);
+            const D2D1_COLOR_F knob_tint = with_alpha(hex(0xffffff), dark ? lerp(0.46f, 0.62f, t) : lerp(0.76f, 0.88f, t));
+            const GlassStyle knob_gs = make_control_glass_style(cv.theme(), krad, knob_tint, 1.0f, 0.0f, 6.5f, 1.14f);
+            if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, thumb_r, knob_gs)) {
+                cv.fill_round(thumb_r, krad, knob_tint);
+                cv.stroke_round(thumb_r, krad, with_alpha(hex(0x000000), dark ? 0.16f : 0.12f), 1.0f);
+            } else {
+                cv.stroke_round(inset(thumb_r, -0.4f, -0.4f), krad + 0.4f, with_alpha(hex(0x000000), dark ? 0.26f : 0.14f), 0.9f);
+            }
         } else {
             const D2D1_COLOR_F off_track = lerp_color(cv.theme().surface_high, cv.theme().surface_highest, ha);
             cv.fill_round(r, 12.0f, lerp_color(off_track, cv.theme().primary, t));
@@ -629,13 +665,19 @@ private:
         if (is_liquid_glass(cv.theme())) {
             const bool dark = cv.theme().dark_mode;
             const D2D1_COLOR_F bg = on
-                ? with_alpha(cv.theme().primary, dark ? 0.22f : 0.18f)
+                ? with_alpha(cv.theme().primary, dark ? 0.24f : 0.20f)
                 : with_alpha(lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha),
                              dark ? lerp(0.24f, 0.36f, ha) : lerp(0.36f, 0.50f, ha));
             const D2D1_COLOR_F bd = on
                 ? cv.theme().primary
                 : with_alpha(hex(0xffffff), dark ? lerp(0.16f, 0.30f, ha) : lerp(0.50f, 0.78f, ha));
-            draw_glass_box(cv, r, 12.0f, bg, bd, on ? 1.5f : 1.0f);
+            const GlassStyle gs = make_control_glass_style(cv.theme(), 12.0f, bg, 1.0f, 0.0f, 10.0f, lerp(1.05f, 1.09f, ha));
+            if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, r, gs)) {
+                draw_glass_box(cv, r, 12.0f, bg, bd, on ? 1.5f : 1.0f);
+            } else {
+                cv.stroke_round(inset(r, -0.5f, -0.5f), 12.5f, with_alpha(hex(0x000000), dark ? 0.24f : 0.08f), 1.0f);
+                if (on) cv.stroke_round(r, 12.0f, cv.theme().primary, 1.5f);
+            }
         } else {
             cv.fill_round(r, 12.0f, on ? with_alpha(cv.theme().primary_container, 0.32f) : lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha));
             cv.stroke_round(r, 12.0f, on ? cv.theme().primary : cv.theme().outline_variant, on ? 1.5f : 1.0f);
@@ -657,12 +699,18 @@ private:
         if (is_liquid_glass(cv.theme())) {
             const bool dark = cv.theme().dark_mode;
             const D2D1_COLOR_F bg = selected
-                ? with_alpha(cv.theme().primary, dark ? lerp(0.26f, 0.38f, ha) : lerp(0.20f, 0.30f, ha))
+                ? with_alpha(cv.theme().primary, dark ? lerp(0.26f, 0.38f, ha) : lerp(0.22f, 0.32f, ha))
                 : with_alpha(cv.theme().surface_high, dark ? lerp(0.26f, 0.42f, ha) : lerp(0.40f, 0.58f, ha));
             const D2D1_COLOR_F bd = selected
                 ? cv.theme().primary
                 : with_alpha(hex(0xffffff), dark ? lerp(0.18f, 0.34f, ha) : lerp(0.54f, 0.80f, ha));
-            draw_glass_box(cv, r, rad, bg, bd, selected ? 1.5f : 1.0f);
+            const GlassStyle gs = make_control_glass_style(cv.theme(), rad, bg, 1.0f, 0.0f, 9.0f, lerp(1.06f, 1.11f, ha));
+            if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, r, gs)) {
+                draw_glass_box(cv, r, rad, bg, bd, selected ? 1.5f : 1.0f);
+            } else {
+                cv.stroke_round(inset(r, -0.5f, -0.5f), rad + 0.5f, with_alpha(hex(0x000000), dark ? 0.26f : 0.09f), 1.0f);
+                if (selected) cv.stroke_round(r, rad, cv.theme().primary, 1.5f);
+            }
         } else {
             const D2D1_COLOR_F bg = selected
                 ? lerp_color(with_alpha(cv.theme().primary_container, 0.55f), with_alpha(cv.theme().primary_container, 0.78f), ha)
@@ -843,16 +891,28 @@ private:
         for (int i = 0; i < 4; ++i) {
             const float act = std::clamp(1.0f - std::abs(t - static_cast<float>(i)), 0.0f, 1.0f);
             if (const float ha = hover_alpha(tabs[i].id); act < 0.5f && ha > 0.002f) {
-                cv.fill_round(rects[i], 10.0f,
-                              glass_ui ? with_alpha(hex(0xffffff), (dark ? 0.09f : 0.34f) * ha)
-                                       : with_alpha(cv.theme().on_surface, 0.07f * ha));
+                if (glass_ui) {
+                    const GlassStyle h_gs = make_control_glass_style(
+                        cv.theme(), 10.0f, with_alpha(cv.theme().surface_high, dark ? 0.24f : 0.38f), ha, 0.6f, 8.0f, 1.07f);
+                    if (!glass_.draw_scene_glass(cv, target_, sh_.gfx, rects[i], h_gs)) {
+                        cv.fill_round(rects[i], 10.0f, with_alpha(hex(0xffffff), (dark ? 0.09f : 0.34f) * ha));
+                    }
+                } else {
+                    cv.fill_round(rects[i], 10.0f, with_alpha(cv.theme().on_surface, 0.07f * ha));
+                }
             }
         }
         const D2D1_RECT_F active_tab = lerp_rect(rects[i0], rects[i1], frac);
         if (glass_ui) {
-            draw_glass_box(cv, active_tab, 10.0f,
-                           with_alpha(cv.theme().primary, dark ? 0.28f : 0.22f),
-                           with_alpha(cv.theme().primary, dark ? 0.65f : 0.58f));
+            const GlassStyle act_gs = make_control_glass_style(
+                cv.theme(), 10.0f, with_alpha(cv.theme().primary, dark ? 0.32f : 0.26f), 1.0f, 0.6f, 9.0f, 1.10f);
+            if (!glass_.draw_scene_glass(cv, target_, sh_.gfx, active_tab, act_gs)) {
+                draw_glass_box(cv, active_tab, 10.0f,
+                               with_alpha(cv.theme().primary, dark ? 0.28f : 0.22f),
+                               with_alpha(cv.theme().primary, dark ? 0.65f : 0.58f));
+            } else {
+                cv.stroke_round(active_tab, 10.0f, with_alpha(cv.theme().primary, dark ? 0.58f : 0.52f), 1.0f);
+            }
         } else {
             cv.fill_round(active_tab, 10.0f, cv.theme().primary_container);
         }
