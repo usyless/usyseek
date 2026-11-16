@@ -741,6 +741,7 @@ private:
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         const bool glass = glass_active();
+        const bool has_scene = glass && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
             if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
                                            make_desktop_glass_style(cv.theme(), 0.0f, true))) {
@@ -750,7 +751,7 @@ private:
             cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().settings_bg_alpha));
         }
 
-        draw_tabs(cv, sz);
+        if (!glass) draw_tabs(cv, sz);
 
         const D2D1_RECT_F view = D2D1::RectF(0, tabs_height(sz.width) + 1.0f, sz.width, sz.height);
         cv.push_clip(view);
@@ -784,6 +785,13 @@ private:
             scroll_thumb_ = tr;
         }
 
+        if (has_scene) glass_.end_scene(target_);
+        if (glass) {
+            const float strip_h = tabs_height(sz.width);
+            glass_.draw_scene_glass(cv, target_, sh_.gfx, D2D1::RectF(0.0f, 0.0f, sz.width, strip_h),
+                                    make_overlay_glass_style(cv.theme(), 0.0f, 1.8f));
+            draw_tabs(cv, sz);
+        }
         draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
     }
 
@@ -801,12 +809,7 @@ private:
 
     void draw_tabs(Canvas& cv, D2D1_SIZE_F sz) {
         const float strip_h = tabs_height(sz.width);
-        if (glass_active()) {
-            const bool dark = cv.theme().dark_mode;
-            draw_glass_box(cv, D2D1::RectF(-2.0f, -2.0f, sz.width + 2.0f, strip_h), 0.0f,
-                           with_alpha(cv.theme().surface_high, dark ? 0.24f : 0.34f),
-                           hex(0, 0.0f), 0.0f, 0.0f);
-        } else {
+        if (!glass_active()) {
             cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(cv.theme().surface_lowest, 0.75f));
         }
         const auto tabs = tab_defs();
@@ -3258,6 +3261,31 @@ private:
                 }
                 return 0;
             }
+            case WM_WINDOWPOSCHANGING: {
+                if (glass_active() && visible() && in_sizemove_) {
+                    const auto* wpos = reinterpret_cast<const WINDOWPOS*>(lp);
+                    if (wpos && !(wpos->flags & SWP_NOMOVE)) {
+                        RECT win_rc{};
+                        POINT cur_origin{0, 0};
+                        GetWindowRect(hwnd_, &win_rc);
+                        ClientToScreen(hwnd_, &cur_origin);
+                        const bool size_same = (wpos->flags & SWP_NOSIZE) ||
+                            (wpos->cx == (win_rc.right - win_rc.left) && wpos->cy == (win_rc.bottom - win_rc.top));
+                        const POINT next_origin{
+                            .x = wpos->x + (cur_origin.x - win_rc.left),
+                            .y = wpos->y + (cur_origin.y - win_rc.top),
+                        };
+                        if (size_same && (next_origin.x != glass_.last_rendered_origin().x ||
+                                          next_origin.y != glass_.last_rendered_origin().y)) {
+                            glass_.set_origin_override(next_origin);
+                            full_dirty_ = true;
+                            render();
+                            glass_.set_origin_override(std::nullopt);
+                        }
+                    }
+                }
+                break;
+            }
             case WM_SIZE:
                 if (wp != SIZE_MINIMIZED) {
                     target_.resize(LOWORD(lp), HIWORD(lp));
@@ -3268,9 +3296,14 @@ private:
                 return 0;
             case WM_MOVE:
                 if (glass_active() && visible()) {
-                    full_dirty_ = true;
-                    if (in_sizemove_) render();
-                    else invalidate();
+                    POINT cur_origin{0, 0};
+                    ClientToScreen(hwnd_, &cur_origin);
+                    if (cur_origin.x != glass_.last_rendered_origin().x ||
+                        cur_origin.y != glass_.last_rendered_origin().y) {
+                        full_dirty_ = true;
+                        if (in_sizemove_) render();
+                        else invalidate();
+                    }
                 }
                 return 0;
             case WM_ENTERSIZEMOVE: in_sizemove_ = true; return 0;

@@ -3428,6 +3428,31 @@ private:
                 }
                 return 0;
             }
+            case WM_WINDOWPOSCHANGING: {
+                if (glass_active() && visible() && in_sizemove_) {
+                    const auto* wpos = reinterpret_cast<const WINDOWPOS*>(lp);
+                    if (wpos && !(wpos->flags & SWP_NOMOVE)) {
+                        RECT win_rc{};
+                        POINT cur_origin{0, 0};
+                        GetWindowRect(hwnd_, &win_rc);
+                        ClientToScreen(hwnd_, &cur_origin);
+                        const bool size_same = (wpos->flags & SWP_NOSIZE) ||
+                            (wpos->cx == (win_rc.right - win_rc.left) && wpos->cy == (win_rc.bottom - win_rc.top));
+                        const POINT next_origin{
+                            .x = wpos->x + (cur_origin.x - win_rc.left),
+                            .y = wpos->y + (cur_origin.y - win_rc.top),
+                        };
+                        if (size_same && (next_origin.x != glass_.last_rendered_origin().x ||
+                                          next_origin.y != glass_.last_rendered_origin().y)) {
+                            glass_.set_origin_override(next_origin);
+                            full_dirty_ = true;
+                            render();
+                            glass_.set_origin_override(std::nullopt);
+                        }
+                    }
+                }
+                break;
+            }
             case WM_SIZE:
                 if (wp != SIZE_MINIMIZED) {
                     target_.resize(LOWORD(lp), HIWORD(lp));
@@ -3438,9 +3463,14 @@ private:
                 return 0;
             case WM_MOVE:
                 if (glass_active() && visible()) {
-                    full_dirty_ = true;
-                    if (in_sizemove_) render();
-                    else invalidate();
+                    POINT cur_origin{0, 0};
+                    ClientToScreen(hwnd_, &cur_origin);
+                    if (cur_origin.x != glass_.last_rendered_origin().x ||
+                        cur_origin.y != glass_.last_rendered_origin().y) {
+                        full_dirty_ = true;
+                        if (in_sizemove_) render();
+                        else invalidate();
+                    }
                 }
                 return 0;
             case WM_ENTERSIZEMOVE: in_sizemove_ = true; return 0;

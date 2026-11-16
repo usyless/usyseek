@@ -90,6 +90,7 @@ private:
     bool create_device(HWND hint) {
         d2d_device_.reset();
         dxgi_device_.reset();
+        frame_query_.reset();
         if (d3d_ctx_) {
             d3d_ctx_->ClearState();
             d3d_ctx_->Flush();
@@ -118,6 +119,9 @@ private:
         if (FAILED(d3d_->QueryInterface(IID_PPV_ARGS(&dxgi_device_)))) return false;
         if (auto d1 = dxgi_device_.try_query<IDXGIDevice1>()) d1->SetMaximumFrameLatency(1);
 
+        D3D11_QUERY_DESC qd{.Query = D3D11_QUERY_EVENT, .MiscFlags = 0};
+        d3d_->CreateQuery(&qd, &frame_query_);
+
         wil::com_ptr<IDXGIAdapter> used;
         if (SUCCEEDED(dxgi_device_->GetAdapter(&used))) {
             DXGI_ADAPTER_DESC d{};
@@ -133,11 +137,24 @@ private:
         return true;
     }
 
+public:
+    void wait_gpu() {
+        if (!d3d_ctx_ || !frame_query_) return;
+        d3d_ctx_->End(frame_query_.get());
+        d3d_ctx_->Flush();
+        BOOL done = FALSE;
+        while (d3d_ctx_->GetData(frame_query_.get(), &done, sizeof(done), 0) == S_FALSE) {
+            YieldProcessor();
+        }
+    }
+
+private:
     wil::com_ptr<ID2D1Factory7> d2d_factory_;
     wil::com_ptr<IDWriteFactory3> dwrite_;
     wil::com_ptr<IWICImagingFactory> wic_;
     wil::com_ptr<ID3D11Device> d3d_;
     wil::com_ptr<ID3D11DeviceContext> d3d_ctx_;
+    wil::com_ptr<ID3D11Query> frame_query_;
     wil::com_ptr<IDXGIFactory2> dxgi_factory_;
     wil::com_ptr<IDXGIDevice> dxgi_device_;
     wil::com_ptr<ID2D1Device6> d2d_device_;
@@ -173,7 +190,7 @@ public:
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc.BufferCount = 2;
         desc.Scaling = DXGI_SCALING_STRETCH;
-        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
         if (FAILED(gfx_->dxgi_factory()->CreateSwapChainForComposition(gfx_->d3d(), &desc, nullptr, &swap_))) return false;
         if (FAILED(DCompositionCreateDevice(gfx_->dxgi_device(), IID_PPV_ARGS(&dcomp_)))) return false;
@@ -269,27 +286,10 @@ public:
         const FlipDirtyTracker::Plan p = dirty_tracker_.plan(full_redraw, curr_px, w_, h_);
         if (p.skip) return true;
 
-        std::vector<RECT> present_rects;
         dc_->BeginDraw();
         dc_->SetTransform(D2D1::Matrix3x2F::Identity());
-        if (p.full) {
-            dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
-            draw_fn(std::nullopt, true);
-        } else {
-            present_rects.reserve(p.render_rects.size());
-            for (const PixelRect& pr : p.render_rects) {
-                present_rects.push_back(RECT{.left = pr.left, .top = pr.top, .right = pr.right, .bottom = pr.bottom});
-                const D2D1_RECT_F clip = D2D1::RectF(
-                    static_cast<float>(pr.left) / s,
-                    static_cast<float>(pr.top) / s,
-                    static_cast<float>(pr.right) / s,
-                    static_cast<float>(pr.bottom) / s);
-                dc_->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
-                dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
-                draw_fn(clip, false);
-                dc_->PopAxisAlignedClip();
-            }
-        }
+        dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
+        draw_fn(std::nullopt, true);
 
         HRESULT hr = dc_->EndDraw();
         if (bmp_brush_) bmp_brush_->SetBitmap(nullptr);
@@ -298,12 +298,19 @@ public:
             capture_.reset();
         }
         if (SUCCEEDED(hr)) {
-            DXGI_PRESENT_PARAMETERS params{};
-            if (!p.full) {
-                params.DirtyRectsCount = static_cast<UINT>(present_rects.size());
-                params.pDirtyRects = present_rects.data();
+            if (!vsync && gfx_) {
+                gfx_->wait_gpu();
             }
+            dc_->SetTarget(nullptr);
+            target_.reset();
+            DXGI_PRESENT_PARAMETERS params{};
             hr = swap_->Present1(vsync ? 1 : 0, 0, &params);
+            if (SUCCEEDED(hr) && !vsync && dcomp_) {
+                dcomp_->Commit();
+            }
+            if (!create_target() && SUCCEEDED(hr)) {
+                hr = E_FAIL;
+            }
         }
         if (hr == DXGI_STATUS_OCCLUDED) {
             dirty_tracker_.reset();
@@ -311,7 +318,7 @@ public:
         }
         if (FAILED(hr)) return false;
 
-        dirty_tracker_.commit(full_redraw, p);
+        dirty_tracker_.commit(true, p);
         return true;
     }
 
