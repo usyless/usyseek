@@ -463,15 +463,15 @@ public:
         return graph->SetSingleTransformNode(this);
     }
 
-    IFACEMETHODIMP PrepareForRender(D2D1_CHANGE_TYPE) override {
+    IFACEMETHODIMP PrepareForRender(D2D1_CHANGE_TYPE) noexcept override {
         if (!draw_info_) return E_UNEXPECTED;
         return draw_info_->SetPixelShaderConstantBuffer(reinterpret_cast<const BYTE*>(&params_), sizeof(params_));
     }
 
-    IFACEMETHODIMP SetGraph(ID2D1TransformGraph*) override { return E_NOTIMPL; }
+    IFACEMETHODIMP SetGraph(ID2D1TransformGraph*) noexcept override { return E_NOTIMPL; }
 
     // ID2D1DrawTransform
-    IFACEMETHODIMP SetDrawInfo(ID2D1DrawInfo* info) override {
+    IFACEMETHODIMP SetDrawInfo(ID2D1DrawInfo* info) noexcept override {
         draw_info_ = info;
         if (!draw_info_) return E_INVALIDARG;
         const HRESULT hr = draw_info_->SetPixelShader(GUID_UsyseekLiquidGlassPS);
@@ -484,28 +484,28 @@ public:
     }
 
     // ID2D1Transform
-    IFACEMETHODIMP MapOutputRectToInputRects(const D2D1_RECT_L* output_rect, D2D1_RECT_L* input_rects, UINT32 count) const override {
+    IFACEMETHODIMP MapOutputRectToInputRects(const D2D1_RECT_L* output_rect, D2D1_RECT_L* input_rects, UINT32 count) const noexcept override {
         if (!output_rect || !input_rects || count != 1) return E_INVALIDARG;
         input_rects[0] = detail::expand_rect_safe(*output_rect, 72);
         return S_OK;
     }
 
     IFACEMETHODIMP MapInputRectsToOutputRect(const D2D1_RECT_L* input_rects, const D2D1_RECT_L*, UINT32 count,
-                                             D2D1_RECT_L* output_rect, D2D1_RECT_L* opaque_sub_rect) override {
+                                             D2D1_RECT_L* output_rect, D2D1_RECT_L* opaque_sub_rect) noexcept override {
         if (!input_rects || !output_rect || !opaque_sub_rect || count != 1) return E_INVALIDARG;
         *output_rect = input_rects[0];
         *opaque_sub_rect = D2D1::RectL(0, 0, 0, 0);
         return S_OK;
     }
 
-    IFACEMETHODIMP MapInvalidRect(UINT32, D2D1_RECT_L invalid_input, D2D1_RECT_L* invalid_output) const override {
+    IFACEMETHODIMP MapInvalidRect(UINT32, D2D1_RECT_L invalid_input, D2D1_RECT_L* invalid_output) const noexcept override {
         if (!invalid_output) return E_INVALIDARG;
         *invalid_output = detail::expand_rect_safe(invalid_input, 72);
         return S_OK;
     }
 
     // ID2D1TransformNode
-    IFACEMETHODIMP_(UINT32) GetInputCount() const override { return 1; }
+    IFACEMETHODIMP_(UINT32) GetInputCount() const noexcept override { return 1; }
 
 private:
     LiquidGlassEffectImpl() = default;
