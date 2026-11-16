@@ -208,6 +208,12 @@ public:
     [[nodiscard]] ID2D1DeviceContext6* dc() const noexcept { return dc_.get(); }
     [[nodiscard]] float scale() const noexcept { return dpi_ / 96.0f; }
     [[nodiscard]] D2D1_SIZE_F size() const noexcept { return {static_cast<float>(w_) / scale(), static_cast<float>(h_) / scale()}; }
+#ifdef USYSEEK_LIQUID_GLASS
+    [[nodiscard]] ID2D1Bitmap1* target_bitmap() const noexcept { return target_.get(); }
+    [[nodiscard]] UINT pixel_width() const noexcept { return w_; }
+    [[nodiscard]] UINT pixel_height() const noexcept { return h_; }
+    [[nodiscard]] float dpi() const noexcept { return dpi_; }
+#endif
 
     /// Reusable solid-color brush for the active device context.
     [[nodiscard]] ID2D1SolidColorBrush* solid_brush() {

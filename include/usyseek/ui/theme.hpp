@@ -473,6 +473,51 @@ struct Theme {
     return theme_from_accent(windows_accent_color(), windows_uses_dark_mode());
 }
 
+[[nodiscard]] inline Theme theme_liquid_glass() {
+    const bool dark = windows_uses_dark_mode();
+    Theme t = dark ? theme_dark() : theme_light();
+    t.id = "liquid-glass";
+    t.name = "Liquid Glass (Exp.)";
+    t.follows_system_mode = true;
+    t.pill_backdrop = DWMSBT_NONE;
+    t.settings_backdrop = DWMSBT_NONE;
+    if (dark) {
+        t.bg = hex(0x0c1018);
+        t.surface_lowest = hex(0x080b12);
+        t.surface_low = hex(0x141a26);
+        t.surface = hex(0x182030);
+        t.surface_high = hex(0x222c40);
+        t.surface_highest = hex(0x2c3850);
+        t.outline_variant = hex(0x5b6b88);
+        t.primary = hex(0x7dd3fc);
+        t.primary_hover = hex(0xa5e1fd);
+        t.on_primary = hex(0x042438);
+        t.primary_container = hex(0x0c4a6e);
+        t.on_primary_container = hex(0xe0f2fe);
+        t.pill_bg_alpha = 0.24f;
+        t.settings_bg_alpha = 0.30f;
+        t.card_alpha = 0.56f;
+    } else {
+        t.bg = hex(0xf2f6fc);
+        t.surface_lowest = hex(0xffffff);
+        t.surface_low = hex(0xeef3fb);
+        t.surface = hex(0xf6f9fe);
+        t.surface_high = hex(0xe2eaf6);
+        t.surface_highest = hex(0xd4dfef);
+        t.outline_variant = hex(0x9fb0cc);
+        t.primary = hex(0x0265b8);
+        t.primary_hover = hex(0x025196);
+        t.on_primary = hex(0xffffff);
+        t.primary_container = hex(0xd1e9ff);
+        t.on_primary_container = hex(0x002447);
+        t.pill_bg_alpha = 0.30f;
+        t.settings_bg_alpha = 0.36f;
+        t.card_alpha = 0.64f;
+    }
+    t.pill_border = with_alpha(hex(0xffffff), dark ? 0.28f : 0.65f);
+    return t;
+}
+
 [[nodiscard]] inline Theme resolve_builtin_theme(std::string_view id) {
     if (id == "system") return theme_system();
     if (id == "accent") return theme_accent();
@@ -480,6 +525,7 @@ struct Theme {
     if (id == "nord") return theme_nord();
     if (id == "mocha") return theme_mocha();
     if (id == "oled") return theme_oled();
+    if (id == "liquid-glass") return theme_liquid_glass();
     return theme_dark();
 }
 

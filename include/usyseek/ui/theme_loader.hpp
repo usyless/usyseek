@@ -102,7 +102,7 @@ class ThemeCatalog {
 public:
     void reload(std::vector<std::string>* errors = nullptr) {
         entries_.clear();
-        for (const char* id : {"system", "accent", "dark", "light", "nord", "mocha", "oled"}) {
+        for (const char* id : {"system", "accent", "dark", "light", "nord", "mocha", "oled", "liquid-glass"}) {
             const Theme t = resolve_builtin_theme(id);
             entries_.push_back({.id = t.id, .name = t.name, .custom = false, .path = {}, .spec = std::nullopt, .swatch = t.primary});
         }
@@ -141,7 +141,7 @@ public:
 
     void refresh_dynamic_swatches() {
         for (ThemeEntry& e : entries_) {
-            if (!e.custom && (e.id == "system" || e.id == "accent")) {
+            if (!e.custom && (e.id == "system" || e.id == "accent" || e.id == "liquid-glass")) {
                 e.swatch = resolve_builtin_theme(e.id).primary;
             } else if (e.custom && e.spec) {
                 e.swatch = apply_theme_spec(*e.spec, e.id, e.name).primary;
@@ -152,7 +152,7 @@ public:
     [[nodiscard]] Theme resolve(std::string_view id_or_name) const {
         if (id_or_name.empty() || id_or_name == "system" || id_or_name == "accent" ||
             id_or_name == "dark" || id_or_name == "light" || id_or_name == "nord" ||
-            id_or_name == "mocha" || id_or_name == "oled") {
+            id_or_name == "mocha" || id_or_name == "oled" || id_or_name == "liquid-glass") {
             return resolve_builtin_theme(id_or_name.empty() ? "system" : id_or_name);
         }
         for (const ThemeEntry& e : entries_) {

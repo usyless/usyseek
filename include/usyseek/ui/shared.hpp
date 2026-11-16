@@ -1,6 +1,7 @@
 #pragma once
 
 #include "canvas.hpp"
+#include "liquid_glass.hpp"
 #include "search.hpp"
 #include "theme_loader.hpp"
 #include "thumbs.hpp"
@@ -271,6 +272,10 @@ inline bool confirm_box(HWND owner, const wchar_t* title, const std::wstring& me
 /// Applies theme-driven immersive dark/light mode, corner preference, backdrop, and border to a window.
 inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool round = true) {
     if (!hwnd) return;
+#ifdef USYSEEK_LIQUID_GLASS
+    const DWORD affinity = (theme.id == "liquid-glass") ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE;
+    SetWindowDisplayAffinity(hwnd, affinity);
+#endif
     ulp::win::dark::allow_dark_mode_for_window(hwnd, theme.dark_mode);
     const BOOL dark = theme.dark_mode ? TRUE : FALSE;
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
@@ -279,11 +284,36 @@ inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool
     const int backdrop = is_pill ? theme.pill_backdrop : theme.settings_backdrop;
     DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
     if (is_pill) {
-        const COLORREF border = to_colorref(theme.pill_border);
+        const COLORREF border = (theme.id == "liquid-glass") ? DWMWA_COLOR_NONE : to_colorref(theme.pill_border);
         DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border, sizeof(border));
     }
     const MARGINS m{.cxLeftWidth = -1, .cxRightWidth = -1, .cyTopHeight = -1, .cyBottomHeight = -1};
     DwmExtendFrameIntoClientArea(hwnd, &m);
+}
+
+/// Switches between `usyseek-ui.exe` and `usyseek-ui-glass.exe` cleanly via the launcher (or standalone).
+inline bool switch_ui_executable(Shared& sh, bool to_glass, int settings_tab = -1) {
+    const fs::path exe = exe_dir() / (to_glass ? L"usyseek-ui-glass.exe" : L"usyseek-ui.exe");
+    std::error_code ec;
+    if (!fs::exists(exe, ec)) return false;
+
+    sh.save();
+    if (HWND launcher = find_launcher()) {
+        const uint32_t payload = settings_tab >= 0 ? static_cast<uint32_t>(10 + settings_tab) : 0u;
+        if (send_cmd_value(launcher, Cmd::SwitchUi, payload)) return true;
+    }
+
+    const std::wstring arg = settings_tab >= 0
+        ? (L"--settings-tab " + std::to_wstring(settings_tab))
+        : std::wstring{L"--show"};
+    std::wstring cmd = L"\"" + exe.wstring() + L"\" " + arg;
+    STARTUPINFOW si{sizeof(si)};
+    wil::unique_process_information pi;
+    if (!CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, exe_dir().c_str(), &si, &pi)) {
+        return false;
+    }
+    PostQuitMessage(0);
+    return true;
 }
 
 /// Applies the dark immersive frame + backdrop attributes used by both windows.

@@ -151,6 +151,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool show_pill = true;
     bool show_settings = false;
+    int settings_tab = 0;
     bool show_notifications = false;
     std::optional<fs::path> test_dir;
     std::optional<std::string> theme_arg;
@@ -158,6 +159,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         const std::wstring_view a{argv[i]};
         if (a == L"--settings") {
             show_settings = true;
+            settings_tab = 0;
+            show_pill = false;
+        } else if (a == L"--settings-tab" && i + 1 < argc) {
+            show_settings = true;
+            settings_tab = std::clamp(_wtoi(argv[++i]), 0, 3);
             show_pill = false;
         } else if (a == L"--notifications") {
             show_notifications = true;
@@ -187,6 +193,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.theme_override = std::move(theme_arg);
     bool settings_corrupt = false;
     sh.settings = load_settings(&settings_corrupt);
+#ifdef USYSEEK_LIQUID_GLASS
+    if (!sh.theme_override && sh.settings.theme != "liquid-glass") {
+        sh.theme_override = "liquid-glass";
+    }
+#endif
     sh.refresh_theme(true, false);
     if (!sh.test_mode) sh.reload_notifications(true);
     if (!sh.gfx.init()) {
@@ -413,7 +424,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         code = run_automated_test(sh, pill, settings_win, *test_dir);
     } else {
         if (show_notifications) settings_win.show(2);
-        else if (show_settings) settings_win.show(0);
+        else if (show_settings) settings_win.show(settings_tab);
         else if (show_pill) pill.show();
 
         MSG msg;

@@ -207,6 +207,16 @@ private:
             case Cmd::TestNotification:
                 show_balloon(APP_NAME, L"Test Windows notification from usyseek. Click to open Notifications.", NIIF_INFO, true);
                 return TRUE;
+            case Cmd::SwitchUi: {
+                settings_ = load_settings();
+                const uint32_t mode = payload(uint32_t{0});
+                close_ui();
+                const std::wstring arg = mode >= 10
+                    ? (L"--settings-tab " + std::to_wstring(mode - 10))
+                    : std::wstring{L"--show"};
+                spawn_ui(arg);
+                return TRUE;
+            }
             case Cmd::Quit:
                 DestroyWindow(hwnd_);
                 return TRUE;
@@ -271,9 +281,14 @@ private:
         }
     }
 
-    void spawn_ui(const wchar_t* arg) {
+    void spawn_ui(const std::wstring& arg) {
         ensure_qdrant();
-        ui_ = spawn(exe_dir() / L"usyseek-ui.exe", arg, false);
+        settings_ = load_settings();
+        std::error_code ec;
+        const fs::path glass_exe = exe_dir() / L"usyseek-ui-glass.exe";
+        const fs::path std_exe = exe_dir() / L"usyseek-ui.exe";
+        const bool want_glass = settings_.theme == "liquid-glass" && fs::exists(glass_exe, ec);
+        ui_ = spawn(want_glass ? glass_exe : std_exe, arg, false);
     }
 
     bool is_pill_visible() const {
