@@ -801,7 +801,12 @@ private:
 
     void draw_tabs(Canvas& cv, D2D1_SIZE_F sz) {
         const float strip_h = tabs_height(sz.width);
-        if (!glass_active()) {
+        if (glass_active()) {
+            const bool dark = cv.theme().dark_mode;
+            draw_glass_box(cv, D2D1::RectF(-2.0f, -2.0f, sz.width + 2.0f, strip_h), 0.0f,
+                           with_alpha(cv.theme().surface_high, dark ? 0.24f : 0.34f),
+                           hex(0, 0.0f), 0.0f, 0.0f);
+        } else {
             cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(cv.theme().surface_lowest, 0.75f));
         }
         const auto tabs = tab_defs();
