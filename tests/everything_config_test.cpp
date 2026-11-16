@@ -54,6 +54,7 @@ int main() {
     CHECK(has_line(EVERYTHING_LEAN_CONFIG, "run_in_background=1"));
     CHECK(has_line(EVERYTHING_LEAN_CONFIG, "monitor_pause=0"));
     CHECK(has_line(EVERYTHING_LEAN_CONFIG, "monitor_stop=0"));
+    CHECK(has_line(EVERYTHING_LEAN_CONFIG, "monitor_notify_results_changed_delay=50"));
 
     // Unneeded features for headless SDK3 queries should be disabled.
     CHECK(has_line(EVERYTHING_LEAN_CONFIG, "show_tray_icon=0"));

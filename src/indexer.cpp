@@ -322,6 +322,12 @@ public:
             return false;
         }
         if (status == ulp::Everything3::LoadStatus::Success) {
+            wait_for_db_idle();
+            if (stopping()) {
+                owned_->close_everything(false);
+                error = L"Stopped";
+                return false;
+            }
             return true;
         }
         if (!launched) {
@@ -333,6 +339,8 @@ public:
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
         while (!stopping()) {
             if (owned_->wait_for_load(std::chrono::milliseconds(50))) {
+                wait_for_db_idle();
+                if (stopping()) break;
                 return true;
             }
             const DWORD err = Everything3_GetLastError();
@@ -419,11 +427,49 @@ public:
             );
         }
 
-        const ulp::everything3::ResultList results = client.search(state);
-        stop_guard.release();
+        wait_for_db_idle(std::chrono::seconds(30));
+        if (stopping()) {
+            stop_guard.release();
+            error = L"Stopped";
+            return out;
+        }
 
+        ulp::everything3::ResultList results = client.search(state);
         if (!results) {
+            stop_guard.release();
             error = stopping() ? L"Stopped" : L"Everything query failed";
+            return out;
+        }
+
+        // Everything 1.5 can finish loading its persisted .db before background USN updates settle.
+        // Wait briefly for DB busy / monitor result changes to settle and re-fetch updated results.
+        constexpr auto settle_quiet = std::chrono::milliseconds(350);
+        constexpr auto settle_max = std::chrono::seconds(10);
+        const auto max_deadline = std::chrono::steady_clock::now() + settle_max;
+        auto quiet_deadline = std::chrono::steady_clock::now() + settle_quiet;
+
+        while (!stopping() && std::chrono::steady_clock::now() < max_deadline) {
+            const bool busy = owned_->is_ipc_db_busy();
+            const bool changed = client.is_result_list_change();
+            if (busy || changed) {
+                if (busy) {
+                    const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::max(std::chrono::steady_clock::duration::zero(), max_deadline - std::chrono::steady_clock::now()));
+                    wait_for_db_idle(rem);
+                }
+                if (stopping()) break;
+                if (auto updated = client.get_results(state)) {
+                    results = std::move(updated);
+                }
+                quiet_deadline = std::chrono::steady_clock::now() + settle_quiet;
+                continue;
+            }
+            if (std::chrono::steady_clock::now() >= quiet_deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        stop_guard.release();
+        if (stopping()) {
+            error = L"Stopped";
             return out;
         }
 
@@ -481,6 +527,17 @@ public:
     }
 
 private:
+    bool wait_for_db_idle(std::chrono::milliseconds timeout = std::chrono::minutes(2)) const {
+        if (!owned_) return true;
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!stopping()) {
+            if (!owned_->is_ipc_db_busy()) return true;
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        }
+        return false;
+    }
+
     bool empty_ = false;
     std::unique_ptr<ulp::Everything3> owned_;
 };

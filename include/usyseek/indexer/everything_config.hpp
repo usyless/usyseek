@@ -23,6 +23,7 @@ inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
     "run_in_background=1\r\n"
     "monitor_pause=0\r\n"
     "monitor_stop=0\r\n"
+    "monitor_notify_results_changed_delay=50\r\n"
     "allow_plugins=0\r\n"
     "plugins=0\r\n"
     "show_tray_icon=0\r\n"
