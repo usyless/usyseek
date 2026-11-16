@@ -35,25 +35,20 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
                           ▼                        ▼
         ┌───────────────────────────┐    ┌───────────────────────────┐
         │       usyseek-ui.exe      │    │    usyseek-indexer.exe    │
-        │  • Direct2D / DirectWrite │    │  • Voidtools Everything   │
+        │  • Direct2D / DirectWrite │    │  • Everything3 SDK        │
         │  • Spotlight Search Pill  │    │  • WIC / Media Foundation │
         │  • ONNX Runtime Text Tower│    │  • Zero-copy Shared Memory│
+        │  • qdrant-edge (Embedded) │    │  • qdrant-edge (Embedded) │
         │  • Exits on idle timeout  │    │  • Exits when scan finishes│
-        └─────────────┬─────────────┘    └─────────────┬─────────────┘
-                      │                                │ Shared Memory IPC
-                      │                                ▼
-                      │                  ┌───────────────────────────┐
-                      │                  │    usyseek_vision.py      │
-                      │                  │  • PyTorch Vision Tower   │
-                      │                  │  • ROCm / CUDA / CPU      │
-                      │                  │  • Portable Python Worker │
-                      │                  └─────────────┬─────────────┘
-                      │ gRPC (Rust staticlib)          │ gRPC (Rust staticlib)
-                      ▼                                ▼
-        ┌────────────────────────────────────────────────────────────┐
-        │                         qdrant.exe                         │
-        │        Local Vector Database (Embeddings & Payloads)       │
-        └────────────────────────────────────────────────────────────┘
+        └───────────────────────────┘    └─────────────┬─────────────┘
+                                                       │ Shared Memory IPC
+                                                       ▼
+                                         ┌───────────────────────────┐
+                                         │    usyseek_vision.py      │
+                                         │  • PyTorch Vision Tower   │
+                                         │  • ROCm / CUDA / CPU      │
+                                         │  • Portable Python Worker │
+                                         └───────────────────────────┘
 ```
 
 1. **`usyseek.exe` (Launcher & Supervisor)**:
@@ -69,15 +64,14 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 
 3. **`usyseek-indexer.exe` (Scanner & Embedding Pipeline)**:
    - On-demand worker process that exists only while indexing is active.
-   - Embeds an isolated instance of **Voidtools Everything** (`uk.usyless.usyseek`) for instant NTFS file discovery across local drives.
+   - Integrates with **Voidtools Everything** via the **Everything3 SDK** (`uk.usyless.usyseek`) for instant NTFS file discovery across local drives.
    - Utilizes **Windows Imaging Component (WIC)** for high-throughput image decoding, **resvg** for SVG / SVGZ rasterisation and **Media Foundation (MF)** for multi-threaded video keyframe extraction.
    - **Zero C++ Python Dependency**: Completely decoupled from CPython at compile and link time (no `pybind11` or `python3XY.dll` link requirement). Communicates with an out-of-process Python worker (`usyseek_vision.py`) via zero-copy **named shared memory**, executing the vision tower on AMD (ROCm), NVIDIA (CUDA), or CPU.
    - Reports live progress, throughput, and status through shared memory (`Local\usyseek.indexer.status`).
 
-4. **`qdrant.exe` (Embedded Vector Engine)**:
-   - Bundled Windows x64 Qdrant vector database running locally over gRPC and HTTP.
-   - Communicates with C++ through a specialized static library written in Rust (`usyseek_rust`) wrapping `qdrant-client` and `tokio` (the same library hosts the tokenizer and the `resvg` SVG renderer).
-   - Includes the bundled static **Qdrant Web UI** for browsing collections and vector payloads.
+4. **Embedded Vector Engine (`qdrant-edge`)**:
+   - Powered by **`qdrant-edge`** embedded directly inside the `usyseek_rust` static library—no external `qdrant.exe` server or gRPC overhead.
+   - Stores vector embeddings, payloads, and a centralized tags database locally on disk.
 
 ---
 
@@ -94,10 +88,14 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 - **Fullscreen Mode**: Expand instantly from the pill into an immersive edge-to-edge media exploration view.
 - **Uniform 16:10 Previews**: Crisp, uniform aspect ratio media cards with pinned bottom metadata (dimensions, file size, duration, and tags).
 - **Find Similar (Visual Cosine Search)**: Click the "Similar" button on any image or video card to search your library for visually and semantically related items.
+- **Interactive Media Previews**: Supports video and animated GIF playback directly in previews with seek controls, volume adjustment, and image/preview zooming.
+- **Search History & Default Open Mode**: Navigate previous queries with text box history, and choose whether the app opens in Pill or Fullscreen mode by default.
+- **Themes & Liquid Glass**: Customize the interface with built-in or custom themes and an optional Liquid Glass visual effect.
 - **Directory Path Scoping**: Filter searches to specific folders or parent directories using `dir:...` or path autocompletion.
 - **Media Kind Filters**: Filter seamlessly between All, Images, or Videos.
 
 ### 🏷️ Interactive Tagging System
+- **Centralized Tags Database**: Tags are stored in a centralized database so your tags persist cleanly even when switching AI models.
 - **Single-Line Tag Strip**: Color-coordinated M3 assist chips with `+N` overflow badges and hover tooltips.
 - **Stamp Mode**: Toggle the Tag Ribbon to enter stamp mode—click any card in the grid to immediately add or remove the selected tag.
 - **`tag:<name>` Autocomplete**: Type `tag:` into the search box for real-time autocomplete suggestions with color dots and live item counts.
@@ -117,11 +115,21 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 </p>
 
 - **Interactive Global Hotkey Recorder**: Easily rebind the spotlight shortcut (e.g. `Alt + Space`, `Ctrl + Shift + Space`) or disable it entirely.
-- **AI Model Selection**: Supports OpenCLIP and Perception Engine vision models (default: `PE-Core-L-14-336`). Automatically exports ONNX text towers for CPU search.
+- **Models UI & Selection**: Dedicated Models UI supporting OpenCLIP and Perception Engine vision models (default: `PE-Core-L-14-336`). Automatically exports ONNX text towers for CPU search.
 - **One-Click Model Download**: Settings fetches the weights and tokenizer from Hugging Face (default repository `timm/<model name>`) and stores them as `<model>.safetensors` and `<model>-tokenizer.json` in the model folder. Downloads resume after an interruption, and a model added while the app is running is picked up without a restart.
 - **Zero-Setup Portable Python**: System-wide Python is **not required**. `usyseek` can download and bootstrap a self-contained portable Python runtime (via NuGet, supporting 3.14, 3.13, 3.12, 3.11) with one click from Settings, or use an existing `.venv`.
 - **Thumbnail Fit**: Show image thumbnails cropped to fill the tile (default) or as the whole image, letterboxed.
 - **Hardware Acceleration**: Configure hardware acceleration (ROCm / CUDA / CPU) with custom PyTorch arguments directly within the UI.
+- **Notifications, About & Auto-Updater**: Built-in notifications tab, About page, and automatic updates.
+
+---
+
+## First Launch Guide
+
+1. **Download the AI Model**: Open **Settings** (from the tray icon or search pill) and click the download button to fetch the vision/text model weights and tokenizer.
+2. **Download Portable Python**: In Settings, click to download the self-contained portable Python runtime (no system Python needed).
+3. **Select GPU Architecture & Variant**: Pick your GPU architecture (**AMD ROCm**, **NVIDIA CUDA**, or **CPU**), then select your specific GPU architecture / CUDA version (e.g., `gfx1030` or `cu126` / `cu130` / `cu132` / `cu134`) or model variant.
+4. **Download Python Packages**: Click to install the required Python packages (PyTorch, etc.) into the portable environment. Once complete, you're ready to start indexing!
 
 ---
 
@@ -181,17 +189,12 @@ All built executables, dependencies, and runtime assets are automatically assemb
 ```
 build/bin/
 ├── usyseek.exe              # Launcher and tray supervisor
-├── usyseek-ui.exe           # Search pill & settings UI
-├── usyseek-indexer.exe      # Indexing and embedding engine
+├── usyseek-ui.exe           # Search pill & settings UI (with embedded qdrant-edge)
+├── usyseek-indexer.exe      # Indexing and embedding engine (with embedded qdrant-edge)
 ├── onnxruntime.dll          # ONNX Runtime (CPU)
-├── qdrant/
-│   ├── qdrant.exe           # Qdrant vector database server
-│   └── static/              # Qdrant Web UI static assets
-├── python/
-│   ├── usyseek_vision.py    # PyTorch vision tower worker
-│   └── requirements.txt     # Python dependencies
-└── config/
-    └── qdrant.yaml          # Qdrant configuration
+└── python/
+    ├── usyseek_vision.py    # PyTorch vision tower worker
+    └── requirements.txt     # Python dependencies
 ```
 
 ---
@@ -203,12 +206,11 @@ build/bin/
 | `USYSEEK_USE_MIMALLOC` | `ON` | Replace the default allocator with Microsoft `mimalloc` |
 | `USYSEEK_USE_INTERPROCEDURAL_OPTIMIZATION` | `ON` | Enable Link-Time Optimization (LTO/LTCG) |
 | `USYSEEK_USE_STATIC_MSVCRT` | `ON` | Link against static MSVC runtime (`/MT`) |
+| `USYSEEK_BUILD_MIGRATE` | `OFF` | Build temporary Qdrant-to-Edge migration tool (`usyseek-migrate.exe`) |
 | `USYSEEK_USYLIBPP_VERSION` | `main` | Git branch/tag for `usylibpp` |
 | `USYSEEK_GLAZE_VERSION` | `v9.1.0` | Git tag for `glaze` (high-performance JSON) |
 | `USYSEEK_MIMALLOC_VERSION` | `v3.5.3` | Git tag for `mimalloc` |
 | `USYSEEK_ORT_VERSION` | `1.31.1` | Prebuilt ONNX Runtime Windows x64 release |
-| `USYSEEK_QDRANT_VERSION` | `v1.20.0` | Prebuilt Qdrant Windows x64 release |
-| `USYSEEK_QDRANT_WEB_UI_VERSION` | `v0.2.20`| Prebuilt Qdrant Web UI release |
 | `USYSEEK_EVERYTHING_VERSION` | `1.5.0.1424b` | Voidtools Everything x64 portable release |
 
 ---
