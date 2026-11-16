@@ -696,6 +696,7 @@ public:
         glass_effect_.reset();
         last_mon_ = nullptr;
         last_seq_ = 0;
+        gdi_origin_ = {LONG_MIN, LONG_MIN};
         seeded_gdi_ = false;
         scene_active_ = false;
         epoch_ = 0;
@@ -764,20 +765,42 @@ public:
 
             POINT origin{0, 0};
             ClientToScreen(hwnd, &origin);
-            const float scale = target.scale();
-            const float ox_dip = static_cast<float>(origin.x - st->mon_rect.left) / scale;
-            const float oy_dip = static_cast<float>(origin.y - st->mon_rect.top) / scale;
-            const float mon_w_dip = static_cast<float>(st->tex_w) / scale;
-            const float mon_h_dip = static_cast<float>(st->tex_h) / scale;
-            const D2D1_RECT_F src_bounds = D2D1::RectF(0.0f, 0.0f, mon_w_dip, mon_h_dip);
-            const D2D1_RECT_F mon_panel = D2D1::RectF(
-                panel_rect.left + ox_dip,
-                panel_rect.top + oy_dip,
-                panel_rect.right + ox_dip,
-                panel_rect.bottom + oy_dip);
+            const LONG sx = origin.x - st->mon_rect.left;
+            const LONG sy = origin.y - st->mon_rect.top;
+            const LONG clip_l = std::clamp<LONG>(sx, 0, static_cast<LONG>(st->tex_w));
+            const LONG clip_t = std::clamp<LONG>(sy, 0, static_cast<LONG>(st->tex_h));
+            const LONG clip_r = std::clamp<LONG>(sx + static_cast<LONG>(pw), 0, static_cast<LONG>(st->tex_w));
+            const LONG clip_b = std::clamp<LONG>(sy + static_cast<LONG>(ph), 0, static_cast<LONG>(st->tex_h));
+            if (clip_r <= clip_l || clip_b <= clip_t) return false;
+
+            win_bmp_.reset();
+            const auto win_props = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_NONE,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+                target.dpi(), target.dpi());
+            if (FAILED(target.dc()->CreateBitmap(D2D1::SizeU(pw, ph), nullptr, 0, &win_props, &win_bmp_))) {
+                return false;
+            }
+            win_bmp_w_ = pw;
+            win_bmp_h_ = ph;
+            win_bmp_dpi_ = target.dpi();
+            win_bmp_epoch_ = gfx.epoch();
+
+            const D2D1_POINT_2U dst_pt{
+                .x = static_cast<UINT32>(clip_l - sx),
+                .y = static_cast<UINT32>(clip_t - sy),
+            };
+            const D2D1_RECT_U src_rc{
+                .left = static_cast<UINT32>(clip_l),
+                .top = static_cast<UINT32>(clip_t),
+                .right = static_cast<UINT32>(clip_r),
+                .bottom = static_cast<UINT32>(clip_b),
+            };
+            if (FAILED(win_bmp_->CopyFromBitmap(&dst_pt, desktop_bmp_.get(), &src_rc))) return false;
+            const D2D1_SIZE_F sz = target.size();
             return draw_bitmap_glass(
-                cv, target, gfx, desktop_bmp_.get(), src_bounds, mon_panel,
-                D2D1::Point2F(panel_rect.left, panel_rect.top), s);
+                cv, target, gfx, win_bmp_.get(), D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
+                panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), s);
         }
 
         ID2D1Bitmap1* bmp = capture_gdi_backdrop(gfx, target, hwnd, pw, ph);
@@ -838,30 +861,43 @@ public:
     }
 
 private:
-    ID2D1Bitmap1* capture_gdi_backdrop(Gfx& gfx, WindowTarget& target, HWND hwnd, UINT pw, UINT ph) {
-        if (!win_bmp_ || win_bmp_w_ != pw || win_bmp_h_ != ph || win_bmp_dpi_ != target.dpi() || win_bmp_epoch_ != gfx.epoch()) {
-            win_bmp_.reset();
-            const auto props = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_NONE,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
-                target.dpi(), target.dpi());
-            if (FAILED(target.dc()->CreateBitmap(D2D1::SizeU(pw, ph), nullptr, 0, &props, &win_bmp_))) {
-                return nullptr;
-            }
-            win_bmp_w_ = pw;
-            win_bmp_h_ = ph;
-            win_bmp_dpi_ = target.dpi();
-            win_bmp_epoch_ = gfx.epoch();
-            seeded_gdi_ = false;
+    bool ensure_win_bmp(Gfx& gfx, WindowTarget& target, UINT pw, UINT ph) {
+        if (pw == 0 || ph == 0) return false;
+        if (win_bmp_ && win_bmp_w_ == pw && win_bmp_h_ == ph &&
+            win_bmp_dpi_ == target.dpi() && win_bmp_epoch_ == gfx.epoch()) {
+            return true;
         }
-        if (!seeded_gdi_) seeded_gdi_ = seed_from_screen_dc(hwnd, pw, ph);
+        win_bmp_.reset();
+        const auto props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+            target.dpi(), target.dpi());
+        if (FAILED(target.dc()->CreateBitmap(D2D1::SizeU(pw, ph), nullptr, 0, &props, &win_bmp_))) {
+            return false;
+        }
+        win_bmp_w_ = pw;
+        win_bmp_h_ = ph;
+        win_bmp_dpi_ = target.dpi();
+        win_bmp_epoch_ = gfx.epoch();
+        seeded_gdi_ = false;
+        return true;
+    }
+
+    ID2D1Bitmap1* capture_gdi_backdrop(Gfx& gfx, WindowTarget& target, HWND hwnd, UINT pw, UINT ph) {
+        if (!ensure_win_bmp(gfx, target, pw, ph)) return nullptr;
+        POINT origin{0, 0};
+        ClientToScreen(hwnd, &origin);
+        if (!seeded_gdi_ || origin.x != gdi_origin_.x || origin.y != gdi_origin_.y) {
+            if (seed_from_screen_dc(origin, pw, ph)) {
+                seeded_gdi_ = true;
+                gdi_origin_ = origin;
+            }
+        }
         return seeded_gdi_ ? win_bmp_.get() : nullptr;
     }
 
-    bool seed_from_screen_dc(HWND hwnd, UINT pw, UINT ph) {
-        if (!win_bmp_ || !hwnd || pw == 0 || ph == 0) return false;
-        POINT origin{0, 0};
-        ClientToScreen(hwnd, &origin);
+    bool seed_from_screen_dc(POINT origin, UINT pw, UINT ph) {
+        if (!win_bmp_ || pw == 0 || ph == 0) return false;
         HDC screen_dc = GetDC(nullptr);
         if (!screen_dc) return false;
         const auto release_screen = wil::scope_exit([&] { ReleaseDC(nullptr, screen_dc); });
@@ -888,7 +924,8 @@ private:
                                screen_dc, origin.x, origin.y, SRCCOPY);
         SelectObject(mem_dc, prev);
         if (!ok) return false;
-        return SUCCEEDED(win_bmp_->CopyFromMemory(nullptr, bits, pw * 4));
+        const D2D1_RECT_U dst_rc{0, 0, pw, ph};
+        return SUCCEEDED(win_bmp_->CopyFromMemory(&dst_rc, bits, pw * 4));
     }
 
     bool ensure_effects(WindowTarget& target, Gfx& gfx) {
@@ -923,6 +960,7 @@ private:
             .misc_params = {target.scale(), style.force_opaque ? 1.0f : 0.0f, 1.5f, style.margin_dip},
         };
 
+        blur_effect_->SetInput(0, nullptr);
         blur_effect_->SetInput(0, src_bmp);
         blur_effect_->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, std::max(0.0f, style.blur_std_dev));
         blur_effect_->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
@@ -957,6 +995,7 @@ private:
     uint64_t scene_epoch_ = 0;
     uint64_t desktop_bmp_epoch_ = 0;
     uint64_t win_bmp_epoch_ = 0;
+    POINT gdi_origin_{LONG_MIN, LONG_MIN};
     bool seeded_gdi_ = false;
     bool scene_active_ = false;
 };
