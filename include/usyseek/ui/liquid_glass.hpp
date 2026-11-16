@@ -626,7 +626,7 @@ private:
         st.dirty_rects.clear();
     }
 
-    bool ensure_duplication(Gfx& gfx, OutputState& st, ULONGLONG now_tick) {
+    static bool ensure_duplication(Gfx& gfx, OutputState& st, ULONGLONG now_tick) {
         if (st.dupl) return true;
         if (now_tick < st.retry_after_tick) return false;
 
