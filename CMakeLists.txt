@@ -249,30 +249,11 @@ target_link_libraries(usyseek-ui PRIVATE
     usyseek_common
     usyseek_rust
     "${ORT_ROOT}/lib/onnxruntime.lib"
-    d2d1 dwrite d3d11 dxgi dxguid dcomp dwmapi windowscodecs mfplat mfuuid
+    d2d1 dwrite d3d11 d3dcompiler dxgi dxguid dcomp dwmapi windowscodecs mfplat mfuuid
     shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys winhttp version
 )
 add_custom_command(TARGET usyseek-ui POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${ORT_ROOT}/lib/onnxruntime.dll" "$<TARGET_FILE_DIR:usyseek-ui>/onnxruntime.dll"
-)
-
-##### usyseek-ui-glass.exe - experimental Liquid Glass UI build (guarded by USYSEEK_LIQUID_GLASS)
-add_executable(usyseek-ui-glass WIN32
-    src/ui.cpp
-    resources/app.rc
-)
-set_target_properties(usyseek-ui-glass PROPERTIES CXX_SCAN_FOR_MODULES OFF)
-target_compile_definitions(usyseek-ui-glass PRIVATE USYSEEK_LIQUID_GLASS=1)
-target_include_directories(usyseek-ui-glass SYSTEM PRIVATE "${ORT_ROOT}/include")
-target_link_libraries(usyseek-ui-glass PRIVATE
-    usyseek_common
-    usyseek_rust
-    "${ORT_ROOT}/lib/onnxruntime.lib"
-    d2d1 dwrite d3d11 d3dcompiler dxgi dxguid dcomp dwmapi windowscodecs mfplat mfuuid
-    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys winhttp version
-)
-add_custom_command(TARGET usyseek-ui-glass POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${ORT_ROOT}/lib/onnxruntime.dll" "$<TARGET_FILE_DIR:usyseek-ui-glass>/onnxruntime.dll"
 )
 
 ##### usyseek-indexer.exe - scanning + embedding (Everything, WIC, Media Foundation, shared-memory Python worker)

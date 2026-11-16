@@ -639,7 +639,7 @@ struct TooltipLayout {
 
 /// Returns true when the active theme is the Liquid Glass theme.
 [[nodiscard]] inline bool is_liquid_glass(const Theme& t) noexcept {
-    return t.id == "liquid-glass";
+    return t.is_liquid_glass;
 }
 
 /// Draws a frosted-glass rounded surface with an inner specular sheen and crisp glass border.

@@ -176,6 +176,7 @@ struct Theme {
     int settings_backdrop = DWMSBT_MAINWINDOW;
     D2D1_COLOR_F pill_border{};
     bool round_corners = true;
+    bool is_liquid_glass = false;
 
     std::array<D2D1_COLOR_F, 8> tag_palette{};
 };
@@ -479,6 +480,7 @@ struct Theme {
     t.id = "liquid-glass";
     t.name = "Liquid Glass (Exp.)";
     t.follows_system_mode = true;
+    t.is_liquid_glass = true;
     t.pill_backdrop = DWMSBT_NONE;
     t.settings_backdrop = DWMSBT_NONE;
     if (dark) {

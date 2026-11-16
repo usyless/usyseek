@@ -114,12 +114,13 @@ public:
 
     void apply_theme() {
         apply_window_theme(hwnd_, sh_.theme, false, true);
-#ifdef USYSEEK_LIQUID_GLASS
-        if (visible() && !sh_.test_mode) {
-            if (glass_active()) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
-            else KillTimer(hwnd_, TIMER_GLASS);
+        if (glass_active()) {
+            if (visible() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
+        } else {
+            KillTimer(hwnd_, TIMER_GLASS);
+            glass_.release();
+            sh_.desktop_dupl.reset();
         }
-#endif
         full_dirty_ = true;
         invalidate();
     }
@@ -151,9 +152,7 @@ public:
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
         SetTimer(hwnd_, TIMER_POLL, 500, nullptr);
-#ifdef USYSEEK_LIQUID_GLASS
         if (glass_active() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
-#endif
         if (sh_.visibility_changed) sh_.visibility_changed();
         render();
         ValidateRect(hwnd_, nullptr);
@@ -178,9 +177,7 @@ public:
         KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_POLL);
         KillTimer(hwnd_, TIMER_DEVICE);
-#ifdef USYSEEK_LIQUID_GLASS
         KillTimer(hwnd_, TIMER_GLASS);
-#endif
         ShowWindow(hwnd_, SW_HIDE);
         ValidateRect(hwnd_, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
@@ -215,12 +212,9 @@ public:
         const float prev_st = sw_startup_.value;
         const float prev_hf = sw_hide_focus_.value;
         if (sh_.test_mode || dragging_scroll_ || std::abs(target_scroll_ - scroll_) >= 0.5f ||
-            tab_anim_.active() || sw_hotkey_.active() || sw_startup_.active() || sw_hide_focus_.active()) {
+            tab_anim_.active() || sw_hotkey_.active() || sw_startup_.active() || sw_hide_focus_.active() || glass_active()) {
             full_dirty_ = true;
         }
-#ifdef USYSEEK_LIQUID_GLASS
-        if (glass_active()) full_dirty_ = true;
-#endif
 
         std::vector<D2D1_RECT_F> dirty_dips;
         if (!full_dirty_) {
@@ -440,10 +434,8 @@ private:
     void recover() {
         sh_.gfx.recover(hwnd_);
         sh_.thumbs.reset_gpu();
-#ifdef USYSEEK_LIQUID_GLASS
         glass_.release();
         sh_.desktop_dupl.reset();
-#endif
         target_.release();
         full_dirty_ = true;
         pending_dirty_.clear();
@@ -744,13 +736,10 @@ private:
         return tab_layout(total_w).height + 16.0f;
     }
 
-#ifdef USYSEEK_LIQUID_GLASS
-    [[nodiscard]] bool glass_active() const noexcept { return sh_.theme.id == "liquid-glass"; }
-#endif
+    [[nodiscard]] bool glass_active() const noexcept { return sh_.theme.is_liquid_glass; }
 
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
-#ifdef USYSEEK_LIQUID_GLASS
         const bool glass = glass_active();
         const bool has_scene = glass && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
@@ -761,6 +750,8 @@ private:
         } else {
             cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().settings_bg_alpha));
         }
+
+        if (!glass) draw_tabs(cv, sz);
 
         const D2D1_RECT_F view = D2D1::RectF(0, tabs_height(sz.width) + 1.0f, sz.width, sz.height);
         cv.push_clip(view);
@@ -799,50 +790,9 @@ private:
             const float strip_h = tabs_height(sz.width);
             glass_.draw_scene_glass(cv, target_, sh_.gfx, D2D1::RectF(0.0f, 0.0f, sz.width, strip_h),
                                     make_overlay_glass_style(cv.theme(), 0.0f, 1.8f));
+            draw_tabs(cv, sz);
         }
-        draw_tabs(cv, sz);
         draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
-#else
-        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().settings_bg_alpha));
-
-        // Top tab bar
-        draw_tabs(cv, sz);
-
-        const D2D1_RECT_F view = D2D1::RectF(0, tabs_height(sz.width) + 1.0f, sz.width, sz.height);
-        cv.push_clip(view);
-
-        const float cw = std::min(860.0f, sz.width - PAD * 2.0f);
-        const float cx = std::round((sz.width - cw) * 0.5f);
-        float y = view.top + PAD - scroll_;
-
-        if (tab_ == 0) {
-            y = draw_tab_progress(cv, cx, y, cw);
-        } else if (tab_ == 1) {
-            y = draw_tab_settings(cv, cx, y, cw);
-        } else if (tab_ == 2) {
-            y = draw_tab_notifications(cv, cx, y, cw);
-        } else {
-            y = draw_tab_about(cv, cx, y, cw);
-        }
-
-        content_h_ = (y + scroll_ - view.top) + PAD;
-        cv.pop_clip();
-
-        // Scrollbar
-        const float ms = max_scroll();
-        if (ms > 0.0f) {
-            const float track_h = height(view) - 8.0f;
-            const float thumb_h = std::max(28.0f, track_h * height(view) / content_h_);
-            const float ty = view.top + 4.0f + (track_h - thumb_h) * (scroll_ / ms);
-            const float ha = dragging_scroll_ ? 1.0f : hover_alpha(IdScrollbar);
-            const D2D1_RECT_F tr = D2D1::RectF(view.right - lerp(7.0f, 9.0f, ha), ty, view.right - 3.0f, ty + thumb_h);
-            cv.fill_round(tr, 3.0f, with_alpha(cv.theme().on_surface_variant, lerp(0.28f, 0.55f, ha)));
-            cv.hit(D2D1::RectF(view.right - 12.0f, view.top, view.right, view.bottom), IdScrollbar);
-            scroll_thumb_ = tr;
-        }
-
-        draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
-#endif
     }
 
     static const wchar_t* tooltip_text(int id) noexcept {
@@ -859,13 +809,9 @@ private:
 
     void draw_tabs(Canvas& cv, D2D1_SIZE_F sz) {
         const float strip_h = tabs_height(sz.width);
-#ifdef USYSEEK_LIQUID_GLASS
         if (!glass_active()) {
             cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(cv.theme().surface_lowest, 0.75f));
         }
-#else
-        cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(cv.theme().surface_lowest, 0.75f));
-#endif
         const auto tabs = tab_defs();
         const FlowResult layout = tab_layout(sz.width);
         D2D1_RECT_F rects[4]{};
@@ -3012,32 +2958,10 @@ private:
             case IdThemeChip: {
                 const auto& entries = sh_.themes.entries();
                 if (idx >= 0 && static_cast<size_t>(idx) < entries.size()) {
-                    const std::string picked = entries[static_cast<size_t>(idx)].id;
-                    const bool want_glass = (picked == "liquid-glass");
-#ifdef USYSEEK_LIQUID_GLASS
-                    constexpr bool compiled_glass = true;
-#else
-                    constexpr bool compiled_glass = false;
-#endif
-                    if (want_glass != compiled_glass) {
-                        const std::string prev = sh_.settings.theme;
-                        sh_.theme_override.reset();
-                        sh_.settings.theme = picked;
-                        if (!switch_ui_executable(sh_, want_glass, tab_)) {
-                            sh_.settings.theme = prev;
-                            sh_.save();
-                            sh_.notify("warning", "Themes",
-                                       want_glass ? "Liquid Glass executable not found" : "Standard UI executable not found",
-                                       want_glass ? "Build usyseek-ui-glass.exe next to usyseek-ui.exe to enable Liquid Glass."
-                                                  : "usyseek-ui.exe was not found next to usyseek-ui-glass.exe.",
-                                       "switch-ui");
-                        }
-                    } else {
-                        sh_.theme_override.reset();
-                        sh_.settings.theme = picked;
-                        sh_.refresh_theme(false, false);
-                        sh_.save();
-                    }
+                    sh_.theme_override.reset();
+                    sh_.settings.theme = entries[static_cast<size_t>(idx)].id;
+                    sh_.refresh_theme(false, false);
+                    sh_.save();
                 }
                 break;
             }
@@ -3345,14 +3269,13 @@ private:
                     render();
                 }
                 return 0;
-#ifdef USYSEEK_LIQUID_GLASS
             case WM_MOVE:
                 if (glass_active() && visible()) {
                     full_dirty_ = true;
-                    invalidate();
+                    if (in_sizemove_) render();
+                    else invalidate();
                 }
                 return 0;
-#endif
             case WM_ENTERSIZEMOVE: in_sizemove_ = true; return 0;
             case WM_EXITSIZEMOVE:
                 in_sizemove_ = false;
@@ -3527,14 +3450,12 @@ private:
                         }
                         return 0;
                     }
-#ifdef USYSEEK_LIQUID_GLASS
                     case TIMER_GLASS:
                         if (glass_active() && visible() && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
                             full_dirty_ = true;
                             invalidate();
                         }
                         return 0;
-#endif
                 }
                 return 0;
             case WM_APP_REDRAW:
@@ -3552,9 +3473,7 @@ private:
     HINSTANCE inst_ = nullptr;
     HWND hwnd_ = nullptr;
     WindowTarget target_;
-#ifdef USYSEEK_LIQUID_GLASS
     LiquidGlassWindow glass_;
-#endif
     wil::com_ptr<ID2D1Bitmap1> app_icon_;
     uint64_t app_icon_epoch_ = 0;
     std::vector<Hit> hits_;

@@ -1,7 +1,5 @@
 #pragma once
 
-#ifdef USYSEEK_LIQUID_GLASS
-
 #include "canvas.hpp"
 
 #include <d2d1effectauthor.h>
@@ -1016,5 +1014,3 @@ private:
 }
 
 } // namespace usyseek::ui
-
-#endif // USYSEEK_LIQUID_GLASS

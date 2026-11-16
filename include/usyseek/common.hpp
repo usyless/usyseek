@@ -43,7 +43,6 @@ enum class Cmd : uint32_t {
     Quit,
     HotkeyStatus,            // query: the reply is a HotkeyState
     TestNotification,
-    SwitchUi,                // payload: uint32 (0 = --show, 10 + tab = --settings-tab <tab>)
 };
 
 /// Whether the launcher currently holds the global search shortcut.

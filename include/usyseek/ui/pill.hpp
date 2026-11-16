@@ -56,12 +56,13 @@ public:
 
     void apply_theme() {
         apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
-#ifdef USYSEEK_LIQUID_GLASS
-        if (visible() && !sh_.test_mode) {
-            if (glass_active()) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
-            else KillTimer(hwnd_, TIMER_GLASS);
+        if (glass_active()) {
+            if (visible() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
+        } else {
+            KillTimer(hwnd_, TIMER_GLASS);
+            glass_.release();
+            sh_.desktop_dupl.reset();
         }
-#endif
         full_dirty_ = true;
         invalidate();
     }
@@ -89,9 +90,7 @@ public:
         sh_.refresh_hotkey_state();
         if (preview_valid()) request_preview();
         SetTimer(hwnd_, TIMER_STATUS, 1000, nullptr);
-#ifdef USYSEEK_LIQUID_GLASS
         if (glass_active() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
-#endif
         if (sh_.visibility_changed) sh_.visibility_changed();
         full_dirty_ = true;
         pending_dirty_.clear();
@@ -117,9 +116,7 @@ public:
         KillTimer(hwnd_, TIMER_DEVICE);
         KillTimer(hwnd_, TIMER_FADE);
         KillTimer(hwnd_, TIMER_GIF);
-#ifdef USYSEEK_LIQUID_GLASS
         KillTimer(hwnd_, TIMER_GLASS);
-#endif
         set_video_timer(false);
         dragging_seek_ = false;
         dragging_volume_ = false;
@@ -232,12 +229,9 @@ public:
         const float prev_scroll = scroll_;
         const float prev_chip = chip_anim_.value;
         if (sh_.test_mode || dragging_scroll_ || std::abs(target_scroll_ - scroll_) >= 0.5f ||
-            chip_anim_.active() || searching_ || loading_more_ || preview_loading()) {
+            chip_anim_.active() || searching_ || loading_more_ || preview_loading() || glass_active()) {
             full_dirty_ = true;
         }
-#ifdef USYSEEK_LIQUID_GLASS
-        if (glass_active()) full_dirty_ = true;
-#endif
 
         std::vector<D2D1_RECT_F> dirty_dips;
         if (!full_dirty_) {
@@ -655,10 +649,8 @@ private:
     void recover() {
         // Present failed: device removed/reset or adapter gone. Rebuild everything on the next frame.
         reset_preview_gpu();
-#ifdef USYSEEK_LIQUID_GLASS
         glass_.release();
         sh_.desktop_dupl.reset();
-#endif
         target_.release();
         sh_.gfx.recover(hwnd_);
         sh_.thumbs.reset_gpu();
@@ -1039,13 +1031,10 @@ private:
         draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
     }
 
-#ifdef USYSEEK_LIQUID_GLASS
-    [[nodiscard]] bool glass_active() const noexcept { return sh_.theme.id == "liquid-glass"; }
-#endif
+    [[nodiscard]] bool glass_active() const noexcept { return sh_.theme.is_liquid_glass; }
 
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
-#ifdef USYSEEK_LIQUID_GLASS
         const bool glass = glass_active();
         const bool has_scene = glass && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
@@ -1071,22 +1060,6 @@ private:
         if (show_help()) draw_help(cv, sz);
         if (menu_open_) draw_menu(cv);
         draw_active_tooltip(cv, sz);
-#else
-        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
-        if (preview_ >= 0) {
-            draw_preview(cv, sz);
-            if (menu_open_) draw_menu(cv);
-            draw_active_tooltip(cv, sz);
-            return;
-        }
-        draw_header(cv, sz);
-        draw_status(cv, sz);
-        if (expanded()) draw_grid(cv);
-        if (drop_open_) draw_dropdown(cv);
-        if (show_help()) draw_help(cv, sz);
-        if (menu_open_) draw_menu(cv);
-        draw_active_tooltip(cv, sz);
-#endif
     }
 
     void icon_button(Canvas& cv, D2D1_RECT_F r, wchar_t g, int id, bool active = false) {
@@ -1555,15 +1528,10 @@ private:
         const float h = drop_items_.empty() ? 44.0f : 8.0f + row * static_cast<float>(drop_items_.size());
         const D2D1_RECT_F r = rect(x, y, w, h);
         cv.shadow(r, 12);
-#ifdef USYSEEK_LIQUID_GLASS
         if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 12.0f, 1.8f))) {
             cv.fill_round(r, 12, cv.theme().surface_high);
         }
         cv.stroke_round(r, 12, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
-#else
-        cv.fill_round(r, 12, cv.theme().surface_high);
-        cv.stroke_round(r, 12, cv.theme().outline_variant);
-#endif
         cv.hit(r, IdDrop);
         if (drop_items_.empty()) {
             cv.text(L"No tags yet", inset(r, 14, 0), Font::Small, cv.theme().outline);
@@ -1601,15 +1569,10 @@ private:
         const float y = HEADER_H - 4.0f;
         const D2D1_RECT_F r = rect(x, y, HELP_W, HELP_H);
         cv.shadow(r, 12, 12, 0.35f);
-#ifdef USYSEEK_LIQUID_GLASS
         if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 12.0f, 1.8f))) {
             cv.fill_round(r, 12, cv.theme().surface_high);
         }
         cv.stroke_round(r, 12, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
-#else
-        cv.fill_round(r, 12, cv.theme().surface_high);
-        cv.stroke_round(r, 12, cv.theme().outline_variant);
-#endif
         cv.hit(rect(x, HEADER_H - 18.0f, HELP_W, HELP_H + 14.0f), IdHelp);
 
         cv.text(L"SEARCH SYNTAX  ·  CLICK TO INSERT", rect(x + 14.0f, y + 8.0f, HELP_W - 28.0f, 22.0f), Font::Label, cv.theme().primary);
@@ -1774,15 +1737,10 @@ private:
     void draw_menu(Canvas& cv) {
         const D2D1_RECT_F r = menu_rect();
         cv.shadow(r, 14, 14, 0.4f);
-#ifdef USYSEEK_LIQUID_GLASS
         if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 14.0f, 2.0f))) {
             cv.fill_round(r, 14, cv.theme().surface_high);
         }
         cv.stroke_round(r, 14, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
-#else
-        cv.fill_round(r, 14, cv.theme().surface_high);
-        cv.stroke_round(r, 14, cv.theme().outline_variant);
-#endif
         cv.hit(r, IdMenu);
 
         struct Act {
@@ -2333,13 +2291,9 @@ private:
         const D2D1_RECT_F ctrl = rect(cx, area.bottom + 4.0f, cw, 34.0f);
         pv_ctrl_rect_ = ctrl;
 
-#ifdef USYSEEK_LIQUID_GLASS
         if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, ctrl, make_overlay_glass_style(cv.theme(), 17.0f, 1.8f))) {
             cv.fill_round(ctrl, 17.0f, with_alpha(cv.theme().surface_low, 0.92f));
         }
-#else
-        cv.fill_round(ctrl, 17.0f, with_alpha(cv.theme().surface_low, 0.92f));
-#endif
         cv.stroke_round(ctrl, 17.0f, cv.theme().outline_variant, 1.0f);
         cv.hit(ctrl, IdPvBar);
 
@@ -2493,9 +2447,7 @@ private:
             }
         }
         pv_media_rect_ = dest;
-#ifdef USYSEEK_LIQUID_GLASS
         if (glass_active()) glass_.end_scene(target_);
-#endif
 
         draw_preview_controls(cv, sz, area, dest, it, is_video, is_gif_ready);
 
@@ -3474,14 +3426,13 @@ private:
                     render();
                 }
                 return 0;
-#ifdef USYSEEK_LIQUID_GLASS
             case WM_MOVE:
                 if (glass_active() && visible()) {
                     full_dirty_ = true;
-                    invalidate();
+                    if (in_sizemove_) render();
+                    else invalidate();
                 }
                 return 0;
-#endif
             case WM_ENTERSIZEMOVE: in_sizemove_ = true; return 0;
             case WM_EXITSIZEMOVE:
                 in_sizemove_ = false;
@@ -3634,14 +3585,12 @@ private:
                     }
                     case TIMER_GIF: on_gif_timer(); return 0;
                     case TIMER_VIDEO: on_video_timer(); return 0;
-#ifdef USYSEEK_LIQUID_GLASS
                     case TIMER_GLASS:
                         if (glass_active() && visible() && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
                             full_dirty_ = true;
                             invalidate();
                         }
                         return 0;
-#endif
                 }
                 return 0;
             case WM_APP_THUMBS: on_thumbs(); return 0;
@@ -3665,9 +3614,7 @@ private:
     Shared& sh_;
     HWND hwnd_ = nullptr;
     WindowTarget target_;
-#ifdef USYSEEK_LIQUID_GLASS
     LiquidGlassWindow glass_;
-#endif
     std::vector<Hit> hits_;
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
     bool rendering_ = false;
