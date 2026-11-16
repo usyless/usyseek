@@ -3272,8 +3272,13 @@ private:
             case WM_MOVE:
                 if (glass_active() && visible()) {
                     full_dirty_ = true;
-                    if (in_sizemove_) render();
-                    else invalidate();
+                    const ULONGLONG now = GetTickCount64();
+                    if (in_sizemove_ && now - last_move_render_tick_ >= 8) {
+                        last_move_render_tick_ = now;
+                        render();
+                    } else {
+                        invalidate();
+                    }
                 }
                 return 0;
             case WM_ENTERSIZEMOVE: in_sizemove_ = true; return 0;
@@ -3497,6 +3502,7 @@ private:
     bool tracking_ = false;
     bool anim_active_ = false;
     bool in_sizemove_ = false;
+    ULONGLONG last_move_render_tick_ = 0;
 
     float scroll_ = 0.0f, target_scroll_ = 0.0f, content_h_ = 0.0f;
     std::chrono::steady_clock::time_point last_anim_ = std::chrono::steady_clock::now();

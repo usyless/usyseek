@@ -370,10 +370,11 @@ public:
         }
     }
 
-    /// Plain (unclipped, square) bitmap draw with high-quality resampling.
-    void bitmap(ID2D1Bitmap* bmp, D2D1_RECT_F dest) {
+    /// Plain (unclipped, square) bitmap draw with configurable resampling.
+    void bitmap(ID2D1Bitmap* bmp, D2D1_RECT_F dest,
+                D2D1_INTERPOLATION_MODE mode = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC) {
         if (!bmp || !intersects_clip(dest, 1.0f)) return;
-        dc_->DrawBitmap(bmp, &dest, opacity_, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr, nullptr);
+        dc_->DrawBitmap(bmp, &dest, opacity_, mode, nullptr, nullptr);
     }
 
     /// Draws `src` rectangle (in bitmap DIPs) mapped into `dest`.

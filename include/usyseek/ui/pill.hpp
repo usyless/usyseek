@@ -1036,7 +1036,8 @@ private:
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         const bool glass = glass_active();
-        const bool has_scene = glass && glass_.begin_scene(target_, sh_.gfx);
+        const bool need_scene = glass && (menu_open_ || (preview_ < 0 && (drop_open_ || show_help())));
+        const bool has_scene = need_scene && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
             const float outer_r = fullscreen_ ? 0.0f : 12.0f;
             if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
@@ -1071,11 +1072,11 @@ private:
                 draw_glass_box(cv, r, rad,
                                with_alpha(cv.theme().primary, dark ? 0.24f : 0.20f),
                                with_alpha(cv.theme().primary, dark ? 0.62f : 0.55f));
-            } else {
-                const float bg_a = dark ? lerp(0.06f, 0.16f, ha) : lerp(0.22f, 0.42f, ha);
-                const float bd_a = dark ? lerp(0.14f, 0.30f, ha) : lerp(0.45f, 0.72f, ha);
-                draw_glass_box(cv, r, rad, with_alpha(hex(0xffffff), bg_a), with_alpha(hex(0xffffff), bd_a),
-                               1.0f, dark ? lerp(0.05f, 0.10f, ha) : lerp(0.22f, 0.38f, ha));
+            } else if (ha > 0.002f) {
+                draw_glass_box(cv, r, rad,
+                               with_alpha(hex(0xffffff), (dark ? 0.14f : 0.40f) * ha),
+                               with_alpha(hex(0xffffff), (dark ? 0.28f : 0.68f) * ha),
+                               1.0f, (dark ? 0.08f : 0.30f) * ha);
             }
         } else {
             if (active) cv.fill_round(r, rad, with_alpha(cv.theme().primary, 0.16f));
@@ -1924,7 +1925,7 @@ private:
     // Full-size viewer
     // ------------------------------------------------------------------------------------------
 
-    static constexpr float PV_TOP = 56.0f;
+    static constexpr float PV_TOP = HEADER_H;
     static constexpr float PV_BOTTOM = 44.0f;
     static constexpr float PV_CONTROLS_H = 42.0f;
 
@@ -2291,10 +2292,15 @@ private:
         const D2D1_RECT_F ctrl = rect(cx, area.bottom + 4.0f, cw, 34.0f);
         pv_ctrl_rect_ = ctrl;
 
-        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, ctrl, make_overlay_glass_style(cv.theme(), 17.0f, 1.8f))) {
+        if (is_liquid_glass(cv.theme())) {
+            const bool dark = cv.theme().dark_mode;
+            draw_glass_box(cv, ctrl, 17.0f,
+                           with_alpha(cv.theme().surface_high, dark ? 0.36f : 0.50f),
+                           with_alpha(hex(0xffffff), dark ? 0.24f : 0.64f));
+        } else {
             cv.fill_round(ctrl, 17.0f, with_alpha(cv.theme().surface_low, 0.92f));
+            cv.stroke_round(ctrl, 17.0f, cv.theme().outline_variant, 1.0f);
         }
-        cv.stroke_round(ctrl, 17.0f, cv.theme().outline_variant, 1.0f);
         cv.hit(ctrl, IdPvBar);
 
         float lx = ctrl.left + 5.0f;
@@ -2382,14 +2388,18 @@ private:
         const int count = static_cast<int>(items_.size());
         const bool glass_ui = is_liquid_glass(cv.theme());
         const bool dark = cv.theme().dark_mode;
-        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height),
-                with_alpha(cv.theme().surface_lowest, glass_ui ? (dark ? 0.14f : 0.10f) : 0.94f));
+        if (!glass_ui) {
+            cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().surface_lowest, 0.94f));
+        }
         // Backdrop below the title bar closes the viewer; the bar itself still drags the window
         cv.hit(D2D1::RectF(0, PV_TOP, sz.width, sz.height), IdPreview);
 
         const bool is_video = (it.pt.p.k == 1);
         const bool is_gif_ready = !is_video && gif_.has_animation() && gif_.has_frame() && gif_.bitmap();
         const D2D1_RECT_F area = preview_media_area(sz, preview_has_controls());
+        const D2D1_INTERPOLATION_MODE img_interp = in_sizemove_
+            ? D2D1_INTERPOLATION_MODE_LINEAR
+            : D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
 
         D2D1_RECT_F dest = inset(area, width(area) * 0.3f, height(area) * 0.3f);
         if (is_video && video_.has_frame() && video_.bitmap()) {
@@ -2403,7 +2413,7 @@ private:
             if (poster) {
                 dest = preview_dest(it, poster, area);
                 cv.shadow(dest, 4, 14, 0.35f);
-                cv.bitmap(poster, dest);
+                cv.bitmap(poster, dest, img_interp);
                 cv.hit(dest, IdPvImage);
             } else {
                 cv.icon(glyph::video, rect(area.left, ((area.top + area.bottom) / 2) - 20, width(area), 40), cv.theme().on_surface_variant, Font::IconLarge);
@@ -2415,7 +2425,7 @@ private:
             const uint32_t mh = gif_.native_height() > 0 ? gif_.native_height() : it.pt.p.h;
             dest = preview_dest_dims(gps.width, gps.height, mw, mh, area);
             cv.shadow(dest, 4, 14, 0.35f);
-            cv.bitmap(gbmp, dest);
+            cv.bitmap(gbmp, dest, img_interp);
             cv.hit(dest, IdPvImage);
         } else {
             ID2D1Bitmap1* full = sh_.previews.get(it.pt.id);
@@ -2424,7 +2434,7 @@ private:
             if (bmp) {
                 dest = preview_dest(it, bmp, area);
                 cv.shadow(dest, 4, 14, 0.35f);
-                cv.bitmap(bmp, dest);
+                cv.bitmap(bmp, dest, img_interp);
                 cv.hit(dest, IdPvImage);
                 if (loading) draw_spinner(cv, {.x = dest.right - 20, .y = dest.bottom - 20});
             } else if (loading) {
@@ -3429,8 +3439,13 @@ private:
             case WM_MOVE:
                 if (glass_active() && visible()) {
                     full_dirty_ = true;
-                    if (in_sizemove_) render();
-                    else invalidate();
+                    const ULONGLONG now = GetTickCount64();
+                    if (in_sizemove_ && now - last_move_render_tick_ >= 8) {
+                        last_move_render_tick_ = now;
+                        render();
+                    } else {
+                        invalidate();
+                    }
                 }
                 return 0;
             case WM_ENTERSIZEMOVE: in_sizemove_ = true; return 0;
@@ -3624,6 +3639,7 @@ private:
     std::optional<D2D1_RECT_F> last_tooltip_dirty_;
     ULONGLONG shown_tick_ = 0;
     ULONGLONG blur_hide_tick_ = 0;
+    ULONGLONG last_move_render_tick_ = 0;
     POINT blur_hide_cursor_{};
 
     TextField field_;
