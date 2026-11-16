@@ -58,7 +58,7 @@ public:
     [[nodiscard]] bool is_warp() const noexcept { return warp_; }
 
     /// True when the DXGI adapter list changed or `hwnd` now sits on another GPU's monitor.
-    [[nodiscard]] bool adapter_stale(HWND hwnd) const {
+    [[nodiscard]] bool adapter_stale(HWND hwnd) const noexcept {
         if (!dxgi_factory_ || !dxgi_factory_->IsCurrent()) return true;
         if (warp_) return false;
         if (auto a = window_adapter(dxgi_factory_.get(), hwnd)) {
@@ -71,7 +71,7 @@ public:
     std::function<void()> on_device_changed;
 
 private:
-    static wil::com_ptr<IDXGIAdapter1> window_adapter(IDXGIFactory2* f, HWND hwnd) {
+    static wil::com_ptr<IDXGIAdapter1> window_adapter(IDXGIFactory2* f, HWND hwnd) noexcept {
         if (!f || !hwnd) return nullptr;
         HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         for (UINT i = 0;; ++i) {
@@ -135,7 +135,7 @@ private:
     }
 
 public:
-    void wait_gpu() {
+    void wait_gpu() noexcept {
         if (!d3d_ || !d3d_ctx_) return;
         if (!frame_query_) {
             const D3D11_QUERY_DESC qd{.Query = D3D11_QUERY_EVENT, .MiscFlags = 0};
@@ -167,14 +167,14 @@ private:
 /// Per-window swapchain composed through DirectComposition (premultiplied alpha so DWM backdrops show through).
 class WindowTarget {
 public:
-    bool attach(Gfx& gfx, HWND hwnd, bool liquid_glass = false) {
+    bool attach(Gfx& gfx, HWND hwnd, bool liquid_glass = false) noexcept {
         gfx_ = &gfx;
         hwnd_ = hwnd;
         liquid_glass_ = liquid_glass;
         return rebuild();
     }
 
-    void set_liquid_glass(bool on) {
+    void set_liquid_glass(bool on) noexcept {
         if (liquid_glass_ == on) return;
         liquid_glass_ = on;
         if (swap_) rebuild();
@@ -182,7 +182,7 @@ public:
 
     [[nodiscard]] bool liquid_glass() const noexcept { return liquid_glass_; }
 
-    bool rebuild() {
+    bool rebuild() noexcept {
         release();
         if (!gfx_ || !gfx_->ready()) return false;
         if (FAILED(gfx_->d2d_device()->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS, &dc_))) return false;
@@ -217,7 +217,7 @@ public:
         return true;
     }
 
-    void release() {
+    void release() noexcept {
         if (bmp_brush_) bmp_brush_->SetBitmap(nullptr);
         bmp_brush_.reset();
         solid_brush_.reset();
@@ -241,7 +241,7 @@ public:
     [[nodiscard]] float dpi() const noexcept { return dpi_; }
 
     /// Reusable solid-color brush for the active device context.
-    [[nodiscard]] ID2D1SolidColorBrush* solid_brush() {
+    [[nodiscard]] ID2D1SolidColorBrush* solid_brush() noexcept {
         if (!solid_brush_ && dc_) {
             dc_->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), &solid_brush_);
         }
@@ -249,7 +249,7 @@ public:
     }
 
     /// Reusable bitmap brush bound to `bmp` for thumbnail rendering.
-    [[nodiscard]] ID2D1BitmapBrush1* bitmap_brush(ID2D1Bitmap1* bmp) {
+    [[nodiscard]] ID2D1BitmapBrush1* bitmap_brush(ID2D1Bitmap1* bmp) noexcept {
         if (!bmp || !dc_) return nullptr;
         if (!bmp_brush_) {
             const auto bp = D2D1::BitmapBrushProperties1(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_INTERPOLATION_MODE_LINEAR);
@@ -260,7 +260,7 @@ public:
         return bmp_brush_.get();
     }
 
-    bool resize(UINT w, UINT h) {
+    bool resize(UINT w, UINT h) noexcept {
         if (w == 0 || h == 0) return ready();
         const float dpi = static_cast<float>(GetDpiForWindow(hwnd_));
         if (!ready()) return rebuild();
@@ -358,14 +358,14 @@ public:
         return true;
     }
 
-    void request_capture(fs::path p) {
+    void request_capture(fs::path p) noexcept {
         capture_ = std::move(p);
         capture_ok_ = false;
     }
     [[nodiscard]] bool capture_ok() const noexcept { return capture_ok_; }
 
 private:
-    bool create_target() {
+    bool create_target() noexcept {
         wil::com_ptr<IDXGISurface> surface;
         if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&surface)))) return false;
         const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,

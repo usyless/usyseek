@@ -20,7 +20,7 @@ inline std::wstring clipboard_text(HWND hwnd) {
     return out;
 }
 
-inline bool set_clipboard_text(HWND hwnd, std::wstring_view s) {
+inline bool set_clipboard_text(HWND hwnd, std::wstring_view s) noexcept {
     if (!OpenClipboard(hwnd)) return false;
     bool ok = false;
     EmptyClipboard();
@@ -50,7 +50,7 @@ public:
     bool focused = false;
     bool caret_on = true;
 
-    void set(std::wstring s) {
+    void set(std::wstring s) noexcept {
         TextBuffer::set(std::move(s));
         scroll_ = 0.0f;
     }
@@ -151,7 +151,7 @@ public:
     }
 
     /// Positions the IME candidate window under the caret (pixels = DIPs * scale).
-    void place_ime(HWND hwnd, float scale) const {
+    void place_ime(HWND hwnd, float scale) const noexcept {
         if (HIMC imc = ImmGetContext(hwnd)) {
             COMPOSITIONFORM cf{};
             cf.dwStyle = CFS_POINT;

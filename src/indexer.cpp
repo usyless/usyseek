@@ -50,21 +50,21 @@ struct Progress {
         publish(true);
         wlog(L"[%s] %.*s\n", phase_label(p), static_cast<int>(msg.size()), msg.data());
     }
-    void set_message(std::wstring_view msg) {
+    void set_message(std::wstring_view msg) noexcept {
         if (msg.empty()) {
             d.message[0] = L'\0';
             return;
         }
         wcsncpy_s(d.message, msg.data(), std::min(msg.size(), std::size(d.message) - 1));
     }
-    void set_current(std::wstring_view path) {
+    void set_current(std::wstring_view path) noexcept {
         if (path.empty()) {
             d.current[0] = L'\0';
             return;
         }
         wcsncpy_s(d.current, path.data(), std::min(path.size(), std::size(d.current) - 1));
     }
-    void publish(bool force = false) {
+    void publish(bool force = false) noexcept {
         const auto now = std::chrono::steady_clock::now();
         if (!force && now - last_publish < std::chrono::milliseconds(100)) return;
         last_publish = now;
@@ -677,13 +677,13 @@ public:
         not_full_.notify_one();
         return true;
     }
-    void close() {
+    void close() noexcept {
         std::lock_guard lk{m_};
         closed_ = true;
         not_full_.notify_all();
         not_empty_.notify_all();
     }
-    [[nodiscard]] bool done() {
+    [[nodiscard]] bool done() noexcept {
         std::lock_guard lk{m_};
         return closed_ && q_.empty();
     }
@@ -801,7 +801,7 @@ struct PyVision {
     std::string shm_name;
     std::string read_buf;
 
-    PyVision() {
+    PyVision() noexcept {
         cancel_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     }
     PyVision(const PyVision&) = delete;

@@ -58,7 +58,7 @@ struct AsyncState {
     std::atomic<DWORD> bytes{0};
 };
 
-inline void CALLBACK winhttp_callback(HINTERNET, DWORD_PTR ctx, DWORD code, LPVOID info, DWORD len) {
+inline void CALLBACK winhttp_callback(HINTERNET, DWORD_PTR ctx, DWORD code, LPVOID info, DWORD len) noexcept {
     auto* s = reinterpret_cast<AsyncState*>(ctx);
     if (!s) return;
     switch (code) {

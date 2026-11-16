@@ -12,7 +12,7 @@ namespace usyseek::ui {
 /// pages cannot couple distinct grid cards in `selected_` or stall offset progression.
 class PaginationTracker {
 public:
-    void reset() {
+    void reset() noexcept {
         seen_ids_.clear();
         next_offset_ = 0;
     }

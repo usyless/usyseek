@@ -114,7 +114,7 @@ public:
 
     /// Absorbs newly decoded header/frames posted from the background worker.
     /// Returns true if visual preview state changed and should be redrawn.
-    bool process_worker_signal() {
+    bool process_worker_signal() noexcept {
         bool changed = false;
         const auto now = std::chrono::steady_clock::now();
         const std::scoped_lock lk{mtx_};
@@ -162,7 +162,7 @@ public:
 
     /// Advances playback if the current frame's delay has elapsed.
     /// Returns `{advanced, next_wait_ms}` (`next_wait_ms == 0` means no timer needed right now).
-    [[nodiscard]] std::pair<bool, UINT> tick(std::chrono::steady_clock::time_point now) {
+    [[nodiscard]] std::pair<bool, UINT> tick(std::chrono::steady_clock::time_point now) noexcept {
         if (!ui_active_ || ui_settled_static_ || !ui_playing_ || ui_total_frames_ <= 1 || !ui_current_pixels_) {
             return {false, 0u};
         }
@@ -210,7 +210,7 @@ public:
     }
 
     /// Ensures `gpu_bmp_` matches `ui_current_pixels_` on `dc`. Safe across GPU resets.
-    [[nodiscard]] MediaTickStatus sync_bitmap(ID2D1DeviceContext* dc) {
+    [[nodiscard]] MediaTickStatus sync_bitmap(ID2D1DeviceContext* dc) noexcept {
         if (!dc || !ui_current_pixels_ || ui_out_w_ == 0 || ui_out_h_ == 0) return MediaTickStatus::NoChange;
         const size_t expected = static_cast<size_t>(ui_out_w_) * ui_out_h_ * 4u;
         if (ui_current_pixels_->size() < expected) return MediaTickStatus::NoChange;
@@ -271,21 +271,21 @@ public:
         }
     }
 
-    void step_frame(int delta) {
+    void step_frame(int delta) noexcept {
         if (!has_animation()) return;
         const auto total = static_cast<int64_t>(ui_total_frames_);
         const int64_t wrapped = (((static_cast<int64_t>(ui_current_index_) + delta) % total) + total) % total;
         seek_to_frame(static_cast<size_t>(wrapped));
     }
 
-    void seek_fraction(float ratio) {
+    void seek_fraction(float ratio) noexcept {
         if (!has_animation()) return;
         const float r = std::clamp(ratio, 0.0f, 1.0f);
         const auto idx = static_cast<size_t>(std::lround(r * static_cast<float>(ui_total_frames_ - 1)));
         seek_to_frame(std::min(idx, ui_total_frames_ - 1));
     }
 
-    void seek_to_frame(size_t target) {
+    void seek_to_frame(size_t target) noexcept {
         if (!has_animation()) return;
         target = std::min(target, ui_total_frames_ - 1);
         const auto now = std::chrono::steady_clock::now();

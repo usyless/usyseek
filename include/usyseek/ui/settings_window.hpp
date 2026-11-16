@@ -21,7 +21,7 @@ namespace usyseek::ui {
 
 class Flow {
 public:
-    Flow(float gap_x, float gap_y) : gap_x_{gap_x}, gap_y_{gap_y} {}
+    Flow(float gap_x, float gap_y) noexcept : gap_x_{gap_x}, gap_y_{gap_y} {}
 
     void add(float w, float h, std::function<void(D2D1_RECT_F)> draw, bool grow = false) {
         items_.push_back({w, h, grow});
@@ -33,7 +33,7 @@ public:
         add(group_w, inner.height(group_w), [inner](D2D1_RECT_F r) { inner.draw(r.left, r.top, width(r)); }, grow);
     }
 
-    [[nodiscard]] float natural_width() const {
+    [[nodiscard]] float natural_width() const noexcept {
         float total = 0.0f;
         for (const FlowItem& item : items_) {
             total += item.width;
@@ -112,7 +112,7 @@ public:
     [[nodiscard]] bool visible() const noexcept { return IsWindowVisible(hwnd_) != FALSE; }
     WindowTarget& target() noexcept { return target_; }
 
-    void apply_theme() {
+    void apply_theme() noexcept {
         apply_window_theme(hwnd_, sh_.theme, false, true);
         target_.set_liquid_glass(glass_active());
         if (glass_active()) {
@@ -127,7 +127,7 @@ public:
     }
 
     /// Cancels and joins background download/install jobs before tearing down the window.
-    void stop() {
+    void stop() noexcept {
         venv_job_.thread = {};
         model_job_.thread = {};
     }
@@ -184,7 +184,7 @@ public:
         if (sh_.visibility_changed) sh_.visibility_changed();
     }
 
-    void set_tab(int t) {
+    void set_tab(int t) noexcept {
         const bool animate = visible() && !sh_.test_mode;
         tab_ = t;
         tab_anim_.set(static_cast<float>(t), animate);
@@ -195,7 +195,7 @@ public:
     }
 
     /// Asks for a repaint; calls made before the next WM_PAINT collapse into one frame, and input is handled first.
-    void invalidate() {
+    void invalidate() noexcept {
         dirty_ = true;
         full_dirty_ = true;
         if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
@@ -706,7 +706,7 @@ private:
         int id;
     };
 
-    static std::array<TabDef, 4> tab_defs() {
+    static std::array<TabDef, 4> tab_defs() noexcept {
         return {{
             {glyph::clock, L"Embeddings & Progress", IdTab0},
             {glyph::settings, L"Application & Venv Settings", IdTab1},
@@ -2038,7 +2038,7 @@ private:
     }
 
     /// Any thread.
-    void request_redraw() {
+    void request_redraw() noexcept {
         if (!redraw_posted_.exchange(true) && !PostMessageW(hwnd_, WM_APP_REDRAW, 0, 0)) {
             redraw_posted_ = false;
         }
@@ -2139,7 +2139,7 @@ private:
     [[nodiscard]] std::string default_repo() const { return "timm/" + sh_.settings.model_name; }
 
     /// "owner/name", nothing that could change the URL it is pasted into.
-    static bool valid_repo(std::string_view repo) {
+    static bool valid_repo(std::string_view repo) noexcept {
         const auto slash = repo.find('/');
         if (slash == std::string_view::npos || slash == 0 || slash + 1 >= repo.size() || repo.find('/', slash + 1) != std::string_view::npos) return false;
         if (repo.contains("..")) return false;
@@ -2506,14 +2506,14 @@ private:
         queue_hover_dirty(pending_dirty_, id, idx, full_dirty_);
     }
 
-    void start_anim() {
+    void start_anim() noexcept {
         if (!visible()) return;
         if (!anim_active_) last_anim_ = std::chrono::steady_clock::now();
         anim_active_ = true;
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
-    bool step_anim() {
+    bool step_anim() noexcept {
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
         last_anim_ = now;
@@ -2541,7 +2541,7 @@ private:
         sw_hide_focus_.set(sh_.settings.hide_on_focus_loss ? 1.0f : 0.0f, animate);
     }
 
-    void update_switch_anims() {
+    void update_switch_anims() noexcept {
         const bool animate = visible() && !sh_.test_mode;
         sync_switch_targets(animate);
         if (animate) start_anim();
@@ -2699,7 +2699,7 @@ private:
         invalidate();
     }
 
-    void stop_recording() {
+    void stop_recording() noexcept {
         if (!recording_hotkey_) return;
         recording_hotkey_ = false;
         send_cmd_value(find_launcher(), Cmd::SuspendHotkey, uint32_t{0});

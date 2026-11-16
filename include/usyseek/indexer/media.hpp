@@ -16,7 +16,7 @@ namespace usyseek::media {
 
 enum class ResizeMode : uint8_t { Squash, Shortest, Longest };
 
-inline ResizeMode parse_resize_mode(std::string_view s) {
+inline ResizeMode parse_resize_mode(std::string_view s) noexcept {
     if (s == "shortest") return ResizeMode::Shortest;
     if (s == "longest") return ResizeMode::Longest;
     return ResizeMode::Squash;
@@ -54,7 +54,7 @@ struct Decoded {
 /// Per-thread decoder (owns its WIC factory; call from a COM MTA thread).
 class Decoder {
 public:
-    Decoder(uint32_t size, ResizeMode mode) : size_{size}, mode_{mode} {
+    Decoder(uint32_t size, ResizeMode mode) noexcept : size_{size}, mode_{mode} {
         CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_));
     }
 
@@ -199,7 +199,7 @@ public:
     }
 
 private:
-    static bool query_u16(IWICMetadataQueryReader* q, const wchar_t* name, UINT& out) {
+    static bool query_u16(IWICMetadataQueryReader* q, const wchar_t* name, UINT& out) noexcept {
         if (!q) return false;
         PROPVARIANT v;
         PropVariantInit(&v);
@@ -359,7 +359,7 @@ private:
         return out;
     }
 
-    static bool copy_sample(IMFSample* sample, UINT32 w, UINT32 h, std::vector<uint8_t>& dst) {
+    static bool copy_sample(IMFSample* sample, UINT32 w, UINT32 h, std::vector<uint8_t>& dst) noexcept {
         wil::com_ptr<IMFMediaBuffer> buf;
         if (FAILED(sample->ConvertToContiguousBuffer(&buf))) return false;
         const size_t row = static_cast<size_t>(w) * 4;
@@ -383,7 +383,7 @@ private:
         return ok;
     }
 
-    static double mean_luma(const std::vector<uint8_t>& rgb) {
+    static double mean_luma(const std::vector<uint8_t>& rgb) noexcept {
         constexpr size_t step = 21; // every 7th RGB pixel is plenty
         uint64_t sum = 0;
         for (size_t i = 0; i + 2 < rgb.size(); i += step) sum += (rgb[i] * 77u + rgb[i + 1] * 150u + rgb[i + 2] * 29u) >> 8;
@@ -391,7 +391,7 @@ private:
         return n ? static_cast<double>(sum) / static_cast<double>(n) : 0.0;
     }
 
-    static WICBitmapTransformOptions orientation(IWICBitmapFrameDecode* frame) {
+    static WICBitmapTransformOptions orientation(IWICBitmapFrameDecode* frame) noexcept {
         wil::com_ptr<IWICMetadataQueryReader> q;
         if (FAILED(frame->GetMetadataQueryReader(&q))) return WICBitmapTransformRotate0;
         PROPVARIANT v;

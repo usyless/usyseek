@@ -248,7 +248,7 @@ public:
 
     /// Processes queued IMFMediaEngine events cleanly on the UI thread.
     /// Returns true if visible state changed.
-    bool process_events() {
+    bool process_events() noexcept {
         if (!notify_cb_) return false;
         std::array<DWORD, 256> events{};
         const size_t n = notify_cb_->drain(events);
@@ -337,7 +337,7 @@ public:
     }
 
     /// Transfers a newly decoded video frame (or re-scales on resize/seek) into `video_bmp_`.
-    [[nodiscard]] MediaTickStatus tick(ID3D11Device* d3d, ID2D1DeviceContext* dc) {
+    [[nodiscard]] MediaTickStatus tick(ID3D11Device* d3d, ID2D1DeviceContext* dc) noexcept {
         if (!engine_ || !d3d || !dc || current_path_.empty() ||
             phase_ == LoadPhase::Idle || phase_ == LoadPhase::Failed) {
             return MediaTickStatus::NoChange;

@@ -100,7 +100,7 @@ public:
         for (unsigned i = 0; i < threads; ++i) workers_.emplace_back([this](const std::stop_token& st) { worker(st); });
     }
 
-    void stop() {
+    void stop() noexcept {
         {
             std::lock_guard lk{m_};
             stopping_ = true;
@@ -169,7 +169,7 @@ public:
     }
 
     /// Device lost / recreated: every bitmap belongs to the old device.
-    void reset_gpu() {
+    void reset_gpu() noexcept {
         bitmaps_.clear();
         lru_.clear();
     }
@@ -185,7 +185,7 @@ public:
         failed_.clear();
     }
 
-    void clear_failed() { failed_.clear(); }
+    void clear_failed() noexcept { failed_.clear(); }
 
 private:
     size_t max_bitmaps_;

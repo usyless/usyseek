@@ -97,7 +97,7 @@ struct Shared {
     }
 
     /// Asks the launcher whether it holds the global shortcut. Returns true when the answer changed.
-    bool refresh_hotkey_state() {
+    bool refresh_hotkey_state() noexcept {
         const HotkeyState before = hotkey_state;
         const auto reply = query_cmd(find_launcher(), Cmd::HotkeyStatus);
         hotkey_state = reply && *reply <= static_cast<DWORD_PTR>(HotkeyState::Unavailable) ? static_cast<HotkeyState>(*reply) : HotkeyState::Unknown;
@@ -271,7 +271,7 @@ inline bool confirm_box(HWND owner, const wchar_t* title, const std::wstring& me
 }
 
 /// Applies theme-driven immersive dark/light mode, corner preference, backdrop, and border to a window.
-inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool round = true) {
+inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool round = true) noexcept {
     if (!hwnd) return;
     const DWORD want_affinity = theme.is_liquid_glass ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE;
     DWORD cur_affinity = WDA_NONE;
@@ -326,7 +326,7 @@ inline bool reveal_in_explorer(const std::wstring& path, std::string* error = nu
 }
 
 /// Hands `n` bytes to `obj` as an HGLOBAL of format `cf` (the data object takes ownership).
-inline bool set_data_bytes(IDataObject* obj, CLIPFORMAT cf, const void* data, size_t n) {
+inline bool set_data_bytes(IDataObject* obj, CLIPFORMAT cf, const void* data, size_t n) noexcept {
     HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, n);
     if (!h) return false;
     if (void* p = GlobalLock(h)) {
@@ -404,7 +404,7 @@ inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring>
 /// drop and its conflict resolution dialogs synchronously inside IDropTarget::Drop() on our UI thread.
 class AsyncDataObject final : public IDataObject, public IDataObjectAsyncCapability {
 public:
-    explicit AsyncDataObject(wil::com_ptr<IDataObject> inner) : inner_(std::move(inner)) {}
+    explicit AsyncDataObject(wil::com_ptr<IDataObject> inner) noexcept : inner_(std::move(inner)) {}
     AsyncDataObject(const AsyncDataObject&) = delete;
     AsyncDataObject& operator=(const AsyncDataObject&) = delete;
     AsyncDataObject(AsyncDataObject&&) = delete;
@@ -412,7 +412,7 @@ public:
     virtual ~AsyncDataObject() = default;
 
     // IUnknown
-    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) noexcept override {
         if (!ppv) return E_POINTER;
         *ppv = nullptr;
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IDataObject)) {
@@ -427,78 +427,78 @@ public:
         return inner_ ? inner_->QueryInterface(riid, ppv) : E_NOINTERFACE;
     }
 
-    IFACEMETHODIMP_(ULONG) AddRef() override {
+    IFACEMETHODIMP_(ULONG) AddRef() noexcept override {
         return ++ref_count_;
     }
 
-    IFACEMETHODIMP_(ULONG) Release() override {
+    IFACEMETHODIMP_(ULONG) Release() noexcept override {
         const ULONG count = --ref_count_;
         if (count == 0) delete this;
         return count;
     }
 
     // IDataObjectAsyncCapability
-    IFACEMETHODIMP SetAsyncMode(BOOL fDoOpAsync) override {
+    IFACEMETHODIMP SetAsyncMode(BOOL fDoOpAsync) noexcept override {
         async_mode_ = fDoOpAsync;
         return S_OK;
     }
 
-    IFACEMETHODIMP GetAsyncMode(BOOL* pfIsOpAsync) override {
+    IFACEMETHODIMP GetAsyncMode(BOOL* pfIsOpAsync) noexcept override {
         if (!pfIsOpAsync) return E_POINTER;
         *pfIsOpAsync = async_mode_;
         return S_OK;
     }
 
-    IFACEMETHODIMP StartOperation(IBindCtx* /*pbcReserved*/) override {
+    IFACEMETHODIMP StartOperation(IBindCtx* /*pbcReserved*/) noexcept override {
         in_operation_ = TRUE;
         return S_OK;
     }
 
-    IFACEMETHODIMP InOperation(BOOL* pfInAsyncOp) override {
+    IFACEMETHODIMP InOperation(BOOL* pfInAsyncOp) noexcept override {
         if (!pfInAsyncOp) return E_POINTER;
         *pfInAsyncOp = in_operation_;
         return S_OK;
     }
 
-    IFACEMETHODIMP EndOperation(HRESULT /*hResult*/, IBindCtx* /*pbcReserved*/, DWORD /*dwEffects*/) override {
+    IFACEMETHODIMP EndOperation(HRESULT /*hResult*/, IBindCtx* /*pbcReserved*/, DWORD /*dwEffects*/) noexcept override {
         in_operation_ = FALSE;
         return S_OK;
     }
 
     // IDataObject
-    IFACEMETHODIMP GetData(FORMATETC* pformatetcIn, STGMEDIUM* pmedium) override {
+    IFACEMETHODIMP GetData(FORMATETC* pformatetcIn, STGMEDIUM* pmedium) noexcept override {
         return inner_ ? inner_->GetData(pformatetcIn, pmedium) : E_UNEXPECTED;
     }
 
-    IFACEMETHODIMP GetDataHere(FORMATETC* pformatetc, STGMEDIUM* pmedium) override {
+    IFACEMETHODIMP GetDataHere(FORMATETC* pformatetc, STGMEDIUM* pmedium) noexcept override {
         return inner_ ? inner_->GetDataHere(pformatetc, pmedium) : E_UNEXPECTED;
     }
 
-    IFACEMETHODIMP QueryGetData(FORMATETC* pformatetc) override {
+    IFACEMETHODIMP QueryGetData(FORMATETC* pformatetc) noexcept override {
         return inner_ ? inner_->QueryGetData(pformatetc) : E_UNEXPECTED;
     }
 
-    IFACEMETHODIMP GetCanonicalFormatEtc(FORMATETC* pformatetcIn, FORMATETC* pformatetcOut) override {
+    IFACEMETHODIMP GetCanonicalFormatEtc(FORMATETC* pformatetcIn, FORMATETC* pformatetcOut) noexcept override {
         return inner_ ? inner_->GetCanonicalFormatEtc(pformatetcIn, pformatetcOut) : E_UNEXPECTED;
     }
 
-    IFACEMETHODIMP SetData(FORMATETC* pformatetc, STGMEDIUM* pmedium, BOOL fRelease) override {
+    IFACEMETHODIMP SetData(FORMATETC* pformatetc, STGMEDIUM* pmedium, BOOL fRelease) noexcept override {
         return inner_ ? inner_->SetData(pformatetc, pmedium, fRelease) : E_UNEXPECTED;
     }
 
-    IFACEMETHODIMP EnumFormatEtc(DWORD dwDirection, IEnumFORMATETC** ppenumFormatEtc) override {
+    IFACEMETHODIMP EnumFormatEtc(DWORD dwDirection, IEnumFORMATETC** ppenumFormatEtc) noexcept override {
         return inner_ ? inner_->EnumFormatEtc(dwDirection, ppenumFormatEtc) : E_UNEXPECTED;
     }
 
-    IFACEMETHODIMP DAdvise(FORMATETC* pformatetc, DWORD advf, IAdviseSink* pAdvSink, DWORD* pdwConnection) override {
+    IFACEMETHODIMP DAdvise(FORMATETC* pformatetc, DWORD advf, IAdviseSink* pAdvSink, DWORD* pdwConnection) noexcept override {
         return inner_ ? inner_->DAdvise(pformatetc, advf, pAdvSink, pdwConnection) : E_UNEXPECTED;
     }
 
-    IFACEMETHODIMP DUnadvise(DWORD dwConnection) override {
+    IFACEMETHODIMP DUnadvise(DWORD dwConnection) noexcept override {
         return inner_ ? inner_->DUnadvise(dwConnection) : E_UNEXPECTED;
     }
 
-    IFACEMETHODIMP EnumDAdvise(IEnumSTATDATA** ppenumAdvise) override {
+    IFACEMETHODIMP EnumDAdvise(IEnumSTATDATA** ppenumAdvise) noexcept override {
         return inner_ ? inner_->EnumDAdvise(ppenumAdvise) : E_UNEXPECTED;
     }
 

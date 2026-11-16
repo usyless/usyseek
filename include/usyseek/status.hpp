@@ -60,7 +60,7 @@ public:
         StatusData data;
     };
 
-    static std::optional<StatusBlock> create() {
+    static std::optional<StatusBlock> create() noexcept {
         StatusBlock b;
         b.mapping_.reset(CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Shared), STATUS_SHM));
         if (!b.mapping_) return std::nullopt;
@@ -68,7 +68,7 @@ public:
         return b;
     }
 
-    static std::optional<StatusBlock> open() {
+    static std::optional<StatusBlock> open() noexcept {
         StatusBlock b;
         b.mapping_.reset(OpenFileMappingW(FILE_MAP_READ, FALSE, STATUS_SHM));
         if (!b.mapping_) return std::nullopt;
@@ -103,7 +103,7 @@ public:
     }
 
 private:
-    bool map(bool read_only = false) {
+    bool map(bool read_only = false) noexcept {
         view_.reset(MapViewOfFile(mapping_.get(), read_only ? FILE_MAP_READ : FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared)));
         return static_cast<bool>(view_);
     }

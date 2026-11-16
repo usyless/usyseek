@@ -276,7 +276,7 @@ private:
         ui_ = spawn(exe_dir() / L"usyseek-ui.exe", arg, false);
     }
 
-    bool is_pill_visible() const {
+    bool is_pill_visible() const noexcept {
         return ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_) && IsWindowVisible(ui_hwnd_);
     }
 
@@ -325,7 +325,7 @@ private:
         }
     }
 
-    bool is_ui_running() const {
+    bool is_ui_running() const noexcept {
         if (ui_.hProcess && WaitForSingleObject(ui_.hProcess, 0) == WAIT_TIMEOUT) return true;
         if (ui_hwnd_ && IsWindow(ui_hwnd_)) return true;
         return FindWindowW(PILL_CLASS, nullptr) != nullptr;
@@ -455,7 +455,7 @@ private:
         SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
     }
 
-    void notify_ui() {
+    void notify_ui() noexcept {
         if (ui_hwnd_ && IsWindow(ui_hwnd_)) PostMessageW(ui_hwnd_, msg_indexer_changed(), indexer_.hProcess ? 1 : 0, 0);
     }
 
@@ -500,7 +500,7 @@ private:
         }
     }
 
-    NOTIFYICONDATAW tray_data() const {
+    NOTIFYICONDATAW tray_data() const noexcept {
         NOTIFYICONDATAW nid{sizeof(nid)};
         nid.hWnd = hwnd_;
         nid.uID = TRAY_ID;
@@ -522,7 +522,7 @@ private:
         update_tip();
     }
 
-    void remove_tray() {
+    void remove_tray() noexcept {
         NOTIFYICONDATAW nid = tray_data();
         Shell_NotifyIconW(NIM_DELETE, &nid);
     }

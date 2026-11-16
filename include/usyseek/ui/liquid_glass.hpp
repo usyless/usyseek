@@ -321,7 +321,7 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
 }
 )hlsl";
 
-inline wil::com_ptr<ID3DBlob> compile_liquid_glass_ps() {
+inline wil::com_ptr<ID3DBlob> compile_liquid_glass_ps() noexcept {
     wil::com_ptr<ID3DBlob> code;
     wil::com_ptr<ID3DBlob> err;
     const HRESULT hr = D3DCompile(
@@ -399,7 +399,7 @@ public:
         return false;
     }
 
-    static HRESULT CALLBACK create_effect(IUnknown** out) {
+    static HRESULT CALLBACK create_effect(IUnknown** out) noexcept {
         if (!out) return E_POINTER;
         auto* p = new (std::nothrow) LiquidGlassEffectImpl();
         if (!p) return E_OUTOFMEMORY;
@@ -407,13 +407,13 @@ public:
         return S_OK;
     }
 
-    HRESULT set_params(const BYTE* data, UINT32 size) {
+    HRESULT set_params(const BYTE* data, UINT32 size) noexcept {
         if (!data || size != sizeof(params_)) return E_INVALIDARG;
         std::memcpy(&params_, data, sizeof(params_));
         return S_OK;
     }
 
-    HRESULT get_params(BYTE* data, UINT32 size, UINT32* actual) const {
+    HRESULT get_params(BYTE* data, UINT32 size, UINT32* actual) const noexcept {
         if (actual) *actual = sizeof(params_);
         if (!data) return S_OK;
         if (size < sizeof(params_)) return E_NOT_SUFFICIENT_BUFFER;
@@ -422,7 +422,7 @@ public:
     }
 
     // IUnknown
-    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) noexcept override {
         if (!ppv) return E_POINTER;
         *ppv = nullptr;
         if (riid == __uuidof(IUnknown) || riid == __uuidof(ID2D1EffectImpl)) {
@@ -441,15 +441,15 @@ public:
         return E_NOINTERFACE;
     }
 
-    IFACEMETHODIMP_(ULONG) AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
-    IFACEMETHODIMP_(ULONG) Release() override {
+    IFACEMETHODIMP_(ULONG) AddRef() noexcept override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+    IFACEMETHODIMP_(ULONG) Release() noexcept override {
         const ULONG r = static_cast<ULONG>(InterlockedDecrement(&refs_));
         if (r == 0) delete this;
         return r;
     }
 
     // ID2D1EffectImpl
-    IFACEMETHODIMP Initialize(ID2D1EffectContext* ctx, ID2D1TransformGraph* graph) override {
+    IFACEMETHODIMP Initialize(ID2D1EffectContext* ctx, ID2D1TransformGraph* graph) noexcept override {
         if (!ctx || !graph) return E_INVALIDARG;
         if (!ctx->IsShaderLoaded(GUID_UsyseekLiquidGlassPS)) {
             static const wil::com_ptr<ID3DBlob> ps = detail::compile_liquid_glass_ps();
@@ -542,7 +542,7 @@ public:
         ULONGLONG retry_after_tick = 0;
     };
 
-    void reset() {
+    void reset() noexcept {
         outputs_.clear();
         epoch_ = 0;
     }
@@ -641,7 +641,7 @@ private:
         return &outputs_.back();
     }
 
-    static void reset_output(OutputState& st) {
+    static void reset_output(OutputState& st) noexcept {
         st.dupl.reset();
         st.desktop_tex.reset();
         st.tex_id = 0;
@@ -651,7 +651,7 @@ private:
         st.history.clear();
     }
 
-    static bool ensure_duplication(Gfx& gfx, OutputState& st, ULONGLONG now_tick) {
+    static bool ensure_duplication(Gfx& gfx, OutputState& st, ULONGLONG now_tick) noexcept {
         if (st.dupl) return true;
         if (now_tick < st.retry_after_tick) return false;
 
@@ -680,7 +680,7 @@ private:
         return false;
     }
 
-    static bool ensure_desktop_surface(Gfx& gfx, OutputState& st, ID3D11Texture2D* src, uint64_t& next_tex_id) {
+    static bool ensure_desktop_surface(Gfx& gfx, OutputState& st, ID3D11Texture2D* src, uint64_t& next_tex_id) noexcept {
         D3D11_TEXTURE2D_DESC sd{};
         src->GetDesc(&sd);
         if (st.desktop_tex && st.tex_w == sd.Width && st.tex_h == sd.Height) return true;
@@ -712,7 +712,7 @@ private:
 /// Per-window Liquid Glass rendering helper (manages blur + shader effects, backdrop copy, and in-app scene snapshot).
 class LiquidGlassWindow {
 public:
-    void release() {
+    void release() noexcept {
         desktop_bmp_.reset();
         desktop_bmp_tex_id_ = 0;
         win_bmp_[0].reset();
@@ -888,7 +888,7 @@ public:
 
     /// Redirects `target.dc()` into an offscreen `scene_bmp_` so floating glass panels
     /// can sample and refract the rendered scene underneath them without copying.
-    bool begin_scene(WindowTarget& target, Gfx& gfx) {
+    bool begin_scene(WindowTarget& target, Gfx& gfx) noexcept {
         scene_active_ = false;
         if (!target.ready() || !target.target_bitmap()) return false;
         const UINT pw = target.pixel_width();
@@ -916,7 +916,7 @@ public:
     }
 
     /// Restores `target.target_bitmap()` and blits `scene_bmp_` onto it as the base layer.
-    void end_scene(WindowTarget& target) {
+    void end_scene(WindowTarget& target) noexcept {
         if (!scene_active_) return;
         scene_active_ = false;
         if (!target.ready() || !target.target_bitmap() || !scene_bmp_) return;
@@ -1151,7 +1151,7 @@ private:
         return changed;
     }
 
-    bool ensure_cached_glass_bmp(Gfx& gfx, WindowTarget& target, UINT pw, UINT ph) {
+    bool ensure_cached_glass_bmp(Gfx& gfx, WindowTarget& target, UINT pw, UINT ph) noexcept {
         if (pw == 0 || ph == 0) return false;
         if (cached_glass_bmp_ && cached_glass_w_ == pw && cached_glass_h_ == ph &&
             cached_glass_dpi_ == target.dpi() && cached_glass_epoch_ == gfx.epoch()) {
@@ -1173,7 +1173,7 @@ private:
         return true;
     }
 
-    bool ensure_win_bmp(Gfx& gfx, WindowTarget& target, UINT pw, UINT ph) {
+    bool ensure_win_bmp(Gfx& gfx, WindowTarget& target, UINT pw, UINT ph) noexcept {
         if (pw == 0 || ph == 0) return false;
         if (win_bmp_[0] && win_bmp_[1] && win_bmp_w_ == pw && win_bmp_h_ == ph &&
             win_bmp_dpi_ == target.dpi() && win_bmp_epoch_ == gfx.epoch()) {
@@ -1199,7 +1199,7 @@ private:
         return true;
     }
 
-    ID2D1Bitmap1* capture_gdi_backdrop(Gfx& gfx, WindowTarget& target, HWND hwnd, POINT origin, UINT pw, UINT ph) {
+    ID2D1Bitmap1* capture_gdi_backdrop(Gfx& gfx, WindowTarget& target, HWND hwnd, POINT origin, UINT pw, UINT ph) noexcept {
         if (!ensure_win_bmp(gfx, target, pw, ph)) return nullptr;
         (void)hwnd;
         if (!seeded_gdi_ || origin.x != gdi_origin_.x || origin.y != gdi_origin_.y) {
@@ -1213,7 +1213,7 @@ private:
         return seeded_gdi_ ? win_bmp_[win_bmp_idx_].get() : nullptr;
     }
 
-    bool seed_from_screen_dc(ID2D1Bitmap1* dst_bmp, POINT origin, UINT pw, UINT ph) {
+    bool seed_from_screen_dc(ID2D1Bitmap1* dst_bmp, POINT origin, UINT pw, UINT ph) noexcept {
         if (!dst_bmp || pw == 0 || ph == 0) return false;
         HDC screen_dc = GetDC(nullptr);
         if (!screen_dc) return false;

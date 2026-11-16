@@ -34,7 +34,7 @@ struct ParsedQuery {
     std::optional<int> kind;
     std::optional<std::wstring> unknown_type;
 
-    [[nodiscard]] bool empty() const {
+    [[nodiscard]] bool empty() const noexcept {
         return text.empty() && tags.empty() && not_tags.empty() && dirs.empty() && names.empty() && !similar && !kind && !unknown_type;
     }
 };
@@ -460,7 +460,7 @@ public:
         thread_ = std::jthread([this] { run(); });
     }
 
-    void stop() {
+    void stop() noexcept {
         {
             std::lock_guard lk{m_};
             stopping_ = true;
@@ -470,7 +470,7 @@ public:
         encoder_.stop();
     }
 
-    void search(SearchRequest r) {
+    void search(SearchRequest r) noexcept {
         {
             std::lock_guard lk{m_};
             pending_search_ = std::move(r);
@@ -491,7 +491,7 @@ public:
         settings_ = s;
     }
 
-    TextEncoder& encoder() { return encoder_; }
+    TextEncoder& encoder() noexcept { return encoder_; }
     [[nodiscard]] bool db_ready() const noexcept { return db_ready_.load(); }
 
     [[nodiscard]] std::string collection() const {

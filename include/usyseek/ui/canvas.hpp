@@ -233,7 +233,7 @@ inline D2D1_RECT_F snap(D2D1_RECT_F r) noexcept { return D2D1::RectF(std::round(
 class Canvas {
 public:
     Canvas(WindowTarget& target, Fonts& fonts, std::vector<Hit>& hits, const Theme& theme,
-           std::optional<D2D1_RECT_F> dirty_clip = std::nullopt, float opacity = 1.0f)
+           std::optional<D2D1_RECT_F> dirty_clip = std::nullopt, float opacity = 1.0f) noexcept
         : target_{target}, dc_{target.dc()}, fonts_{fonts}, hits_{hits}, theme_{theme},
           dirty_clip_{dirty_clip}, opacity_{std::clamp(opacity, 0.0f, 1.0f)} {}
 
@@ -276,7 +276,7 @@ public:
         ScopedOpacity& operator=(ScopedOpacity&&) = delete;
     };
 
-    ID2D1SolidColorBrush* brush(D2D1_COLOR_F c) {
+    ID2D1SolidColorBrush* brush(D2D1_COLOR_F c) noexcept {
         c.a *= opacity_;
         ID2D1SolidColorBrush* b = target_.solid_brush();
         if (b && (!has_color_ || c.r != last_color_.r || c.g != last_color_.g || c.b != last_color_.b || c.a != last_color_.a)) {
@@ -300,31 +300,31 @@ public:
         }
     }
 
-    void fill(D2D1_RECT_F r, D2D1_COLOR_F c) {
+    void fill(D2D1_RECT_F r, D2D1_COLOR_F c) noexcept {
         if (!intersects_clip(r, 1.0f)) return;
         dc_->FillRectangle(r, brush(c));
     }
-    void fill_round(D2D1_RECT_F r, float radius, D2D1_COLOR_F c) {
+    void fill_round(D2D1_RECT_F r, float radius, D2D1_COLOR_F c) noexcept {
         if (!intersects_clip(r, 1.0f)) return;
         dc_->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), brush(c));
     }
-    void stroke_round(D2D1_RECT_F r, float radius, D2D1_COLOR_F c, float w = 1.0f) {
+    void stroke_round(D2D1_RECT_F r, float radius, D2D1_COLOR_F c, float w = 1.0f) noexcept {
         if (!intersects_clip(r, (w * 0.5f) + 1.0f)) return;
         const float h = w * 0.5f;
         dc_->DrawRoundedRectangle(D2D1::RoundedRect(inset(r, h, h), radius, radius), brush(c), w);
     }
-    void fill_circle(D2D1_POINT_2F c, float r, D2D1_COLOR_F col) {
+    void fill_circle(D2D1_POINT_2F c, float r, D2D1_COLOR_F col) noexcept {
         if (!intersects_clip(D2D1::RectF(c.x - r, c.y - r, c.x + r, c.y + r), 1.0f)) return;
         dc_->FillEllipse(D2D1::Ellipse(c, r, r), brush(col));
     }
-    void stroke_circle(D2D1_POINT_2F c, float r, D2D1_COLOR_F col, float w = 1.0f) {
+    void stroke_circle(D2D1_POINT_2F c, float r, D2D1_COLOR_F col, float w = 1.0f) noexcept {
         if (!intersects_clip(D2D1::RectF(c.x - r, c.y - r, c.x + r, c.y + r), (w * 0.5f) + 1.0f)) return;
         dc_->DrawEllipse(D2D1::Ellipse(c, r, r), brush(col), w);
     }
-    void hline(float x0, float x1, float y, D2D1_COLOR_F c) { fill(D2D1::RectF(x0, y, x1, y + 1.0f), c); }
-    void vline(float x, float y0, float y1, D2D1_COLOR_F c) { fill(D2D1::RectF(x, y0, x + 1.0f, y1), c); }
+    void hline(float x0, float x1, float y, D2D1_COLOR_F c) noexcept { fill(D2D1::RectF(x0, y, x1, y + 1.0f), c); }
+    void vline(float x, float y0, float y1, D2D1_COLOR_F c) noexcept { fill(D2D1::RectF(x, y0, x + 1.0f, y1), c); }
 
-    void text(std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c, Align a = Align::Left) {
+    void text(std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c, Align a = Align::Left) noexcept {
         if (s.empty() || !intersects_clip(r, 1.0f)) return;
         IDWriteTextFormat* fmt = fonts_.get(f);
         fmt->SetTextAlignment(text_alignment(a));
@@ -347,7 +347,7 @@ public:
         dc_->DrawTextLayout(D2D1::Point2F(r.left, r.top), e->layout.get(), brush(c), D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 
-    void icon(wchar_t g, D2D1_RECT_F r, D2D1_COLOR_F c, Font f = Font::Icon) {
+    void icon(wchar_t g, D2D1_RECT_F r, D2D1_COLOR_F c, Font f = Font::Icon) noexcept {
         const wchar_t s[2] = {g, 0};
         text(std::wstring_view{s, 1}, r, f, c, Align::Center);
     }
@@ -356,7 +356,7 @@ public:
         return fonts_.measure(s, f);
     }
 
-    void fill_bitmap_round(ID2D1Bitmap1* bmp, D2D1_RECT_F tr, float radius, ThumbFit fit = ThumbFit::Crop) {
+    void fill_bitmap_round(ID2D1Bitmap1* bmp, D2D1_RECT_F tr, float radius, ThumbFit fit = ThumbFit::Crop) noexcept {
         if (!bmp || !intersects_clip(tr, 1.0f)) return;
         const D2D1_SIZE_F bs = bmp->GetSize();
         if (bs.width <= 0.0f || bs.height <= 0.0f) return;
@@ -372,14 +372,14 @@ public:
 
     /// Plain (unclipped, square) bitmap draw with configurable resampling.
     void bitmap(ID2D1Bitmap* bmp, D2D1_RECT_F dest,
-                D2D1_INTERPOLATION_MODE mode = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC) {
+                D2D1_INTERPOLATION_MODE mode = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC) noexcept {
         if (!bmp || !intersects_clip(dest, 1.0f)) return;
         dc_->DrawBitmap(bmp, &dest, opacity_, mode, nullptr, nullptr);
     }
 
     /// Draws `src` rectangle (in bitmap DIPs) mapped into `dest`.
     void bitmap_region(ID2D1Bitmap* bmp, D2D1_RECT_F dest, D2D1_RECT_F src,
-                       D2D1_INTERPOLATION_MODE mode = D2D1_INTERPOLATION_MODE_LINEAR) {
+                       D2D1_INTERPOLATION_MODE mode = D2D1_INTERPOLATION_MODE_LINEAR) noexcept {
         if (!bmp || !intersects_clip(dest, 1.0f)) return;
         dc_->DrawBitmap(bmp, &dest, opacity_, mode, &src, nullptr);
     }
@@ -406,13 +406,13 @@ public:
         }
         clips_.push_back(r);
     }
-    void pop_clip() {
+    void pop_clip() noexcept {
         dc_->PopAxisAlignedClip();
         if (!clips_.empty()) clips_.pop_back();
     }
 
     /// Soft drop shadow approximated with stacked translucent rounded rects (cheap, no effects).
-    void shadow(D2D1_RECT_F r, float radius, float spread = 10.0f, float alpha = 0.28f) {
+    void shadow(D2D1_RECT_F r, float radius, float spread = 10.0f, float alpha = 0.28f) noexcept {
         const float scaled = alpha * theme_.shadow_alpha_scale;
         if (scaled <= 0.002f) return;
         const D2D1_RECT_F bounds = D2D1::RectF(r.left - (spread * 0.6f), r.top - (spread * 0.2f), r.right + (spread * 0.6f), r.bottom + spread);
@@ -442,7 +442,7 @@ private:
     std::vector<D2D1_RECT_F> clips_;
 };
 
-inline const Hit* hit_test(const std::vector<Hit>& hits, D2D1_POINT_2F p) {
+inline const Hit* hit_test(const std::vector<Hit>& hits, D2D1_POINT_2F p) noexcept {
     for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
         if (contains(it->r, p)) return &*it;
     }
@@ -570,7 +570,7 @@ struct HoverTooltip {
         if (eligible && hwnd) SetTimer(hwnd, timer_id, DELAY_MS, nullptr);
     }
 
-    bool on_timer(HWND hwnd, UINT_PTR timer_id, bool allow, std::wstring new_title, std::wstring new_subtitle, bool animate) {
+    bool on_timer(HWND hwnd, UINT_PTR timer_id, bool allow, std::wstring new_title, std::wstring new_subtitle, bool animate) noexcept {
         if (hwnd) KillTimer(hwnd, timer_id);
         if (!allow || (new_title.empty() && new_subtitle.empty())) return false;
         anchor = pending_anchor;
@@ -645,7 +645,7 @@ struct TooltipLayout {
 
 /// Draws a frosted-glass rounded surface with an inner specular sheen and crisp glass border.
 inline void draw_glass_box(Canvas& cv, D2D1_RECT_F r, float radius, D2D1_COLOR_F fill, D2D1_COLOR_F border,
-                           float border_w = 1.0f, float sheen_alpha = -1.0f) {
+                           float border_w = 1.0f, float sheen_alpha = -1.0f) noexcept {
     if (fill.a > 0.0f) cv.fill_round(r, radius, fill);
     const float sa = sheen_alpha >= 0.0f ? sheen_alpha : (cv.theme().dark_mode ? 0.09f : 0.32f);
     if (sa > 0.002f && width(r) > 4.0f && height(r) > 4.0f) {

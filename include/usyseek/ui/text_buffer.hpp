@@ -24,7 +24,7 @@ struct TextBuffer {
     size_t caret = 0;
     size_t anchor = 0;
 
-    void set(std::wstring s) {
+    void set(std::wstring s) noexcept {
         text = std::move(s);
         caret = anchor = text.size();
         clear_history();
@@ -109,12 +109,12 @@ struct TextBuffer {
     bool undo() { return step_history(undo_, redo_); }
     bool redo() { return step_history(redo_, undo_); }
 
-    void move_left(bool word, bool extend) {
+    void move_left(bool word, bool extend) noexcept {
         if (!extend && has_selection()) move_to(sel().first, false);
         else move_to(word ? word_left(caret) : (caret ? caret - 1 : 0), extend);
     }
 
-    void move_right(bool word, bool extend) {
+    void move_right(bool word, bool extend) noexcept {
         if (!extend && has_selection()) move_to(sel().second, false);
         else move_to(word ? word_right(caret) : std::min(text.size(), caret + 1), extend);
     }
@@ -128,7 +128,7 @@ struct TextBuffer {
         break_undo_group();
     }
 
-    void select_word_at_caret() {
+    void select_word_at_caret() noexcept {
         anchor = word_left(std::min(text.size(), caret + 1));
         caret = word_right(anchor);
         break_undo_group();
@@ -192,14 +192,14 @@ private:
         caret = anchor = a + s.size();
     }
 
-    [[nodiscard]] size_t word_left(size_t i) const {
+    [[nodiscard]] size_t word_left(size_t i) const noexcept {
         while (i > 0 && std::iswspace(text[i - 1])) --i;
         while (i > 0 && !std::iswspace(text[i - 1]) && !is_sep(text[i - 1])) --i;
         if (i > 0 && i == caret && is_sep(text[i - 1])) --i;
         return i;
     }
 
-    [[nodiscard]] size_t word_right(size_t i) const {
+    [[nodiscard]] size_t word_right(size_t i) const noexcept {
         const size_t n = text.size();
         if (i < n && is_sep(text[i])) return i + 1;
         while (i < n && !std::iswspace(text[i]) && !is_sep(text[i])) ++i;

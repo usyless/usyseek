@@ -54,7 +54,7 @@ public:
     [[nodiscard]] bool visible() const noexcept { return IsWindowVisible(hwnd_) != FALSE; }
     WindowTarget& target() noexcept { return target_; }
 
-    void apply_theme() {
+    void apply_theme() noexcept {
         apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
         target_.set_liquid_glass(glass_active());
         if (glass_active()) {
@@ -173,13 +173,13 @@ public:
     }
 
     /// Cancels and joins background clipboard copy workers before message-queue teardown.
-    void stop_workers() {
+    void stop_workers() noexcept {
         for (auto& [id, worker] : copy_workers_) worker.request_stop();
         copy_workers_.clear();
     }
 
     /// COM objects this window still holds; released before OLE is uninitialised.
-    void release_com_objects() {
+    void release_com_objects() noexcept {
         async_drops_.clear();
         pending_clipboard_.reset();
         gif_.shutdown();
@@ -213,7 +213,7 @@ public:
 
     /// Asks for a repaint. Any number of calls before the next WM_PAINT collapse into a single frame, and
     /// WM_PAINT is only delivered once pending input has been handled, so typing never waits on drawing.
-    void invalidate() {
+    void invalidate() noexcept {
         dirty_ = true;
         full_dirty_ = true;
         if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
@@ -420,7 +420,7 @@ private:
 
     [[nodiscard]] bool expanded() const noexcept { return !field_.text.empty() || !items_.empty() || fullscreen_; }
 
-    void place() {
+    void place() noexcept {
         if (fullscreen_) return;
         POINT cur;
         GetCursorPos(&cur);
@@ -581,12 +581,12 @@ private:
         return (HEADER_H - 4.0f) + h + 12.0f;
     }
 
-    [[nodiscard]] float current_height_dip() const {
+    [[nodiscard]] float current_height_dip() const noexcept {
         if (!expanded()) return std::max({HEADER_H + STATUS_H, dropdown_height_dip(), help_height_dip()});
         return sh_.settings.pill_h > 0 ? static_cast<float>(sh_.settings.pill_h) : DEFAULT_H;
     }
 
-    void apply_height() {
+    void apply_height() noexcept {
         if (fullscreen_ || in_sizemove_ || rendering_) return;
         RECT wr;
         GetWindowRect(hwnd_, &wr);
@@ -793,7 +793,7 @@ private:
         return std::max(1, static_cast<int>((avail + GAP) / (min_w + GAP)));
     }
 
-    [[nodiscard]] Grid grid() const {
+    [[nodiscard]] Grid grid() const noexcept {
         Grid g;
         const D2D1_SIZE_F sz = target_.size();
         g.view = D2D1::RectF(0, HEADER_H + STATUS_H + 1.0f, sz.width, sz.height);
@@ -859,12 +859,12 @@ private:
         }
     }
 
-    [[nodiscard]] float max_scroll() const {
+    [[nodiscard]] float max_scroll() const noexcept {
         const Grid g = grid();
         return std::max(0.0f, g.content_h - height(g.view));
     }
 
-    [[nodiscard]] D2D1_RECT_F card_rect(const Grid& g, int i) const {
+    [[nodiscard]] D2D1_RECT_F card_rect(const Grid& g, int i) const noexcept {
         const int row = i / g.cols, col = i % g.cols;
         const float x = PAD + col * (g.card_w + GAP);
         const float y = g.view.top + PAD + row * (g.card_h + GAP) - scroll_;
@@ -882,7 +882,7 @@ private:
         else scroll_ = target_scroll_;
     }
 
-    void apply_fade() {
+    void apply_fade() noexcept {
         const BYTE a = static_cast<BYTE>(std::round(std::clamp(fade_, 0.0f, 1.0f) * 255.0f));
         if (a != last_alpha_) {
             last_alpha_ = a;
@@ -908,14 +908,14 @@ private:
         }
     }
 
-    void start_anim() {
+    void start_anim() noexcept {
         if (!visible()) return;
         if (!anim_active_) last_anim_ = std::chrono::steady_clock::now();
         anim_active_ = true;
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
-    bool step_anim() {
+    bool step_anim() noexcept {
         const auto now = std::chrono::steady_clock::now();
         const float dt = std::clamp(std::chrono::duration<float>(now - last_anim_).count(), 0.001f, 0.05f);
         last_anim_ = now;
@@ -1186,7 +1186,7 @@ private:
         cv.hline(0, sz.width, HEADER_H, with_alpha(cv.theme().outline_variant, 0.7f));
     }
 
-    [[nodiscard]] D2D1_COLOR_F status_dot_color() const {
+    [[nodiscard]] D2D1_COLOR_F status_dot_color() const noexcept {
         if (sh_.indexer_running) return sh_.theme.amber;
         const auto st = sh_.engine.encoder().state();
         if (st == TextEncoder::State::Failed || !error_.empty() || (!sh_.engine.db_ready() && !sh_.test_mode)) return sh_.theme.error;
@@ -1643,7 +1643,7 @@ private:
         invalidate();
     }
 
-    void close_popups() {
+    void close_popups() noexcept {
         tooltip_.clear(hwnd_, TIMER_TOOLTIP);
         menu_open_ = false;
         drop_open_ = false;
@@ -1727,7 +1727,7 @@ private:
         }
     }
 
-    [[nodiscard]] D2D1_RECT_F menu_rect() const {
+    [[nodiscard]] D2D1_RECT_F menu_rect() const noexcept {
         const D2D1_SIZE_F sz = target_.size();
         const float h = static_cast<float>(ActCount) * 36.0f + 16 + 30 + std::min<size_t>(menu_tags_.size(), 10) * 32.0f + 48;
         float x = std::min(menu_at_.x, sz.width - MENU_W - 8);
@@ -1945,13 +1945,13 @@ private:
         return D2D1::RectF(16.0f, PV_TOP, std::max(32.0f, sz.width - 16.0f), bottom);
     }
 
-    [[nodiscard]] D2D1_RECT_F preview_dest_dims(uint32_t src_w, uint32_t src_h, uint32_t meta_w, uint32_t meta_h, D2D1_RECT_F area) const {
+    [[nodiscard]] D2D1_RECT_F preview_dest_dims(uint32_t src_w, uint32_t src_h, uint32_t meta_w, uint32_t meta_h, D2D1_RECT_F area) const noexcept {
         const FitBox b = compute_preview_box(src_w, src_h, meta_w, meta_h, target_.scale(),
                                              FitBox{.left = area.left, .top = area.top, .width = width(area), .height = height(area)});
         return rect(b.left, b.top, b.width, b.height);
     }
 
-    [[nodiscard]] D2D1_RECT_F preview_dest(const Item& it, ID2D1Bitmap* bmp, D2D1_RECT_F area) const {
+    [[nodiscard]] D2D1_RECT_F preview_dest(const Item& it, ID2D1Bitmap* bmp, D2D1_RECT_F area) const noexcept {
         const D2D1_SIZE_U ps = bmp->GetPixelSize();
         return preview_dest_dims(ps.width, ps.height, it.pt.p.w, it.pt.p.h, area);
     }
@@ -1996,7 +1996,7 @@ private:
         return true;
     }
 
-    void set_video_timer(bool active) {
+    void set_video_timer(bool active) noexcept {
         if (!hwnd_) {
             video_timer_active_ = false;
             return;
@@ -2012,7 +2012,7 @@ private:
         }
     }
 
-    void sync_preview_timers() {
+    void sync_preview_timers() noexcept {
         if (!hwnd_) return;
         if (!visible() || !preview_valid()) {
             KillTimer(hwnd_, TIMER_GIF);
@@ -2225,7 +2225,7 @@ private:
     }
 
     /// Decodes are bounded by the monitor, so the image is sharp even when the window goes fullscreen.
-    [[nodiscard]] UINT preview_px() const {
+    [[nodiscard]] UINT preview_px() const noexcept {
         MONITORINFO mi{.cbSize = sizeof(mi)};
         GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi);
         return static_cast<UINT>(std::max({mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, 256L}));
@@ -2529,7 +2529,7 @@ private:
         cv.text(meta, D2D1::RectF(18, sz.height - PV_BOTTOM, sz.width - 18, sz.height), Font::Caption, cv.theme().outline, Align::Center);
     }
 
-    bool preview_seek_to_x(float x, bool force = false) {
+    bool preview_seek_to_x(float x, bool force = false) noexcept {
         if (!preview_valid() || pv_seek_rect_.right <= pv_seek_rect_.left) return false;
         const float ratio = std::clamp((x - pv_seek_rect_.left) / width(pv_seek_rect_), 0.0f, 1.0f);
         if (!force && ratio == seek_drag_ratio_) return false;
@@ -2798,7 +2798,7 @@ private:
     // Dragging media out to other applications
     // ------------------------------------------------------------------------------------------
 
-    void begin_drag_detect(int index) {
+    void begin_drag_detect(int index) noexcept {
         drag_pending_ = true;
         drag_index_ = index;
         GetCursorPos(&drag_origin_);
@@ -2854,12 +2854,12 @@ private:
     // Input
     // ------------------------------------------------------------------------------------------
 
-    [[nodiscard]] D2D1_POINT_2F to_dip(LPARAM lp) const {
+    [[nodiscard]] D2D1_POINT_2F to_dip(LPARAM lp) const noexcept {
         const float s = target_.scale();
         return {GET_X_LPARAM(lp) / s, GET_Y_LPARAM(lp) / s};
     }
 
-    void caret_reset() {
+    void caret_reset() noexcept {
         field_.caret_on = true;
         menu_field_.caret_on = true;
         SetTimer(hwnd_, TIMER_CARET, GetCaretBlinkTime(), nullptr);

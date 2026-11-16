@@ -128,7 +128,7 @@ inline std::vector<std::string> default_excludes() {
     return v;
 }
 
-inline bool is_startup_enabled() {
+inline bool is_startup_enabled() noexcept {
     HKEY key = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &key) != ERROR_SUCCESS) {
         return false;

@@ -159,7 +159,7 @@ inline std::wstring format_duration_ms(uint64_t ms) {
     return buf;
 }
 
-inline int64_t unix_now() {
+inline int64_t unix_now() noexcept {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
@@ -174,7 +174,7 @@ inline std::wstring format_ago(int64_t unix_time) {
     return buf;
 }
 
-inline int64_t filetime_to_unix(uint64_t ft) {
+inline int64_t filetime_to_unix(uint64_t ft) noexcept {
     return ft == 0 ? 0 : static_cast<int64_t>(ft / 10'000'000ull) - 11'644'473'600ll;
 }
 
