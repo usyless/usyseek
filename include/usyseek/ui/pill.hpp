@@ -3439,10 +3439,9 @@ private:
             case WM_MOVE:
                 if (glass_active() && visible()) {
                     full_dirty_ = true;
-                    const ULONGLONG now = GetTickCount64();
-                    if (in_sizemove_ && now - last_move_render_tick_ >= 8) {
-                        last_move_render_tick_ = now;
+                    if (in_sizemove_) {
                         render();
+                        DwmFlush();
                     } else {
                         invalidate();
                     }
@@ -3639,7 +3638,6 @@ private:
     std::optional<D2D1_RECT_F> last_tooltip_dirty_;
     ULONGLONG shown_tick_ = 0;
     ULONGLONG blur_hide_tick_ = 0;
-    ULONGLONG last_move_render_tick_ = 0;
     POINT blur_hide_cursor_{};
 
     TextField field_;
