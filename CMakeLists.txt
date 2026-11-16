@@ -180,10 +180,21 @@ if(MSVC)
 endif()
 
 ##### Common compile settings
+foreach(_part IN ITEMS MAJOR MINOR PATCH TWEAK)
+    if(DEFINED PROJECT_VERSION_${_part} AND NOT "${PROJECT_VERSION_${_part}}" STREQUAL "")
+        set(USYSEEK_VERSION_${_part} "${PROJECT_VERSION_${_part}}")
+    else()
+        set(USYSEEK_VERSION_${_part} 0)
+    endif()
+endforeach()
+set(USYSEEK_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
+configure_file("${PROJECT_SOURCE_DIR}/resources/version.h.in" "${USYSEEK_GENERATED_DIR}/usyseek_version.h" @ONLY)
+
 add_library(usyseek_common INTERFACE)
 target_include_directories(usyseek_common INTERFACE
     "${PROJECT_SOURCE_DIR}/include"
     "${PROJECT_SOURCE_DIR}/resources"
+    "${USYSEEK_GENERATED_DIR}"
 )
 target_include_directories(usyseek_common SYSTEM INTERFACE "${PROJECT_SOURCE_DIR}/3rdparty")
 target_link_libraries(usyseek_common INTERFACE usylibpp::usylibpp glaze::glaze version)
@@ -261,6 +272,7 @@ add_executable(usyseek-ui WIN32
     resources/app.rc
 )
 set_target_properties(usyseek-ui PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+target_compile_definitions(usyseek-ui PRIVATE USYSEEK_TARGET_UI)
 target_include_directories(usyseek-ui SYSTEM PRIVATE "${ORT_ROOT}/include")
 target_link_libraries(usyseek-ui PRIVATE
     usyseek_common
@@ -282,6 +294,7 @@ add_executable(usyseek-indexer
     "${CMAKE_BINARY_DIR}/indexer.rc"
 )
 set_target_properties(usyseek-indexer PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+target_compile_definitions(usyseek-indexer PRIVATE USYSEEK_TARGET_INDEXER)
 target_link_libraries(usyseek-indexer PRIVATE
     usyseek_common
     usyseek_rust

@@ -15,13 +15,14 @@
 #include <string_view>
 
 #include <rapidhash.h>
+#include <usyseek_version.h>
 
 namespace usyseek {
 
 namespace fs = std::filesystem;
 
 inline constexpr wchar_t APP_NAME[] = L"usyseek";
-inline constexpr wchar_t APP_VERSION[] = L"0.3.1";
+inline constexpr wchar_t APP_VERSION[] = USYSEEK_VERSION_WSTR;
 
 inline constexpr wchar_t LAUNCHER_CLASS[] = L"usyseek.launcher";
 inline constexpr wchar_t LAUNCHER_MUTEX[] = L"Local\\usyseek.launcher";
