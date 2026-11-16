@@ -21,7 +21,7 @@ namespace usyseek {
 namespace fs = std::filesystem;
 
 inline constexpr wchar_t APP_NAME[] = L"usyseek";
-inline constexpr wchar_t APP_VERSION[] = L"0.1.0";
+inline constexpr wchar_t APP_VERSION[] = L"0.2.0";
 
 inline constexpr wchar_t LAUNCHER_CLASS[] = L"usyseek.launcher";
 inline constexpr wchar_t LAUNCHER_MUTEX[] = L"Local\\usyseek.launcher";
