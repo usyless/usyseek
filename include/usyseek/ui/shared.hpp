@@ -243,8 +243,11 @@ struct Shared {
         }
         const std::string& wanted = theme_override ? *theme_override : settings.theme;
         theme = themes.resolve(wanted);
-        if (theme_changed) theme_changed();
-        else if (redraw_all) redraw_all();
+        if (theme_changed) {
+            theme_changed();
+        } else if (redraw_all) {
+            redraw_all();
+        }
     }
 
     void on_windows_theme_changed() {
@@ -279,7 +282,7 @@ inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool
         const COLORREF border = to_colorref(theme.pill_border);
         DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border, sizeof(border));
     }
-    const MARGINS m{-1, -1, -1, -1};
+    const MARGINS m{.cxLeftWidth = -1, .cxRightWidth = -1, .cyTopHeight = -1, .cyBottomHeight = -1};
     DwmExtendFrameIntoClientArea(hwnd, &m);
 }
 

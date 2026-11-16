@@ -584,7 +584,7 @@ private:
         const float rad = std::min(10.0f, height(r) * 0.5f);
         cv.fill_round(r, rad, bg);
         cv.stroke_round(r, rad, border, selected ? 1.5f : 1.0f);
-        const D2D1_POINT_2F dot{r.left + 15.0f, (r.top + r.bottom) * 0.5f};
+        const D2D1_POINT_2F dot{.x = r.left + 15.0f, .y = (r.top + r.bottom) * 0.5f};
         cv.fill_circle(dot, 5.0f, te.swatch);
         cv.stroke_circle(dot, 5.0f, with_alpha(cv.theme().on_surface, 0.25f), 1.0f);
         const std::wstring wname = to_wide(te.name);
@@ -592,7 +592,7 @@ private:
         cv.hit(r, IdThemeChip, idx);
     }
 
-    float card_begin(Canvas& cv, float x, float y, float w, float h) {
+    static float card_begin(Canvas& cv, float x, float y, float w, float h) {
         const D2D1_RECT_F r = rect(x, y, w, h);
         cv.fill_round(r, 16.0f, with_alpha(cv.theme().surface, cv.theme().card_alpha));
         cv.stroke_round(r, 16.0f, with_alpha(cv.theme().outline_variant, 0.65f));
@@ -1314,7 +1314,8 @@ private:
     float draw_tab_settings(Canvas& cv, float x, float y, float w) {
         // 0. Appearance & Theme card
         {
-            const float lx = x + 22.0f, rw = w - 44.0f;
+            const float lx = x + 22.0f;
+            const float rw = w - 44.0f;
             const CardHeader hd = make_header(cv, rw, L"Appearance & Theme", cv.theme().on_surface,
                                               L"Built-in palettes, Windows light/dark & accent sync, and custom JSON themes");
 
@@ -2816,7 +2817,7 @@ private:
                 break;
             case IdThemeChip: {
                 const auto& entries = sh_.themes.entries();
-                if (idx >= 0 && idx < static_cast<int>(entries.size())) {
+                if (idx >= 0 && static_cast<size_t>(idx) < entries.size()) {
                     sh_.theme_override.reset();
                     sh_.settings.theme = entries[static_cast<size_t>(idx)].id;
                     sh_.refresh_theme(false, false);

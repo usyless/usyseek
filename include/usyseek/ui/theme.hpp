@@ -24,7 +24,11 @@
 namespace usyseek::ui {
 
 [[nodiscard]] inline D2D1_COLOR_F hex(uint32_t rgb, float a = 1.0f) noexcept {
-    return D2D1::ColorF(((rgb >> 16) & 0xFF) / 255.0f, ((rgb >> 8) & 0xFF) / 255.0f, (rgb & 0xFF) / 255.0f, a);
+    return D2D1::ColorF(
+        static_cast<float>((rgb >> 16u) & 0xFFu) / 255.0f,
+        static_cast<float>((rgb >> 8u) & 0xFFu) / 255.0f,
+        static_cast<float>(rgb & 0xFFu) / 255.0f,
+        a);
 }
 
 [[nodiscard]] inline D2D1_COLOR_F with_alpha(D2D1_COLOR_F c, float a) noexcept {
@@ -35,10 +39,10 @@ namespace usyseek::ui {
 [[nodiscard]] inline D2D1_COLOR_F lerp_color(D2D1_COLOR_F a, D2D1_COLOR_F b, float t) noexcept {
     const float k = std::clamp(t, 0.0f, 1.0f);
     return {
-        a.r + (b.r - a.r) * k,
-        a.g + (b.g - a.g) * k,
-        a.b + (b.b - a.b) * k,
-        a.a + (b.a - a.a) * k,
+        .r = a.r + ((b.r - a.r) * k),
+        .g = a.g + ((b.g - a.g) * k),
+        .b = a.b + ((b.b - a.b) * k),
+        .a = a.a + ((b.a - a.a) * k),
     };
 }
 
@@ -66,9 +70,13 @@ struct Hsl {
     out.l = (mx + mn) * 0.5f;
     if (d > 1e-5f) {
         out.s = out.l > 0.5f ? d / (2.0f - mx - mn) : d / (mx + mn);
-        if (mx == r) out.h = (g - b) / d + (g < b ? 6.0f : 0.0f);
-        else if (mx == g) out.h = (b - r) / d + 2.0f;
-        else out.h = (r - g) / d + 4.0f;
+        if (mx == r) {
+            out.h = ((g - b) / d) + (g < b ? 6.0f : 0.0f);
+        } else if (mx == g) {
+            out.h = ((b - r) / d) + 2.0f;
+        } else {
+            out.h = ((r - g) / d) + 4.0f;
+        }
         out.h *= 60.0f;
     }
     return out;
@@ -79,24 +87,24 @@ struct Hsl {
     if (h < 0.0f) h += 360.0f;
     s = std::clamp(s, 0.0f, 1.0f);
     l = std::clamp(l, 0.0f, 1.0f);
-    if (s <= 1e-5f) return {l, l, l, a};
+    if (s <= 1e-5f) return {.r = l, .g = l, .b = l, .a = a};
 
     const auto hue2rgb = [](float p, float q, float t) -> float {
         if (t < 0.0f) t += 1.0f;
         if (t > 1.0f) t -= 1.0f;
-        if (t < 1.0f / 6.0f) return p + (q - p) * 6.0f * t;
-        if (t < 1.0f / 2.0f) return q;
-        if (t < 2.0f / 3.0f) return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
+        if (t < (1.0f / 6.0f)) return p + ((q - p) * 6.0f * t);
+        if (t < (1.0f / 2.0f)) return q;
+        if (t < (2.0f / 3.0f)) return p + ((q - p) * ((2.0f / 3.0f) - t) * 6.0f);
         return p;
     };
-    const float q = l < 0.5f ? l * (1.0f + s) : l + s - l * s;
-    const float p = 2.0f * l - q;
+    const float q = l < 0.5f ? (l * (1.0f + s)) : ((l + s) - (l * s));
+    const float p = (2.0f * l) - q;
     const float hn = h / 360.0f;
     return {
-        hue2rgb(p, q, hn + 1.0f / 3.0f),
-        hue2rgb(p, q, hn),
-        hue2rgb(p, q, hn - 1.0f / 3.0f),
-        a,
+        .r = hue2rgb(p, q, hn + (1.0f / 3.0f)),
+        .g = hue2rgb(p, q, hn),
+        .b = hue2rgb(p, q, hn - (1.0f / 3.0f)),
+        .a = a,
     };
 }
 
@@ -105,7 +113,7 @@ struct Hsl {
         v = std::clamp(v, 0.0f, 1.0f);
         return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
     };
-    return 0.2126f * lin(c.r) + 0.7152f * lin(c.g) + 0.0722f * lin(c.b);
+    return (0.2126f * lin(c.r)) + (0.7152f * lin(c.g)) + (0.0722f * lin(c.b));
 }
 
 [[nodiscard]] inline D2D1_COLOR_F contrast_fg(D2D1_COLOR_F bg, D2D1_COLOR_F dark_fg, D2D1_COLOR_F light_fg) noexcept {
@@ -123,7 +131,7 @@ struct Hsl {
     if (ec != std::errc{} || ptr != s.data() + s.size()) return std::nullopt;
 
     if (s.size() == 6) return hex(v, 1.0f);
-    const uint32_t rgb = (v >> 8) & 0xFFFFFFu;
+    const uint32_t rgb = (v >> 8u) & 0xFFFFFFu;
     const float a = static_cast<float>(v & 0xFFu) / 255.0f;
     return hex(rgb, a);
 }
@@ -205,10 +213,10 @@ struct Theme {
     if (read_dwm_dword(L"AccentColor", raw)) {
         // AccentColor is stored as 0xAABBGGRR.
         const D2D1_COLOR_F c{
-            static_cast<float>(raw & 0xFFu) / 255.0f,
-            static_cast<float>((raw >> 8) & 0xFFu) / 255.0f,
-            static_cast<float>((raw >> 16) & 0xFFu) / 255.0f,
-            1.0f,
+            .r = static_cast<float>(raw & 0xFFu) / 255.0f,
+            .g = static_cast<float>((raw >> 8u) & 0xFFu) / 255.0f,
+            .b = static_cast<float>((raw >> 16u) & 0xFFu) / 255.0f,
+            .a = 1.0f,
         };
         if (rgb_to_hsl(c).s > 0.05f) return c;
     }
@@ -394,7 +402,7 @@ struct Theme {
 
 /// Derives a complete Material-inspired theme from an arbitrary Windows accent color + dark/light mode.
 [[nodiscard]] inline Theme theme_from_accent(D2D1_COLOR_F accent, bool dark) {
-    Hsl hsl = rgb_to_hsl(accent);
+    const Hsl hsl = rgb_to_hsl(accent);
     const float h = hsl.h;
     const float sat = std::clamp(hsl.s, 0.38f, 0.88f);
     const float neu_s = std::min(0.18f, sat * 0.22f);
@@ -523,16 +531,20 @@ struct ThemeSpec {
 }
 
 /// Applies `spec` onto its `base` preset without altering any application logic.
-[[nodiscard]] inline Theme apply_theme_spec(const ThemeSpec& spec, std::string id, std::string fallback_name) {
+[[nodiscard]] inline Theme apply_theme_spec(const ThemeSpec& spec, std::string id, std::string_view fallback_name) {
     std::string_view base_id = spec.base;
     if (base_id.empty()) {
-        if (spec.mode == "light") base_id = "light";
-        else if (spec.mode == "system") base_id = "system";
-        else base_id = "dark";
+        if (spec.mode == "light") {
+            base_id = "light";
+        } else if (spec.mode == "system") {
+            base_id = "system";
+        } else {
+            base_id = "dark";
+        }
     }
     Theme t = resolve_builtin_theme(base_id);
     t.id = std::move(id);
-    t.name = !spec.name.empty() ? spec.name : std::move(fallback_name);
+    t.name = !spec.name.empty() ? spec.name : std::string{fallback_name};
 
     if (spec.mode == "dark") {
         t.dark_mode = true;

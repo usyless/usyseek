@@ -104,7 +104,7 @@ public:
         entries_.clear();
         for (const char* id : {"system", "accent", "dark", "light", "nord", "mocha", "oled"}) {
             const Theme t = resolve_builtin_theme(id);
-            entries_.push_back({t.id, t.name, false, {}, std::nullopt, t.primary});
+            entries_.push_back({.id = t.id, .name = t.name, .custom = false, .path = {}, .spec = std::nullopt, .swatch = t.primary});
         }
 
         ensure_themes_dir();
@@ -115,7 +115,7 @@ public:
                 files.push_back(e.path());
             }
         }
-        std::sort(files.begin(), files.end());
+        std::ranges::sort(files);
 
         for (const fs::path& p : files) {
             const auto bytes = ulp::fs::read_as_bytes(p);
@@ -133,7 +133,7 @@ public:
             const std::string id = "custom:" + stem;
             const std::string disp = spec.name.empty() ? stem : spec.name;
             const Theme preview = apply_theme_spec(spec, id, disp);
-            entries_.push_back({id, disp, true, p, std::move(spec), preview.primary});
+            entries_.push_back({.id = id, .name = disp, .custom = true, .path = p, .spec = std::move(spec), .swatch = preview.primary});
         }
     }
 
