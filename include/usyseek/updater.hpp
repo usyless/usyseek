@@ -15,13 +15,13 @@
 
 namespace usyseek {
 
-inline constexpr wchar_t GITHUB_LATEST_RELEASE_URL[] = L"https://api.github.com/repos/usyless/usyseek/releases/latest";
-inline constexpr wchar_t GITHUB_RELEASES_PAGE_URL[] = L"https://github.com/usyless/usyseek/releases";
+inline constexpr std::wstring_view GITHUB_LATEST_RELEASE_URL = L"https://api.github.com/repos/usyless/usyseek/releases/latest";
+inline constexpr std::wstring_view GITHUB_RELEASES_PAGE_URL = L"https://github.com/usyless/usyseek/releases";
 
 inline fs::path system_tar_path() {
-    wchar_t sys_dir[MAX_PATH]{};
-    GetSystemDirectoryW(sys_dir, MAX_PATH);
-    return fs::path{sys_dir} / L"tar.exe";
+    std::array<wchar_t, MAX_PATH> sys_dir{};
+    GetSystemDirectoryW(sys_dir.data(), static_cast<UINT>(sys_dir.size()));
+    return fs::path{sys_dir.data()} / L"tar.exe";
 }
 
 /// True when the system `tar.exe` (`bsdtar` / `libarchive`) supports extracting `.7z` archives (Windows 11 23H2+).
@@ -59,7 +59,7 @@ inline bool check_latest_release(UpdateState& st, bool& is_newer) {
     is_newer = false;
     st.last_check_unix = unix_now();
 
-    const auto body = http::get(GITHUB_LATEST_RELEASE_URL);
+    const auto body = http::get(std::wstring{GITHUB_LATEST_RELEASE_URL});
     if (!body) {
         st.last_error = "Could not reach GitHub releases (network error or API rate limit).";
         save_update_state(st);
@@ -104,8 +104,8 @@ inline bool check_latest_release(UpdateState& st, bool& is_newer) {
 }
 
 inline std::string sha256_file_hex(const fs::path& path, std::wstring& err) {
-    wil::unique_hfile file{CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                       FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
+    const wil::unique_hfile file{CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                             FILE_FLAG_SEQUENTIAL_SCAN, nullptr)};
     if (!file) {
         err = L"Could not open downloaded archive for verification.";
         return {};
@@ -133,7 +133,7 @@ inline std::string sha256_file_hex(const fs::path& path, std::wstring& err) {
     }
     const auto close_hash = wil::scope_exit([&] { BCryptDestroyHash(hash); });
 
-    std::vector<uint8_t> buf(64u << 10);
+    std::vector<uint8_t> buf(65536);
     for (;;) {
         DWORD got = 0;
         if (!ReadFile(file.get(), buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr)) {
@@ -153,12 +153,12 @@ inline std::string sha256_file_hex(const fs::path& path, std::wstring& err) {
         return {};
     }
 
-    static constexpr char hex[] = "0123456789abcdef";
+    static constexpr std::string_view hex = "0123456789abcdef";
     std::string out;
     out.reserve(64);
-    for (uint8_t b : digest) {
-        out.push_back(hex[b >> 4]);
-        out.push_back(hex[b & 0x0f]);
+    for (const uint8_t b : digest) {
+        out.push_back(hex[(static_cast<unsigned>(b) >> 4U) & 0x0FU]);
+        out.push_back(hex[static_cast<unsigned>(b) & 0x0FU]);
     }
     return out;
 }
@@ -185,8 +185,8 @@ inline std::string sha256_file_hex(const fs::path& path, std::wstring& err) {
 
 inline bool is_dir_writable(const fs::path& dir) {
     const fs::path probe = dir / (L".usyseek-write-probe-" + std::to_wstring(GetCurrentProcessId()));
-    wil::unique_hfile f{CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                    FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr)};
+    const wil::unique_hfile f{CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                          FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr)};
     if (f) return true;
     std::error_code ec;
     fs::remove(probe, ec);
@@ -283,7 +283,7 @@ inline bool launch_staged_updater(const fs::path& staging_root, const fs::path& 
 
     if (is_dir_writable(target_dir)) {
         std::wstring cmd = L"\"" + staged_exe.wstring() + L"\" " + args;
-        STARTUPINFOW si{sizeof(si)};
+        STARTUPINFOW si{.cb = sizeof(STARTUPINFOW)};
         wil::unique_process_information pi;
         if (!CreateProcessW(staged_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
                             CREATE_UNICODE_ENVIRONMENT, nullptr, staging_root.c_str(), &si, &pi)) {
@@ -293,13 +293,15 @@ inline bool launch_staged_updater(const fs::path& staging_root, const fs::path& 
         return true;
     }
 
-    SHELLEXECUTEINFOW sei{sizeof(sei)};
-    sei.fMask = SEE_MASK_NOASYNC;
-    sei.lpVerb = L"runas";
-    sei.lpFile = staged_exe.c_str();
-    sei.lpParameters = args.c_str();
-    sei.lpDirectory = staging_root.c_str();
-    sei.nShow = SW_SHOWNORMAL;
+    SHELLEXECUTEINFOW sei{
+        .cbSize = sizeof(SHELLEXECUTEINFOW),
+        .fMask = SEE_MASK_NOASYNC,
+        .lpVerb = L"runas",
+        .lpFile = staged_exe.c_str(),
+        .lpParameters = args.c_str(),
+        .lpDirectory = staging_root.c_str(),
+        .nShow = SW_SHOWNORMAL,
+    };
     if (!ShellExecuteExW(&sei)) {
         const DWORD e = GetLastError();
         if (e == ERROR_CANCELLED) {

@@ -1243,7 +1243,7 @@ private:
                 notes_txt = to_wide(sh_.update_state.release_notes);
                 if (notes_txt.size() > 600) {
                     notes_txt.resize(600);
-                    notes_txt += L"…";
+                    notes_txt += L'…';
                 }
             }
 
@@ -2661,15 +2661,21 @@ private:
 
         run_job(update_job_,
                 [this, st, staged_root, stage_ok](const std::stop_token& stop) {
-                    std::wstring err;
-                    *stage_ok = download_and_stage_update(
-                        st, *staged_root, err,
-                        [this](std::wstring_view msg) { report(update_job_, msg); },
-                        [this](uint64_t done, uint64_t total) { report_progress(update_job_, done, total); },
-                        stop);
-                    report_progress(update_job_, 0, 0);
-                    if (!*stage_ok) {
-                        report(update_job_, err, !stop.stop_requested());
+                    try {
+                        std::wstring err;
+                        *stage_ok = download_and_stage_update(
+                            st, *staged_root, err,
+                            [this](std::wstring_view msg) { report(update_job_, msg); },
+                            [this](uint64_t done, uint64_t total) { report_progress(update_job_, done, total); },
+                            stop);
+                        report_progress(update_job_, 0, 0);
+                        if (!*stage_ok) {
+                            report(update_job_, err, !stop.stop_requested());
+                        }
+                    } catch (const std::exception& e) {
+                        *stage_ok = false;
+                        report_progress(update_job_, 0, 0);
+                        report(update_job_, to_wide(e.what()), true);
                     }
                 },
                 [this, staged_root, stage_ok] {

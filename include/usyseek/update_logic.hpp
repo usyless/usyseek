@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <optional>
@@ -11,7 +12,7 @@
 namespace usyseek {
 
 /// Hardcoded 24-hour cooldown between automatic update checks (whether the last check succeeded or failed).
-inline constexpr int64_t UPDATE_CHECK_INTERVAL_S = 24 * 60 * 60;
+inline constexpr int64_t UPDATE_CHECK_INTERVAL_S = 24LL * 60 * 60;
 
 struct SemVer {
     int major = 0;
@@ -34,7 +35,7 @@ struct SemVer {
     if (pre) s = s.substr(0, dash);
 
     if (s.empty()) return {};
-    int parts[3]{0, 0, 0};
+    std::array<int, 3> parts{0, 0, 0};
     int count = 0;
     size_t pos = 0;
     while (pos < s.size() && count < 3) {
@@ -42,12 +43,12 @@ struct SemVer {
         const std::string_view seg = dot == std::string_view::npos ? s.substr(pos) : s.substr(pos, dot - pos);
         if (seg.empty()) return {};
         int val = 0;
-        for (char c : seg) {
+        for (const char c : seg) {
             if (c < '0' || c > '9') return {};
             if (val > 100'000'000) return {};
-            val = val * 10 + (c - '0');
+            val = (val * 10) + (c - '0');
         }
-        parts[count++] = val;
+        parts[static_cast<size_t>(count++)] = val;
         if (dot == std::string_view::npos) {
             pos = s.size();
             break;
@@ -56,7 +57,7 @@ struct SemVer {
         if (pos == s.size()) return {};
     }
     if (pos < s.size() || count < 2) return {};
-    return SemVer{parts[0], parts[1], parts[2], pre, true};
+    return SemVer{.major = parts[0], .minor = parts[1], .patch = parts[2], .prerelease = pre, .valid = true};
 }
 
 /// True when `candidate` is strictly newer than `current`.
@@ -118,20 +119,21 @@ struct UpdateState {
 
 /// Checks `tar.exe --version` output for `.7z` support (Windows 11 23H2+ ships libarchive >= 3.6 with liblzma).
 [[nodiscard]] inline bool parse_tar_supports_7z(std::string_view version_output) noexcept {
-    if (version_output.find("liblzma/") == std::string_view::npos) return false;
+    if (!version_output.contains("liblzma/")) return false;
     const size_t pos = version_output.find("libarchive ");
     if (pos == std::string_view::npos) return false;
-    std::string_view rest = version_output.substr(pos + 11);
-    int major = 0, minor = 0;
+    const std::string_view rest = version_output.substr(pos + 11);
+    int major = 0;
+    int minor = 0;
     size_t i = 0;
     while (i < rest.size() && rest[i] >= '0' && rest[i] <= '9') {
-        major = major * 10 + (rest[i++] - '0');
+        major = (major * 10) + (rest[i++] - '0');
     }
     if (i == 0 || i >= rest.size() || rest[i] != '.') return false;
     ++i;
     const size_t mstart = i;
     while (i < rest.size() && rest[i] >= '0' && rest[i] <= '9') {
-        minor = minor * 10 + (rest[i++] - '0');
+        minor = (minor * 10) + (rest[i++] - '0');
     }
     if (i == mstart) return false;
     return major > 3 || (major == 3 && minor >= 6);
@@ -145,7 +147,7 @@ struct UpdateState {
     }
     std::string out;
     out.reserve(64);
-    for (char c : digest.substr(prefix.size())) {
+    for (const char c : digest.substr(prefix.size())) {
         if (!std::isxdigit(static_cast<unsigned char>(c))) return {};
         out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
     }

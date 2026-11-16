@@ -230,7 +230,7 @@ private:
     wil::unique_process_information spawn(const fs::path& exe, const std::wstring& args, bool no_window, HANDLE std_out = nullptr) {
         wil::unique_process_information pi;
         std::wstring cmd = L"\"" + exe.wstring() + L"\" " + args;
-        STARTUPINFOW si{sizeof(si)};
+        STARTUPINFOW si{.cb = sizeof(STARTUPINFOW)};
         si.dwFlags |= STARTF_USESHOWWINDOW;
         si.wShowWindow = no_window ? SW_HIDE : SW_SHOWNORMAL;
         BOOL inherit = FALSE;
@@ -690,7 +690,7 @@ private:
 
 int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::path& target_dir, bool open_about) {
     if (wait_pid != 0) {
-        if (wil::unique_handle proc{OpenProcess(SYNCHRONIZE, FALSE, wait_pid)}) {
+        if (const wil::unique_handle proc{OpenProcess(SYNCHRONIZE, FALSE, wait_pid)}) {
             WaitForSingleObject(proc.get(), 15'000);
         }
     }
@@ -749,7 +749,7 @@ int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::pat
     const fs::path update_dir = target_dir / L"data" / L"update";
     std::wstring cmd = L"\"" + next_exe.wstring() + L"\" --cleanup-update \"" + update_dir.wstring() + L"\"";
     if (open_about) cmd += L" --open-about";
-    STARTUPINFOW si{sizeof(si)};
+    STARTUPINFOW si{.cb = sizeof(STARTUPINFOW)};
     wil::unique_process_information pi;
     if (!CreateProcessW(next_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
                         CREATE_UNICODE_ENVIRONMENT, nullptr, target_dir.c_str(), &si, &pi)) {
@@ -790,7 +790,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
         for (int i = 5; i < argc; ++i) {
             if (std::wstring_view{argv[i]} == L"--open-about") open_about = true;
         }
-        LocalFree(argv);
+        LocalFree(static_cast<HLOCAL>(argv));
         return run_apply_update(wait_pid, staging_root, target_dir, open_about);
     }
 
@@ -802,7 +802,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
             if (a == L"--cleanup-update" && i + 1 < argc) cleanup_dir = fs::path{argv[++i]};
             else if (a == L"--open-about") open_about = true;
         }
-        LocalFree(argv);
+        LocalFree(static_cast<HLOCAL>(argv));
     }
     if (!cleanup_dir.empty()) {
         cleanup_update_artifacts(cleanup_dir, exe_dir());

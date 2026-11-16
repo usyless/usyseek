@@ -240,7 +240,7 @@ struct Shared {
         }));
     }
 
-    [[nodiscard]] bool has_update_available() const noexcept {
+    [[nodiscard]] bool has_update_available() const {
         return !update_state.latest_version.empty() && is_newer_version(update_state.latest_version, to_utf8(APP_VERSION));
     }
 

@@ -17,7 +17,7 @@ int main() {
     CHECK(normalize_version_string(" v0.3.0 ") == "0.3.0");
 
     // 2. Hardcoded 24h auto-check cooldown
-    constexpr int64_t day = 24 * 60 * 60;
+    constexpr int64_t day = 24LL * 60 * 60;
     CHECK(day == UPDATE_CHECK_INTERVAL_S);
     CHECK(!should_auto_check_updates(false, 0, 1000));
     CHECK(should_auto_check_updates(true, 0, 1000));
@@ -32,17 +32,21 @@ int main() {
 
     // 4. Asset selection & SHA-256 digest extraction
     const std::vector<GithubAsset> both{
-        {"usyseek.zip", "https://example.com/usyseek.zip", 35'000'000, "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
-        {"usyseek.7z", "https://example.com/usyseek.7z", 22'000'000, "sha256:ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"},
+        {.name = "usyseek.zip", .browser_download_url = "https://example.com/usyseek.zip", .size = 35'000'000, .digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+        {.name = "usyseek.7z", .browser_download_url = "https://example.com/usyseek.7z", .size = 22'000'000, .digest = "sha256:ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"},
     };
     const auto a7z = pick_release_asset(both, true);
     CHECK(a7z.has_value());
-    CHECK(a7z->name == "usyseek.7z");
-    CHECK(extract_sha256_digest(a7z->digest) == "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+    if (a7z) {
+        CHECK(a7z->name == "usyseek.7z");
+        CHECK(extract_sha256_digest(a7z->digest) == "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+    }
 
     const auto azip = pick_release_asset(both, false);
     CHECK(azip.has_value());
-    CHECK(azip->name == "usyseek.zip");
+    if (azip) {
+        CHECK(azip->name == "usyseek.zip");
+    }
 
     const std::vector<GithubAsset> only_7z{both[1]};
     CHECK(!pick_release_asset(only_7z, false).has_value());
