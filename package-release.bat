@@ -41,13 +41,21 @@ if exist "licenses" xcopy /e /i /y /q "licenses" "%STAGE%\licenses" >nul
 if exist "%DIST%\usyseek.7z" del /f /q "%DIST%\usyseek.7z"
 if exist "%DIST%\usyseek.zip" del /f /q "%DIST%\usyseek.zip"
 
+pushd "%STAGE%"
 echo [package-release] Creating %DIST%\usyseek.7z...
-7z a -t7z -mx=9 -ms=on "%DIST%\usyseek.7z" "%STAGE%\*" >nul
-if errorlevel 1 goto :fail
+7z a -t7z -mx=9 -ms=on "..\usyseek.7z" * >nul
+if errorlevel 1 (
+    popd
+    goto :fail
+)
 
 echo [package-release] Creating %DIST%\usyseek.zip...
-7z a -tzip -mx=9 "%DIST%\usyseek.zip" "%STAGE%\*" >nul
-if errorlevel 1 goto :fail
+7z a -tzip -mx=9 "..\usyseek.zip" * >nul
+if errorlevel 1 (
+    popd
+    goto :fail
+)
+popd
 
 rmdir /s /q "%STAGE%"
 
