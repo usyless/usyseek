@@ -40,6 +40,9 @@ inline std::wstring format_hotkey(uint32_t mods, uint32_t vk) {
 /// State and services shared by the pill and the settings window (UI thread only unless noted).
 struct Shared {
     Gfx gfx;
+#ifdef USYSEEK_LIQUID_GLASS
+    DesktopDuplicator desktop_dupl;
+#endif
     Fonts fonts;
     Settings settings;
     ThemeCatalog themes;

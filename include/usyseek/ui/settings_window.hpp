@@ -116,7 +116,7 @@ public:
         apply_window_theme(hwnd_, sh_.theme, false, true);
 #ifdef USYSEEK_LIQUID_GLASS
         if (visible() && !sh_.test_mode) {
-            if (glass_active()) SetTimer(hwnd_, TIMER_GLASS, 33, nullptr);
+            if (glass_active()) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
             else KillTimer(hwnd_, TIMER_GLASS);
         }
 #endif
@@ -152,7 +152,7 @@ public:
         SetFocus(hwnd_);
         SetTimer(hwnd_, TIMER_POLL, 500, nullptr);
 #ifdef USYSEEK_LIQUID_GLASS
-        if (glass_active() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 33, nullptr);
+        if (glass_active() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
 #endif
         if (sh_.visibility_changed) sh_.visibility_changed();
         render();
@@ -442,6 +442,7 @@ private:
         sh_.thumbs.reset_gpu();
 #ifdef USYSEEK_LIQUID_GLASS
         glass_.release();
+        sh_.desktop_dupl.reset();
 #endif
         target_.release();
         full_dirty_ = true;
@@ -668,7 +669,7 @@ private:
         const bool glass = glass_active();
         const bool has_scene = glass && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
-            if (!glass_.draw_desktop_glass(cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
+            if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
                                            make_desktop_glass_style(cv.theme(), 0.0f, true))) {
                 cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().settings_bg_alpha));
             }
@@ -712,7 +713,7 @@ private:
         if (glass) {
             const float strip_h = tabs_height(sz.width);
             glass_.draw_scene_glass(cv, target_, sh_.gfx, D2D1::RectF(0.0f, 0.0f, sz.width, strip_h),
-                                    make_overlay_glass_style(cv.theme(), 0.0f, 4.0f));
+                                    make_overlay_glass_style(cv.theme(), 0.0f, 1.8f));
         }
         draw_tabs(cv, sz);
         draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
@@ -3417,7 +3418,7 @@ private:
                     }
 #ifdef USYSEEK_LIQUID_GLASS
                     case TIMER_GLASS:
-                        if (glass_active() && visible() && glass_.poll_desktop(sh_.gfx, hwnd_)) {
+                        if (glass_active() && visible() && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
                             full_dirty_ = true;
                             invalidate();
                         }

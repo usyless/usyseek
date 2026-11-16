@@ -511,85 +511,283 @@ private:
     LiquidGlassShaderParams params_{};
 };
 
-/// Captures the live monitor desktop behind a window on the GPU via DXGI Output Duplication.
+/// Captures the live monitor desktop on the GPU via DXGI Output Duplication.
+/// Shared across all windows on the same D3D11 device so `DuplicateOutput` is only
+/// acquired once per monitor (DXGI rejects a second duplication on the same device & output).
 class DesktopDuplicator {
 public:
+    struct OutputState {
+        HMONITOR mon = nullptr;
+        RECT mon_rect{};
+        wil::com_ptr<IDXGIOutputDuplication> dupl;
+        wil::com_ptr<ID3D11Texture2D> desktop_tex;
+        uint64_t tex_id = 0;
+        UINT tex_w = 0;
+        UINT tex_h = 0;
+        bool has_frame = false;
+        uint64_t frame_seq = 0;
+        bool dirty_all = false;
+        std::vector<RECT> dirty_rects;
+        ULONGLONG retry_after_tick = 0;
+    };
+
     void reset() {
-        dupl_.reset();
-        desktop_tex_.reset();
-        desktop_bmp_.reset();
-        mon_ = nullptr;
-        mon_rect_ = {};
-        tex_w_ = tex_h_ = 0;
+        outputs_.clear();
         epoch_ = 0;
-        has_frame_ = false;
-        seeded_gdi_ = false;
     }
 
     /// Polls DXGI Output Duplication without blocking (or with a brief wait on initial acquire).
-    /// Returns true when a new desktop frame overlapping `hwnd`'s screen rect arrived.
-    bool poll(Gfx& gfx, HWND hwnd, ULONGLONG now_tick) {
-        if (!ensure_duplication(gfx, hwnd, now_tick)) return false;
+    /// Returns the monitor state when valid (or nullptr if duplication is currently unavailable).
+    const OutputState* poll_monitor(Gfx& gfx, HWND hwnd, ULONGLONG now_tick) {
+        if (!gfx.ready() || !hwnd) return nullptr;
+        if (epoch_ != gfx.epoch()) {
+            outputs_.clear();
+            epoch_ = gfx.epoch();
+        }
 
-        const int max_tries = has_frame_ ? 1 : 4;
-        for (int attempt = 0; attempt < max_tries; ++attempt) {
+        const HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        OutputState* st = find_or_create(mon);
+        if (!ensure_duplication(gfx, *st, now_tick)) return st->has_frame ? st : nullptr;
+
+        for (int attempt = 0; attempt < 4; ++attempt) {
             DXGI_OUTDUPL_FRAME_INFO info{};
             wil::com_ptr<IDXGIResource> res;
-            const UINT timeout_ms = has_frame_ ? 0u : 25u;
-            const HRESULT hr = dupl_->AcquireNextFrame(timeout_ms, &info, &res);
-            if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
+            const UINT timeout_ms = st->has_frame ? 0u : 25u;
+            const HRESULT hr = st->dupl->AcquireNextFrame(timeout_ms, &info, &res);
+            if (hr == DXGI_ERROR_WAIT_TIMEOUT) break;
             if (FAILED(hr)) {
                 if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL) {
-                    reset();
-                    retry_after_tick_ = now_tick + 400;
+                    reset_output(*st);
+                    st->retry_after_tick = now_tick + 400;
                 }
-                return false;
+                return st->has_frame ? st : nullptr;
             }
 
-            const auto release_frame = wil::scope_exit([&] { dupl_->ReleaseFrame(); });
-            // The initial DXGI handshake frame has LastPresentTime == 0 and an all-black buffer: skip it.
+            const auto release_frame = wil::scope_exit([&] { st->dupl->ReleaseFrame(); });
+            // The initial DXGI handshake frame (and pointer-only updates) have LastPresentTime == 0: skip them.
             if (info.LastPresentTime.QuadPart == 0) continue;
 
-            const bool was_first = !has_frame_;
-            bool overlaps = was_first;
-            RECT win_rc{};
-            if (!was_first && GetWindowRect(hwnd, &win_rc)) {
-                const UINT dirty_bytes = info.TotalMetadataBufferSize;
-                if (dirty_bytes > 0) {
-                    metadata_buf_.resize(dirty_bytes);
-                    UINT needed = 0;
-                    if (SUCCEEDED(dupl_->GetFrameDirtyRects(dirty_bytes, reinterpret_cast<RECT*>(metadata_buf_.data()), &needed))) {
-                        const UINT n = needed / sizeof(RECT);
-                        const auto* rects = reinterpret_cast<const RECT*>(metadata_buf_.data());
-                        overlaps = (n == 0);
-                        for (UINT i = 0; i < n; ++i) {
-                            RECT r = rects[i];
-                            OffsetRect(&r, mon_rect_.left, mon_rect_.top);
-                            RECT inter{};
-                            if (IntersectRect(&inter, &r, &win_rc)) {
-                                overlaps = true;
-                                break;
-                            }
-                        }
+            st->dirty_rects.clear();
+            st->dirty_all = !st->has_frame;
+            const UINT dirty_bytes = info.TotalMetadataBufferSize;
+            if (dirty_bytes > 0) {
+                metadata_buf_.resize(dirty_bytes);
+                UINT needed = 0;
+                if (SUCCEEDED(st->dupl->GetFrameDirtyRects(dirty_bytes, reinterpret_cast<RECT*>(metadata_buf_.data()), &needed)) && needed > 0) {
+                    const UINT n = needed / sizeof(RECT);
+                    const auto* rects = reinterpret_cast<const RECT*>(metadata_buf_.data());
+                    st->dirty_rects.reserve(n);
+                    for (UINT i = 0; i < n; ++i) {
+                        RECT r = rects[i];
+                        OffsetRect(&r, st->mon_rect.left, st->mon_rect.top);
+                        st->dirty_rects.push_back(r);
                     }
+                } else {
+                    st->dirty_all = true;
                 }
+            } else {
+                st->dirty_all = true;
             }
 
             if (auto tex = res.try_query<ID3D11Texture2D>()) {
-                if (ensure_desktop_surface(gfx, tex.get())) {
-                    gfx.d3d_context()->CopyResource(desktop_tex_.get(), tex.get());
-                    has_frame_ = true;
+                if (ensure_desktop_surface(gfx, *st, tex.get(), next_tex_id_)) {
+                    gfx.d3d_context()->CopyResource(st->desktop_tex.get(), tex.get());
+                    st->has_frame = true;
+                    ++st->frame_seq;
                 }
             }
-            return overlaps && has_frame_;
+            break;
+        }
+        return st->has_frame ? st : nullptr;
+    }
+
+private:
+    OutputState* find_or_create(HMONITOR mon) {
+        for (auto& o : outputs_) {
+            if (o.mon == mon) return &o;
+        }
+        outputs_.push_back(OutputState{.mon = mon});
+        return &outputs_.back();
+    }
+
+    static void reset_output(OutputState& st) {
+        st.dupl.reset();
+        st.desktop_tex.reset();
+        st.tex_id = 0;
+        st.mon_rect = {};
+        st.tex_w = st.tex_h = 0;
+        st.has_frame = false;
+        st.dirty_all = false;
+        st.dirty_rects.clear();
+    }
+
+    bool ensure_duplication(Gfx& gfx, OutputState& st, ULONGLONG now_tick) {
+        if (st.dupl) return true;
+        if (now_tick < st.retry_after_tick) return false;
+
+        reset_output(st);
+        wil::com_ptr<IDXGIAdapter> adapter;
+        if (FAILED(gfx.dxgi_device()->GetAdapter(&adapter)) || !adapter) {
+            st.retry_after_tick = now_tick + 1000;
+            return false;
+        }
+        for (UINT i = 0;; ++i) {
+            wil::com_ptr<IDXGIOutput> out;
+            if (adapter->EnumOutputs(i, &out) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_OUTPUT_DESC desc{};
+            if (SUCCEEDED(out->GetDesc(&desc)) && desc.Monitor == st.mon) {
+                if (auto out1 = out.try_query<IDXGIOutput1>()) {
+                    if (SUCCEEDED(out1->DuplicateOutput(gfx.d3d(), &st.dupl))) {
+                        st.mon_rect = desc.DesktopCoordinates;
+                        st.has_frame = false;
+                        return true;
+                    }
+                }
+                break;
+            }
+        }
+        st.retry_after_tick = now_tick + 1000;
+        return false;
+    }
+
+    static bool ensure_desktop_surface(Gfx& gfx, OutputState& st, ID3D11Texture2D* src, uint64_t& next_tex_id) {
+        D3D11_TEXTURE2D_DESC sd{};
+        src->GetDesc(&sd);
+        if (st.desktop_tex && st.tex_w == sd.Width && st.tex_h == sd.Height) return true;
+
+        st.desktop_tex.reset();
+        st.tex_id = 0;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = sd.Width;
+        td.Height = sd.Height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(gfx.d3d()->CreateTexture2D(&td, nullptr, &st.desktop_tex))) return false;
+        st.tex_id = ++next_tex_id;
+        st.tex_w = sd.Width;
+        st.tex_h = sd.Height;
+        return true;
+    }
+
+    std::vector<OutputState> outputs_;
+    uint64_t epoch_ = 0;
+    uint64_t next_tex_id_ = 0;
+    std::vector<uint8_t> metadata_buf_;
+};
+
+/// Per-window Liquid Glass rendering helper (manages blur + shader effects, backdrop copy, and in-app scene snapshot).
+class LiquidGlassWindow {
+public:
+    void release() {
+        desktop_bmp_.reset();
+        desktop_bmp_tex_id_ = 0;
+        win_bmp_.reset();
+        scene_bmp_.reset();
+        blur_effect_.reset();
+        glass_effect_.reset();
+        last_mon_ = nullptr;
+        last_seq_ = 0;
+        seeded_gdi_ = false;
+        scene_active_ = false;
+        epoch_ = 0;
+        scene_epoch_ = 0;
+        desktop_bmp_epoch_ = 0;
+        win_bmp_epoch_ = 0;
+    }
+
+    bool poll_desktop(DesktopDuplicator& dupl, Gfx& gfx, HWND hwnd) {
+        const auto* st = dupl.poll_monitor(gfx, hwnd, GetTickCount64());
+        if (!st || !st->has_frame) return false;
+
+        const bool mon_changed = (last_mon_ != st->mon);
+        if (!mon_changed && last_seq_ == st->frame_seq) return false;
+
+        const bool skipped = (!mon_changed && last_seq_ != 0 && st->frame_seq - last_seq_ > 1);
+        last_mon_ = st->mon;
+        last_seq_ = st->frame_seq;
+
+        if (mon_changed || skipped || st->dirty_all) return true;
+
+        RECT win_rc{};
+        if (!GetWindowRect(hwnd, &win_rc)) return true;
+        for (const RECT& r : st->dirty_rects) {
+            RECT inter{};
+            if (IntersectRect(&inter, &r, &win_rc)) return true;
         }
         return false;
     }
 
-    /// Ensures the current monitor frame is ready and copies the window's screen region into `win_bmp_`.
-    ID2D1Bitmap1* capture_window_backdrop(Gfx& gfx, WindowTarget& target, HWND hwnd, ULONGLONG now_tick) {
+    /// Draws the live monitor desktop behind `hwnd` through the Liquid Glass shader across `panel_rect`.
+    /// Returns false if Desktop Duplication or shader compilation is unavailable.
+    bool draw_desktop_glass(DesktopDuplicator& dupl, Canvas& cv, WindowTarget& target, Gfx& gfx, HWND hwnd,
+                            D2D1_RECT_F panel_rect, const GlassStyle& style) {
+        ID2D1Bitmap1* bmp = capture_window_backdrop(dupl, gfx, target, hwnd, GetTickCount64());
+        if (!bmp) return false;
+        const D2D1_SIZE_F sz = target.size();
+        GlassStyle s = style;
+        s.force_opaque = true;
+        return draw_bitmap_glass(cv, target, gfx, bmp, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), panel_rect, s);
+    }
+
+    /// Redirects `target.dc()` into an offscreen `scene_bmp_` so floating glass panels
+    /// can sample and refract the rendered scene underneath them without copying.
+    bool begin_scene(WindowTarget& target, Gfx& gfx) {
+        scene_active_ = false;
+        if (!target.ready() || !target.target_bitmap()) return false;
+        const UINT pw = target.pixel_width();
+        const UINT ph = target.pixel_height();
+        if (pw == 0 || ph == 0) return false;
+
+        if (!scene_bmp_ || scene_w_ != pw || scene_h_ != ph || scene_dpi_ != target.dpi() || scene_epoch_ != gfx.epoch()) {
+            scene_bmp_.reset();
+            const auto props = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                target.dpi(), target.dpi());
+            if (FAILED(target.dc()->CreateBitmap(D2D1::SizeU(pw, ph), nullptr, 0, &props, &scene_bmp_))) {
+                return false;
+            }
+            scene_w_ = pw;
+            scene_h_ = ph;
+            scene_dpi_ = target.dpi();
+            scene_epoch_ = gfx.epoch();
+        }
+        target.dc()->SetTarget(scene_bmp_.get());
+        target.dc()->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+        scene_active_ = true;
+        return true;
+    }
+
+    /// Restores `target.target_bitmap()` and blits `scene_bmp_` onto it as the base layer.
+    void end_scene(WindowTarget& target) {
+        if (!scene_active_) return;
+        scene_active_ = false;
+        if (!target.ready() || !target.target_bitmap() || !scene_bmp_) return;
+        ID2D1DeviceContext6* dc = target.dc();
+        dc->SetTarget(target.target_bitmap());
+        dc->DrawBitmap(scene_bmp_.get(), nullptr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
+    }
+
+    /// Draws a floating Liquid Glass panel refracting the captured in-app scene (`scene_bmp_`).
+    bool draw_scene_glass(Canvas& cv, WindowTarget& target, Gfx& gfx,
+                          D2D1_RECT_F panel_rect, const GlassStyle& style) {
+        if (!scene_bmp_) return false;
+        const D2D1_SIZE_F sz = target.size();
+        return draw_bitmap_glass(cv, target, gfx, scene_bmp_.get(), D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), panel_rect, style);
+    }
+
+private:
+    ID2D1Bitmap1* capture_window_backdrop(DesktopDuplicator& dupl, Gfx& gfx, WindowTarget& target, HWND hwnd, ULONGLONG now_tick) {
         if (!target.ready() || !hwnd) return nullptr;
-        poll(gfx, hwnd, now_tick);
+        const auto* st = dupl.poll_monitor(gfx, hwnd, now_tick);
+        if (st && st->has_frame) {
+            last_mon_ = st->mon;
+            last_seq_ = st->frame_seq;
+        }
 
         const UINT pw = target.pixel_width();
         const UINT ph = target.pixel_height();
@@ -611,16 +809,15 @@ public:
             seeded_gdi_ = false;
         }
 
-        if (!has_frame_ || !desktop_tex_) {
-            // Static/idle desktop before DXGI emits its first LastPresentTime != 0 frame:
-            // seed once from screen DC (WDA_EXCLUDEFROMCAPTURE hides this window from BitBlt).
+        if (!st || !st->has_frame || !st->desktop_tex) {
             if (!seeded_gdi_) seeded_gdi_ = seed_from_screen_dc(hwnd, pw, ph);
             return seeded_gdi_ ? win_bmp_.get() : nullptr;
         }
 
-        if (!desktop_bmp_ || desktop_bmp_epoch_ != gfx.epoch()) {
+        if (!desktop_bmp_ || desktop_bmp_tex_id_ != st->tex_id || desktop_bmp_epoch_ != gfx.epoch()) {
             desktop_bmp_.reset();
-            auto surf = desktop_tex_.try_query<IDXGISurface>();
+            desktop_bmp_tex_id_ = 0;
+            auto surf = st->desktop_tex.try_query<IDXGISurface>();
             if (!surf) return nullptr;
             const auto props = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_NONE,
@@ -629,17 +826,18 @@ public:
             if (FAILED(target.dc()->CreateBitmapFromDxgiSurface(surf.get(), &props, &desktop_bmp_))) {
                 return nullptr;
             }
+            desktop_bmp_tex_id_ = st->tex_id;
             desktop_bmp_epoch_ = gfx.epoch();
         }
 
         POINT origin{0, 0};
         ClientToScreen(hwnd, &origin);
-        const LONG sx = origin.x - mon_rect_.left;
-        const LONG sy = origin.y - mon_rect_.top;
-        const LONG clip_l = std::clamp<LONG>(sx, 0, static_cast<LONG>(tex_w_));
-        const LONG clip_t = std::clamp<LONG>(sy, 0, static_cast<LONG>(tex_h_));
-        const LONG clip_r = std::clamp<LONG>(sx + static_cast<LONG>(pw), 0, static_cast<LONG>(tex_w_));
-        const LONG clip_b = std::clamp<LONG>(sy + static_cast<LONG>(ph), 0, static_cast<LONG>(tex_h_));
+        const LONG sx = origin.x - st->mon_rect.left;
+        const LONG sy = origin.y - st->mon_rect.top;
+        const LONG clip_l = std::clamp<LONG>(sx, 0, static_cast<LONG>(st->tex_w));
+        const LONG clip_t = std::clamp<LONG>(sy, 0, static_cast<LONG>(st->tex_h));
+        const LONG clip_r = std::clamp<LONG>(sx + static_cast<LONG>(pw), 0, static_cast<LONG>(st->tex_w));
+        const LONG clip_b = std::clamp<LONG>(sy + static_cast<LONG>(ph), 0, static_cast<LONG>(st->tex_h));
         if (clip_r <= clip_l || clip_b <= clip_t) return nullptr;
 
         const D2D1_POINT_2U dst_pt{
@@ -656,7 +854,6 @@ public:
         return win_bmp_.get();
     }
 
-private:
     bool seed_from_screen_dc(HWND hwnd, UINT pw, UINT ph) {
         if (!win_bmp_ || !hwnd || pw == 0 || ph == 0) return false;
         POINT origin{0, 0};
@@ -690,152 +887,6 @@ private:
         return SUCCEEDED(win_bmp_->CopyFromMemory(nullptr, bits, pw * 4));
     }
 
-private:
-    bool ensure_duplication(Gfx& gfx, HWND hwnd, ULONGLONG now_tick) {
-        if (!gfx.ready() || !hwnd) return false;
-        if (now_tick < retry_after_tick_) return dupl_ != nullptr;
-
-        const HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        if (dupl_ && mon_ == mon && epoch_ == gfx.epoch()) return true;
-
-        reset();
-        wil::com_ptr<IDXGIAdapter> adapter;
-        if (FAILED(gfx.dxgi_device()->GetAdapter(&adapter)) || !adapter) {
-            retry_after_tick_ = now_tick + 1000;
-            return false;
-        }
-        for (UINT i = 0;; ++i) {
-            wil::com_ptr<IDXGIOutput> out;
-            if (adapter->EnumOutputs(i, &out) == DXGI_ERROR_NOT_FOUND) break;
-            DXGI_OUTPUT_DESC desc{};
-            if (SUCCEEDED(out->GetDesc(&desc)) && desc.Monitor == mon) {
-                if (auto out1 = out.try_query<IDXGIOutput1>()) {
-                    if (SUCCEEDED(out1->DuplicateOutput(gfx.d3d(), &dupl_))) {
-                        mon_ = mon;
-                        mon_rect_ = desc.DesktopCoordinates;
-                        epoch_ = gfx.epoch();
-                        has_frame_ = false;
-                        return true;
-                    }
-                }
-                break;
-            }
-        }
-        retry_after_tick_ = now_tick + 1000;
-        return false;
-    }
-
-    bool ensure_desktop_surface(Gfx& gfx, ID3D11Texture2D* src) {
-        D3D11_TEXTURE2D_DESC sd{};
-        src->GetDesc(&sd);
-        if (desktop_tex_ && tex_w_ == sd.Width && tex_h_ == sd.Height && epoch_ == gfx.epoch()) return true;
-
-        desktop_tex_.reset();
-        desktop_bmp_.reset();
-        D3D11_TEXTURE2D_DESC td{};
-        td.Width = sd.Width;
-        td.Height = sd.Height;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(gfx.d3d()->CreateTexture2D(&td, nullptr, &desktop_tex_))) return false;
-        tex_w_ = sd.Width;
-        tex_h_ = sd.Height;
-        return true;
-    }
-
-    wil::com_ptr<IDXGIOutputDuplication> dupl_;
-    wil::com_ptr<ID3D11Texture2D> desktop_tex_;
-    wil::com_ptr<ID2D1Bitmap1> desktop_bmp_;
-    wil::com_ptr<ID2D1Bitmap1> win_bmp_;
-    HMONITOR mon_ = nullptr;
-    RECT mon_rect_{};
-    UINT tex_w_ = 0, tex_h_ = 0;
-    UINT win_bmp_w_ = 0, win_bmp_h_ = 0;
-    float win_bmp_dpi_ = 0.0f;
-    uint64_t epoch_ = 0;
-    uint64_t desktop_bmp_epoch_ = 0;
-    uint64_t win_bmp_epoch_ = 0;
-    ULONGLONG retry_after_tick_ = 0;
-    bool has_frame_ = false;
-    bool seeded_gdi_ = false;
-    std::vector<uint8_t> metadata_buf_;
-};
-
-/// Per-window Liquid Glass rendering helper (manages blur + shader effects and in-app scene snapshot).
-class LiquidGlassWindow {
-public:
-    void release() {
-        dupl_.reset();
-        scene_bmp_.reset();
-        blur_effect_.reset();
-        glass_effect_.reset();
-        epoch_ = 0;
-    }
-
-    bool poll_desktop(Gfx& gfx, HWND hwnd) {
-        return dupl_.poll(gfx, hwnd, GetTickCount64());
-    }
-
-    /// Draws the live monitor desktop behind `hwnd` through the Liquid Glass shader across `panel_rect`.
-    /// Returns false if Desktop Duplication or shader compilation is unavailable.
-    bool draw_desktop_glass(Canvas& cv, WindowTarget& target, Gfx& gfx, HWND hwnd,
-                            D2D1_RECT_F panel_rect, const GlassStyle& style) {
-        ID2D1Bitmap1* bmp = dupl_.capture_window_backdrop(gfx, target, hwnd, GetTickCount64());
-        if (!bmp) return false;
-        const D2D1_SIZE_F sz = target.size();
-        GlassStyle s = style;
-        s.force_opaque = true;
-        return draw_bitmap_glass(cv, target, gfx, bmp, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), panel_rect, s);
-    }
-
-    /// Redirects `target.dc()` into an offscreen `scene_bmp_` so floating glass panels
-    /// can sample and refract the rendered scene underneath them without copying.
-    bool begin_scene(WindowTarget& target, Gfx& gfx) {
-        if (!target.ready() || !target.target_bitmap()) return false;
-        const UINT pw = target.pixel_width();
-        const UINT ph = target.pixel_height();
-        if (pw == 0 || ph == 0) return false;
-
-        if (!scene_bmp_ || scene_w_ != pw || scene_h_ != ph || scene_dpi_ != target.dpi() || scene_epoch_ != gfx.epoch()) {
-            scene_bmp_.reset();
-            const auto props = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
-                target.dpi(), target.dpi());
-            if (FAILED(target.dc()->CreateBitmap(D2D1::SizeU(pw, ph), nullptr, 0, &props, &scene_bmp_))) {
-                return false;
-            }
-            scene_w_ = pw;
-            scene_h_ = ph;
-            scene_dpi_ = target.dpi();
-            scene_epoch_ = gfx.epoch();
-        }
-        target.dc()->SetTarget(scene_bmp_.get());
-        target.dc()->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
-        return true;
-    }
-
-    /// Restores `target.target_bitmap()` and blits `scene_bmp_` onto it as the base layer.
-    void end_scene(WindowTarget& target) {
-        if (!target.ready() || !target.target_bitmap() || !scene_bmp_) return;
-        ID2D1DeviceContext6* dc = target.dc();
-        dc->SetTarget(target.target_bitmap());
-        dc->DrawBitmap(scene_bmp_.get(), nullptr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr);
-    }
-
-    /// Draws a floating Liquid Glass panel refracting the captured in-app scene (`scene_bmp_`).
-    bool draw_scene_glass(Canvas& cv, WindowTarget& target, Gfx& gfx,
-                          D2D1_RECT_F panel_rect, const GlassStyle& style) {
-        if (!scene_bmp_) return false;
-        const D2D1_SIZE_F sz = target.size();
-        return draw_bitmap_glass(cv, target, gfx, scene_bmp_.get(), D2D1::RectF(0.0f, 0.0f, sz.width, sz.height), panel_rect, style);
-    }
-
-private:
     bool ensure_effects(WindowTarget& target, Gfx& gfx) {
         if (blur_effect_ && glass_effect_ && epoch_ == gfx.epoch()) return true;
         blur_effect_.reset();
@@ -870,7 +921,7 @@ private:
         blur_effect_->SetInput(0, src_bmp);
         blur_effect_->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, std::max(0.0f, style.blur_std_dev));
         blur_effect_->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
-        blur_effect_->SetValue(D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED);
+        blur_effect_->SetValue(D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED);
 
         glass_effect_->SetInputEffect(0, blur_effect_.get());
         if (FAILED(glass_effect_->SetValue(0, reinterpret_cast<const BYTE*>(&params), sizeof(params)))) return false;
@@ -884,61 +935,71 @@ private:
         return true;
     }
 
-    DesktopDuplicator dupl_;
+    wil::com_ptr<ID2D1Bitmap1> desktop_bmp_;
+    uint64_t desktop_bmp_tex_id_ = 0;
+    wil::com_ptr<ID2D1Bitmap1> win_bmp_;
     wil::com_ptr<ID2D1Bitmap1> scene_bmp_;
     wil::com_ptr<ID2D1Effect> blur_effect_;
     wil::com_ptr<ID2D1Effect> glass_effect_;
+    HMONITOR last_mon_ = nullptr;
+    uint64_t last_seq_ = 0;
+    UINT win_bmp_w_ = 0, win_bmp_h_ = 0;
+    float win_bmp_dpi_ = 0.0f;
     UINT scene_w_ = 0, scene_h_ = 0;
     float scene_dpi_ = 0.0f;
     uint64_t epoch_ = 0;
     uint64_t scene_epoch_ = 0;
+    uint64_t desktop_bmp_epoch_ = 0;
+    uint64_t win_bmp_epoch_ = 0;
+    bool seeded_gdi_ = false;
+    bool scene_active_ = false;
 };
 
 [[nodiscard]] inline GlassStyle make_desktop_glass_style(const Theme& t, float corner_radius, bool fullscreen = false) noexcept {
     GlassStyle s;
-    s.blur_std_dev = 6.0f;
+    s.blur_std_dev = 1.4f;
     s.corner_radius = fullscreen ? 0.0f : corner_radius;
     s.roundness = 4.6f;
     s.margin_dip = fullscreen ? 0.0f : 0.5f;
-    s.ref_thickness = fullscreen ? 14.0f : 28.0f;
-    s.ref_factor = 1.48f;
-    s.ref_dispersion = 4.5f;
-    s.dispersion_range = 0.65f;
-    s.fresnel_range = 38.0f;
-    s.fresnel_hardness = 8.0f;
-    s.fresnel_factor = t.dark_mode ? 24.0f : 34.0f;
-    s.magnification = 1.02f;
-    s.glare_range = 34.0f;
-    s.glare_hardness = 14.0f;
-    s.glare_factor = t.dark_mode ? 54.0f : 78.0f;
-    s.glare_convergence = 55.0f;
-    s.glare_opposite_factor = 68.0f;
+    s.ref_thickness = fullscreen ? 14.0f : 30.0f;
+    s.ref_factor = 1.52f;
+    s.ref_dispersion = 5.5f;
+    s.dispersion_range = 0.70f;
+    s.fresnel_range = 30.0f;
+    s.fresnel_hardness = 12.0f;
+    s.fresnel_factor = t.dark_mode ? 34.0f : 44.0f;
+    s.magnification = 1.035f;
+    s.glare_range = 28.0f;
+    s.glare_hardness = 18.0f;
+    s.glare_factor = t.dark_mode ? 70.0f : 88.0f;
+    s.glare_convergence = 58.0f;
+    s.glare_opposite_factor = 72.0f;
     s.glare_angle_deg = -45.0f;
     s.tint = with_alpha(t.bg, t.pill_bg_alpha);
     return s;
 }
 
-[[nodiscard]] inline GlassStyle make_overlay_glass_style(const Theme& t, float corner_radius, float blur_std = 3.2f) noexcept {
+[[nodiscard]] inline GlassStyle make_overlay_glass_style(const Theme& t, float corner_radius, float blur_std = 1.8f) noexcept {
     GlassStyle s;
     s.blur_std_dev = blur_std;
     s.corner_radius = corner_radius;
     s.roundness = 4.5f;
     s.margin_dip = 0.5f;
-    s.ref_thickness = 22.0f;
-    s.ref_factor = 1.50f;
-    s.ref_dispersion = 4.0f;
+    s.ref_thickness = 24.0f;
+    s.ref_factor = 1.54f;
+    s.ref_dispersion = 4.5f;
     s.dispersion_range = 0.65f;
-    s.fresnel_range = 30.0f;
-    s.fresnel_hardness = 10.0f;
-    s.fresnel_factor = t.dark_mode ? 30.0f : 40.0f;
-    s.magnification = 1.04f;
-    s.glare_range = 30.0f;
-    s.glare_hardness = 15.0f;
-    s.glare_factor = t.dark_mode ? 66.0f : 84.0f;
-    s.glare_convergence = 58.0f;
-    s.glare_opposite_factor = 72.0f;
+    s.fresnel_range = 26.0f;
+    s.fresnel_hardness = 12.0f;
+    s.fresnel_factor = t.dark_mode ? 36.0f : 46.0f;
+    s.magnification = 1.045f;
+    s.glare_range = 26.0f;
+    s.glare_hardness = 18.0f;
+    s.glare_factor = t.dark_mode ? 74.0f : 92.0f;
+    s.glare_convergence = 60.0f;
+    s.glare_opposite_factor = 74.0f;
     s.glare_angle_deg = -45.0f;
-    s.tint = with_alpha(t.surface_high, t.dark_mode ? 0.34f : 0.44f);
+    s.tint = with_alpha(t.surface_high, t.dark_mode ? 0.28f : 0.36f);
     return s;
 }
 

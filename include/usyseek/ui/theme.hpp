@@ -494,8 +494,8 @@ struct Theme {
         t.on_primary = hex(0x042438);
         t.primary_container = hex(0x0c4a6e);
         t.on_primary_container = hex(0xe0f2fe);
-        t.pill_bg_alpha = 0.24f;
-        t.settings_bg_alpha = 0.30f;
+        t.pill_bg_alpha = 0.18f;
+        t.settings_bg_alpha = 0.24f;
         t.card_alpha = 0.56f;
     } else {
         t.bg = hex(0xf2f6fc);
@@ -510,8 +510,8 @@ struct Theme {
         t.on_primary = hex(0xffffff);
         t.primary_container = hex(0xd1e9ff);
         t.on_primary_container = hex(0x002447);
-        t.pill_bg_alpha = 0.30f;
-        t.settings_bg_alpha = 0.36f;
+        t.pill_bg_alpha = 0.22f;
+        t.settings_bg_alpha = 0.28f;
         t.card_alpha = 0.64f;
     }
     t.pill_border = with_alpha(hex(0xffffff), dark ? 0.28f : 0.65f);

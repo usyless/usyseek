@@ -231,6 +231,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                   "Direct3D fell back to WARP software rendering; animations and video playback may be slower.", "warp-fallback");
     }
     sh.gfx.on_device_changed = [&] {
+#ifdef USYSEEK_LIQUID_GLASS
+        sh.desktop_dupl.reset();
+#endif
         sh.thumbs.reset_gpu();
         sh.previews.reset_gpu();
         pill.reset_preview_gpu();
@@ -299,6 +302,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     const auto arm_idle_timer = [&] {
         KillTimer(pill.hwnd(), TIMER_IDLE_EXIT);
+        if (!pill.visible() && !settings_win.visible()) {
+#ifdef USYSEEK_LIQUID_GLASS
+            sh.desktop_dupl.reset();
+#endif
+        }
         // A download or package install keeps the process alive even with both windows closed
         if (!pill.visible() && !settings_win.visible() && !sh.test_mode && sh.background_jobs == 0) {
             SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));

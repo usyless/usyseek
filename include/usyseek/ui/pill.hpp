@@ -58,7 +58,7 @@ public:
         apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
 #ifdef USYSEEK_LIQUID_GLASS
         if (visible() && !sh_.test_mode) {
-            if (glass_active()) SetTimer(hwnd_, TIMER_GLASS, 33, nullptr);
+            if (glass_active()) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
             else KillTimer(hwnd_, TIMER_GLASS);
         }
 #endif
@@ -90,7 +90,7 @@ public:
         if (preview_valid()) request_preview();
         SetTimer(hwnd_, TIMER_STATUS, 1000, nullptr);
 #ifdef USYSEEK_LIQUID_GLASS
-        if (glass_active() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 33, nullptr);
+        if (glass_active() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
 #endif
         if (sh_.visibility_changed) sh_.visibility_changed();
         full_dirty_ = true;
@@ -657,6 +657,7 @@ private:
         reset_preview_gpu();
 #ifdef USYSEEK_LIQUID_GLASS
         glass_.release();
+        sh_.desktop_dupl.reset();
 #endif
         target_.release();
         sh_.gfx.recover(hwnd_);
@@ -1049,7 +1050,7 @@ private:
         const bool has_scene = glass && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
             const float outer_r = fullscreen_ ? 0.0f : 12.0f;
-            if (!glass_.draw_desktop_glass(cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
+            if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
                                            make_desktop_glass_style(cv.theme(), outer_r, fullscreen_))) {
                 cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
             }
@@ -1062,16 +1063,8 @@ private:
             draw_active_tooltip(cv, sz);
             return;
         }
-        if (expanded()) {
-            draw_grid(cv);
-            if (has_scene) glass_.end_scene(target_);
-            if (glass) {
-                const D2D1_RECT_F hdr = D2D1::RectF(6.0f, 6.0f, sz.width - 6.0f, HEADER_H + STATUS_H - 4.0f);
-                glass_.draw_scene_glass(cv, target_, sh_.gfx, hdr, make_overlay_glass_style(cv.theme(), 14.0f, 3.8f));
-            }
-        } else if (has_scene) {
-            glass_.end_scene(target_);
-        }
+        if (expanded()) draw_grid(cv);
+        if (has_scene) glass_.end_scene(target_);
         draw_header(cv, sz);
         draw_status(cv, sz);
         if (drop_open_) draw_dropdown(cv);
@@ -1517,7 +1510,7 @@ private:
         const D2D1_RECT_F r = rect(x, y, w, h);
         cv.shadow(r, 12);
 #ifdef USYSEEK_LIQUID_GLASS
-        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 12.0f, 3.5f))) {
+        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 12.0f, 1.8f))) {
             cv.fill_round(r, 12, cv.theme().surface_high);
         }
         cv.stroke_round(r, 12, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
@@ -1563,7 +1556,7 @@ private:
         const D2D1_RECT_F r = rect(x, y, HELP_W, HELP_H);
         cv.shadow(r, 12, 12, 0.35f);
 #ifdef USYSEEK_LIQUID_GLASS
-        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 12.0f, 3.5f))) {
+        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 12.0f, 1.8f))) {
             cv.fill_round(r, 12, cv.theme().surface_high);
         }
         cv.stroke_round(r, 12, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
@@ -1736,7 +1729,7 @@ private:
         const D2D1_RECT_F r = menu_rect();
         cv.shadow(r, 14, 14, 0.4f);
 #ifdef USYSEEK_LIQUID_GLASS
-        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 14.0f, 3.8f))) {
+        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 14.0f, 2.0f))) {
             cv.fill_round(r, 14, cv.theme().surface_high);
         }
         cv.stroke_round(r, 14, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
@@ -2295,7 +2288,7 @@ private:
         pv_ctrl_rect_ = ctrl;
 
 #ifdef USYSEEK_LIQUID_GLASS
-        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, ctrl, make_overlay_glass_style(cv.theme(), 17.0f, 3.2f))) {
+        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, ctrl, make_overlay_glass_style(cv.theme(), 17.0f, 1.8f))) {
             cv.fill_round(ctrl, 17.0f, with_alpha(cv.theme().surface_low, 0.92f));
         }
 #else
@@ -3578,7 +3571,7 @@ private:
                     case TIMER_VIDEO: on_video_timer(); return 0;
 #ifdef USYSEEK_LIQUID_GLASS
                     case TIMER_GLASS:
-                        if (glass_active() && visible() && glass_.poll_desktop(sh_.gfx, hwnd_)) {
+                        if (glass_active() && visible() && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
                             full_dirty_ = true;
                             invalidate();
                         }
