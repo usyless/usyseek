@@ -505,6 +505,21 @@ private:
         return hover_.alpha(id, idx);
     }
 
+    /// Draws a button's icon and/or label centered inside `r`.
+    static void draw_button_content(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, D2D1_COLOR_F fg) {
+        if (icon_g && !label.empty()) {
+            const float tw = cv.measure(label, Font::SmallSemi);
+            const float total = 18.0f + 6.0f + tw;
+            const float sx = r.left + (width(r) - total) * 0.5f;
+            cv.icon(icon_g, rect(sx, r.top, 18.0f, height(r)), fg, Font::IconSmall);
+            cv.text(label, rect(sx + 24.0f, r.top, tw + 4.0f, height(r)), Font::SmallSemi, fg);
+        } else if (icon_g) {
+            cv.icon(icon_g, r, fg, Font::IconSmall);
+        } else {
+            cv.text(label, r, Font::SmallSemi, fg, Align::Center);
+        }
+    }
+
     void draw_button(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, int id, int idx = 0,
                      int style = 0 /* 0=secondary, 1=primary, 2=danger, 3=ghost */) {
         const float ha = hover_alpha(id, idx);
@@ -568,15 +583,7 @@ private:
             if (bg.a > 0.0f) cv.fill_round(r, rad, bg);
             if (border.a > 0.0f && style != 1) cv.stroke_round(r, rad, border);
         }
-        if (icon_g) {
-            const float tw = cv.measure(label, Font::SmallSemi);
-            const float total = 18.0f + 6.0f + tw;
-            const float sx = r.left + (width(r) - total) * 0.5f;
-            cv.icon(icon_g, rect(sx, r.top, 18.0f, height(r)), fg, Font::IconSmall);
-            cv.text(label, rect(sx + 24.0f, r.top, tw + 4.0f, height(r)), Font::SmallSemi, fg);
-        } else {
-            cv.text(label, r, Font::SmallSemi, fg, Align::Center);
-        }
+        draw_button_content(cv, r, icon_g, label, fg);
         cv.hit(r, id, idx);
     }
 
@@ -585,15 +592,7 @@ private:
         cv.fill_round(r, rad, with_alpha(cv.theme().surface_high, 0.45f));
         cv.stroke_round(r, rad, with_alpha(cv.theme().outline_variant, 0.40f));
         const D2D1_COLOR_F dfg = with_alpha(cv.theme().on_surface_variant, 0.45f);
-        if (icon_g) {
-            const float tw = cv.measure(label, Font::SmallSemi);
-            const float total = 18.0f + 6.0f + tw;
-            const float sx = r.left + (width(r) - total) * 0.5f;
-            cv.icon(icon_g, rect(sx, r.top, 18.0f, height(r)), dfg, Font::IconSmall);
-            cv.text(label, rect(sx + 24.0f, r.top, tw + 4.0f, height(r)), Font::SmallSemi, dfg);
-        } else {
-            cv.text(label, r, Font::SmallSemi, dfg, Align::Center);
-        }
+        draw_button_content(cv, r, icon_g, label, dfg);
         cv.hit(r, id, idx);
     }
 
@@ -1884,7 +1883,7 @@ private:
                     cv.icon(glyph::lock, lr, cv.theme().outline, Font::IconSmall);
                     cv.hit(lr, IdLockedExclude, row.index);
                 } else {
-                    draw_button(cv, rect(ir.right - 30.0f, ir.top + (row.h - 28.0f) * 0.5f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveExclude, row.index, 3);
+                    draw_button(cv, rect(ir.right - 32.0f, ir.top + (row.h - 28.0f) * 0.5f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveExclude, row.index, 3);
                 }
             }
             y = next_y;
