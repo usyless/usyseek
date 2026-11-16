@@ -318,6 +318,8 @@ private:
     static constexpr float GAP = 12.0f;
     static constexpr float CARD_MIN_W = 228.0f;
     static constexpr float CARD_BODY_H = 124.0f;
+    static constexpr double GRID_ZOOM_MIN = 1.0;
+    static constexpr double GRID_ZOOM_MAX = 4.0;
     static constexpr float DEFAULT_W = 880.0f;
     static constexpr float DEFAULT_H = 640.0f;
     static constexpr float MENU_W = 256.0f;
@@ -332,6 +334,7 @@ private:
         IdTagBtn,
         IdNotifyBtn,
         IdStatusNotify,
+        IdZoomReset,
         IdSettings,
         IdFullscreen,
         IdClose,
@@ -763,18 +766,83 @@ private:
         float content_h = 0;
     };
 
+    [[nodiscard]] double effective_grid_zoom() const noexcept {
+        return std::clamp(sh_.settings.grid_zoom, GRID_ZOOM_MIN, GRID_ZOOM_MAX);
+    }
+
+    [[nodiscard]] bool is_grid_zoomed() const noexcept {
+        return effective_grid_zoom() > GRID_ZOOM_MIN + 0.005;
+    }
+
+    [[nodiscard]] static int cols_for_zoom(float avail, double zoom) noexcept {
+        const float min_w = CARD_MIN_W * static_cast<float>(std::clamp(zoom, GRID_ZOOM_MIN, GRID_ZOOM_MAX));
+        return std::max(1, static_cast<int>((avail + GAP) / (min_w + GAP)));
+    }
+
     [[nodiscard]] Grid grid() const {
         Grid g;
         const D2D1_SIZE_F sz = target_.size();
         g.view = D2D1::RectF(0, HEADER_H + STATUS_H + 1.0f, sz.width, sz.height);
         const float avail = sz.width - PAD * 2;
-        g.cols = std::max(1, static_cast<int>((avail + GAP) / (CARD_MIN_W + GAP)));
+        g.cols = cols_for_zoom(avail, effective_grid_zoom());
         g.card_w = std::floor((avail - GAP * (g.cols - 1)) / g.cols);
         g.thumb_h = std::round((g.card_w - 12.0f) * 10.0f / 16.0f);
         g.card_h = g.thumb_h + CARD_BODY_H;
         const int rows = (static_cast<int>(items_.size()) + g.cols - 1) / g.cols;
         g.content_h = PAD + rows * (g.card_h + GAP) - (rows ? GAP : 0) + PAD + (has_more_ ? 40.0f : 0.0f);
         return g;
+    }
+
+    void set_grid_zoom(double next_zoom) {
+        next_zoom = std::clamp(next_zoom, GRID_ZOOM_MIN, GRID_ZOOM_MAX);
+        if (next_zoom < GRID_ZOOM_MIN + 0.02) next_zoom = GRID_ZOOM_MIN;
+        if (std::abs(next_zoom - effective_grid_zoom()) < 0.001) return;
+
+        const Grid old_g = grid();
+        const int top_row = std::max(0, static_cast<int>(std::floor((scroll_ - PAD) / (old_g.card_h + GAP))));
+        const float row_y_old = top_row * (old_g.card_h + GAP);
+        const float in_row_frac = (scroll_ > 0.0f && old_g.card_h + GAP > 0.0f)
+            ? std::clamp((scroll_ - PAD - row_y_old) / (old_g.card_h + GAP), 0.0f, 1.0f)
+            : 0.0f;
+        const int anchor_idx = items_.empty() ? 0 : std::clamp(top_row * old_g.cols, 0, static_cast<int>(items_.size()) - 1);
+
+        sh_.settings.grid_zoom = next_zoom;
+        sh_.save();
+
+        if (!items_.empty() && scroll_ > 0.0f) {
+            const Grid new_g = grid();
+            const int new_row = anchor_idx / new_g.cols;
+            scroll_ = target_scroll_ = std::clamp(PAD + (new_row + in_row_frac) * (new_g.card_h + GAP), 0.0f, max_scroll());
+        } else {
+            scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
+        }
+        clear_hover(false);
+        full_dirty_ = true;
+        invalidate();
+    }
+
+    void step_grid_zoom(int dir) {
+        const float avail = std::max(1.0f, target_.size().width - PAD * 2.0f);
+        const Grid g = grid();
+        if (dir > 0) {
+            if (g.cols <= 1) return;
+            const double min_w = ((static_cast<double>(avail) + GAP) / static_cast<double>(g.cols)) - GAP + 1.0;
+            double next_z = std::ceil((min_w / CARD_MIN_W) * 100.0) / 100.0;
+            next_z = std::max(next_z, effective_grid_zoom() + 0.05);
+            if (next_z > GRID_ZOOM_MAX) return;
+            set_grid_zoom(next_z);
+        } else if (dir < 0) {
+            if (!is_grid_zoomed()) return;
+            const int default_cols = cols_for_zoom(avail, GRID_ZOOM_MIN);
+            const int target_cols = g.cols + 1;
+            if (target_cols >= default_cols) {
+                set_grid_zoom(GRID_ZOOM_MIN);
+                return;
+            }
+            const double min_w = ((static_cast<double>(avail) + GAP) / (static_cast<double>(target_cols) + 0.5)) - GAP;
+            const double next_z = std::clamp(min_w / CARD_MIN_W, GRID_ZOOM_MIN, effective_grid_zoom() - 0.01);
+            set_grid_zoom(next_z);
+        }
     }
 
     [[nodiscard]] float max_scroll() const {
@@ -862,6 +930,13 @@ private:
         subtitle.clear();
         switch (id) {
             case IdTagBtn: title = L"Filter by tag"; return true;
+            case IdZoomReset: {
+                title = L"Reset grid zoom (Ctrl+0)";
+                wchar_t zbuf[48];
+                swprintf_s(zbuf, L"Currently %.2gx — click to reset", effective_grid_zoom());
+                subtitle = zbuf;
+                return true;
+            }
             case IdNotifyBtn:
             case IdStatusNotify:
                 title = L"View notifications";
@@ -1137,10 +1212,19 @@ private:
             x += nw;
         }
 
+        float right_edge = sz.width - 18.0f;
+        if (is_grid_zoomed()) {
+            const D2D1_RECT_F zr = rect(right_edge - 24.0f, y + 3.0f, 24.0f, STATUS_H - 6.0f);
+            const float ha = hover_.alpha(IdZoomReset);
+            cv.fill_round(zr, 6.0f, lerp_color(with_alpha(color::primary, 0.14f), with_alpha(color::primary, 0.26f), ha));
+            cv.icon(glyph::search, zr, lerp_color(color::primary, color::on_primary_container, ha * 0.35f), Font::IconSmall);
+            cv.hit(zr, IdZoomReset);
+            right_edge -= 32.0f;
+        }
         if (expanded() && !items_.empty()) {
             std::wstring right = format_count(items_.size()) + (has_more_ ? L"+" : L"") + L" results";
             if (selected_.size() > 1) right = format_count(selected_.size()) + L" selected  •  " + right;
-            cv.text(right, D2D1::RectF(x + 12, y, sz.width - 18, y + STATUS_H), Font::Caption, color::outline, Align::Right);
+            cv.text(right, D2D1::RectF(x + 12, y, right_edge, y + STATUS_H), Font::Caption, color::outline, Align::Right);
         }
         if (expanded()) cv.hline(0, sz.width, HEADER_H + STATUS_H, with_alpha(color::outline_variant, 0.5f));
     }
@@ -1158,7 +1242,8 @@ private:
 
         const int first_row = std::max(0, static_cast<int>((scroll_ - PAD) / (g.card_h + GAP)));
         const int last_row = static_cast<int>((scroll_ + height(g.view)) / (g.card_h + GAP)) + 1;
-        const UINT px = static_cast<UINT>(std::max(g.card_w, g.thumb_h * 1.6f) * target_.scale());
+        const UINT raw_px = static_cast<UINT>(std::max(g.card_w, g.thumb_h * 1.6f) * target_.scale());
+        const UINT px = std::clamp(((raw_px + 63u) / 64u) * 64u, 64u, 2048u);
         thumb_px_ = px;
         if (cv.intersects_clip(g.view, 1.0f)) {
             const int first_vis = std::max(0, first_row * g.cols);
@@ -1169,7 +1254,10 @@ private:
             // Request visible thumbnails last so they're served first (LIFO); skip when drawing a dirty rect
             if (!cv.has_dirty_clip()) {
                 for (int i = std::min<int>(static_cast<int>(items_.size()), (last_row + 2) * g.cols) - 1; i >= std::max(0, (first_row - 1) * g.cols); --i) {
-                    if (!sh_.thumbs.get(items_[i].pt.id)) sh_.thumbs.request(items_[i].pt.id, item_path(items_[i]), px);
+                    UINT cached_px = 0;
+                    if (!sh_.thumbs.get(items_[i].pt.id, &cached_px) || cached_px < px) {
+                        sh_.thumbs.request(items_[i].pt.id, item_path(items_[i]), px);
+                    }
                 }
             }
         }
@@ -2854,6 +2942,7 @@ private:
                 if (sh_.open_notifications) sh_.open_notifications();
                 else if (sh_.open_settings) sh_.open_settings();
                 return;
+            case IdZoomReset: set_grid_zoom(GRID_ZOOM_MIN); return;
             case IdSettings:
                 if (sh_.open_settings) sh_.open_settings();
                 else hide();
@@ -2985,6 +3074,18 @@ private:
             return;
         }
         if (!expanded()) return;
+        if (GetKeyState(VK_CONTROL) < 0 && !drop_open_) {
+            grid_wheel_ += delta;
+            while (grid_wheel_ >= WHEEL_DELTA) {
+                grid_wheel_ -= WHEEL_DELTA;
+                step_grid_zoom(1);
+            }
+            while (grid_wheel_ <= -WHEEL_DELTA) {
+                grid_wheel_ += WHEEL_DELTA;
+                step_grid_zoom(-1);
+            }
+            return;
+        }
         target_scroll_ = std::clamp(target_scroll_ - delta * 0.9f, 0.0f, max_scroll());
         start_anim();
     }
@@ -3072,6 +3173,11 @@ private:
             field_.select_all();
             invalidate();
             return;
+        }
+        if (ctrl && expanded()) {
+            if (vk == VK_OEM_PLUS || vk == VK_ADD) { step_grid_zoom(1); return; }
+            if (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) { step_grid_zoom(-1); return; }
+            if (vk == '0' || vk == VK_NUMPAD0) { set_grid_zoom(GRID_ZOOM_MIN); return; }
         }
         if (vk == VK_SPACE && !field_.focused && focus_ >= 0 && focus_ < static_cast<int>(items_.size())) {
             swallow_space_ = true;
@@ -3456,6 +3562,7 @@ private:
     int preview_initial_index_ = -1;
     float preview_initial_scroll_ = 0.0f;
     int preview_wheel_ = 0;  // wheel delta not yet turned into a step
+    int grid_wheel_ = 0;     // ctrl+wheel delta for grid zoom
     UINT thumb_px_ = 0;      // card thumbnail size last requested by the grid
     bool swallow_space_ = false;
     bool swallow_dbl_ = false;

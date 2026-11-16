@@ -111,7 +111,8 @@ public:
 
     /// Newest requests are served first; the queue is bounded so scrolled-past cards are dropped.
     void request(uint64_t id, const std::wstring& path, UINT px) {
-        if (bitmaps_.contains(id) || failed_.contains(id)) return;
+        if (failed_.contains(id)) return;
+        if (const auto it = bitmaps_.find(id); it != bitmaps_.end() && it->second.px >= px) return;
         {
             std::lock_guard lk{m_};
             if (!pending_.insert(id).second) return;
@@ -124,10 +125,11 @@ public:
         cv_.notify_one();
     }
 
-    ID2D1Bitmap1* get(uint64_t id) {
+    ID2D1Bitmap1* get(uint64_t id, UINT* out_px = nullptr) {
         const auto it = bitmaps_.find(id);
         if (it == bitmaps_.end()) return nullptr;
         lru_.splice(lru_.begin(), lru_, it->second.lru);
+        if (out_px) *out_px = it->second.px;
         return it->second.bmp.get();
     }
 
@@ -148,11 +150,19 @@ public:
             wil::com_ptr<ID2D1Bitmap1> bmp;
             const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
             if (FAILED(dc->CreateBitmap(D2D1::SizeU(d.w, d.h), d.pixels.data(), d.w * 4, &props, &bmp))) continue;
-            lru_.push_front(d.id);
-            bitmaps_[d.id] = {std::move(bmp), lru_.begin()};
-            while (bitmaps_.size() > max_bitmaps_) {
-                bitmaps_.erase(lru_.back());
-                lru_.pop_back();
+            if (const auto existing = bitmaps_.find(d.id); existing != bitmaps_.end()) {
+                if (d.px >= existing->second.px) {
+                    existing->second.bmp = std::move(bmp);
+                    existing->second.px = d.px;
+                }
+                lru_.splice(lru_.begin(), lru_, existing->second.lru);
+            } else {
+                lru_.push_front(d.id);
+                bitmaps_[d.id] = {std::move(bmp), lru_.begin(), d.px};
+                while (bitmaps_.size() > max_bitmaps_) {
+                    bitmaps_.erase(lru_.back());
+                    lru_.pop_back();
+                }
             }
         }
         return !done.empty();
@@ -189,11 +199,13 @@ private:
     struct Done {
         uint64_t id = 0;
         UINT w = 0, h = 0;
+        UINT px = 0;
         std::vector<uint8_t> pixels;
     };
     struct Entry {
         wil::com_ptr<ID2D1Bitmap1> bmp;
         std::list<uint64_t>::iterator lru;
+        UINT px = 0;
     };
 
     void worker(const std::stop_token& st) {
@@ -209,6 +221,7 @@ private:
                 queue_.pop_front();
             }
             Done d{r.id};
+            d.px = r.px;
             if (!full_ || !load_full(r, d)) load(r, d);
             {
                 std::lock_guard lk{m_};
