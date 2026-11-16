@@ -212,6 +212,7 @@ inline const fs::path& data_dir() {
 inline fs::path settings_path() { return data_dir() / L"settings.json"; }
 inline fs::path state_path() { return data_dir() / L"state.json"; }
 inline fs::path edge_data_dir() { return data_dir() / L"qdrant_edge"; }
+inline fs::path tags_db_path() { return data_dir() / L"tags.db"; }
 
 /// True while an indexer process holds the indexer mutex or is being launched.
 inline bool is_indexer_db_wanted() noexcept {

@@ -302,6 +302,8 @@ private:
         IdUseDbModel,
         IdDeleteDb,
         IdDeleteDbDisabled,
+        IdPruneMissingTags,
+        IdPruneMissingTagsDisabled,
         IdClearFailed,
         IdClearFailedDisabled,
         IdOpenFailedLog,
@@ -899,7 +901,7 @@ private:
         draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
     }
 
-    static const wchar_t* tooltip_text(int id) noexcept {
+    [[nodiscard]] const wchar_t* tooltip_text(int id) const noexcept {
         switch (id) {
             case IdRemoveInclude: return L"Remove folder";
             case IdRemoveExclude: return L"Remove exclusion";
@@ -907,6 +909,7 @@ private:
             case IdClearFailed: return L"Clear failed list and retry indexing";
             case IdClearFailedDisabled: return L"Stop indexing before retrying failed files";
             case IdDeleteDbDisabled: return L"Stop indexing before deleting a database";
+            case IdPruneMissingTagsDisabled: return prune_checking_ ? L"Checking files on disk…" : L"Stop indexing before pruning tags";
             case IdDeleteModelDisabled: return L"Stop indexing before deleting the active model";
             case IdDismissNotif: return L"Dismiss notification";
             default: return nullptr;
@@ -1491,6 +1494,36 @@ private:
                 L"Per-model collections in data\\qdrant_edge — switch to search or delete unused databases",
                 L"No Qdrant Edge collections found on disk yet.", rows,
                 IdRefreshDbs, IdUseDbModel, IdDeleteDb, IdDeleteDbDisabled);
+        }
+
+        // 1d. Tag Backup & Sync (SQLite) card
+        {
+            const float lx = x + 22.0f, rw = w - 44.0f;
+            const bool prune_disabled = sh_.indexer_running || prune_checking_;
+            const std::wstring prune_lbl = prune_checking_ ? L"Checking…" : L"Prune Missing Tags";
+            const float prune_w = button_width(cv, prune_lbl, true, 162.0f);
+            const CardHeader hd = make_header(cv, rw, L"Tag Backup & Sync", cv.theme().on_surface,
+                                              L"Shared SQLite tag store (data\\tags.db) — tags are copied automatically when indexing with any model",
+                                              prune_w, 32.0f);
+            const TagStoreStats& ts = sh_.tag_store_stats;
+            const std::wstring summary = ts.file_count > 0
+                ? (format_count(ts.file_count) + (ts.file_count == 1 ? L" tagged file" : L" tagged files") +
+                   L"  •  " + format_count(ts.tag_count) + (ts.tag_count == 1 ? L" tag" : L" tags") +
+                   L"  •  " + format_size(ts.bytes))
+                : L"No tags stored in data\\tags.db yet — tags are saved as you tag media or backfill on startup.";
+            const float sum_y = y + 16.0f + hd.h + 10.0f;
+            const float sum_h = text_height(cv, summary, Font::Caption, rw, 18.0f);
+            const float h = sum_y + sum_h + 16.0f - y;
+            const float next_y = card_begin(cv, x, y, w, h);
+
+            const D2D1_RECT_F side = draw_header(cv, lx, y, rw, hd);
+            if (prune_disabled) {
+                draw_disabled_button(cv, side, glyph::del, prune_lbl, IdPruneMissingTagsDisabled);
+            } else {
+                draw_button(cv, side, glyph::del, prune_lbl, IdPruneMissingTags, 0, 2);
+            }
+            cv.text_wrap(summary, rect(lx, sum_y, rw, sum_h), Font::Caption, cv.theme().on_surface_variant);
+            y = next_y;
         }
 
         // 2. Indexing Scope Card
@@ -3077,6 +3110,10 @@ private:
                         sh_.engine.post_when_ready([this, coll](Db& db) {
                             std::string drop_err;
                             const bool ok = db.drop_collection(coll, &drop_err);
+                            if (ok) {
+                                TagStore store;
+                                if (store.open(tags_db_path())) (void)store.clear_collection_backfilled(coll);
+                            }
                             sh_.call([this, ok, drop_err, coll] {
                                 if (!ok) {
                                     sh_.notify("error", "Database", "Failed to drop Qdrant Edge collection '" + coll + "'", drop_err, "db-drop");
@@ -3126,6 +3163,10 @@ private:
                         sh_.engine.post_when_ready([this, coll = col.name, is_active](Db& db) {
                             std::string drop_err;
                             const bool ok = db.drop_collection(coll, &drop_err);
+                            if (ok) {
+                                TagStore store;
+                                if (store.open(tags_db_path())) (void)store.clear_collection_backfilled(coll);
+                            }
                             sh_.call([this, ok, drop_err, coll, is_active] {
                                 if (!ok) {
                                     sh_.notify("error", "Database", "Failed to drop Qdrant Edge collection '" + coll + "'", drop_err, "db-drop");
@@ -3140,6 +3181,103 @@ private:
                         });
                     }
                 }
+                break;
+            }
+            case IdPruneMissingTags: {
+                if (sh_.indexer_running || prune_checking_ || in_modal_) break;
+                prune_checking_ = true;
+                invalidate();
+                sh_.engine.post([this](Db&) {
+                    TagStore store;
+                    std::string err;
+                    std::vector<uint64_t> missing_ids;
+                    size_t total_count = 0;
+                    bool ok = store.open(tags_db_path(), &err);
+                    if (ok) {
+                        auto entries = store.list_all(&err);
+                        if (!entries) {
+                            ok = false;
+                        } else {
+                            total_count = entries->size();
+                            for (const TaggedFileEntry& e : *entries) {
+                                const std::wstring wp = to_wide(e.path);
+                                if (wp.empty() || GetFileAttributesW(wp.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                                    missing_ids.push_back(e.id);
+                                }
+                            }
+                        }
+                    }
+                    sh_.call([this, ok, err, total_count, missing_ids = std::move(missing_ids)]() mutable {
+                        prune_checking_ = false;
+                        if (!ok) {
+                            sh_.notify("error", "Tags", "Failed to read tags.db", err, "tags-prune");
+                            invalidate();
+                            return;
+                        }
+                        if (missing_ids.empty()) {
+                            const std::wstring msg = L"All " + format_count(total_count) +
+                                                     L" tagged file(s) in data\\tags.db currently exist on disk.";
+                            if (!in_modal_) {
+                                in_modal_ = true;
+                                MessageBoxW(hwnd_, msg.c_str(), L"Prune Missing Tags", MB_ICONINFORMATION | MB_OK);
+                                in_modal_ = false;
+                            }
+                            invalidate();
+                            return;
+                        }
+                        if (in_modal_) {
+                            invalidate();
+                            return;
+                        }
+                        in_modal_ = true;
+                        const std::wstring msg = L"Remove tags for " + format_count(missing_ids.size()) +
+                                                 (missing_ids.size() == 1 ? L" file" : L" files") +
+                                                 L" that no longer exist on disk?\n\n"
+                                                 L"This deletes their entries from data\\tags.db and clears their tags from the active collection if still present.";
+                        const bool confirmed = confirm_box(hwnd_, L"Prune Missing Tags", msg);
+                        in_modal_ = false;
+                        if (!confirmed) {
+                            invalidate();
+                            return;
+                        }
+                        sh_.engine.post_when_ready([this, missing_ids = std::move(missing_ids)](Db& db) {
+                            TagStore store;
+                            std::string rm_err;
+                            if (!store.open(tags_db_path(), &rm_err) || !store.remove_ids(missing_ids, &rm_err)) {
+                                sh_.call([this, rm_err] {
+                                    sh_.notify("error", "Tags", "Failed to prune tags from tags.db", rm_err, "tags-prune");
+                                });
+                                return;
+                            }
+                            const std::string coll = sh_.engine.collection();
+                            if (db.ensure_collection_status(coll, 0) == Db::CollectionStatus::Ready) {
+                                constexpr size_t CHUNK = 1024;
+                                bool updated_coll = false;
+                                for (size_t i = 0; i < missing_ids.size(); i += CHUNK) {
+                                    const size_t n = std::min(CHUNK, missing_ids.size() - i);
+                                    const auto pts = db.retrieve(coll, std::span{missing_ids.data() + i, n}, {"t"});
+                                    if (!pts || pts->points.empty()) continue;
+                                    std::vector<uint64_t> present;
+                                    present.reserve(pts->points.size());
+                                    for (const auto& p : pts->points) {
+                                        if (!p.p.t.empty()) present.push_back(p.id);
+                                    }
+                                    if (!present.empty() && db.set_tags(coll, present, {})) {
+                                        updated_coll = true;
+                                    }
+                                }
+                                if (updated_coll) (void)db.flush(coll);
+                            }
+                            sh_.call([this, count = missing_ids.size()] {
+                                sh_.refresh_tags();
+                                sh_.notify("info", "Tags", "Pruned missing tags",
+                                    "Removed tags for " + std::to_string(count) + (count == 1 ? " missing file." : " missing files."),
+                                    "tags-prune");
+                            });
+                        });
+                        invalidate();
+                    });
+                });
                 break;
             }
             case IdClearFailed: {
@@ -3925,6 +4063,7 @@ private:
     uint64_t db_collections_seq_ = 0;
     bool last_db_ready_ = false;
     bool last_indexer_running_ = false;
+    bool prune_checking_ = false;
     ModelFiles model_files_;
     VenvInfo venv_;
     std::wstring venv_pkgs_;

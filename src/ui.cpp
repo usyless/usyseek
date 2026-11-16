@@ -245,7 +245,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         sh.call([&, ready, err = std::move(err)] {
             if (ready) {
                 sh.clear_notification_key("Database", "db-connect");
-                sh.refresh_tags();
+                sh.refresh_tags(true);
             } else if (!err.empty()) {
                 sh.notify("error", "Database", "Could not open Qdrant Edge database", err, "db-connect");
             }

@@ -9,6 +9,7 @@
 #include <usyseek/notifications.hpp>
 #include <usyseek/progress.hpp>
 #include <usyseek/status.hpp>
+#include <usyseek/tag_sync.hpp>
 
 #include <atomic>
 #include <dwmapi.h>
@@ -52,6 +53,7 @@ struct Shared {
 
     std::vector<TagCount> tags;      // facet counts
     std::optional<uint64_t> db_count;
+    TagStoreStats tag_store_stats;
     IndexState index_state;
     std::vector<FailedFile> failed_files;
     std::vector<Notification> notifications;
@@ -83,13 +85,22 @@ struct Shared {
         (void)p.release();
     }
 
-    void refresh_tags() {
-        engine.post([this](Db& db) {
+    void refresh_tags(bool backfill = false) {
+        engine.post([this, backfill](Db& db) {
+            std::optional<TagStoreStats> ts;
+            {
+                TagStore store;
+                if (store.open(tags_db_path())) {
+                    if (backfill) (void)backfill_all_collections(db, store);
+                    ts = store.stats();
+                }
+            }
             auto t = db.tags(engine.collection());
             auto c = db.count(engine.collection());
-            call([this, t = std::move(t), c]() mutable {
+            call([this, t = std::move(t), c, ts]() mutable {
                 tags = std::move(t);
                 db_count = c;
+                if (ts) tag_store_stats = *ts;
                 if (tags_refreshed) tags_refreshed();
                 if (redraw_all) redraw_all();
             });

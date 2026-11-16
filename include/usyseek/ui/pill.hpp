@@ -1731,6 +1731,7 @@ private:
         if (tag.empty()) return;
         struct Change {
             uint64_t id;
+            std::string path;
             std::vector<std::string> tags;
         };
         std::vector<Change> changes;
@@ -1743,7 +1744,7 @@ private:
             else continue;
             it.tags_w.clear();
             for (const auto& s : t) it.tags_w.push_back(to_wide(s));
-            changes.push_back({it.pt.id, t});
+            changes.push_back({it.pt.id, it.pt.p.p, t});
         }
         if (changes.empty()) return;
         if (on && std::find(menu_tags_.begin(), menu_tags_.end(), tag) == menu_tags_.end()) menu_tags_.insert(menu_tags_.begin(), tag);
@@ -1763,11 +1764,30 @@ private:
                 fail_cnt = 1;
                 first_err = std::move(flush_err);
             }
-            if (fail_cnt > 0) {
-                sh_.call([this, fail_cnt, first_err] {
-                    sh_.notify("error", "Tags",
-                        "Failed to update tags on " + std::to_string(fail_cnt) + (fail_cnt == 1 ? " item" : " items"),
-                        first_err, "tags-save");
+            std::string store_err;
+            {
+                TagStore store;
+                if (!store.open(tags_db_path(), &store_err)) {
+                    // keep store_err to notify below
+                } else {
+                    for (const auto& c : changes) {
+                        std::string err;
+                        if (!store.set_file_tags(c.id, c.path, c.tags, &err) && store_err.empty()) {
+                            store_err = std::move(err);
+                        }
+                    }
+                }
+            }
+            if (fail_cnt > 0 || !store_err.empty()) {
+                sh_.call([this, fail_cnt, first_err, store_err] {
+                    if (fail_cnt > 0) {
+                        sh_.notify("error", "Tags",
+                            "Failed to update tags on " + std::to_string(fail_cnt) + (fail_cnt == 1 ? " item" : " items"),
+                            first_err, "tags-save");
+                    }
+                    if (!store_err.empty()) {
+                        sh_.notify("warning", "Tags", "Failed to save tags to tags.db", store_err, "tags-backup");
+                    }
                 });
             }
             sh_.refresh_tags();

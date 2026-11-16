@@ -45,6 +45,7 @@ set_tracked_cache_version(USYSEEK_PYBIND11_VERSION "v3.1.0" "pybind11 git tag")
 set_tracked_cache_version(USYSEEK_MIMALLOC_VERSION "v3.5.3" "Version (git tag/branch) to use for mimalloc")
 set_tracked_cache_version(USYSEEK_ORT_VERSION "1.31.1" "onnxruntime release")
 set_tracked_cache_version(USYSEEK_EVERYTHING_VERSION "1.5.0.1424b" "Voidtools Everything release")
+set_tracked_cache_version(USYSEEK_SQLITE_VERSION "3540100" "SQLite amalgamation release")
 
 # Status Reports
 if(WIN32)
@@ -160,7 +161,24 @@ FetchContent_Declare(
     EXCLUDE_FROM_ALL
     SYSTEM
 )
-FetchContent_MakeAvailable(usylibpp glaze)
+FetchContent_Declare(
+    sqlite3
+    URL "https://sqlite.org/2026/sqlite-amalgamation-${USYSEEK_SQLITE_VERSION}.zip"
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(usylibpp glaze sqlite3)
+
+add_library(usyseek_sqlite3 STATIC "${sqlite3_SOURCE_DIR}/sqlite3.c")
+set_target_properties(usyseek_sqlite3 PROPERTIES CXX_SCAN_FOR_MODULES OFF)
+target_include_directories(usyseek_sqlite3 SYSTEM PUBLIC "${sqlite3_SOURCE_DIR}")
+target_compile_definitions(usyseek_sqlite3 PRIVATE
+    SQLITE_THREADSAFE=1
+    SQLITE_DEFAULT_WAL_SYNCHRONOUS=1
+    SQLITE_DQS=0
+)
+if(MSVC)
+    target_compile_options(usyseek_sqlite3 PRIVATE /W0)
+endif()
 
 ##### Common compile settings
 add_library(usyseek_common INTERFACE)
@@ -248,6 +266,7 @@ target_include_directories(usyseek-ui SYSTEM PRIVATE "${ORT_ROOT}/include")
 target_link_libraries(usyseek-ui PRIVATE
     usyseek_common
     usyseek_rust
+    usyseek_sqlite3
     "${ORT_ROOT}/lib/onnxruntime.lib"
     d2d1 dwrite d3d11 d3dcompiler dxgi dxguid dcomp dwmapi windowscodecs mfplat mfuuid
     shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys winhttp version
@@ -267,6 +286,7 @@ set_target_properties(usyseek-indexer PROPERTIES CXX_SCAN_FOR_MODULES OFF)
 target_link_libraries(usyseek-indexer PRIVATE
     usyseek_common
     usyseek_rust
+    usyseek_sqlite3
     windowscodecs mfplat mfreadwrite mfuuid propsys
     shell32 shlwapi ole32 oleaut32 user32
 )

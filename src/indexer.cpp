@@ -5,6 +5,7 @@
 #include <usyseek/notifications.hpp>
 #include <usyseek/status.hpp>
 #include <usyseek/db.hpp>
+#include <usyseek/tag_sync.hpp>
 #include <usyseek/indexer/everything_config.hpp>
 #include <usyseek/indexer/media.hpp>
 
@@ -1209,12 +1210,35 @@ int run_indexer(Settings& settings) {
         return 1;
     }
 
-    // --- Compare against the database (carry tags over for changed files)
+    // --- Compare against the database (copy tags from tags.db and sync unchanged entries)
     pr.phase(Phase::Comparing);
+    TagStore tag_store;
+    std::string tag_err;
+    const bool tag_store_ok = tag_store.open(tags_db_path(), &tag_err);
+    std::unordered_map<uint64_t, TaggedFileEntry> tag_map;
+    if (!tag_store_ok) {
+        push_notification_to_disk("warning", "Tags", "Could not open tags.db",
+            tag_err, "indexer-tags-db");
+    } else {
+        std::string bf_err;
+        if (!backfill_all_collections(db, tag_store, &bf_err)) {
+            push_notification_to_disk("warning", "Tags", "Tag backfill from existing collections incomplete",
+                bf_err, "indexer-tags-backfill");
+        }
+        if (auto loaded = tag_store.load_all(&bf_err)) {
+            tag_map = std::move(*loaded);
+        } else {
+            push_notification_to_disk("warning", "Tags", "Could not read tags.db",
+                bf_err, "indexer-tags-read");
+        }
+    }
+
     uint64_t already_embedded = 0;
     FailureCache failures{coll};
     std::vector<size_t> todo;
     std::unordered_set<uint64_t> found_ids;
+    std::vector<std::pair<uint64_t, std::vector<std::string>>> qdrant_tag_updates;
+    static const std::vector<std::string> empty_tags;
     found_ids.reserve(files.size());
     if (collection_exists) {
         constexpr size_t CHUNK = 1024;
@@ -1243,9 +1267,22 @@ int run_indexer(Settings& settings) {
                     if (it->second.m == f.mtime && it->second.s == f.size) {
                         ++already_embedded;
                         failures.remove(f.id);
+                        if (tag_store_ok) {
+                            const auto tit = tag_map.find(f.id);
+                            const std::vector<std::string>& desired = tit != tag_map.end() ? tit->second.tags : empty_tags;
+                            if (!same_tag_set(it->second.t, desired)) {
+                                qdrant_tag_updates.emplace_back(f.id, desired);
+                            }
+                        }
                         continue;
                     }
-                    f.tags = std::move(it->second.t);
+                    if (tag_store_ok) {
+                        if (const auto tit = tag_map.find(f.id); tit != tag_map.end()) f.tags = tit->second.tags;
+                    } else {
+                        f.tags = std::move(it->second.t);
+                    }
+                } else if (tag_store_ok) {
+                    if (const auto tit = tag_map.find(f.id); tit != tag_map.end()) f.tags = tit->second.tags;
                 }
                 if (failures.known(f)) {
                     ++pr.d.failed;
@@ -1255,9 +1292,32 @@ int run_indexer(Settings& settings) {
             }
             pr.publish();
         }
+        if (!qdrant_tag_updates.empty() && !stopping()) {
+            std::string sync_err;
+            bool sync_warned = false;
+            for (const auto& [pid, ptags] : qdrant_tag_updates) {
+                if (stopping()) break;
+                std::string e;
+                if (db.set_tags(coll, std::span{&pid, 1}, ptags, &e)) {
+                    db_modified = true;
+                } else if (!sync_warned) {
+                    sync_warned = true;
+                    sync_err = std::move(e);
+                }
+            }
+            if (sync_warned) {
+                push_notification_to_disk("warning", "Tags", "Some tags could not be synced to Qdrant",
+                    sync_err, "indexer-tags-sync");
+            }
+        }
     } else {
         for (size_t j = 0; j < files.size() && !stopping(); ++j) {
             found_ids.insert(files[j].id);
+            if (tag_store_ok) {
+                if (const auto tit = tag_map.find(files[j].id); tit != tag_map.end()) {
+                    files[j].tags = tit->second.tags;
+                }
+            }
             if (failures.known(files[j])) {
                 ++pr.d.failed;
                 continue;
@@ -1308,6 +1368,20 @@ int run_indexer(Settings& settings) {
                     rm_err, "indexer-remove-stale");
             } else {
                 db_modified = true;
+            }
+        }
+    }
+    if (tag_store_ok && !stopping()) {
+        std::vector<uint64_t> excluded_tags;
+        for (const auto& [id, entry] : tag_map) {
+            if (scope.excluded(to_wide(entry.path))) excluded_tags.push_back(id);
+        }
+        if (!excluded_tags.empty()) {
+            wlog(L"Pruning %zu excluded tag entries from tags.db\n", excluded_tags.size());
+            std::string prune_err;
+            if (!tag_store.remove_ids(excluded_tags, &prune_err)) {
+                push_notification_to_disk("warning", "Tags", "Failed to prune excluded tags from tags.db",
+                    prune_err, "indexer-tags-prune");
             }
         }
     }
@@ -1392,9 +1466,12 @@ int run_indexer(Settings& settings) {
         }
     }
 
-    if (!collection_exists && !db.ensure_collection(coll, vision.dim, &err)) {
-        pr.phase(Phase::Error, to_wide(err));
-        return 1;
+    if (!collection_exists) {
+        if (!db.ensure_collection(coll, vision.dim, &err)) {
+            pr.phase(Phase::Error, to_wide(err));
+            return 1;
+        }
+        if (tag_store_ok) (void)tag_store.mark_collection_backfilled(coll);
     }
 
     // --- Batch size
