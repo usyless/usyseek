@@ -521,7 +521,14 @@ private:
 /// acquired once per monitor (DXGI rejects a second duplication on the same device & output).
 class DesktopDuplicator {
 public:
+    struct FrameDelta {
+        uint64_t seq = 0;
+        bool dirty_all = false;
+        std::vector<RECT> dirty_rects;
+    };
+
     struct OutputState {
+        static constexpr size_t MAX_HISTORY = 16;
         HMONITOR mon = nullptr;
         RECT mon_rect{};
         wil::com_ptr<IDXGIOutputDuplication> dupl;
@@ -531,8 +538,7 @@ public:
         UINT tex_h = 0;
         bool has_frame = false;
         uint64_t frame_seq = 0;
-        bool dirty_all = false;
-        std::vector<RECT> dirty_rects;
+        std::vector<FrameDelta> history;
         ULONGLONG retry_after_tick = 0;
     };
 
@@ -572,26 +578,43 @@ public:
             // The initial DXGI handshake frame (and pointer-only updates) have LastPresentTime == 0: skip them.
             if (info.LastPresentTime.QuadPart == 0) continue;
 
-            st->dirty_rects.clear();
-            st->dirty_all = !st->has_frame;
-            const UINT dirty_bytes = info.TotalMetadataBufferSize;
-            if (dirty_bytes > 0) {
-                metadata_buf_.resize(dirty_bytes);
-                UINT needed = 0;
-                if (SUCCEEDED(st->dupl->GetFrameDirtyRects(dirty_bytes, reinterpret_cast<RECT*>(metadata_buf_.data()), &needed)) && needed > 0) {
-                    const UINT n = needed / sizeof(RECT);
+            FrameDelta delta;
+            delta.dirty_all = !st->has_frame;
+            const UINT meta_bytes = info.TotalMetadataBufferSize;
+            if (meta_bytes > 0) {
+                metadata_buf_.resize(meta_bytes);
+                bool any_meta = false;
+                UINT move_bytes = 0;
+                if (SUCCEEDED(st->dupl->GetFrameMoveRects(
+                        meta_bytes, reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(metadata_buf_.data()), &move_bytes)) &&
+                    move_bytes > 0) {
+                    const UINT n = move_bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT);
+                    const auto* moves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(metadata_buf_.data());
+                    delta.dirty_rects.reserve(delta.dirty_rects.size() + n);
+                    for (UINT i = 0; i < n; ++i) {
+                        RECT r = moves[i].DestinationRect;
+                        OffsetRect(&r, st->mon_rect.left, st->mon_rect.top);
+                        delta.dirty_rects.push_back(r);
+                    }
+                    any_meta = true;
+                }
+                UINT dirty_bytes = 0;
+                if (SUCCEEDED(st->dupl->GetFrameDirtyRects(
+                        meta_bytes, reinterpret_cast<RECT*>(metadata_buf_.data()), &dirty_bytes)) &&
+                    dirty_bytes > 0) {
+                    const UINT n = dirty_bytes / sizeof(RECT);
                     const auto* rects = reinterpret_cast<const RECT*>(metadata_buf_.data());
-                    st->dirty_rects.reserve(n);
+                    delta.dirty_rects.reserve(delta.dirty_rects.size() + n);
                     for (UINT i = 0; i < n; ++i) {
                         RECT r = rects[i];
                         OffsetRect(&r, st->mon_rect.left, st->mon_rect.top);
-                        st->dirty_rects.push_back(r);
+                        delta.dirty_rects.push_back(r);
                     }
-                } else {
-                    st->dirty_all = true;
+                    any_meta = true;
                 }
+                if (!any_meta) delta.dirty_all = true;
             } else {
-                st->dirty_all = true;
+                delta.dirty_all = true;
             }
 
             if (auto tex = res.try_query<ID3D11Texture2D>()) {
@@ -599,6 +622,9 @@ public:
                     gfx.d3d_context()->CopyResource(st->desktop_tex.get(), tex.get());
                     st->has_frame = true;
                     ++st->frame_seq;
+                    delta.seq = st->frame_seq;
+                    st->history.push_back(std::move(delta));
+                    if (st->history.size() > OutputState::MAX_HISTORY) st->history.erase(st->history.begin());
                 }
             }
             break;
@@ -622,8 +648,7 @@ private:
         st.mon_rect = {};
         st.tex_w = st.tex_h = 0;
         st.has_frame = false;
-        st.dirty_all = false;
-        st.dirty_rects.clear();
+        st.history.clear();
     }
 
     static bool ensure_duplication(Gfx& gfx, OutputState& st, ULONGLONG now_tick) {
@@ -693,15 +718,29 @@ public:
         win_bmp_[0].reset();
         win_bmp_[1].reset();
         win_bmp_idx_ = 0;
+        cached_glass_bmp_.reset();
+        cached_glass_valid_ = false;
         scene_bmp_.reset();
         blur_effect_.reset();
         glass_effect_.reset();
         scene_blur_effect_.reset();
         scene_glass_effect_.reset();
+        probe_tex_.reset();
+        last_probe_px_.clear();
+        last_probe_valid_ = false;
+        last_probe_seq_ = 0;
+        last_probe_mon_ = nullptr;
+        last_probe_origin_ = {.x = LONG_MIN, .y = LONG_MIN};
+        last_probe_pw_ = last_probe_ph_ = 0;
+        last_probe_clip_l_ = last_probe_clip_t_ = 0;
+        last_probe_cw_ = last_probe_ch_ = 0;
+        probe_epoch_ = 0;
         last_mon_ = nullptr;
+        last_tex_id_ = 0;
         last_seq_ = 0;
-        gdi_origin_ = {LONG_MIN, LONG_MIN};
-        last_rendered_origin_ = {LONG_MIN, LONG_MIN};
+        backdrop_ver_ = 0;
+        gdi_origin_ = {.x = LONG_MIN, .y = LONG_MIN};
+        last_rendered_origin_ = {.x = LONG_MIN, .y = LONG_MIN};
         origin_override_.reset();
         seeded_gdi_ = false;
         scene_active_ = false;
@@ -709,31 +748,22 @@ public:
         scene_epoch_ = 0;
         desktop_bmp_epoch_ = 0;
         win_bmp_epoch_ = 0;
+        cached_glass_epoch_ = 0;
     }
 
     void set_origin_override(std::optional<POINT> pt) noexcept { origin_override_ = pt; }
     [[nodiscard]] POINT last_rendered_origin() const noexcept { return last_rendered_origin_; }
 
     bool poll_desktop(DesktopDuplicator& dupl, Gfx& gfx, HWND hwnd) {
-        const auto* st = dupl.poll_monitor(gfx, hwnd, GetTickCount64());
-        if (!st || !st->has_frame) return false;
-
-        const bool mon_changed = (last_mon_ != st->mon);
-        if (!mon_changed && last_seq_ == st->frame_seq) return false;
-
-        const bool skipped = (!mon_changed && last_seq_ != 0 && st->frame_seq - last_seq_ > 1);
-        last_mon_ = st->mon;
-        last_seq_ = st->frame_seq;
-
-        if (mon_changed || skipped || st->dirty_all) return true;
-
-        RECT win_rc{};
-        if (!GetWindowRect(hwnd, &win_rc)) return true;
-        for (const RECT& r : st->dirty_rects) {
-            RECT inter{};
-            if (IntersectRect(&inter, &r, &win_rc)) return true;
-        }
-        return false;
+        if (!hwnd) return false;
+        RECT crc{};
+        if (!GetClientRect(hwnd, &crc)) return false;
+        const UINT pw = static_cast<UINT>(std::max(1L, crc.right - crc.left));
+        const UINT ph = static_cast<UINT>(std::max(1L, crc.bottom - crc.top));
+        POINT origin{0, 0};
+        ClientToScreen(hwnd, &origin);
+        const auto [st, changed] = sync_dupl_state(dupl, gfx, hwnd, pw, ph, origin, true);
+        return st != nullptr && changed;
     }
 
     /// Draws the live monitor desktop behind `hwnd` through the Liquid Glass shader across `panel_rect`.
@@ -741,24 +771,48 @@ public:
     bool draw_desktop_glass(DesktopDuplicator& dupl, Canvas& cv, WindowTarget& target, Gfx& gfx, HWND hwnd,
                             D2D1_RECT_F panel_rect, const GlassStyle& style) {
         if (!target.ready() || !hwnd) return false;
-        const auto* st = dupl.poll_monitor(gfx, hwnd, GetTickCount64());
-        if (st && st->has_frame) {
-            last_mon_ = st->mon;
-            last_seq_ = st->frame_seq;
-        }
 
         const UINT pw = target.pixel_width();
         const UINT ph = target.pixel_height();
         if (pw == 0 || ph == 0) return false;
 
+        POINT origin{0, 0};
+        if (origin_override_) {
+            origin = *origin_override_;
+        } else {
+            ClientToScreen(hwnd, &origin);
+        }
+        last_rendered_origin_ = origin;
+
+        const bool allow_probe = !origin_override_ && last_probe_valid_ &&
+                                 last_probe_origin_.x == origin.x && last_probe_origin_.y == origin.y &&
+                                 last_probe_pw_ == pw && last_probe_ph_ == ph;
+        const auto [st, _] = sync_dupl_state(dupl, gfx, hwnd, pw, ph, origin, allow_probe);
+
         GlassStyle s = style;
         s.force_opaque = true;
 
-        if (st && st->has_frame && st->desktop_tex) {
+        const bool use_dupl = (st && st->has_frame && st->desktop_tex);
+        ID2D1Bitmap1* gdi_bmp = nullptr;
+        if (!use_dupl) {
+            gdi_bmp = capture_gdi_backdrop(gfx, target, hwnd, origin, pw, ph);
+            if (!gdi_bmp) return false;
+        }
+
+        const D2D1_SIZE_F sz = target.size();
+        const D2D1_RECT_F full_dest = D2D1::RectF(0.0f, 0.0f, sz.width, sz.height);
+        const GlassCacheKey key = make_cache_key(pw, ph, target.dpi(), gfx.epoch(), origin, panel_rect, s, use_dupl, backdrop_ver_);
+        if (cached_glass_valid_ && cached_glass_bmp_ && cached_key_ == key) {
+            cv.dc()->DrawBitmap(cached_glass_bmp_.get(), &full_dest, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr, nullptr);
+            return true;
+        }
+
+        ID2D1Bitmap1* src_bmp = nullptr;
+        if (use_dupl) {
             if (!desktop_bmp_ || desktop_bmp_tex_id_ != st->tex_id || desktop_bmp_dpi_ != target.dpi() || desktop_bmp_epoch_ != gfx.epoch()) {
                 desktop_bmp_.reset();
                 desktop_bmp_tex_id_ = 0;
-                auto surf = st->desktop_tex.try_query<IDXGISurface>();
+                const auto surf = st->desktop_tex.try_query<IDXGISurface>();
                 if (!surf) return false;
                 const auto props = D2D1::BitmapProperties1(
                     D2D1_BITMAP_OPTIONS_NONE,
@@ -772,13 +826,6 @@ public:
                 desktop_bmp_epoch_ = gfx.epoch();
             }
 
-            POINT origin{0, 0};
-            if (origin_override_) {
-                origin = *origin_override_;
-            } else {
-                ClientToScreen(hwnd, &origin);
-            }
-            last_rendered_origin_ = origin;
             const LONG sx = origin.x - st->mon_rect.left;
             const LONG sy = origin.y - st->mon_rect.top;
             const LONG clip_l = std::clamp<LONG>(sx, 0, static_cast<LONG>(st->tex_w));
@@ -802,18 +849,41 @@ public:
                 .bottom = static_cast<UINT32>(clip_b),
             };
             if (FAILED(dst_bmp->CopyFromBitmap(&dst_pt, desktop_bmp_.get(), &src_rc))) return false;
-            const D2D1_SIZE_F sz = target.size();
+            if (!origin_override_ && last_probe_seq_ != st->frame_seq) {
+                (void)probe_desktop_changed(gfx, *st, origin, pw, ph);
+            }
+            src_bmp = dst_bmp;
+        } else {
+            src_bmp = gdi_bmp;
+        }
+
+        if (!ensure_cached_glass_bmp(gfx, target, pw, ph)) {
             return draw_bitmap_glass(
-                cv, target, gfx, dst_bmp, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
+                cv, target, gfx, src_bmp, full_dest,
                 panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), s, false);
         }
 
-        ID2D1Bitmap1* bmp = capture_gdi_backdrop(gfx, target, hwnd, pw, ph);
-        if (!bmp) return false;
-        const D2D1_SIZE_F sz = target.size();
-        return draw_bitmap_glass(
-            cv, target, gfx, bmp, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
+        wil::com_ptr<ID2D1Image> prev_target;
+        cv.dc()->GetTarget(&prev_target);
+        D2D1_MATRIX_3X2_F prev_xf{};
+        cv.dc()->GetTransform(&prev_xf);
+        cv.dc()->SetTransform(D2D1::Matrix3x2F::Identity());
+        cv.dc()->SetTarget(cached_glass_bmp_.get());
+        cv.dc()->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+        const bool ok = draw_bitmap_glass(
+            cv, target, gfx, src_bmp, full_dest,
             panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), s, false);
+        cv.dc()->SetTarget(prev_target.get());
+        cv.dc()->SetTransform(prev_xf);
+        if (!ok) {
+            cached_glass_valid_ = false;
+            return false;
+        }
+
+        cached_key_ = make_cache_key(pw, ph, target.dpi(), gfx.epoch(), origin, panel_rect, s, use_dupl, backdrop_ver_);
+        cached_glass_valid_ = true;
+        cv.dc()->DrawBitmap(cached_glass_bmp_.get(), &full_dest, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, nullptr, nullptr);
+        return true;
     }
 
     /// Redirects `target.dc()` into an offscreen `scene_bmp_` so floating glass panels
@@ -866,6 +936,243 @@ public:
     }
 
 private:
+    struct GlassCacheKey {
+        UINT pw = 0;
+        UINT ph = 0;
+        float dpi = 0.0f;
+        uint64_t epoch = 0;
+        LONG origin_x = LONG_MIN;
+        LONG origin_y = LONG_MIN;
+        D2D1_RECT_F panel_rect{};
+        float blur_std_dev = 0.0f;
+        float corner_radius = 0.0f;
+        float roundness = 0.0f;
+        float margin_dip = 0.0f;
+        float ref_thickness = 0.0f;
+        float ref_factor = 0.0f;
+        float ref_dispersion = 0.0f;
+        float dispersion_range = 0.0f;
+        float fresnel_range = 0.0f;
+        float fresnel_hardness = 0.0f;
+        float fresnel_factor = 0.0f;
+        float magnification = 0.0f;
+        float glare_range = 0.0f;
+        float glare_hardness = 0.0f;
+        float glare_factor = 0.0f;
+        float glare_convergence = 0.0f;
+        float glare_opposite_factor = 0.0f;
+        float glare_angle_deg = 0.0f;
+        D2D1_COLOR_F tint{};
+        bool force_opaque = false;
+        bool use_dupl = false;
+        uint64_t backdrop_ver = 0;
+
+        [[nodiscard]] bool operator==(const GlassCacheKey& o) const noexcept {
+            return pw == o.pw && ph == o.ph && dpi == o.dpi && epoch == o.epoch &&
+                   origin_x == o.origin_x && origin_y == o.origin_y &&
+                   panel_rect.left == o.panel_rect.left && panel_rect.top == o.panel_rect.top &&
+                   panel_rect.right == o.panel_rect.right && panel_rect.bottom == o.panel_rect.bottom &&
+                   blur_std_dev == o.blur_std_dev && corner_radius == o.corner_radius &&
+                   roundness == o.roundness && margin_dip == o.margin_dip &&
+                   ref_thickness == o.ref_thickness && ref_factor == o.ref_factor &&
+                   ref_dispersion == o.ref_dispersion && dispersion_range == o.dispersion_range &&
+                   fresnel_range == o.fresnel_range && fresnel_hardness == o.fresnel_hardness &&
+                   fresnel_factor == o.fresnel_factor && magnification == o.magnification &&
+                   glare_range == o.glare_range && glare_hardness == o.glare_hardness &&
+                   glare_factor == o.glare_factor && glare_convergence == o.glare_convergence &&
+                   glare_opposite_factor == o.glare_opposite_factor && glare_angle_deg == o.glare_angle_deg &&
+                   tint.r == o.tint.r && tint.g == o.tint.g && tint.b == o.tint.b && tint.a == o.tint.a &&
+                   force_opaque == o.force_opaque && use_dupl == o.use_dupl && backdrop_ver == o.backdrop_ver;
+        }
+    };
+
+    [[nodiscard]] static GlassCacheKey make_cache_key(UINT pw, UINT ph, float dpi, uint64_t epoch, POINT origin,
+                                                      D2D1_RECT_F panel_rect, const GlassStyle& s,
+                                                      bool use_dupl, uint64_t backdrop_ver) noexcept {
+        return GlassCacheKey{
+            .pw = pw,
+            .ph = ph,
+            .dpi = dpi,
+            .epoch = epoch,
+            .origin_x = origin.x,
+            .origin_y = origin.y,
+            .panel_rect = panel_rect,
+            .blur_std_dev = s.blur_std_dev,
+            .corner_radius = s.corner_radius,
+            .roundness = s.roundness,
+            .margin_dip = s.margin_dip,
+            .ref_thickness = s.ref_thickness,
+            .ref_factor = s.ref_factor,
+            .ref_dispersion = s.ref_dispersion,
+            .dispersion_range = s.dispersion_range,
+            .fresnel_range = s.fresnel_range,
+            .fresnel_hardness = s.fresnel_hardness,
+            .fresnel_factor = s.fresnel_factor,
+            .magnification = s.magnification,
+            .glare_range = s.glare_range,
+            .glare_hardness = s.glare_hardness,
+            .glare_factor = s.glare_factor,
+            .glare_convergence = s.glare_convergence,
+            .glare_opposite_factor = s.glare_opposite_factor,
+            .glare_angle_deg = s.glare_angle_deg,
+            .tint = s.tint,
+            .force_opaque = s.force_opaque,
+            .use_dupl = use_dupl,
+            .backdrop_ver = backdrop_ver,
+        };
+    }
+
+    std::pair<const DesktopDuplicator::OutputState*, bool> sync_dupl_state(
+        DesktopDuplicator& dupl, Gfx& gfx, HWND hwnd, UINT pw, UINT ph, POINT origin, bool allow_probe) {
+        const auto* st = dupl.poll_monitor(gfx, hwnd, GetTickCount64());
+        if (!st || !st->has_frame) return {nullptr, false};
+
+        const bool mon_changed = (last_mon_ != st->mon || last_tex_id_ != st->tex_id);
+        if (!mon_changed && last_seq_ == st->frame_seq) return {st, false};
+
+        bool need_check = mon_changed || last_seq_ == 0 || st->history.empty() ||
+                          st->history.front().seq > last_seq_ + 1;
+        if (!need_check) {
+            RECT win_rc{.left = origin.x, .top = origin.y, .right = origin.x + static_cast<LONG>(pw), .bottom = origin.y + static_cast<LONG>(ph)};
+            RECT full_win_rc{};
+            if (GetWindowRect(hwnd, &full_win_rc)) UnionRect(&win_rc, &win_rc, &full_win_rc);
+            for (const auto& delta : st->history) {
+                if (delta.seq <= last_seq_) continue;
+                if (delta.dirty_all) {
+                    need_check = true;
+                    break;
+                }
+                for (const RECT& r : delta.dirty_rects) {
+                    RECT inter{};
+                    if (IntersectRect(&inter, &r, &win_rc)) {
+                        need_check = true;
+                        break;
+                    }
+                }
+                if (need_check) break;
+            }
+        }
+
+        last_mon_ = st->mon;
+        last_tex_id_ = st->tex_id;
+        last_seq_ = st->frame_seq;
+        if (!need_check) return {st, false};
+
+        if (allow_probe && !probe_desktop_changed(gfx, *st, origin, pw, ph)) {
+            return {st, false};
+        }
+        ++backdrop_ver_;
+        return {st, true};
+    }
+
+    bool probe_desktop_changed(Gfx& gfx, const DesktopDuplicator::OutputState& st, POINT origin, UINT pw, UINT ph) {
+        if (!st.desktop_tex || !gfx.d3d() || !gfx.d3d_context() || pw == 0 || ph == 0) return true;
+
+        const LONG sx = origin.x - st.mon_rect.left;
+        const LONG sy = origin.y - st.mon_rect.top;
+        const LONG clip_l = std::clamp<LONG>(sx, 0, static_cast<LONG>(st.tex_w));
+        const LONG clip_t = std::clamp<LONG>(sy, 0, static_cast<LONG>(st.tex_h));
+        const LONG clip_r = std::clamp<LONG>(sx + static_cast<LONG>(pw), 0, static_cast<LONG>(st.tex_w));
+        const LONG clip_b = std::clamp<LONG>(sy + static_cast<LONG>(ph), 0, static_cast<LONG>(st.tex_h));
+        if (clip_r <= clip_l || clip_b <= clip_t) {
+            last_probe_seq_ = st.frame_seq;
+            return false;
+        }
+
+        const UINT cw = static_cast<UINT>(clip_r - clip_l);
+        const UINT ch = static_cast<UINT>(clip_b - clip_t);
+        if (!probe_tex_ || last_probe_cw_ != cw || last_probe_ch_ != ch || probe_epoch_ != gfx.epoch()) {
+            probe_tex_.reset();
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = cw;
+            td.Height = ch;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_STAGING;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(gfx.d3d()->CreateTexture2D(&td, nullptr, &probe_tex_))) return true;
+            probe_epoch_ = gfx.epoch();
+        }
+
+        const D3D11_BOX src_box{
+            .left = static_cast<UINT>(clip_l),
+            .top = static_cast<UINT>(clip_t),
+            .front = 0,
+            .right = static_cast<UINT>(clip_r),
+            .bottom = static_cast<UINT>(clip_b),
+            .back = 1,
+        };
+        gfx.d3d_context()->CopySubresourceRegion(probe_tex_.get(), 0, 0, 0, 0, st.desktop_tex.get(), 0, &src_box);
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(gfx.d3d_context()->Map(probe_tex_.get(), 0, D3D11_MAP_READ, 0, &mapped))) return true;
+        const auto unmap = wil::scope_exit([&] { gfx.d3d_context()->Unmap(probe_tex_.get(), 0); });
+
+        const LONG rel_l = clip_l - sx;
+        const LONG rel_t = clip_t - sy;
+        const size_t row_bytes = static_cast<size_t>(cw) * 4;
+        const bool same_meta = last_probe_valid_ && last_probe_mon_ == st.mon &&
+                               last_probe_origin_.x == origin.x && last_probe_origin_.y == origin.y &&
+                               last_probe_pw_ == pw && last_probe_ph_ == ph &&
+                               last_probe_clip_l_ == rel_l && last_probe_clip_t_ == rel_t &&
+                               last_probe_cw_ == cw && last_probe_ch_ == ch &&
+                               last_probe_px_.size() == row_bytes * ch;
+
+        const auto* src_ptr = static_cast<const uint8_t*>(mapped.pData);
+        bool changed = !same_meta;
+        if (!changed) {
+            for (UINT y = 0; y < ch; ++y) {
+                if (std::memcmp(src_ptr + (static_cast<size_t>(y) * mapped.RowPitch),
+                                last_probe_px_.data() + (static_cast<size_t>(y) * row_bytes), row_bytes) != 0) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (changed) {
+            last_probe_px_.resize(row_bytes * ch);
+            for (UINT y = 0; y < ch; ++y) {
+                std::memcpy(last_probe_px_.data() + (static_cast<size_t>(y) * row_bytes),
+                            src_ptr + (static_cast<size_t>(y) * mapped.RowPitch), row_bytes);
+            }
+            last_probe_valid_ = true;
+            last_probe_mon_ = st.mon;
+            last_probe_origin_ = origin;
+            last_probe_pw_ = pw;
+            last_probe_ph_ = ph;
+            last_probe_clip_l_ = rel_l;
+            last_probe_clip_t_ = rel_t;
+            last_probe_cw_ = cw;
+            last_probe_ch_ = ch;
+        }
+        last_probe_seq_ = st.frame_seq;
+        return changed;
+    }
+
+    bool ensure_cached_glass_bmp(Gfx& gfx, WindowTarget& target, UINT pw, UINT ph) {
+        if (pw == 0 || ph == 0) return false;
+        if (cached_glass_bmp_ && cached_glass_w_ == pw && cached_glass_h_ == ph &&
+            cached_glass_dpi_ == target.dpi() && cached_glass_epoch_ == gfx.epoch()) {
+            return true;
+        }
+        cached_glass_bmp_.reset();
+        cached_glass_valid_ = false;
+        const auto props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            target.dpi(), target.dpi());
+        if (FAILED(target.dc()->CreateBitmap(D2D1::SizeU(pw, ph), nullptr, 0, &props, &cached_glass_bmp_))) {
+            return false;
+        }
+        cached_glass_w_ = pw;
+        cached_glass_h_ = ph;
+        cached_glass_dpi_ = target.dpi();
+        cached_glass_epoch_ = gfx.epoch();
+        return true;
+    }
+
     bool ensure_win_bmp(Gfx& gfx, WindowTarget& target, UINT pw, UINT ph) {
         if (pw == 0 || ph == 0) return false;
         if (win_bmp_[0] && win_bmp_[1] && win_bmp_w_ == pw && win_bmp_h_ == ph &&
@@ -892,20 +1199,15 @@ private:
         return true;
     }
 
-    ID2D1Bitmap1* capture_gdi_backdrop(Gfx& gfx, WindowTarget& target, HWND hwnd, UINT pw, UINT ph) {
+    ID2D1Bitmap1* capture_gdi_backdrop(Gfx& gfx, WindowTarget& target, HWND hwnd, POINT origin, UINT pw, UINT ph) {
         if (!ensure_win_bmp(gfx, target, pw, ph)) return nullptr;
-        POINT origin{0, 0};
-        if (origin_override_) {
-            origin = *origin_override_;
-        } else {
-            ClientToScreen(hwnd, &origin);
-        }
-        last_rendered_origin_ = origin;
+        (void)hwnd;
         if (!seeded_gdi_ || origin.x != gdi_origin_.x || origin.y != gdi_origin_.y) {
             win_bmp_idx_ ^= 1u;
             if (seed_from_screen_dc(win_bmp_[win_bmp_idx_].get(), origin, pw, ph)) {
                 seeded_gdi_ = true;
                 gdi_origin_ = origin;
+                ++backdrop_ver_;
             }
         }
         return seeded_gdi_ ? win_bmp_[win_bmp_idx_].get() : nullptr;
@@ -1011,13 +1313,31 @@ private:
     float desktop_bmp_dpi_ = 0.0f;
     std::array<wil::com_ptr<ID2D1Bitmap1>, 2> win_bmp_;
     uint32_t win_bmp_idx_ = 0;
+    wil::com_ptr<ID2D1Bitmap1> cached_glass_bmp_;
+    GlassCacheKey cached_key_{};
+    bool cached_glass_valid_ = false;
+    UINT cached_glass_w_ = 0, cached_glass_h_ = 0;
+    float cached_glass_dpi_ = 0.0f;
+    uint64_t cached_glass_epoch_ = 0;
     wil::com_ptr<ID2D1Bitmap1> scene_bmp_;
     wil::com_ptr<ID2D1Effect> blur_effect_;
     wil::com_ptr<ID2D1Effect> glass_effect_;
     wil::com_ptr<ID2D1Effect> scene_blur_effect_;
     wil::com_ptr<ID2D1Effect> scene_glass_effect_;
+    wil::com_ptr<ID3D11Texture2D> probe_tex_;
+    std::vector<uint8_t> last_probe_px_;
+    bool last_probe_valid_ = false;
+    uint64_t last_probe_seq_ = 0;
+    HMONITOR last_probe_mon_ = nullptr;
+    POINT last_probe_origin_{.x = LONG_MIN, .y = LONG_MIN};
+    UINT last_probe_pw_ = 0, last_probe_ph_ = 0;
+    LONG last_probe_clip_l_ = 0, last_probe_clip_t_ = 0;
+    UINT last_probe_cw_ = 0, last_probe_ch_ = 0;
+    uint64_t probe_epoch_ = 0;
     HMONITOR last_mon_ = nullptr;
+    uint64_t last_tex_id_ = 0;
     uint64_t last_seq_ = 0;
+    uint64_t backdrop_ver_ = 0;
     UINT win_bmp_w_ = 0, win_bmp_h_ = 0;
     float win_bmp_dpi_ = 0.0f;
     UINT scene_w_ = 0, scene_h_ = 0;
@@ -1026,8 +1346,8 @@ private:
     uint64_t scene_epoch_ = 0;
     uint64_t desktop_bmp_epoch_ = 0;
     uint64_t win_bmp_epoch_ = 0;
-    POINT gdi_origin_{LONG_MIN, LONG_MIN};
-    POINT last_rendered_origin_{LONG_MIN, LONG_MIN};
+    POINT gdi_origin_{.x = LONG_MIN, .y = LONG_MIN};
+    POINT last_rendered_origin_{.x = LONG_MIN, .y = LONG_MIN};
     std::optional<POINT> origin_override_;
     bool seeded_gdi_ = false;
     bool scene_active_ = false;
