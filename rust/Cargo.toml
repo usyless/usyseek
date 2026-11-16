@@ -6,7 +6,7 @@ publish = false
 
 [lib]
 name = "usyseek_rust"
-crate-type = ["staticlib", "rlib"]
+crate-type = ["staticlib"]
 
 [[bin]]
 name = "usyseek-migrate"

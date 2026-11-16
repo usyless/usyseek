@@ -1,25 +1,25 @@
 //! usyseek native bridge: Qdrant Edge embedded engine + HuggingFace tokenizer + resvg, exposed over a small C ABI.
 //! All structured data crosses the boundary as UTF-8 JSON; bulk numeric data (vectors, ids, pixels) as raw slices.
 
+mod edge_common;
 mod svg;
+
+use edge_common::{create_edge_shard, sanitize_collection_name, shard_exists_on_disk};
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr;
 use std::slice;
 use std::sync::{Arc, Mutex};
 
 use qdrant_edge::{
-    AnyVariants, Condition, CountRequestBuilder, Direction, Distance, EdgeConfigBuilder,
-    EdgeOptimizersConfig, EdgeShard, EdgeVectorParamsBuilder, FacetRequestBuilder, FacetValue,
-    FieldCondition, FieldIndexOperations, Filter, HnswIndexConfig, JsonPath, Match, Memory, NamedQuery,
-    OrderBy, OrderByInterface, Payload, PayloadFieldSchema, PayloadOps, PayloadSchemaParams,
-    PayloadSchemaType, PointId, PointInsertOperations, PointOperations, PointStruct,
+    AnyVariants, Condition, CountRequestBuilder, Direction, EdgeShard, FacetRequestBuilder,
+    FacetValue, FieldCondition, Filter, JsonPath, Match, NamedQuery, OrderBy, OrderByInterface,
+    Payload, PayloadOps, PointId, PointInsertOperations, PointOperations, PointStruct,
     PointStructPersisted, QueryEnum, QueryRequestBuilder, RetrieveRequestBuilder, ScoringQuery,
-    ScrollRequestBuilder, SearchParams, SetPayloadOp, TextIndexParamsBuilder, TokenizerType,
-    UpdateOperation, ValueVariants, VectorInternal, VectorStorageDatatype, VectorStructInternal,
-    WithPayloadInterface, WithVector, CreateIndex, DEFAULT_VECTOR_NAME,
+    ScrollRequestBuilder, SearchParams, SetPayloadOp, UpdateOperation, ValueVariants,
+    VectorInternal, VectorStructInternal, WithPayloadInterface, WithVector, DEFAULT_VECTOR_NAME,
 };
 use serde_json::{Map as JsonMap, Value as Json, json};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -137,96 +137,11 @@ pub struct UsyQdrant {
     shards: Mutex<HashMap<String, Arc<EdgeShard>>>,
 }
 
-const F_PATH: &str = "p";
 const F_NAME: &str = "n";
 const F_ANCESTORS: &str = "a";
 const F_TAGS: &str = "t";
 const F_KIND: &str = "k";
 const F_MTIME: &str = "m";
-
-pub fn sanitize_collection_name(name: &str) -> Result<String, String> {
-    if name.is_empty() || name == "." || name == ".." {
-        return Err("invalid collection name".into());
-    }
-    let clean: String = name
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect();
-    if clean.is_empty() || clean == "." || clean == ".." {
-        return Err("invalid collection name".into());
-    }
-    Ok(clean)
-}
-
-pub fn shard_exists_on_disk(dir: &Path) -> bool {
-    dir.join("edge_config.json").is_file() || dir.join("segments").is_dir()
-}
-
-pub fn create_edge_shard(dir: &Path, dim: usize) -> Result<EdgeShard, String> {
-    let cfg = EdgeConfigBuilder::new()
-        .vector(
-            DEFAULT_VECTOR_NAME,
-            EdgeVectorParamsBuilder::new(dim, Distance::Cosine)
-                .memory(Memory::Cold)
-                .datatype(VectorStorageDatatype::Float16)
-                .build(),
-        )
-        .payload_memory(Memory::Cold)
-        .hnsw_config({
-            #[allow(deprecated)]
-            HnswIndexConfig {
-                m: 0,
-                ef_construct: 100,
-                full_scan_threshold: 10000,
-                max_indexing_threads: 0,
-                on_disk: None,
-                memory: Some(Memory::Cold),
-                payload_m: None,
-                inline_storage: None,
-            }
-        })
-        .optimizers(EdgeOptimizersConfig {
-            deleted_threshold: Some(0.2),
-            vacuum_min_vector_number: Some(1000),
-            default_segment_number: Some(0),
-            max_segment_size: None,
-            indexing_threshold: Some(10000),
-            prevent_unoptimized: None,
-        })
-        .build();
-
-    let shard = EdgeShard::new(dir, cfg).map_err(err)?;
-    let create_idx = |field: &str, schema: PayloadFieldSchema| -> Result<(), String> {
-        let field_name = json_path(field)?;
-        shard
-            .update(UpdateOperation::FieldIndexOperation(FieldIndexOperations::CreateIndex(
-                CreateIndex { field_name, field_schema: Some(schema) },
-            )))
-            .map_err(err)
-    };
-    create_idx(F_TAGS, PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword))?;
-    create_idx(F_ANCESTORS, PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword))?;
-    create_idx(F_KIND, PayloadFieldSchema::FieldType(PayloadSchemaType::Integer))?;
-    create_idx(F_MTIME, PayloadFieldSchema::FieldType(PayloadSchemaType::Integer))?;
-    create_idx(
-        F_NAME,
-        PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(
-            TextIndexParamsBuilder::new()
-                .tokenizer(TokenizerType::Prefix)
-                .lowercase(true)
-                .min_token_len(1)
-                .max_token_len(32)
-                .build(),
-        )),
-    )?;
-    shard.flush().map_err(err)?;
-    let _ = F_PATH;
-    Ok(shard)
-}
 
 impl UsyQdrant {
     fn collection_dir(&self, name: &str) -> Result<PathBuf, String> {

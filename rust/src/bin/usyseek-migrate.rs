@@ -5,12 +5,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+#[path = "../edge_common.rs"]
+mod edge_common;
+
+use edge_common::{create_edge_shard, sanitize_collection_name, shard_exists_on_disk};
 use qdrant_edge::{
     CountRequestBuilder, EdgeShard, PointInsertOperations, PointOperations, PointStructPersisted,
     ScrollRequestBuilder, UpdateOperation, WithPayloadInterface, WithVector,
 };
 use serde_json::Value as Json;
-use usyseek_rust::{create_edge_shard, sanitize_collection_name, shard_exists_on_disk};
 
 const BATCH_SIZE: usize = 512;
 const FLUSH_INTERVAL_BATCHES: usize = 8;

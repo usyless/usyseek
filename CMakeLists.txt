@@ -110,19 +110,19 @@ set(RUST_DIR "${PROJECT_SOURCE_DIR}/rust")
 set(RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/rust_target")
 set(RUST_STATIC_LIB "${RUST_TARGET_DIR}/release/usyseek_rust.lib")
 set(RUST_OUTPUTS "${RUST_STATIC_LIB}")
-set(RUST_DEPENDS "${RUST_DIR}/Cargo.toml" "${RUST_DIR}/Cargo.lock" "${RUST_DIR}/src/lib.rs" "${RUST_DIR}/src/svg.rs")
-set(RUST_CARGO_CMD "${CARGO_EXECUTABLE}" rustc --release --lib --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}" -- --crate-type staticlib)
+set(RUST_DEPENDS "${RUST_DIR}/Cargo.toml" "${RUST_DIR}/Cargo.lock" "${RUST_DIR}/src/lib.rs" "${RUST_DIR}/src/edge_common.rs" "${RUST_DIR}/src/svg.rs")
+set(RUST_CARGO_TARGETS --lib)
 set(RUST_BUILD_COMMENT "Building usyseek_rust staticlib (qdrant-edge + tokenizers + resvg)...")
 if(USYSEEK_BUILD_MIGRATE)
     set(RUST_MIGRATE_EXE "${RUST_TARGET_DIR}/release/usyseek-migrate.exe")
     list(APPEND RUST_OUTPUTS "${RUST_MIGRATE_EXE}")
     list(APPEND RUST_DEPENDS "${RUST_DIR}/src/bin/usyseek-migrate.rs")
-    set(RUST_CARGO_CMD "${CARGO_EXECUTABLE}" build --release --lib --bin usyseek-migrate --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}")
+    list(APPEND RUST_CARGO_TARGETS --bin usyseek-migrate)
     set(RUST_BUILD_COMMENT "Building usyseek_rust staticlib and usyseek-migrate (qdrant-edge + tokenizers + resvg)...")
 endif()
 add_custom_command(
     OUTPUT ${RUST_OUTPUTS}
-    COMMAND ${RUST_CARGO_CMD}
+    COMMAND "${CARGO_EXECUTABLE}" build --release ${RUST_CARGO_TARGETS} --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
     DEPENDS ${RUST_DEPENDS}
     WORKING_DIRECTORY "${RUST_DIR}"
     COMMENT "${RUST_BUILD_COMMENT}"
