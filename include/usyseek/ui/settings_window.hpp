@@ -798,17 +798,20 @@ private:
     }
 
     /// Draws an input field, path row, or recessed well with translucent glass styling when active.
-    static void draw_well(Canvas& cv, D2D1_RECT_F r, float rad, bool stroke = false, bool focused = false, bool locked = false) {
+    static void draw_well(Canvas& cv, D2D1_RECT_F r, float rad, bool stroke = false, bool focused = false, bool locked = false, float hover = 0.0f) {
         if (is_liquid_glass(cv.theme())) {
             const bool dark = cv.theme().dark_mode;
-            const float bg_a = locked ? (dark ? 0.18f : 0.28f) : (dark ? 0.28f : 0.42f);
+            const float bg_a = locked ? (dark ? 0.18f : 0.28f) : (dark ? lerp(0.28f, 0.40f, hover) : lerp(0.42f, 0.56f, hover));
+            const D2D1_COLOR_F bg_col = locked ? cv.theme().surface_lowest : lerp_color(cv.theme().surface_lowest, cv.theme().surface_high, hover);
             const D2D1_COLOR_F bd = focused
                 ? cv.theme().primary
-                : with_alpha(hex(0xffffff), stroke ? (dark ? 0.22f : 0.60f) : (dark ? 0.12f : 0.42f));
-            draw_glass_box(cv, r, rad, with_alpha(cv.theme().surface_lowest, bg_a), bd, focused ? 1.5f : 1.0f,
-                           dark ? 0.05f : 0.20f);
+                : with_alpha(hex(0xffffff), stroke ? (dark ? lerp(0.22f, 0.34f, hover) : lerp(0.60f, 0.78f, hover))
+                                                   : (dark ? lerp(0.12f, 0.28f, hover) : lerp(0.42f, 0.70f, hover)));
+            draw_glass_box(cv, r, rad, with_alpha(bg_col, bg_a), bd, focused ? 1.5f : 1.0f,
+                           dark ? lerp(0.05f, 0.10f, hover) : lerp(0.20f, 0.28f, hover));
         } else {
-            cv.fill_round(r, rad, locked ? with_alpha(cv.theme().surface_lowest, 0.7f) : cv.theme().surface_low);
+            cv.fill_round(r, rad, locked ? with_alpha(cv.theme().surface_lowest, 0.7f)
+                                         : lerp_color(cv.theme().surface_low, cv.theme().surface_high, hover));
             if (stroke) cv.stroke_round(r, rad, focused ? cv.theme().primary : cv.theme().outline_variant, focused ? 1.5f : 1.0f);
         }
     }
@@ -1618,8 +1621,8 @@ private:
                 const auto& ff = sh_.failed_files[i];
                 const FailedRow& row = rows[i];
                 const D2D1_RECT_F ir = rect(lx, row.y, rw, row.h);
-                const float ha = hover_alpha(IdFailedRow, static_cast<int>(i));
-                cv.fill_round(ir, 8.0f, lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha));
+                const float ha = ff.path.empty() ? 0.0f : hover_alpha(IdFailedRow, static_cast<int>(i));
+                draw_well(cv, ir, 8.0f, false, false, false, ha);
                 cv.icon(glyph::warning, rect(ir.left + 8.0f, ir.top, 20.0f, row.h), cv.theme().error, Font::IconSmall);
                 const float content_top = ir.top + (row.h - row.content_h) * 0.5f;
                 const float path_y = stacked ? content_top : ir.top + (row.h - row.path_h) * 0.5f;
