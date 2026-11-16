@@ -1091,8 +1091,23 @@ private:
 
     void icon_button(Canvas& cv, D2D1_RECT_F r, wchar_t g, int id, bool active = false) {
         const float ha = hover_.alpha(id);
-        if (active) cv.fill_round(r, height(r) / 2, with_alpha(cv.theme().primary, 0.16f));
-        else if (ha > 0.002f) cv.fill_round(r, height(r) / 2, with_alpha(cv.theme().on_surface, 0.08f * ha));
+        const float rad = height(r) * 0.5f;
+        if (is_liquid_glass(cv.theme())) {
+            const bool dark = cv.theme().dark_mode;
+            if (active) {
+                draw_glass_box(cv, r, rad,
+                               with_alpha(cv.theme().primary, dark ? 0.24f : 0.20f),
+                               with_alpha(cv.theme().primary, dark ? 0.62f : 0.55f));
+            } else {
+                const float bg_a = dark ? lerp(0.06f, 0.16f, ha) : lerp(0.22f, 0.42f, ha);
+                const float bd_a = dark ? lerp(0.14f, 0.30f, ha) : lerp(0.45f, 0.72f, ha);
+                draw_glass_box(cv, r, rad, with_alpha(hex(0xffffff), bg_a), with_alpha(hex(0xffffff), bd_a),
+                               1.0f, dark ? lerp(0.05f, 0.10f, ha) : lerp(0.22f, 0.38f, ha));
+            }
+        } else {
+            if (active) cv.fill_round(r, rad, with_alpha(cv.theme().primary, 0.16f));
+            else if (ha > 0.002f) cv.fill_round(r, rad, with_alpha(cv.theme().on_surface, 0.08f * ha));
+        }
         cv.icon(g, r, active ? cv.theme().primary : lerp_color(cv.theme().on_surface_variant, cv.theme().on_surface, ha));
         cv.hit(r, id);
     }
@@ -1147,7 +1162,15 @@ private:
         }
         x -= total;
         const D2D1_RECT_F seg = rect(x, cy - 17, total, 34);
-        cv.fill_round(seg, 17, with_alpha(cv.theme().surface_highest, 0.85f));
+        const bool glass_ui = is_liquid_glass(cv.theme());
+        const bool dark = cv.theme().dark_mode;
+        if (glass_ui) {
+            draw_glass_box(cv, seg, 17,
+                           with_alpha(cv.theme().surface_high, dark ? 0.26f : 0.36f),
+                           with_alpha(hex(0xffffff), dark ? 0.20f : 0.62f));
+        } else {
+            cv.fill_round(seg, 17, with_alpha(cv.theme().surface_highest, 0.85f));
+        }
         D2D1_RECT_F chip_rects[3]{};
         float cx = x + 3;
         for (int i = 0; i < 3; ++i) {
@@ -1159,12 +1182,21 @@ private:
             const float act = std::max(0.0f, 1.0f - std::abs(ct - static_cast<float>(i)));
             const float ha = hover_.alpha(IdChip, i);
             if (act < 0.5f && ha > 0.002f) {
-                cv.fill_round(chip_rects[i], 14, with_alpha(cv.theme().on_surface, 0.07f * ha));
+                cv.fill_round(chip_rects[i], 14,
+                              glass_ui ? with_alpha(hex(0xffffff), (dark ? 0.10f : 0.32f) * ha)
+                                       : with_alpha(cv.theme().on_surface, 0.07f * ha));
             }
         }
         const int lo = std::clamp(static_cast<int>(std::floor(ct)), 0, 1);
         const float frac = ct - static_cast<float>(lo);
-        cv.fill_round(lerp_rect(chip_rects[lo], chip_rects[lo + 1], frac), 14, cv.theme().primary_container);
+        const D2D1_RECT_F active_chip = lerp_rect(chip_rects[lo], chip_rects[lo + 1], frac);
+        if (glass_ui) {
+            draw_glass_box(cv, active_chip, 14,
+                           with_alpha(cv.theme().primary, dark ? 0.28f : 0.22f),
+                           with_alpha(cv.theme().primary, dark ? 0.65f : 0.58f));
+        } else {
+            cv.fill_round(active_chip, 14, cv.theme().primary_container);
+        }
         for (int i = 0; i < 3; ++i) {
             const float act = std::max(0.0f, 1.0f - std::abs(ct - static_cast<float>(i)));
             cv.text(labels[i], chip_rects[i], Font::SmallSemi,
@@ -1361,20 +1393,34 @@ private:
         const bool sel = selected_.contains(it.pt.id);
         const bool focus = focus_ == i;
 
-        cv.fill_round(r, 14, with_alpha(lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha), 0.92f));
-        if (sel) cv.stroke_round(r, 14, cv.theme().primary, 2.0f);
-        else if (focus) cv.stroke_round(r, 14, with_alpha(cv.theme().primary, 0.6f), 1.0f);
-        else cv.stroke_round(r, 14, with_alpha(cv.theme().outline_variant, lerp(0.45f, 0.9f, ha)));
+        const bool glass_ui = is_liquid_glass(cv.theme());
+        const bool dark = cv.theme().dark_mode;
+        if (glass_ui) {
+            const D2D1_COLOR_F card_fill = with_alpha(lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha),
+                                                      dark ? lerp(0.28f, 0.40f, ha) : lerp(0.38f, 0.52f, ha));
+            const D2D1_COLOR_F card_border = sel
+                ? cv.theme().primary
+                : (focus ? with_alpha(cv.theme().primary, 0.72f)
+                         : with_alpha(hex(0xffffff), dark ? lerp(0.18f, 0.36f, ha) : lerp(0.55f, 0.85f, ha)));
+            draw_glass_box(cv, r, 14, card_fill, card_border, sel ? 2.0f : 1.0f);
+        } else {
+            cv.fill_round(r, 14, with_alpha(lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha), 0.92f));
+            if (sel) cv.stroke_round(r, 14, cv.theme().primary, 2.0f);
+            else if (focus) cv.stroke_round(r, 14, with_alpha(cv.theme().primary, 0.6f), 1.0f);
+            else cv.stroke_round(r, 14, with_alpha(cv.theme().outline_variant, lerp(0.45f, 0.9f, ha)));
+        }
         cv.hit(r, IdCard, i);
 
         // Thumbnail (cropped or letterboxed through a reusable bitmap brush so the corners stay rounded)
         const D2D1_RECT_F tr = rect(r.left + 6, r.top + 6, g.card_w - 12, g.thumb_h);
         if (ID2D1Bitmap1* bmp = sh_.thumbs.get(it.pt.id)) {
             const ThumbFit fit = parse_thumb_fit(sh_.settings.thumb_fit);
-            if (fit == ThumbFit::Contain) cv.fill_round(tr, 10, cv.theme().surface_lowest);
+            if (fit == ThumbFit::Contain) {
+                cv.fill_round(tr, 10, glass_ui ? with_alpha(cv.theme().surface_lowest, dark ? 0.24f : 0.35f) : cv.theme().surface_lowest);
+            }
             cv.fill_bitmap_round(bmp, tr, 10.0f, fit);
         } else {
-            cv.fill_round(tr, 10, with_alpha(cv.theme().surface_highest, 0.6f));
+            cv.fill_round(tr, 10, with_alpha(cv.theme().surface_highest, glass_ui ? (dark ? 0.24f : 0.36f) : 0.6f));
             cv.icon(it.pt.p.k == 1 ? glyph::video : glyph::photo, tr, with_alpha(cv.theme().outline, 0.6f), Font::IconLarge);
         }
 
@@ -2380,7 +2426,10 @@ private:
         }
         const Item& it = items_[preview_];
         const int count = static_cast<int>(items_.size());
-        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().surface_lowest, 0.94f));
+        const bool glass_ui = is_liquid_glass(cv.theme());
+        const bool dark = cv.theme().dark_mode;
+        cv.fill(D2D1::RectF(0, 0, sz.width, sz.height),
+                with_alpha(cv.theme().surface_lowest, glass_ui ? (dark ? 0.14f : 0.10f) : 0.94f));
         // Backdrop below the title bar closes the viewer; the bar itself still drags the window
         cv.hit(D2D1::RectF(0, PV_TOP, sz.width, sz.height), IdPreview);
 
@@ -2459,8 +2508,18 @@ private:
             const float cy = (nav_area.top + nav_area.bottom) / 2;
             const int id = next ? IdPvNext : IdPvPrev;
             const float ha = hover_.alpha(id);
-            cv.fill_circle({.x = cx, .y = cy}, 22, lerp_color(hex(0x000000, 0.45f), with_alpha(cv.theme().surface_highest, 0.96f), ha));
-            cv.icon(next ? glyph::chevron_right : glyph::chevron_left, rect(cx - 22, cy - 22, 44, 44), lerp_color(hex(0xffffff, 0.9f), cv.theme().on_surface, ha));
+            if (is_liquid_glass(cv.theme())) {
+                const bool dark = cv.theme().dark_mode;
+                cv.fill_circle({.x = cx, .y = cy}, 22,
+                               with_alpha(cv.theme().surface_high, dark ? lerp(0.32f, 0.52f, ha) : lerp(0.46f, 0.68f, ha)));
+                cv.stroke_circle({.x = cx, .y = cy}, 22,
+                                 with_alpha(hex(0xffffff), dark ? lerp(0.22f, 0.42f, ha) : lerp(0.55f, 0.85f, ha)), 1.0f);
+                cv.icon(next ? glyph::chevron_right : glyph::chevron_left, rect(cx - 22, cy - 22, 44, 44),
+                        lerp_color(with_alpha(cv.theme().on_surface, 0.85f), cv.theme().on_surface, ha));
+            } else {
+                cv.fill_circle({.x = cx, .y = cy}, 22, lerp_color(hex(0x000000, 0.45f), with_alpha(cv.theme().surface_highest, 0.96f), ha));
+                cv.icon(next ? glyph::chevron_right : glyph::chevron_left, rect(cx - 22, cy - 22, 44, 44), lerp_color(hex(0xffffff, 0.9f), cv.theme().on_surface, ha));
+            }
             cv.hit(rect(cx - 28, cy - 44, 56, 88), id);
         };
         arrow(false);
@@ -2484,7 +2543,13 @@ private:
         const float pw = cv.measure(pos, Font::SmallSemi) + 24;
         x -= pw + 6;
         const D2D1_RECT_F pr = rect(x, cy - 13, pw, 26);
-        cv.fill_round(pr, 13, with_alpha(cv.theme().surface_highest, 0.85f));
+        if (is_liquid_glass(cv.theme())) {
+            draw_glass_box(cv, pr, 13,
+                           with_alpha(cv.theme().surface_high, dark ? 0.30f : 0.44f),
+                           with_alpha(hex(0xffffff), dark ? 0.20f : 0.58f));
+        } else {
+            cv.fill_round(pr, 13, with_alpha(cv.theme().surface_highest, 0.85f));
+        }
         cv.text(pos, pr, Font::SmallSemi, cv.theme().on_surface_variant, Align::Center);
         const float path_w = std::max(40.0f, x - 34.0f);
         const std::wstring dir_disp = middle_truncate_dir(cv, it.dir, Font::MonoSmall, path_w);

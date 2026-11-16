@@ -637,6 +637,22 @@ struct TooltipLayout {
     return out;
 }
 
+/// Returns true when the active theme is the Liquid Glass theme.
+[[nodiscard]] inline bool is_liquid_glass(const Theme& t) noexcept {
+    return t.id == "liquid-glass";
+}
+
+/// Draws a frosted-glass rounded surface with an inner specular sheen and crisp glass border.
+inline void draw_glass_box(Canvas& cv, D2D1_RECT_F r, float radius, D2D1_COLOR_F fill, D2D1_COLOR_F border,
+                           float border_w = 1.0f, float sheen_alpha = -1.0f) {
+    if (fill.a > 0.0f) cv.fill_round(r, radius, fill);
+    const float sa = sheen_alpha >= 0.0f ? sheen_alpha : (cv.theme().dark_mode ? 0.09f : 0.32f);
+    if (sa > 0.002f && width(r) > 4.0f && height(r) > 4.0f) {
+        cv.stroke_round(inset(r, 1.0f, 1.0f), std::max(0.0f, radius - 1.0f), with_alpha(hex(0xffffff), sa), 1.0f);
+    }
+    if (border.a > 0.0f && border_w > 0.0f) cv.stroke_round(r, radius, border, border_w);
+}
+
 /// Draws a floating wrapped tooltip anchored near `anchor`, clamped within `win_sz`.
 inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std::wstring_view title,
                          std::wstring_view subtitle = {}, float opacity = 1.0f) {
@@ -650,8 +666,14 @@ inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std
     const D2D1_RECT_F r = tl.box;
     const Theme& t = cv.theme();
     cv.shadow(r, 8.0f, 10.0f, 0.38f);
-    cv.fill_round(r, 8.0f, t.surface_highest);
-    cv.stroke_round(r, 8.0f, with_alpha(t.outline_variant, 0.85f));
+    if (is_liquid_glass(t)) {
+        draw_glass_box(cv, r, 8.0f,
+                       with_alpha(t.surface_high, t.dark_mode ? 0.56f : 0.76f),
+                       with_alpha(hex(0xffffff), t.dark_mode ? 0.24f : 0.68f));
+    } else {
+        cv.fill_round(r, 8.0f, t.surface_highest);
+        cv.stroke_round(r, 8.0f, with_alpha(t.outline_variant, 0.85f));
+    }
 
     float ty = r.top + pad_y;
     if (!title.empty()) {

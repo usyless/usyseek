@@ -108,6 +108,17 @@ float RoundedRectSDF(float2 p, float2 center, float2 half0, float cr, float n)
         float2 cornerCenter = sign(p) * (half0 - float2(cr, cr));
         return superellipseCornerSDF(p - cornerCenter, cr, n);
     }
+    if (d.x < -cr && d.y < -cr)
+    {
+        float a = d.x + cr;
+        float b = d.y + cr;
+        float k = min(8.0, max(-a, -b));
+        if (k > 1e-4)
+        {
+            float h = saturate(0.5 + 0.5 * (a - b) / k);
+            return -cr + lerp(b, a, h) + k * h * (1.0 - h);
+        }
+    }
     return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
 }
 
@@ -126,7 +137,8 @@ float2 RoundedRectUnitNormal(float2 fragCoord, float2 center, float2 halfPx,
     }
     else
     {
-        float t = smoothstep(-blend, blend, cc.x - cc.y);
+        float b = max(min(blend, max(-cc.x, -cc.y)), 1e-4);
+        float t = smoothstep(-b, b, cc.x - cc.y);
         local = normalize(float2(t, 1.0 - t));
     }
     return sgn * local;
@@ -193,7 +205,7 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
         float edgeFactor = EdgeSlopeFactor(nmerged, refThickness, refFactor);
         float ef1 = EdgeSlopeFactor(nmerged + 1.0, refThickness, refFactor);
 
-        float2 unitN = RoundedRectUnitNormal(fragCoord, center, halfPx, cr, n, 3.0 * dpr);
+        float2 unitN = RoundedRectUnitNormal(fragCoord, center, halfPx, cr, n, 16.0 * dpr);
         float nLen = length(unitN);
         float2 safeN = nLen > 1e-6 ? (unitN / nLen) : float2(0.0, 0.0);
 
@@ -961,15 +973,15 @@ private:
     s.corner_radius = fullscreen ? 0.0f : corner_radius;
     s.roundness = 4.6f;
     s.margin_dip = fullscreen ? 0.0f : 0.5f;
-    s.ref_thickness = fullscreen ? 14.0f : 30.0f;
-    s.ref_factor = 1.52f;
+    s.ref_thickness = fullscreen ? 14.0f : 18.0f;
+    s.ref_factor = 1.56f;
     s.ref_dispersion = 5.5f;
     s.dispersion_range = 0.70f;
-    s.fresnel_range = 30.0f;
+    s.fresnel_range = 28.0f;
     s.fresnel_hardness = 12.0f;
     s.fresnel_factor = t.dark_mode ? 34.0f : 44.0f;
     s.magnification = 1.035f;
-    s.glare_range = 28.0f;
+    s.glare_range = 26.0f;
     s.glare_hardness = 18.0f;
     s.glare_factor = t.dark_mode ? 70.0f : 88.0f;
     s.glare_convergence = 58.0f;
@@ -985,8 +997,8 @@ private:
     s.corner_radius = corner_radius;
     s.roundness = 4.5f;
     s.margin_dip = 0.5f;
-    s.ref_thickness = 24.0f;
-    s.ref_factor = 1.54f;
+    s.ref_thickness = 16.0f;
+    s.ref_factor = 1.56f;
     s.ref_dispersion = 4.5f;
     s.dispersion_range = 0.65f;
     s.fresnel_range = 26.0f;
