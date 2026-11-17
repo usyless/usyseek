@@ -819,13 +819,13 @@ public:
         const bool use_dupl = (st && st->has_frame && st->desktop_tex);
         ID2D1Bitmap1* gdi_bmp = nullptr;
         if (!use_dupl) {
-            gdi_bmp = capture_gdi_backdrop(gfx, target, hwnd, origin, pw, ph);
+            gdi_bmp = capture_gdi_backdrop(target, origin, pw, ph);
             if (!gdi_bmp) return false;
         }
 
         const D2D1_SIZE_F sz = target.size();
         const D2D1_RECT_F full_dest = D2D1::RectF(0.0f, 0.0f, sz.width, sz.height);
-        const GlassCacheKey key = make_cache_key(pw, ph, target.dpi(), gfx.epoch(), origin, panel_rect, s, use_dupl, backdrop_ver_);
+        const GlassCacheKey key = make_cache_key(pw, ph, target.dpi(), target.target_epoch(), origin, panel_rect, s, use_dupl, backdrop_ver_);
         if (cached_glass_valid_ && cached_glass_bmp_ && cached_key_ == key) {
             cv.dc()->DrawBitmap(cached_glass_bmp_.get(), &full_dest, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &full_dest, nullptr);
             return true;
@@ -833,7 +833,7 @@ public:
 
         ID2D1Bitmap1* src_bmp = nullptr;
         if (use_dupl) {
-            if (!desktop_bmp_ || desktop_bmp_tex_id_ != st->tex_id || desktop_bmp_dpi_ != target.dpi() || desktop_bmp_epoch_ != gfx.epoch()) {
+            if (!desktop_bmp_ || desktop_bmp_tex_id_ != st->tex_id || desktop_bmp_dpi_ != target.dpi() || desktop_bmp_epoch_ != target.target_epoch()) {
                 desktop_bmp_.reset();
                 desktop_bmp_tex_id_ = 0;
                 const auto surf = st->desktop_tex.try_query<IDXGISurface>();
@@ -847,7 +847,7 @@ public:
                 }
                 desktop_bmp_tex_id_ = st->tex_id;
                 desktop_bmp_dpi_ = target.dpi();
-                desktop_bmp_epoch_ = gfx.epoch();
+                desktop_bmp_epoch_ = target.target_epoch();
             }
 
             const LONG sx = origin.x - st->mon_rect.left;
@@ -858,7 +858,7 @@ public:
             const LONG clip_b = std::clamp<LONG>(sy + static_cast<LONG>(ph), 0, static_cast<LONG>(st->tex_h));
             if (clip_r <= clip_l || clip_b <= clip_t) return false;
 
-            if (!ensure_win_bmp(gfx, target, pw, ph)) return false;
+            if (!ensure_win_bmp(target, pw, ph)) return false;
             win_bmp_idx_ ^= 1u;
             ID2D1Bitmap1* dst_bmp = win_bmp_[win_bmp_idx_].get();
 
@@ -881,7 +881,7 @@ public:
             src_bmp = gdi_bmp;
         }
 
-        if (!ensure_cached_glass_bmp(gfx, target, pw, ph)) {
+        if (!ensure_cached_glass_bmp(target, pw, ph)) {
             if (!ensure_effects(target, gfx)) return false;
             return draw_bitmap_glass_with(
                 cv, target, src_bmp, full_dest,
@@ -905,7 +905,7 @@ public:
             return false;
         }
 
-        cached_key_ = make_cache_key(pw, ph, target.dpi(), gfx.epoch(), origin, panel_rect, s, use_dupl, backdrop_ver_);
+        cached_key_ = make_cache_key(pw, ph, target.dpi(), target.target_epoch(), origin, panel_rect, s, use_dupl, backdrop_ver_);
         cached_glass_valid_ = true;
         cv.dc()->DrawBitmap(cached_glass_bmp_.get(), &full_dest, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &full_dest, nullptr);
         return true;
@@ -913,14 +913,14 @@ public:
 
     /// Redirects `target.dc()` into an offscreen `scene_bmp_` so floating glass panels
     /// can sample and refract the rendered scene underneath them without copying.
-    bool begin_scene(WindowTarget& target, Gfx& gfx) noexcept {
+    bool begin_scene(WindowTarget& target, Gfx&) noexcept {
         scene_active_ = false;
         if (!target.ready() || !target.target_bitmap()) return false;
         const UINT pw = target.pixel_width();
         const UINT ph = target.pixel_height();
         if (pw == 0 || ph == 0) return false;
 
-        const bool same_env = scene_bmp_ && scene_dpi_ == target.dpi() && scene_epoch_ == gfx.epoch();
+        const bool same_env = scene_bmp_ && scene_dpi_ == target.dpi() && scene_epoch_ == target.target_epoch();
         const auto [want_w, want_h] = desired_bitmap_size(scene_w_, scene_h_, pw, ph, same_env);
         if (!same_env || scene_w_ != want_w || scene_h_ != want_h) {
             scene_bmp_.reset();
@@ -935,7 +935,7 @@ public:
             scene_w_ = want_w;
             scene_h_ = want_h;
             scene_dpi_ = target.dpi();
-            scene_epoch_ = gfx.epoch();
+            scene_epoch_ = target.target_epoch();
         }
         target.dc()->SetTarget(scene_bmp_.get());
         target.dc()->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
@@ -1210,9 +1210,9 @@ private:
         return {pw, ph};
     }
 
-    bool ensure_cached_glass_bmp(Gfx& gfx, WindowTarget& target, UINT pw, UINT ph) noexcept {
+    bool ensure_cached_glass_bmp(WindowTarget& target, UINT pw, UINT ph) noexcept {
         if (pw == 0 || ph == 0) return false;
-        const bool same_env = cached_glass_bmp_ && cached_glass_dpi_ == target.dpi() && cached_glass_epoch_ == gfx.epoch();
+        const bool same_env = cached_glass_bmp_ && cached_glass_dpi_ == target.dpi() && cached_glass_epoch_ == target.target_epoch();
         const auto [want_w, want_h] = desired_bitmap_size(cached_glass_w_, cached_glass_h_, pw, ph, same_env);
         if (same_env && cached_glass_w_ == want_w && cached_glass_h_ == want_h) {
             return true;
@@ -1230,13 +1230,13 @@ private:
         cached_glass_w_ = want_w;
         cached_glass_h_ = want_h;
         cached_glass_dpi_ = target.dpi();
-        cached_glass_epoch_ = gfx.epoch();
+        cached_glass_epoch_ = target.target_epoch();
         return true;
     }
 
-    bool ensure_win_bmp(Gfx& gfx, WindowTarget& target, UINT pw, UINT ph) noexcept {
+    bool ensure_win_bmp(WindowTarget& target, UINT pw, UINT ph) noexcept {
         if (pw == 0 || ph == 0) return false;
-        const bool same_env = win_bmp_[0] && win_bmp_[1] && win_bmp_dpi_ == target.dpi() && win_bmp_epoch_ == gfx.epoch();
+        const bool same_env = win_bmp_[0] && win_bmp_[1] && win_bmp_dpi_ == target.dpi() && win_bmp_epoch_ == target.target_epoch();
         const auto [want_w, want_h] = desired_bitmap_size(win_bmp_w_, win_bmp_h_, pw, ph, same_env);
         if (same_env && win_bmp_w_ == want_w && win_bmp_h_ == want_h) {
             return true;
@@ -1257,15 +1257,14 @@ private:
         win_bmp_w_ = want_w;
         win_bmp_h_ = want_h;
         win_bmp_dpi_ = target.dpi();
-        win_bmp_epoch_ = gfx.epoch();
+        win_bmp_epoch_ = target.target_epoch();
         seeded_gdi_ = false;
         gdi_pw_ = gdi_ph_ = 0;
         return true;
     }
 
-    ID2D1Bitmap1* capture_gdi_backdrop(Gfx& gfx, WindowTarget& target, HWND hwnd, POINT origin, UINT pw, UINT ph) noexcept {
-        if (!ensure_win_bmp(gfx, target, pw, ph)) return nullptr;
-        (void)hwnd;
+    ID2D1Bitmap1* capture_gdi_backdrop(WindowTarget& target, POINT origin, UINT pw, UINT ph) noexcept {
+        if (!ensure_win_bmp(target, pw, ph)) return nullptr;
         if (!seeded_gdi_ || origin.x != gdi_origin_.x || origin.y != gdi_origin_.y || pw > gdi_pw_ || ph > gdi_ph_) {
             win_bmp_idx_ ^= 1u;
             if (seed_from_screen_dc(win_bmp_[win_bmp_idx_].get(), origin, pw, ph)) {
@@ -1320,7 +1319,7 @@ private:
     };
 
     bool ensure_effects(WindowTarget& target, Gfx& gfx) {
-        if (desktop_fx_.blur && desktop_fx_.glass && epoch_ == gfx.epoch()) return true;
+        if (desktop_fx_.blur && desktop_fx_.glass && epoch_ == target.target_epoch()) return true;
         desktop_fx_ = {};
         lens_pool_.clear();
         lens_cursor_ = 0;
@@ -1331,7 +1330,7 @@ private:
             desktop_fx_ = {};
             return false;
         }
-        epoch_ = gfx.epoch();
+        epoch_ = target.target_epoch();
         return true;
     }
 

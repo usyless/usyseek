@@ -8,12 +8,15 @@
 #include <d2d1_3helper.h>
 #include <d3d11.h>
 #include <dcomp.h>
+#include <dwmapi.h>
 #include <dwrite_3.h>
 #include <dxgi1_3.h>
 #include <wincodec.h>
 #include <wil/com.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <functional>
 #include <span>
 #include <vector>
@@ -126,7 +129,7 @@ private:
         dxgi_factory_ = std::move(factory);
 
         if (FAILED(d2d_factory_->CreateDevice(dxgi_device_.get(), &d2d_device_))) return false;
-        // Keep the D2D glyph/bitmap caches small - this process should stay light
+        // Keep the D2D glyph/bitmap caches small outside Liquid Glass.
         d2d_device_->SetMaximumTextureMemory(32ull << 20u);
         ++epoch_;
         if (on_device_changed) on_device_changed();
@@ -134,6 +137,12 @@ private:
     }
 
 public:
+    void set_glass_texture_budget(bool glass) noexcept {
+        if (d2d_device_) {
+            d2d_device_->SetMaximumTextureMemory((glass ? 128ull : 32ull) << 20u);
+        }
+    }
+
     void wait_gpu() noexcept {
         if (!d3d_ || !d3d_ctx_) return;
         if (!frame_query_) {
@@ -176,15 +185,29 @@ public:
     void set_liquid_glass(bool on) noexcept {
         if (liquid_glass_ == on) return;
         liquid_glass_ = on;
-        if (swap_) rebuild();
+        if (gfx_) gfx_->set_glass_texture_budget(on);
+        dirty_tracker_.reset();
     }
 
     [[nodiscard]] bool liquid_glass() const noexcept { return liquid_glass_; }
 
     bool rebuild() noexcept {
-        release();
-        if (!gfx_ || !gfx_->ready()) return false;
-        if (FAILED(gfx_->d2d_device()->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS, &dc_))) return false;
+        if (!gfx_ || !gfx_->ready()) {
+            release();
+            return false;
+        }
+        gfx_->set_glass_texture_budget(liquid_glass_);
+        // Keep the HWND's DirectComposition target alive across swap-effect rebuilds on theme switches.
+        const bool keep_dcomp = (dcomp_ && dcomp_target_ && visual_ && epoch_ == gfx_->epoch());
+        if (keep_dcomp) {
+            release_swap_and_dc();
+        } else {
+            release();
+        }
+        if (FAILED(gfx_->d2d_device()->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_ENABLE_MULTITHREADED_OPTIMIZATIONS, &dc_))) {
+            release();
+            return false;
+        }
 
         RECT rc{};
         GetClientRect(hwnd_, &rc);
@@ -201,37 +224,47 @@ public:
         desc.Scaling = DXGI_SCALING_STRETCH;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-        if (FAILED(gfx_->dxgi_factory()->CreateSwapChainForComposition(gfx_->d3d(), &desc, nullptr, &swap_))) return false;
-        if (FAILED(DCompositionCreateDevice(gfx_->dxgi_device(), IID_PPV_ARGS(&dcomp_)))) return false;
-        if (FAILED(dcomp_->CreateTargetForHwnd(hwnd_, TRUE, &dcomp_target_))) return false;
-        if (FAILED(dcomp_->CreateVisual(&visual_))) return false;
-        visual_->SetContent(swap_.get());
-        dcomp_target_->SetRoot(visual_.get());
-        dcomp_->Commit();
+        if (FAILED(gfx_->dxgi_factory()->CreateSwapChainForComposition(gfx_->d3d(), &desc, nullptr, &swap_))) {
+            release();
+            return false;
+        }
+        if (!keep_dcomp) {
+            if (FAILED(DCompositionCreateDevice(gfx_->dxgi_device(), IID_PPV_ARGS(&dcomp_))) ||
+                FAILED(dcomp_->CreateTargetForHwnd(hwnd_, TRUE, &dcomp_target_)) ||
+                FAILED(dcomp_->CreateVisual(&visual_)) ||
+                FAILED(dcomp_target_->SetRoot(visual_.get()))) {
+                release();
+                return false;
+            }
+        }
+        if (FAILED(visual_->SetContent(swap_.get())) || FAILED(dcomp_->Commit())) {
+            release();
+            return false;
+        }
 
         dpi_ = static_cast<float>(GetDpiForWindow(hwnd_));
         if (dpi_ <= 0) dpi_ = 96.0f;
-        if (!create_target()) return false;
+        if (!create_target()) {
+            release();
+            return false;
+        }
         epoch_ = gfx_->epoch();
         return true;
     }
 
     void release() noexcept {
-        if (bmp_brush_) bmp_brush_->SetBitmap(nullptr);
-        bmp_brush_.reset();
-        solid_brush_.reset();
-        dirty_tracker_.reset();
-        if (dc_) dc_->SetTarget(nullptr);
-        target_.reset();
+        release_swap_and_dc();
+        if (visual_) visual_->SetContent(nullptr);
+        if (dcomp_target_) dcomp_target_->SetRoot(nullptr);
+        if (dcomp_) dcomp_->Commit();
         visual_.reset();
         dcomp_target_.reset();
         dcomp_.reset();
-        swap_.reset();
-        dc_.reset();
     }
 
     [[nodiscard]] bool ready() const noexcept { return dc_ && target_ && gfx_ && epoch_ == gfx_->epoch(); }
     [[nodiscard]] ID2D1DeviceContext6* dc() const noexcept { return dc_.get(); }
+    [[nodiscard]] uint64_t target_epoch() const noexcept { return target_epoch_; }
     [[nodiscard]] float scale() const noexcept { return dpi_ / 96.0f; }
     [[nodiscard]] D2D1_SIZE_F size() const noexcept { return {.width = static_cast<float>(w_) / scale(), .height = static_cast<float>(h_) / scale()}; }
     [[nodiscard]] ID2D1Bitmap1* target_bitmap() const noexcept { return target_.get(); }
@@ -282,6 +315,9 @@ public:
         if (!ready()) return false;
         const float s = scale();
         if (capture_) full_redraw = true;
+        // Liquid Glass drag frames are paced against DWM below so the swapchain flip and the HWND move
+        // land in the same composition pass.
+        const bool paced = liquid_glass_ && !vsync;
 
         curr_px_.clear();
         if (!full_redraw) {
@@ -324,8 +360,13 @@ public:
             capture_.reset();
         }
         if (SUCCEEDED(hr)) {
-            if (liquid_glass_ && !vsync && gfx_) {
-                gfx_->wait_gpu();
+            if (paced) {
+                // 1. Finish all GPU work so the flip is ready the instant it is queued.
+                if (gfx_) gfx_->wait_gpu();
+                // 2. Wait until DWM has just finished a composition pass. That leaves almost a whole frame
+                //    before DWM latches again, so the Present below and the move DefWindowProc applies right
+                //    after WM_WINDOWPOSCHANGING returns reach the same composition (no one-frame lead).
+                (void)DwmFlush();
             }
             DXGI_PRESENT_PARAMETERS params{};
             if (!p.full) {
@@ -333,9 +374,6 @@ public:
                 params.pDirtyRects = present_rects_.data();
             }
             hr = swap_->Present1(vsync ? 1 : 0, 0, &params);
-            if (SUCCEEDED(hr) && liquid_glass_ && !vsync && dcomp_) {
-                dcomp_->Commit();
-            }
         }
         if (hr == DXGI_STATUS_OCCLUDED) {
             dirty_tracker_.reset();
@@ -354,6 +392,18 @@ public:
     [[nodiscard]] bool capture_ok() const noexcept { return capture_ok_; }
 
 private:
+    void release_swap_and_dc() noexcept {
+        if (bmp_brush_) bmp_brush_->SetBitmap(nullptr);
+        bmp_brush_.reset();
+        solid_brush_.reset();
+        dirty_tracker_.reset();
+        if (dc_) dc_->SetTarget(nullptr);
+        target_.reset();
+        swap_.reset();
+        dc_.reset();
+        ++target_epoch_;
+    }
+
     bool create_target() noexcept {
         wil::com_ptr<IDXGISurface> surface;
         if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&surface)))) return false;
@@ -423,6 +473,7 @@ private:
     UINT w_ = 0, h_ = 0;
     float dpi_ = 96.0f;
     uint64_t epoch_ = 0;
+    uint64_t target_epoch_ = 0;
     FlipDirtyTracker dirty_tracker_;
     std::vector<PixelRect> curr_px_;
     std::vector<RECT> present_rects_;

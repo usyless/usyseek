@@ -82,6 +82,7 @@ public:
         selecting_text_ = false;
         dragging_scroll_ = false;
         ShowWindow(hwnd_, SW_SHOWNORMAL);
+        if (glass_active()) ensure_window_capture_affinity(hwnd_, true);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
         field_.focused = !preview_valid();
@@ -3751,6 +3752,7 @@ private:
                                 full_dirty_ = true;
                                 render();
                                 glass_.set_origin_override(std::nullopt);
+                                if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
                             }
                         }
                     }
@@ -3764,7 +3766,7 @@ private:
                     scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
                     full_dirty_ = true;
                     render();
-                    if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
+                    if (glass_active() && visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
                 }
                 return 0;
             case WM_MOVE:
@@ -3786,17 +3788,18 @@ private:
             case WM_ENTERSIZEMOVE:
                 in_sizemove_ = true;
                 resize_pending_ = false;
-                glass_.set_sizemove(true);
+                if (glass_active()) glass_.set_sizemove(true);
                 return 0;
             case WM_EXITSIZEMOVE:
                 in_sizemove_ = false;
                 resize_pending_ = false;
-                glass_.set_sizemove(false);
+                if (glass_active()) glass_.set_sizemove(false);
                 save_rect();
                 if (sh_.gfx.adapter_stale(hwnd_)) recover();
+                if (glass_active()) (void)sh_.poll_indexer();
                 full_dirty_ = true;
                 render();
-                if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
+                if (glass_active() && visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
                 return 0;
             case WM_DISPLAYCHANGE:
                 if (sh_.gfx.adapter_stale(hwnd_)) recover();
@@ -3902,13 +3905,14 @@ private:
             case WM_TIMER:
                 switch (wp) {
                     case TIMER_CARET:
+                        if (glass_active() && in_sizemove_) return 0;
                         field_.caret_on = !field_.caret_on;
                         menu_field_.caret_on = field_.caret_on;
                         if (field_.focused || menu_open_) invalidate();
                         return 0;
                     case TIMER_DEBOUNCE: run_search(0); return 0;
                     case TIMER_STATUS:
-                        if (sh_.poll_indexer()) invalidate();
+                        if (!(glass_active() && in_sizemove_) && sh_.poll_indexer()) invalidate();
                         return 0;
                     case TIMER_DEVICE:
                         KillTimer(hwnd_, TIMER_DEVICE);

@@ -165,6 +165,7 @@ public:
         pending_dirty_.clear();
         last_tooltip_dirty_.reset();
         ShowWindow(hwnd_, SW_SHOWNORMAL);
+        if (glass_active()) ensure_window_capture_affinity(hwnd_, true);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
         SetTimer(hwnd_, TIMER_POLL, 500, nullptr);
@@ -437,6 +438,23 @@ private:
         now.onnx = fs::exists(dir / ulp::str::concat_strings(name, L"-text.onnx"), ec);
         const bool changed = now != model_files_;
         model_files_ = now;
+        return changed;
+    }
+
+    bool poll_status() {
+        bool changed = sh_.poll_indexer();
+        if (sh_.reload_notifications()) changed = true;
+        if (refresh_model_files()) {
+            scan_models(); // a model was added to or removed from the folder
+            changed = true;
+        }
+        const bool db_ready = sh_.engine.db_ready();
+        if (db_ready != last_db_ready_ || sh_.indexer_running != last_indexer_running_) {
+            last_db_ready_ = db_ready;
+            last_indexer_running_ = sh_.indexer_running;
+            refresh_db_collections();
+            changed = true;
+        }
         return changed;
     }
 
@@ -863,7 +881,8 @@ private:
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         const bool glass = glass_active();
-        const float strip_h = tabs_height(sz.width);
+        const FlowResult tlayout = tab_layout(sz.width);
+        const float strip_h = tlayout.height + 16.0f;
         const bool need_scene = glass && (!cv.dirty_clip() || cv.dirty_clip()->top < strip_h + 24.0f);
         const bool has_scene = need_scene && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
@@ -875,9 +894,9 @@ private:
             cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().settings_bg_alpha));
         }
 
-        if (!glass) draw_tabs(cv, sz);
+        if (!glass) draw_tabs(cv, sz, strip_h, tlayout);
 
-        const D2D1_RECT_F view = D2D1::RectF(0, tabs_height(sz.width) + 1.0f, sz.width, sz.height);
+        const D2D1_RECT_F view = D2D1::RectF(0, strip_h + 1.0f, sz.width, sz.height);
         cv.push_clip(view);
 
         const float cw = std::min(860.0f, sz.width - (PAD * 2.0f));
@@ -913,7 +932,7 @@ private:
         if (need_scene) {
             glass_.draw_scene_glass(cv, target_, sh_.gfx, D2D1::RectF(0.0f, 0.0f, sz.width, strip_h),
                                     make_overlay_glass_style(cv.theme(), 0.0f, 1.8f));
-            draw_tabs(cv, sz);
+            draw_tabs(cv, sz, strip_h, tlayout);
         }
         draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
     }
@@ -934,13 +953,11 @@ private:
         }
     }
 
-    void draw_tabs(Canvas& cv, D2D1_SIZE_F sz) {
-        const float strip_h = tabs_height(sz.width);
+    void draw_tabs(Canvas& cv, D2D1_SIZE_F sz, float strip_h, const FlowResult& layout) {
         if (!glass_active()) {
             cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(cv.theme().surface_lowest, 0.75f));
         }
         constexpr auto tabs = tab_defs();
-        const FlowResult layout = tab_layout(sz.width);
         std::array<D2D1_RECT_F, 4> rects; // NOLINT(cppcoreguidelines-pro-type-member-init)
         for (size_t i = 0; i < rects.size(); ++i) {
             const FlowPlacement& p = layout.placements[i];
@@ -4153,6 +4170,7 @@ private:
                                 full_dirty_ = true;
                                 render();
                                 glass_.set_origin_override(std::nullopt);
+                                if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
                             }
                         }
                     }
@@ -4166,7 +4184,7 @@ private:
                     scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
                     full_dirty_ = true;
                     render();
-                    if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
+                    if (glass_active() && visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
                 }
                 return 0;
             case WM_MOVE:
@@ -4188,16 +4206,23 @@ private:
             case WM_ENTERSIZEMOVE:
                 in_sizemove_ = true;
                 resize_pending_ = false;
-                glass_.set_sizemove(true);
+                if (glass_active()) glass_.set_sizemove(true);
                 return 0;
             case WM_EXITSIZEMOVE:
                 in_sizemove_ = false;
                 resize_pending_ = false;
-                glass_.set_sizemove(false);
-                if (sh_.gfx.adapter_stale(hwnd_)) recover();
-                full_dirty_ = true;
-                render();
-                if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
+                if (glass_active()) {
+                    glass_.set_sizemove(false);
+                    if (sh_.gfx.adapter_stale(hwnd_)) recover();
+                    (void)poll_status();
+                    full_dirty_ = true;
+                    render();
+                    if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
+                } else {
+                    if (sh_.gfx.adapter_stale(hwnd_)) recover();
+                    full_dirty_ = true;
+                    render();
+                }
                 return 0;
             case WM_DISPLAYCHANGE:
                 if (sh_.gfx.adapter_stale(hwnd_)) recover();
@@ -4343,28 +4368,15 @@ private:
             case WM_TIMER:
                 switch (wp) {
                     case TIMER_CARET:
+                        if (glass_active() && in_sizemove_) return 0;
                         if (active_field_) {
                             active_field_->caret_on = !active_field_->caret_on;
                             invalidate();
                         }
                         return 0;
-                    case TIMER_POLL: {
-                        bool changed = sh_.poll_indexer();
-                        if (sh_.reload_notifications()) changed = true;
-                        if (refresh_model_files()) {
-                            scan_models(); // a model was added to or removed from the folder
-                            changed = true;
-                        }
-                        const bool db_ready = sh_.engine.db_ready();
-                        if (db_ready != last_db_ready_ || sh_.indexer_running != last_indexer_running_) {
-                            last_db_ready_ = db_ready;
-                            last_indexer_running_ = sh_.indexer_running;
-                            refresh_db_collections();
-                            changed = true;
-                        }
-                        if (changed) invalidate();
+                    case TIMER_POLL:
+                        if (!(glass_active() && in_sizemove_) && poll_status()) invalidate();
                         return 0;
-                    }
                     case TIMER_DEVICE:
                         KillTimer(hwnd_, TIMER_DEVICE);
                         full_dirty_ = true;

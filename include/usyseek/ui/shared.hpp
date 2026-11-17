@@ -296,14 +296,20 @@ inline bool confirm_box(HWND owner, const wchar_t* title, const std::wstring& me
     return MessageBoxW(owner, message.c_str(), title, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES;
 }
 
-/// Applies theme-driven immersive dark/light mode, corner preference, backdrop, and border to a window.
-inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool round = true) noexcept {
+/// Synchronizes capture exclusion (`WDA_EXCLUDEFROMCAPTURE`) so Liquid Glass windows never capture themselves.
+inline void ensure_window_capture_affinity(HWND hwnd, bool exclude) noexcept {
     if (!hwnd) return;
-    const DWORD want_affinity = theme.is_liquid_glass ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE;
+    const DWORD want_affinity = exclude ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE;
     DWORD cur_affinity = WDA_NONE;
     if (!GetWindowDisplayAffinity(hwnd, &cur_affinity) || cur_affinity != want_affinity) {
         SetWindowDisplayAffinity(hwnd, want_affinity);
     }
+}
+
+/// Applies theme-driven immersive dark/light mode, corner preference, backdrop, and border to a window.
+inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool round = true) noexcept {
+    if (!hwnd) return;
+    ensure_window_capture_affinity(hwnd, theme.is_liquid_glass);
     ulp::win::dark::allow_dark_mode_for_window(hwnd, theme.dark_mode);
     const BOOL dark = theme.dark_mode ? TRUE : FALSE;
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
