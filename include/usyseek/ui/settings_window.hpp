@@ -4208,13 +4208,13 @@ private:
             case WM_ENTERSIZEMOVE:
                 in_sizemove_ = true;
                 resize_pending_ = false;
-                if (glass_active()) glass_.set_sizemove(true);
+                if (glass_active()) glass_.set_sizemove(true, sh_.desktop_dupl, sh_.gfx);
                 return 0;
             case WM_EXITSIZEMOVE:
                 in_sizemove_ = false;
                 resize_pending_ = false;
+                glass_.set_sizemove(false, sh_.desktop_dupl, sh_.gfx); // unconditional: always balance the freeze
                 if (glass_active()) {
-                    glass_.set_sizemove(false);
                     if (sh_.gfx.adapter_stale(hwnd_)) recover();
                     (void)poll_status();
                     full_dirty_ = true;

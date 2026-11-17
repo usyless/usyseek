@@ -10,10 +10,13 @@
 #include <dxgi1_2.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -565,11 +568,34 @@ public:
         wil::com_ptr<ID2D1Bitmap1> desktop_target_bmp;
         bool has_frame = false;
         uint64_t frame_seq = 0;
-        std::vector<FrameDelta> history;
         ULONGLONG retry_after_tick = 0;
 
         [[nodiscard]] long desk_w() const noexcept { return mon_rect.right - mon_rect.left; }
         [[nodiscard]] long desk_h() const noexcept { return mon_rect.bottom - mon_rect.top; }
+
+        /// Frame history, oldest first. Fixed ring: slots (and their rect vectors' capacity) are reused.
+        [[nodiscard]] size_t history_size() const noexcept { return history_len_; }
+        [[nodiscard]] const FrameDelta& history_at(size_t i) const noexcept { return history_[(history_head_ + i) % MAX_HISTORY]; }
+        /// Swaps `delta` into the newest slot; `delta` gets the evicted slot back for reuse.
+        void push_history(FrameDelta& delta) noexcept {
+            size_t idx = 0;
+            if (history_len_ < MAX_HISTORY) {
+                idx = (history_head_ + history_len_) % MAX_HISTORY;
+                ++history_len_;
+            } else {
+                idx = history_head_;
+                history_head_ = (history_head_ + 1) % MAX_HISTORY;
+            }
+            std::swap(history_[idx], delta);
+        }
+        void clear_history() noexcept { history_head_ = history_len_ = 0; }
+
+    private:
+        std::array<FrameDelta, MAX_HISTORY> history_{};
+        size_t history_head_ = 0;
+        size_t history_len_ = 0;
+
+    public:
 
         /// Part of `screen_rc` (virtual-desktop coordinates) on this output, in `desktop_tex` coordinates.
         [[nodiscard]] IntRect tex_rect_for(const RECT& screen_rc) const noexcept {
@@ -586,16 +612,29 @@ public:
         epoch_ = 0;
     }
 
+    /// Stops acquiring new frames (outputs that have none yet still get one) until the matching `end_freeze`.
+    /// Used while a glass window is dragged: the window is capture-excluded so the desktop behind it doesn't change,
+    /// and Windows can bake the cursor into duplicated frames during a move loop. Every output is refreshed first so
+    /// the frozen frames are current.
+    void begin_freeze(Gfx& gfx) {
+        if (freeze_depth_++ > 0 || !gfx.ready()) return;
+        sync_epoch(gfx);
+        const ULONGLONG now = GetTickCount64();
+        mons_scratch_.clear();
+        EnumDisplayMonitors(nullptr, nullptr, &collect_monitor, reinterpret_cast<LPARAM>(&mons_scratch_));
+        for (const HMONITOR mon : mons_scratch_) (void)poll_output(gfx, mon, now, true);
+    }
+
+    void end_freeze() noexcept {
+        if (freeze_depth_ > 0) --freeze_depth_;
+    }
+
     /// Polls every output that `screen_rc` overlaps (without blocking, or with a brief wait on initial acquire).
     /// Fills `out` with their states and returns true only when every overlapped output has a valid frame.
     bool poll_rect(Gfx& gfx, const RECT& screen_rc, ULONGLONG now_tick, std::vector<const OutputState*>& out) {
         out.clear();
         if (!gfx.ready()) return false;
-        if (epoch_ != gfx.epoch()) {
-            outputs_.clear();
-            rot_dc_.reset();
-            epoch_ = gfx.epoch();
-        }
+        sync_epoch(gfx);
 
         mons_scratch_.clear();
         EnumDisplayMonitors(nullptr, &screen_rc, &collect_monitor, reinterpret_cast<LPARAM>(&mons_scratch_));
@@ -605,7 +644,7 @@ public:
 
         bool all_ok = true;
         for (const HMONITOR mon : mons_scratch_) {
-            if (const OutputState* st = poll_output(gfx, mon, now_tick)) {
+            if (const OutputState* st = poll_output(gfx, mon, now_tick, freeze_depth_ == 0)) {
                 out.push_back(st);
             } else {
                 all_ok = false;
@@ -615,6 +654,17 @@ public:
     }
 
 private:
+    /// Above this many changed rects a whole-frame copy is cheaper than individual region copies.
+    static constexpr size_t MAX_REGION_COPIES = 48;
+
+    void sync_epoch(Gfx& gfx) noexcept {
+        if (epoch_ != gfx.epoch()) {
+            outputs_.clear();
+            rot_dc_.reset();
+            epoch_ = gfx.epoch();
+        }
+    }
+
     static BOOL CALLBACK collect_monitor(HMONITOR m, HDC /*dc*/, LPRECT /*rc*/, LPARAM lp) noexcept {
         try {
             reinterpret_cast<std::vector<HMONITOR>*>(lp)->push_back(m);
@@ -624,9 +674,10 @@ private:
         return TRUE;
     }
 
-    const OutputState* poll_output(Gfx& gfx, HMONITOR mon, ULONGLONG now_tick) {
+    const OutputState* poll_output(Gfx& gfx, HMONITOR mon, ULONGLONG now_tick, bool acquire) {
         OutputState* st = find_or_create(mon);
         if (!ensure_duplication(gfx, *st, now_tick)) return st->has_frame ? st : nullptr;
+        if (!acquire && st->has_frame) return st;
 
         for (int attempt = 0; attempt < 4; ++attempt) {
             DXGI_OUTDUPL_FRAME_INFO info{};
@@ -649,51 +700,75 @@ private:
             const auto tex = res.try_query<ID3D11Texture2D>();
             if (!tex || !ensure_desktop_surface(gfx, *st, tex.get(), next_tex_id_)) break;
 
-            FrameDelta delta;
-            delta.dirty_all = !st->has_frame;
-            const UINT meta_bytes = info.TotalMetadataBufferSize;
-            if (meta_bytes > 0) {
-                metadata_buf_.resize(meta_bytes);
-                bool any_meta = false;
-                UINT move_bytes = 0;
-                if (SUCCEEDED(st->dupl->GetFrameMoveRects(
-                        meta_bytes, reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(metadata_buf_.data()), &move_bytes)) &&
-                    move_bytes > 0) {
-                    const UINT n = move_bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT);
-                    const auto* moves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(metadata_buf_.data());
-                    delta.dirty_rects.reserve(delta.dirty_rects.size() + n);
-                    for (UINT i = 0; i < n; ++i) delta.dirty_rects.push_back(tex_to_screen(*st, moves[i].DestinationRect));
-                    any_meta = true;
-                }
-                UINT dirty_bytes = 0;
-                if (SUCCEEDED(st->dupl->GetFrameDirtyRects(
-                        meta_bytes, reinterpret_cast<RECT*>(metadata_buf_.data()), &dirty_bytes)) &&
-                    dirty_bytes > 0) {
-                    const UINT n = dirty_bytes / sizeof(RECT);
-                    const auto* rects = reinterpret_cast<const RECT*>(metadata_buf_.data());
-                    delta.dirty_rects.reserve(delta.dirty_rects.size() + n);
-                    for (UINT i = 0; i < n; ++i) delta.dirty_rects.push_back(tex_to_screen(*st, rects[i]));
-                    any_meta = true;
-                }
-                if (!any_meta) delta.dirty_all = true;
+            FrameDelta& delta = scratch_delta_;
+            delta.seq = 0;
+            const bool have_meta = collect_frame_rects(*st, info.TotalMetadataBufferSize, delta);
+            delta.dirty_all = !st->has_frame || !have_meta;
+
+            const bool rotated = st->rotation != DesktopRotation::Identity;
+            ID3D11Texture2D* dst = rotated ? st->native_tex.get() : st->desktop_tex.get();
+            const bool full = delta.dirty_all || copy_rects_.size() > MAX_REGION_COPIES;
+            if (full) {
+                gfx.d3d_context()->CopyResource(dst, tex.get());
             } else {
-                delta.dirty_all = true;
+                // Only changed regions differ from the previous frame already held in `dst`.
+                for (const RECT& r : copy_rects_) {
+                    const D3D11_BOX box{.left = static_cast<UINT>(r.left), .top = static_cast<UINT>(r.top), .front = 0,
+                                        .right = static_cast<UINT>(r.right), .bottom = static_cast<UINT>(r.bottom), .back = 1,};
+                    gfx.d3d_context()->CopySubresourceRegion(dst, 0, box.left, box.top, 0, tex.get(), 0, &box);
+                }
+            }
+            if (rotated && !rotate_into_desktop(*st, full ? nullptr : &delta.dirty_rects)) {
+                st->has_frame = false; // desktop_tex is now out of step with native_tex: force a full copy next time
+                break;
             }
 
-            if (st->rotation == DesktopRotation::Identity) {
-                gfx.d3d_context()->CopyResource(st->desktop_tex.get(), tex.get());
-            } else {
-                gfx.d3d_context()->CopyResource(st->native_tex.get(), tex.get());
-                if (!rotate_into_desktop(*st)) break;
-            }
             st->has_frame = true;
             ++st->frame_seq;
             delta.seq = st->frame_seq;
-            st->history.push_back(std::move(delta));
-            if (st->history.size() > OutputState::MAX_HISTORY) st->history.erase(st->history.begin());
+            st->push_history(delta);
             break;
         }
         return st->has_frame ? st : nullptr;
+    }
+
+    /// Reads the frame's move/dirty rects into `copy_rects_` (texture space, clamped) and `delta.dirty_rects`
+    /// (virtual-desktop space). Returns false when the frame carries no usable metadata.
+    bool collect_frame_rects(const OutputState& st, UINT meta_bytes, FrameDelta& delta) {
+        delta.dirty_rects.clear();
+        copy_rects_.clear();
+        if (meta_bytes == 0) return false;
+        metadata_buf_.resize(meta_bytes);
+        const bool swap = st.rotation == DesktopRotation::Rot90 || st.rotation == DesktopRotation::Rot270;
+        const RECT bounds{.left = 0, .top = 0,
+                          .right = static_cast<LONG>(swap ? st.tex_h : st.tex_w),
+                          .bottom = static_cast<LONG>(swap ? st.tex_w : st.tex_h),};
+        const auto add = [&](const RECT& r) {
+            RECT c{};
+            if (!IntersectRect(&c, &r, &bounds)) return;
+            copy_rects_.push_back(c);
+            delta.dirty_rects.push_back(tex_to_screen(st, c));
+        };
+
+        bool any_meta = false;
+        UINT move_bytes = 0;
+        if (SUCCEEDED(st.dupl->GetFrameMoveRects(
+                meta_bytes, reinterpret_cast<DXGI_OUTDUPL_MOVE_RECT*>(metadata_buf_.data()), &move_bytes)) &&
+            move_bytes > 0) {
+            const std::span moves{reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(metadata_buf_.data()),
+                                  move_bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT)};
+            for (const auto& m : moves) add(m.DestinationRect);
+            any_meta = true;
+        }
+        UINT dirty_bytes = 0;
+        if (SUCCEEDED(st.dupl->GetFrameDirtyRects(
+                meta_bytes, reinterpret_cast<RECT*>(metadata_buf_.data()), &dirty_bytes)) &&
+            dirty_bytes > 0) {
+            const std::span rects{reinterpret_cast<const RECT*>(metadata_buf_.data()), dirty_bytes / sizeof(RECT)};
+            for (const RECT& r : rects) add(r);
+            any_meta = true;
+        }
+        return any_meta;
     }
 
     /// Duplication metadata rects are in texture space; map them to virtual-desktop coordinates.
@@ -723,17 +798,28 @@ private:
         return outputs_.back().get();
     }
 
-    /// Draws the native-orientation frame into the desktop-oriented texture.
-    bool rotate_into_desktop(OutputState& st) noexcept {
+    /// Draws the native-orientation frame into the desktop-oriented texture, limited to the bounding box of
+    /// `dirty` (virtual-desktop rects) when given.
+    bool rotate_into_desktop(OutputState& st, const std::vector<RECT>* dirty) noexcept {
         if (!rot_dc_ || !st.native_bmp || !st.desktop_target_bmp) return false;
+        std::optional<D2D1_RECT_F> clip;
+        if (dirty) {
+            if (dirty->empty()) return true;
+            RECT bb = dirty->front();
+            for (const RECT& r : *dirty) UnionRect(&bb, &bb, &r);
+            clip = D2D1::RectF(static_cast<float>(bb.left - st.mon_rect.left), static_cast<float>(bb.top - st.mon_rect.top),
+                               static_cast<float>(bb.right - st.mon_rect.left), static_cast<float>(bb.bottom - st.mon_rect.top));
+        }
         const Affine2D m = tex_to_desktop_xform(st.rotation, st.desk_w(), st.desk_h(), 0.0f, 0.0f);
         const D2D1_SIZE_U native = st.native_bmp->GetPixelSize();
         const D2D1_RECT_F src = D2D1::RectF(0.0f, 0.0f, static_cast<float>(native.width), static_cast<float>(native.height));
         rot_dc_->SetTarget(st.desktop_target_bmp.get());
         rot_dc_->BeginDraw();
+        if (clip) rot_dc_->PushAxisAlignedClip(*clip, D2D1_ANTIALIAS_MODE_ALIASED);
         rot_dc_->SetTransform(D2D1::Matrix3x2F(m.m11, m.m12, m.m21, m.m22, m.dx, m.dy));
         rot_dc_->DrawBitmap(st.native_bmp.get(), &src, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src, nullptr);
         rot_dc_->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (clip) rot_dc_->PopAxisAlignedClip();
         const HRESULT hr = rot_dc_->EndDraw();
         rot_dc_->SetTarget(nullptr);
         return SUCCEEDED(hr);
@@ -750,7 +836,7 @@ private:
         st.rotation = DesktopRotation::Identity;
         st.tex_w = st.tex_h = 0;
         st.has_frame = false;
-        st.history.clear();
+        st.clear_history();
     }
 
     static bool ensure_duplication(Gfx& gfx, OutputState& st, ULONGLONG now_tick) noexcept {
@@ -848,6 +934,9 @@ private:
 
     std::vector<std::unique_ptr<OutputState>> outputs_; // stable addresses: windows hold pointers across a frame
     std::vector<HMONITOR> mons_scratch_;
+    std::vector<RECT> copy_rects_; // texture-space regions to copy for the frame being acquired
+    FrameDelta scratch_delta_;     // swapped with the evicted history slot, so rect storage is recycled
+    int freeze_depth_ = 0;
     wil::com_ptr<ID2D1DeviceContext> rot_dc_; // only created once a rotated output is duplicated
     uint64_t epoch_ = 0;
     uint64_t next_tex_id_ = 0;
@@ -879,6 +968,7 @@ public:
         origin_override_.reset();
         seeded_gdi_ = false;
         scene_active_ = false;
+        end_freeze();
         sizemove_ = false;
         win_bmp_w_ = win_bmp_h_ = 0;
         cached_glass_w_ = cached_glass_h_ = 0;
@@ -890,7 +980,17 @@ public:
     }
 
     void set_origin_override(std::optional<POINT> pt) noexcept { origin_override_ = pt; }
-    void set_sizemove(bool on) noexcept { sizemove_ = on; }
+    /// Enters/leaves a window move-size loop; while in one the shared duplicator stops acquiring frames.
+    void set_sizemove(bool on, DesktopDuplicator& dupl, Gfx& gfx) {
+        if (on == sizemove_) return;
+        sizemove_ = on;
+        if (on) {
+            dupl.begin_freeze(gfx);
+            frozen_dupl_ = &dupl;
+        } else {
+            end_freeze();
+        }
+    }
     [[nodiscard]] POINT last_rendered_origin() const noexcept { return last_rendered_origin_; }
     [[nodiscard]] bool has_cached_desktop_glass() const noexcept { return cached_glass_valid_ && cached_glass_bmp_ != nullptr; }
 
@@ -1053,6 +1153,11 @@ public:
     }
 
 private:
+    void end_freeze() noexcept {
+        if (frozen_dupl_) frozen_dupl_->end_freeze();
+        frozen_dupl_ = nullptr;
+    }
+
     struct GlassCacheKey {
         UINT pw = 0;
         UINT ph = 0;
@@ -1170,24 +1275,27 @@ private:
             return {false, false};
         }
 
-        // Re-align views with outputs, keeping existing state for monitors that are still covered.
-        bool set_changed = views_.size() != outs_.size();
-        views_scratch_.clear();
-        for (size_t i = 0; i < outs_.size(); ++i) {
-            const auto* st = outs_[i];
-            const auto it = std::ranges::find(views_, st->mon, &OutputView::mon);
-            if (it == views_.end()) {
-                OutputView v;
-                v.mon = st->mon;
-                views_scratch_.push_back(std::move(v));
-                set_changed = true;
-            } else {
-                if (std::cmp_not_equal(it - views_.begin(), i) || it->seen_tex_id != st->tex_id) set_changed = true;
-                views_scratch_.push_back(std::move(*it));
+        // Re-align views with outputs (keeping state for monitors still covered) only when the monitor list changed.
+        bool aligned = views_.size() == outs_.size();
+        for (size_t i = 0; aligned && i < outs_.size(); ++i) aligned = views_[i].mon == outs_[i]->mon;
+        bool set_changed = !aligned;
+        if (aligned) {
+            for (size_t i = 0; i < outs_.size(); ++i) {
+                if (views_[i].seen_tex_id != outs_[i]->tex_id) set_changed = true;
             }
+        } else {
+            views_scratch_.clear();
+            for (const auto* st : outs_) {
+                const auto it = std::ranges::find(views_, st->mon, &OutputView::mon);
+                if (it == views_.end()) {
+                    views_scratch_.emplace_back().mon = st->mon;
+                } else {
+                    views_scratch_.push_back(std::move(*it));
+                }
+            }
+            views_.swap(views_scratch_);
+            views_scratch_.clear();
         }
-        views_.swap(views_scratch_);
-        views_scratch_.clear();
 
         bool any_new_frame = set_changed;
         for (size_t i = 0; i < outs_.size() && !any_new_frame; ++i) {
@@ -1221,8 +1329,9 @@ private:
     /// True when frames newer than `seen_seq` may have changed pixels inside `win_rc`.
     [[nodiscard]] static bool output_touched(const DesktopDuplicator::OutputState& st, uint64_t seen_seq, const RECT& win_rc) noexcept {
         if (st.frame_seq == seen_seq) return false;
-        if (seen_seq == 0 || st.history.empty() || st.history.front().seq > seen_seq + 1) return true;
-        for (const auto& delta : st.history) {
+        if (seen_seq == 0 || st.history_size() == 0 || st.history_at(0).seq > seen_seq + 1) return true;
+        for (size_t h = 0; h < st.history_size(); ++h) {
+            const auto& delta = st.history_at(h);
             if (delta.seq <= seen_seq) continue;
             if (delta.dirty_all) return true;
             for (const RECT& r : delta.dirty_rects) {
@@ -1651,6 +1760,7 @@ private:
     bool seeded_gdi_ = false;
     bool scene_active_ = false;
     bool sizemove_ = false;
+    DesktopDuplicator* frozen_dupl_ = nullptr; // set while this window holds a duplicator freeze
 };
 
 [[nodiscard]] inline GlassStyle make_desktop_glass_style(const Theme& t, float corner_radius, bool fullscreen = false) noexcept {
