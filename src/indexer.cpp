@@ -675,13 +675,13 @@ public:
         return true;
     }
     void close() noexcept {
-        std::lock_guard lk{m_};
+        std::scoped_lock lk{m_};
         closed_ = true;
         not_full_.notify_all();
         not_empty_.notify_all();
     }
     [[nodiscard]] bool done() noexcept {
-        std::lock_guard lk{m_};
+        std::scoped_lock lk{m_};
         return closed_ && q_.empty();
     }
 
@@ -825,7 +825,7 @@ struct PyVision {
     }
 
     [[nodiscard]] bool is_cancelled() const noexcept {
-        std::lock_guard lk{proc_mu};
+        std::scoped_lock lk{proc_mu};
         return cancelled;
     }
 
@@ -1588,7 +1588,7 @@ int run_indexer(Settings& settings) {
                     upsert_any.store(true, std::memory_order_relaxed);
                 } else {
                     std::printf("upsert failed: %s\n", e.c_str());
-                    std::lock_guard lk{upsert_mx};
+                    std::scoped_lock lk{upsert_mx};
                     ++upsert_failures;
                     if (upsert_err.empty()) upsert_err = std::move(e);
                 }

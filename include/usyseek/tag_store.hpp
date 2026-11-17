@@ -45,7 +45,7 @@ public:
     ~TagStore() { close(); }
 
     bool open(const std::filesystem::path& db_path, std::string* error = nullptr) {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         close_locked();
 
         std::error_code ec;
@@ -93,12 +93,12 @@ public:
     }
 
     void close() noexcept {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         close_locked();
     }
 
     [[nodiscard]] bool opened() const noexcept {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         return db_ != nullptr;
     }
 
@@ -106,7 +106,7 @@ public:
     template <std::ranges::input_range R>
         requires std::convertible_to<std::ranges::range_reference_t<R>, std::string_view>
     bool set_file_tags(uint64_t id, std::string_view path_utf8, const R& tags, std::string* error = nullptr) {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return false;
 
         std::vector<std::string_view> clean;
@@ -140,7 +140,7 @@ public:
 
     /// Unions `entries` into the store inside a single transaction (ignores entries with no tags).
     bool merge_batch(std::span<const TaggedFileEntry> entries, std::string* error = nullptr) {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return false;
         if (entries.empty()) return true;
 
@@ -187,7 +187,7 @@ public:
     }
 
     bool remove_ids(std::span<const uint64_t> ids, std::string* error = nullptr) {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return false;
         if (ids.empty()) return true;
 
@@ -205,7 +205,7 @@ public:
     }
 
     [[nodiscard]] std::optional<bool> is_collection_backfilled(std::string_view coll, std::string* error = nullptr) {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return std::nullopt;
         const std::string key = backfill_key(coll);
         Stmt st;
@@ -219,7 +219,7 @@ public:
     }
 
     bool mark_collection_backfilled(std::string_view coll, std::string* error = nullptr) {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return false;
         const std::string key = backfill_key(coll);
         Stmt st;
@@ -231,7 +231,7 @@ public:
     }
 
     bool clear_collection_backfilled(std::string_view coll, std::string* error = nullptr) {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return false;
         const std::string key = backfill_key(coll);
         Stmt st;
@@ -241,7 +241,7 @@ public:
     }
 
     [[nodiscard]] std::optional<std::vector<TaggedFileEntry>> list_all(std::string* error = nullptr) {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return std::nullopt;
 
         Stmt st;
@@ -293,7 +293,7 @@ public:
     }
 
     [[nodiscard]] std::optional<TagStoreStats> stats(std::string* error = nullptr) {
-        std::lock_guard lk{mx_};
+        std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return std::nullopt;
 
         TagStoreStats out;

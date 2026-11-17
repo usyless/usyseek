@@ -102,7 +102,7 @@ public:
 
     void stop() noexcept {
         {
-            std::lock_guard lk{m_};
+            std::scoped_lock lk{m_};
             stopping_ = true;
         }
         cv_.notify_all();
@@ -114,7 +114,7 @@ public:
         if (failed_.contains(id)) return;
         if (const auto it = bitmaps_.find(id); it != bitmaps_.end() && it->second.px >= px) return;
         {
-            std::lock_guard lk{m_};
+            std::scoped_lock lk{m_};
             if (!pending_.insert(id).second) return;
             queue_.push_front({id, path, px});
             while (queue_.size() > (full_ ? 6u : 64u)) {
@@ -139,7 +139,7 @@ public:
     bool process(ID2D1DeviceContext* dc) {
         done_scratch_.clear();
         {
-            std::lock_guard lk{m_};
+            std::scoped_lock lk{m_};
             done_scratch_.swap(done_);
         }
         for (auto& d : done_scratch_) {
@@ -177,7 +177,7 @@ public:
     /// Drops every bitmap, queued request and failure (frees preview memory once the viewer closes).
     void clear() {
         {
-            std::lock_guard lk{m_};
+            std::scoped_lock lk{m_};
             for (const auto& q : queue_) pending_.erase(q.id);
             queue_.clear();
         }
@@ -224,7 +224,7 @@ private:
             d.px = r.px;
             if (!full_ || !load_full(r, d)) load(r, d);
             {
-                std::lock_guard lk{m_};
+                std::scoped_lock lk{m_};
                 pending_.erase(r.id);
                 done_.push_back(std::move(d));
             }

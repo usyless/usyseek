@@ -147,7 +147,7 @@ public:
     void load_async(fs::path model_dir, std::string model_name) {
         if (stopping_.load(std::memory_order_acquire)) return;
         {
-            const std::lock_guard lk{m_};
+            const std::scoped_lock lk{m_};
             if (stopping_.load(std::memory_order_acquire)) return;
             const bool same = model_name == name_ && model_dir == dir_;
             if (same && (busy_ || state_ == State::Ready)) return;
@@ -167,7 +167,7 @@ public:
         fs::path dir;
         std::string name;
         {
-            const std::lock_guard lk{m_};
+            const std::scoped_lock lk{m_};
             if (busy_ || state_ != State::Failed) return;
             dir = dir_;
             name = name_;
@@ -181,14 +181,14 @@ public:
         fs::path dir;
         std::string name;
         {
-            const std::lock_guard lk{m_};
+            const std::scoped_lock lk{m_};
             if (busy_ || state_ != State::Failed) return;
             dir = dir_;
             name = name_;
         }
         const FileSignature now = file_signature(dir, name);
         {
-            const std::lock_guard lk{m_};
+            const std::scoped_lock lk{m_};
             const bool settled = now == seen_files_;
             seen_files_ = now;
             if (!settled || now == failed_files_) return;
@@ -199,7 +199,7 @@ public:
     /// Lock-free: drawn every frame by the UI thread.
     [[nodiscard]] State state() const noexcept { return state_.load(); }
     [[nodiscard]] std::wstring error() const {
-        const std::lock_guard lk{m_};
+        const std::scoped_lock lk{m_};
         return error_;
     }
 
@@ -246,7 +246,7 @@ public:
             const size_t n = out[0].GetTensorTypeAndShapeInfo().GetElementCount();
             std::vector<float> v(p, p + n);
 
-            const std::lock_guard lk{m_};
+            const std::scoped_lock lk{m_};
             if (model == model_) { // not replaced by another model in the meantime
                 cache_.emplace_front(text, v);
                 if (cache_.size() > 64) cache_.pop_back();
@@ -311,7 +311,7 @@ private:
             std::string name;
             uint64_t generation = 0;
             {
-                const std::lock_guard lk{m_};
+                const std::scoped_lock lk{m_};
                 dir = dir_;
                 name = name_;
                 generation = wanted_;
@@ -330,7 +330,7 @@ private:
 
             std::shared_ptr<const Model> previous; // released after the lock
             {
-                const std::lock_guard lk{m_};
+                const std::scoped_lock lk{m_};
                 if (stopping_.load(std::memory_order_acquire)) {
                     busy_ = false;
                     break;
@@ -472,7 +472,7 @@ public:
     void stop() noexcept {
         disarm_db_want_wait();
         {
-            std::lock_guard lk{m_};
+            std::scoped_lock lk{m_};
             stopping_ = true;
         }
         cv_.notify_all();
@@ -482,7 +482,7 @@ public:
 
     void set_indexing_active(bool active) noexcept {
         {
-            std::lock_guard lk{m_};
+            std::scoped_lock lk{m_};
             indexing_active_hint_ = active;
         }
         cv_.notify_one();
@@ -490,7 +490,7 @@ public:
 
     void search(SearchRequest r) noexcept {
         {
-            std::lock_guard lk{m_};
+            std::scoped_lock lk{m_};
             pending_search_ = std::move(r);
         }
         cv_.notify_one();
@@ -498,7 +498,7 @@ public:
 
     void post(std::function<void(Db&)> job, bool notify_if_dropped = true) {
         {
-            std::lock_guard lk{m_};
+            std::scoped_lock lk{m_};
             jobs_.push_back({std::move(job), notify_if_dropped});
         }
         cv_.notify_one();
@@ -507,14 +507,14 @@ public:
     /// Runs `job` as soon as the database is open (waiting through an indexing pause if needed).
     void post_when_ready(std::function<void(Db&)> job) {
         {
-            std::lock_guard lk{m_};
+            std::scoped_lock lk{m_};
             deferred_jobs_.push_back(std::move(job));
         }
         cv_.notify_one();
     }
 
     void set_settings(const Settings& s) {
-        std::lock_guard lk{m_};
+        std::scoped_lock lk{m_};
         settings_ = s;
     }
 
@@ -527,7 +527,7 @@ public:
     [[nodiscard]] bool db_paused_for_indexing() const noexcept { return db_state() == DbState::PausedForIndexing; }
 
     [[nodiscard]] std::string collection() const {
-        std::lock_guard lk{m_};
+        std::scoped_lock lk{m_};
         return settings_.model_name;
     }
 
@@ -538,7 +538,7 @@ private:
 
     void arm_db_want_wait() noexcept {
         if (!db_want_event_) return;
-        std::lock_guard lk{wait_mx_};
+        std::scoped_lock lk{wait_mx_};
         if (wait_handle_) {
             UnregisterWaitEx(wait_handle_, nullptr);
             wait_handle_ = nullptr;
@@ -547,7 +547,7 @@ private:
     }
 
     void disarm_db_want_wait() noexcept {
-        std::lock_guard lk{wait_mx_};
+        std::scoped_lock lk{wait_mx_};
         if (wait_handle_) {
             UnregisterWaitEx(wait_handle_, INVALID_HANDLE_VALUE);
             wait_handle_ = nullptr;
@@ -558,7 +558,7 @@ private:
         ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
         Settings s;
         {
-            std::lock_guard lk{m_};
+            std::scoped_lock lk{m_};
             s = settings_;
         }
 

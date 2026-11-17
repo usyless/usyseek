@@ -2532,7 +2532,7 @@ private:
     };
 
     static JobView view(Job& job) {
-        const std::lock_guard lk{job.m};
+        const std::scoped_lock lk{job.m};
         return {job.log, job.failed, job.done, job.total};
     }
 
@@ -2547,7 +2547,7 @@ private:
         std::wstring clean = trim(line);
         if (clean.empty()) return;
         {
-            const std::lock_guard lk{job.m};
+            const std::scoped_lock lk{job.m};
             job.log = std::move(clean);
             job.failed = failed;
         }
@@ -2556,7 +2556,7 @@ private:
 
     void report_progress(Job& job, uint64_t done, uint64_t total) {
         {
-            const std::lock_guard lk{job.m};
+            const std::scoped_lock lk{job.m};
             job.done = done;
             job.total = total;
         }
@@ -2570,7 +2570,7 @@ private:
         job.busy = true;
         ++sh_.background_jobs;
         {
-            const std::lock_guard lk{job.m};
+            const std::scoped_lock lk{job.m};
             job.log = L"Starting…";
             job.failed = false;
             job.done = job.total = 0;
@@ -2582,7 +2582,7 @@ private:
                 job.busy = false;
                 --sh_.background_jobs;
                 {
-                    const std::lock_guard lk{job.m};
+                    const std::scoped_lock lk{job.m};
                     job.done = job.total = 0;
                 }
                 finished();
@@ -2808,7 +2808,7 @@ private:
         if (repo.empty()) repo = default_repo();
         if (!valid_repo(repo)) {
             {
-                const std::lock_guard lk{model_job_.m};
+                const std::scoped_lock lk{model_job_.m};
                 model_job_.log = L"Enter the repository as owner/name, for example timm/PE-Core-L-14-336";
                 model_job_.failed = true;
             }

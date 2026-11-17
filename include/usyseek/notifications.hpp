@@ -35,7 +35,7 @@ namespace detail {
 template <typename Fn>
 inline auto with_notifications_lock(Fn&& fn) {
     static std::mutex in_proc_mu;
-    const std::lock_guard in_proc_lk{in_proc_mu};
+    const std::scoped_lock in_proc_lk{in_proc_mu};
     const wil::unique_mutex_nothrow mu{CreateMutexW(nullptr, FALSE, NOTIFICATIONS_MUTEX)};
     bool owned = !mu;
     if (mu) {
