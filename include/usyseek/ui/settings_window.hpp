@@ -75,21 +75,35 @@ public:
         wc.lpfnWndProc = &SettingsWindow::wndproc;
         wc.hInstance = inst;
         wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(101));
-        wc.hIconSm = LoadIconW(inst, MAKEINTRESOURCEW(101));
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         wc.lpszClassName = SETTINGS_CLASS;
         RegisterClassExW(&wc);
 
-        const UINT dpi = GetDpiForSystem();
-        const float s = (dpi > 0 ? static_cast<float>(dpi) : 96.0f) / 96.0f;
-        RECT rc{.left = 0, .top = 0, .right = static_cast<LONG>(920 * s), .bottom = static_cast<LONG>(720 * s)};
         const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-        AdjustWindowRectExForDpi(&rc, style, FALSE, 0, dpi);
+        const auto initial_size = [style](UINT dpi) noexcept {
+            const float s = (dpi > 0 ? static_cast<float>(dpi) : 96.0f) / 96.0f;
+            RECT rc{.left = 0, .top = 0, .right = static_cast<LONG>(920 * s), .bottom = static_cast<LONG>(720 * s)};
+            AdjustWindowRectExForDpi(&rc, style, FALSE, 0, dpi);
+            return SIZE{.cx = rc.right - rc.left, .cy = rc.bottom - rc.top};
+        };
+        const UINT sys_dpi = GetDpiForSystem();
+        const SIZE guess = initial_size(sys_dpi);
 
         hwnd_ = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, SETTINGS_CLASS, L"usyseek — Settings & Indexing",
-                                style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
+                                style, CW_USEDEFAULT, CW_USEDEFAULT, guess.cx, guess.cy,
                                 nullptr, nullptr, inst, this);
         if (!hwnd_) return false;
+        // The window can land on a monitor whose scale differs from the (sign-in time) system DPI.
+        if (const UINT dpi = GetDpiForWindow(hwnd_); dpi != 0 && dpi != sys_dpi) {
+            SIZE sz = initial_size(dpi);
+            MONITORINFO mi{.cbSize = sizeof(mi)};
+            if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) {
+                sz.cx = std::min<LONG>(sz.cx, std::max<LONG>(1, mi.rcWork.right - mi.rcWork.left));
+                sz.cy = std::min<LONG>(sz.cy, std::max<LONG>(1, mi.rcWork.bottom - mi.rcWork.top));
+            }
+            SetWindowPos(hwnd_, nullptr, 0, 0, sz.cx, sz.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        icons_.apply(hwnd_, inst, 101);
         apply_window_theme(hwnd_, sh_.theme, false, true);
         if (!target_.attach(sh_.gfx, hwnd_, glass_active())) return false;
 
@@ -1157,7 +1171,7 @@ private:
 
         const float next_y = card_begin(cv, x, y, w, h);
 
-        const D2D1_RECT_F icon_r = rect(std::round(x + ((w - icon_sz) * 0.5f)), icon_y, icon_sz, icon_sz);
+        const D2D1_RECT_F icon_r = cv.snap(rect(x + ((w - icon_sz) * 0.5f), icon_y, icon_sz, icon_sz));
         if (ID2D1Bitmap1* bmp = ensure_app_icon(cv)) {
             cv.bitmap(bmp, icon_r);
         } else {
@@ -4240,8 +4254,10 @@ private:
                 return 0;
             case WM_DPICHANGED: {
                 full_dirty_ = true;
+                icons_.apply(hwnd_, inst_, 101);
                 const RECT* r = reinterpret_cast<const RECT*>(lp);
                 SetWindowPos(hwnd_, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+                target_.sync_dpi();
                 return 0;
             }
             case WM_GETMINMAXINFO: {
@@ -4458,6 +4474,7 @@ private:
     int raw_hover_id_ = IdNone;
     int raw_hover_index_ = 0;
     HoverTracker hover_;
+    WindowIcons icons_;
     HoverTooltip tooltip_;
     bool tracking_ = false;
     bool anim_active_ = false;

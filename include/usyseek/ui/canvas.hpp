@@ -266,7 +266,6 @@ inline D2D1_RECT_F rect(float x, float y, float w, float h) noexcept { return D2
 inline D2D1_RECT_F inset(D2D1_RECT_F r, float dx, float dy) noexcept { return D2D1::RectF(r.left + dx, r.top + dy, r.right - dx, r.bottom - dy); }
 inline float width(const D2D1_RECT_F& r) noexcept { return r.right - r.left; }
 inline float height(const D2D1_RECT_F& r) noexcept { return r.bottom - r.top; }
-inline D2D1_RECT_F snap(D2D1_RECT_F r) noexcept { return D2D1::RectF(std::round(r.left), std::round(r.top), std::round(r.right), std::round(r.bottom)); }
 
 /// Immediate-mode drawing helpers over one device context, plus hit-region recording.
 class Canvas {
@@ -282,6 +281,29 @@ public:
     [[nodiscard]] D2D1_COLOR_F tag_color(std::string_view tag) const noexcept { return usyseek::ui::tag_color(theme_, tag); }
     [[nodiscard]] bool has_dirty_clip() const noexcept { return dirty_clip_.has_value(); }
     [[nodiscard]] const std::optional<D2D1_RECT_F>& dirty_clip() const noexcept { return dirty_clip_; }
+    [[nodiscard]] float scale() const noexcept {
+        const float s = target_.scale();
+        return s > 0.0f ? s : 1.0f;
+    }
+    [[nodiscard]] float snap(float v) const noexcept {
+        const float s = scale();
+        return std::round(v * s) / s;
+    }
+    [[nodiscard]] D2D1_RECT_F snap(D2D1_RECT_F r) const noexcept {
+        const float s = scale();
+        const float l = std::round(r.left * s);
+        const float t = std::round(r.top * s);
+        const float ri = r.right > r.left ? std::max(l + 1.0f, std::round(r.right * s)) : std::round(r.right * s);
+        const float b = r.bottom > r.top ? std::max(t + 1.0f, std::round(r.bottom * s)) : std::round(r.bottom * s);
+        return D2D1::RectF(l / s, t / s, ri / s, b / s);
+    }
+    /// Returns `{origin_dip, thickness_dip}` for a 1-DIP hairline aligned to whole device pixels.
+    [[nodiscard]] std::pair<float, float> hairline(float v) const noexcept {
+        const float s = scale();
+        const float px = std::round(v * s);
+        const float n = std::max(1.0f, std::round(s));
+        return {px / s, n / s};
+    }
 
     /// Returns true if `r` (expanded by `pad`) overlaps the dirty clip and active stack clip.
     [[nodiscard]] bool intersects_clip(D2D1_RECT_F r, float pad = 0.0f) const noexcept {
@@ -361,8 +383,15 @@ public:
         if (!intersects_clip(D2D1::RectF(c.x - r, c.y - r, c.x + r, c.y + r), (w * 0.5f) + 1.0f)) return;
         dc_->DrawEllipse(D2D1::Ellipse(c, r, r), brush(col), w);
     }
-    void hline(float x0, float x1, float y, D2D1_COLOR_F c) noexcept { fill(D2D1::RectF(x0, y, x1, y + 1.0f), c); }
-    void vline(float x, float y0, float y1, D2D1_COLOR_F c) noexcept { fill(D2D1::RectF(x, y0, x + 1.0f, y1), c); }
+    /// Hairlines land on whole device pixels (a 1-DIP line is 1.5 px at 150%, which renders soft and uneven).
+    void hline(float x0, float x1, float y, D2D1_COLOR_F c) noexcept {
+        const auto [top, thick] = hairline(y);
+        fill(D2D1::RectF(snap(x0), top, snap(x1), top + thick), c);
+    }
+    void vline(float x, float y0, float y1, D2D1_COLOR_F c) noexcept {
+        const auto [left, thick] = hairline(x);
+        fill(D2D1::RectF(left, snap(y0), left + thick, snap(y1)), c);
+    }
 
     void text(std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c, Align a = Align::Left) noexcept {
         if (s.empty() || !intersects_clip(r, 1.0f)) return;
@@ -400,12 +429,16 @@ public:
         if (!bmp || !intersects_clip(tr, 1.0f)) return;
         const D2D1_SIZE_F bs = bmp->GetSize();
         if (bs.width <= 0.0f || bs.height <= 0.0f) return;
-        const FitRect dest = fit_image(bs.width, bs.height, FitRect{.left = tr.left, .top = tr.top, .width = width(tr), .height = height(tr)}, fit);
-        const float s = dest.width / bs.width;
-        const D2D1_RECT_F drawn = fit == ThumbFit::Contain ? rect(dest.left, dest.top, dest.width, dest.height) : tr;
+        const D2D1_RECT_F box = snap(tr);
+        const FitRect dest = fit_image(bs.width, bs.height, FitRect{.left = box.left, .top = box.top, .width = width(box), .height = height(box)}, fit);
+        const D2D1_RECT_F drawn = fit == ThumbFit::Contain ? snap(rect(dest.left, dest.top, dest.width, dest.height)) : box;
+        const float sx = fit == ThumbFit::Contain ? (width(drawn) / bs.width) : (dest.width / bs.width);
+        const float sy = fit == ThumbFit::Contain ? (height(drawn) / bs.height) : sx;
+        const float tx = fit == ThumbFit::Contain ? drawn.left : dest.left;
+        const float ty = fit == ThumbFit::Contain ? drawn.top : dest.top;
         if (ID2D1BitmapBrush1* bb = target_.bitmap_brush(bmp)) {
             bb->SetOpacity(opacity_);
-            bb->SetTransform(D2D1::Matrix3x2F::Scale(s, s) * D2D1::Matrix3x2F::Translation(dest.left, dest.top));
+            bb->SetTransform(D2D1::Matrix3x2F::Scale(sx, sy) * D2D1::Matrix3x2F::Translation(tx, ty));
             dc_->FillRoundedRectangle(D2D1::RoundedRect(drawn, radius, radius), bb);
         }
     }
@@ -413,14 +446,18 @@ public:
     /// Plain (unclipped, square) bitmap draw with configurable resampling.
     void bitmap(ID2D1Bitmap* bmp, D2D1_RECT_F dest,
                 D2D1_INTERPOLATION_MODE mode = D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC) noexcept {
-        if (!bmp || !intersects_clip(dest, 1.0f)) return;
+        if (!bmp) return;
+        dest = snap(dest);
+        if (!intersects_clip(dest, 1.0f)) return;
         dc_->DrawBitmap(bmp, &dest, opacity_, mode, nullptr, nullptr);
     }
 
     /// Draws `src` rectangle (in bitmap DIPs) mapped into `dest`.
     void bitmap_region(ID2D1Bitmap* bmp, D2D1_RECT_F dest, D2D1_RECT_F src,
                        D2D1_INTERPOLATION_MODE mode = D2D1_INTERPOLATION_MODE_LINEAR) noexcept {
-        if (!bmp || !intersects_clip(dest, 1.0f)) return;
+        if (!bmp) return;
+        dest = snap(dest);
+        if (!intersects_clip(dest, 1.0f)) return;
         dc_->DrawBitmap(bmp, &dest, opacity_, mode, &src, nullptr);
     }
 

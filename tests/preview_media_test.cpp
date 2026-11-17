@@ -79,6 +79,15 @@ void test_path_and_timing_helpers() {
     // Invalid dpi_scale <= 0 safely defaults to 1.0.
     const FitBox b3 = compute_preview_box(200, 100, 0, 0, 0.0f, FitBox{0.0f, 0.0f, 400.0f, 400.0f});
     CHECK(approx(b3.width, 200.0f) && approx(b3.height, 100.0f));
+
+    // Fractional DPI scales snap preview box edges to whole device pixels.
+    for (const float scale : {1.25f, 1.5f}) {
+        const FitBox bf = compute_preview_box(101, 75, 0, 0, scale, FitBox{10.0f, 20.0f, 400.0f, 300.0f});
+        CHECK(approx(bf.width * scale, 101.0f));
+        CHECK(approx(bf.height * scale, 75.0f));
+        CHECK(approx(bf.left * scale, std::round(bf.left * scale)));
+        CHECK(approx(bf.top * scale, std::round(bf.top * scale)));
+    }
 }
 
 void test_gif_compositor() {

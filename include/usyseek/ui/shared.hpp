@@ -296,6 +296,30 @@ inline bool confirm_box(HWND owner, const wchar_t* title, const std::wstring& me
     return MessageBoxW(owner, message.c_str(), title, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES;
 }
 
+/// Title-bar/taskbar icons loaded at the window's current DPI (class icons are fixed at the system DPI).
+struct WindowIcons {
+    wil::unique_hicon big_icon;
+    wil::unique_hicon small_icon;
+
+    void apply(HWND hwnd, HINSTANCE inst, int res_id) noexcept {
+        if (!hwnd) return;
+        UINT dpi = GetDpiForWindow(hwnd);
+        if (dpi == 0) dpi = GetDpiForSystem();
+        const auto load = [&](int cx_metric, int cy_metric) noexcept {
+            return static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(res_id), IMAGE_ICON,
+                                                 GetSystemMetricsForDpi(cx_metric, dpi),
+                                                 GetSystemMetricsForDpi(cy_metric, dpi), LR_DEFAULTCOLOR));
+        };
+        wil::unique_hicon new_big{load(SM_CXICON, SM_CYICON)};
+        wil::unique_hicon new_small{load(SM_CXSMICON, SM_CYSMICON)};
+        if (new_big) SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(new_big.get()));
+        if (new_small) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(new_small.get()));
+        // The window no longer references the previous icons, so they can be released now.
+        if (new_big) big_icon = std::move(new_big);
+        if (new_small) small_icon = std::move(new_small);
+    }
+};
+
 /// Synchronizes capture exclusion (`WDA_EXCLUDEFROMCAPTURE`) so Liquid Glass windows never capture themselves.
 inline void ensure_window_capture_affinity(HWND hwnd, bool exclude) noexcept {
     if (!hwnd) return;

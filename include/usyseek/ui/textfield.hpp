@@ -136,7 +136,7 @@ public:
         }
         cv.dc()->DrawTextLayout(D2D1::Point2F(r.left - scroll_, r.top), layout, cv.brush(col), D2D1_DRAW_TEXT_OPTIONS_NONE);
         if (focused && caret_on) {
-            const float x = std::round(r.left + caret_x - scroll_);
+            const float x = cv.snap(r.left + caret_x - scroll_);
             const float cy0 = r.top + hm.top + 1.0f;
             const float cy1 = r.top + hm.top + hm.height - 1.0f;
             cv.fill(D2D1::RectF(x, cy0, x + 1.5f, cy1), cv.theme().primary);

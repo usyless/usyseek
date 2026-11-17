@@ -174,6 +174,10 @@ private:
                     }
                 }
                 return 0;
+            case WM_DPICHANGED:
+            case WM_DISPLAYCHANGE:
+                refresh_tray_icon();
+                return 0;
             case WM_DESTROY:
                 PostQuitMessage(0);
                 return 0;
@@ -519,14 +523,41 @@ private:
         NOTIFYICONDATAW nid = tray_data();
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         nid.uCallbackMessage = WM_TRAY;
-        tray_icon_.reset(static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
-                                                       GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR)));
+        load_tray_icon();
         nid.hIcon = tray_icon_.get();
         wcscpy_s(nid.szTip, APP_NAME);
         Shell_NotifyIconW(NIM_ADD, &nid);
         nid.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &nid);
         update_tip();
+    }
+
+    /// Tray icons are drawn at the taskbar's (primary monitor's) scale; this hidden window sits on that monitor.
+    void load_tray_icon() noexcept {
+        UINT dpi = GetDpiForWindow(hwnd_);
+        if (dpi == 0) dpi = GetDpiForSystem();
+        wil::unique_hicon next{static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                                                             GetSystemMetricsForDpi(SM_CXSMICON, dpi),
+                                                             GetSystemMetricsForDpi(SM_CYSMICON, dpi), LR_DEFAULTCOLOR))};
+        if (next) {
+            tray_icon_ = std::move(next);
+            tray_icon_dpi_ = dpi;
+        }
+    }
+
+    void refresh_tray_icon() noexcept {
+        const UINT dpi = GetDpiForWindow(hwnd_);
+        if (dpi != 0 && dpi == tray_icon_dpi_ && tray_icon_) return;
+        wil::unique_hicon old = std::move(tray_icon_);
+        load_tray_icon();
+        if (!tray_icon_) {
+            tray_icon_ = std::move(old);
+            return;
+        }
+        NOTIFYICONDATAW nid = tray_data();
+        nid.uFlags = NIF_ICON;
+        nid.hIcon = tray_icon_.get();
+        Shell_NotifyIconW(NIM_MODIFY, &nid); // `old` is released after the shell has the new icon
     }
 
     void remove_tray() noexcept {
@@ -707,6 +738,7 @@ private:
     wil::unique_process_information ui_;
     wil::unique_process_information indexer_;
     wil::unique_hicon tray_icon_;
+    UINT tray_icon_dpi_ = 0;
     mutable std::optional<StatusBlock> indexer_status_;
     bool stopping_index_ = false;
     bool tray_hide_on_select_ = false;

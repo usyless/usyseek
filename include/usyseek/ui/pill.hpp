@@ -440,34 +440,62 @@ private:
 
     [[nodiscard]] bool expanded() const noexcept { return !field_.text.empty() || !items_.empty() || fullscreen_; }
 
+    [[nodiscard]] static UINT monitor_dpi(HMONITOR mon) noexcept {
+        UINT dpi_x = 96;
+        UINT dpi_y = 96;
+        if (FAILED(GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y)) || dpi_x == 0) return 96;
+        return dpi_x;
+    }
+
+    /// Moves/sizes the window ourselves for a known destination DPI; the WM_DPICHANGED this can trigger must not
+    /// apply its suggested rect on top (that would scale the window a second time), and WM_GETMINMAXINFO must use
+    /// the destination DPI rather than the previous monitor's DPI.
+    void set_pos_for_dpi(HWND after, int x, int y, int w, int h, UINT flags, UINT dpi = 0) noexcept {
+        placing_ = true;
+        placing_dpi_ = dpi;
+        SetWindowPos(hwnd_, after, x, y, w, h, flags);
+        placing_ = false;
+        placing_dpi_ = 0;
+    }
+
     void place() noexcept {
         if (fullscreen_) return;
         POINT cur;
         GetCursorPos(&cur);
         HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
-        if (sh_.settings.pill_x != INT32_MIN) {
-            const POINT saved{.x=sh_.settings.pill_x, .y=sh_.settings.pill_y};
-            if (HMONITOR m = MonitorFromPoint(saved, MONITOR_DEFAULTTONULL)) mon = m;
+        const POINT saved{.x = sh_.settings.pill_x, .y = sh_.settings.pill_y};
+        bool use_saved = sh_.settings.pill_x != INT32_MIN;
+        const auto size_on = [&](HMONITOR m) noexcept {
+            const float s = static_cast<float>(monitor_dpi(m)) / 96.0f;
+            return SIZE{.cx = static_cast<LONG>((sh_.settings.pill_w > 0 ? static_cast<float>(sh_.settings.pill_w) : DEFAULT_W) * s),
+                        .cy = static_cast<LONG>(current_height_dip() * s)};
+        };
+        if (use_saved) {
+            // Windows gives a window the DPI of the monitor holding most of it, not the one under its top-left corner.
+            HMONITOR guess = MonitorFromPoint(saved, MONITOR_DEFAULTTONULL);
+            if (!guess) guess = MonitorFromPoint(saved, MONITOR_DEFAULTTONEAREST);
+            const SIZE est = size_on(guess);
+            const RECT predicted{.left = saved.x, .top = saved.y, .right = saved.x + est.cx, .bottom = saved.y + est.cy};
+            if (HMONITOR m = MonitorFromRect(&predicted, MONITOR_DEFAULTTONULL)) {
+                mon = m;
+            } else {
+                use_saved = false; // the monitor it was saved on is gone: re-centre on the cursor's monitor
+            }
         }
+        const UINT dpi = monitor_dpi(mon);
+        const SIZE sz = size_on(mon);
         MONITORINFO mi{.cbSize = sizeof(mi)};
         GetMonitorInfoW(mon, &mi);
-        UINT dpi_x = 96;
-        UINT dpi_y = 96;
-        GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y);
-        const float s = static_cast<float>(dpi_x) / 96.0f;
-        const int w = static_cast<int>((sh_.settings.pill_w > 0 ? static_cast<float>(sh_.settings.pill_w) : DEFAULT_W) * s);
-        const int h = static_cast<int>(current_height_dip() * s);
-        int x = 0;
-        int y = 0;
-        if (sh_.settings.pill_x != INT32_MIN) {
-            x = sh_.settings.pill_x;
-            y = sh_.settings.pill_y;
-        } else {
-            const RECT& wa = mi.rcWork;
-            x = wa.left + ((wa.right - wa.left - w) / 2);
-            y = wa.top + ((wa.bottom - wa.top) / 5);
-        }
-        SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+        const RECT& wa = mi.rcWork;
+        const int wa_w = std::max<int>(1, wa.right - wa.left);
+        const int wa_h = std::max<int>(1, wa.bottom - wa.top);
+        const int w = std::min<int>(sz.cx, wa_w);
+        const int h = std::min<int>(sz.cy, wa_h);
+        int x = use_saved ? saved.x : wa.left + ((wa_w - w) / 2);
+        int y = use_saved ? saved.y : wa.top + ((wa_h - h) / 5);
+        x = std::clamp<int>(x, wa.left, wa.right - w);
+        y = std::clamp<int>(y, wa.top, wa.bottom - h);
+        set_pos_for_dpi(HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE, dpi);
     }
 
     static constexpr float HELP_W = 420.0f;
@@ -612,7 +640,14 @@ private:
         if (fullscreen_ || in_sizemove_ || rendering_) return;
         RECT wr;
         GetWindowRect(hwnd_, &wr);
-        const int h = static_cast<int>(current_height_dip() * target_.scale());
+        const UINT dpi = GetDpiForWindow(hwnd_);
+        const float s = dpi > 0 ? static_cast<float>(dpi) / 96.0f : target_.scale();
+        MONITORINFO mi{.cbSize = sizeof(mi)};
+        int max_h = INT_MAX;
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) {
+            max_h = std::max<int>(1, mi.rcWork.bottom - mi.rcWork.top);
+        }
+        const int h = std::min(static_cast<int>(current_height_dip() * s), max_h);
         if (wr.bottom - wr.top != h) SetWindowPos(hwnd_, nullptr, 0, 0, wr.right - wr.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
@@ -630,17 +665,32 @@ private:
     void toggle_fullscreen() {
         if (!fullscreen_) {
             GetWindowRect(hwnd_, &restore_rect_);
+            restore_dpi_ = GetDpiForWindow(hwnd_);
+            HMONITOR mon = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
             MONITORINFO mi{.cbSize = sizeof(mi)};
-            GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi);
+            GetMonitorInfoW(mon, &mi);
             fullscreen_ = true;
             apply_window_theme(hwnd_, sh_.theme, true, false);
             const RECT& r = mi.rcMonitor;
-            SetWindowPos(hwnd_, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED);
+            set_pos_for_dpi(HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED, monitor_dpi(mon));
         } else {
             fullscreen_ = false;
             apply_window_theme(hwnd_, sh_.theme, true, true);
+            // The restore rect was captured at `restore_dpi_`; rescale it if that monitor's scale changed meanwhile.
             const RECT& r = restore_rect_;
-            SetWindowPos(hwnd_, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED);
+            HMONITOR mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
+            const UINT dpi_now = monitor_dpi(mon);
+            const float k = restore_dpi_ > 0 ? static_cast<float>(dpi_now) / static_cast<float>(restore_dpi_) : 1.0f;
+            MONITORINFO mi{.cbSize = sizeof(mi)};
+            GetMonitorInfoW(mon, &mi);
+            const RECT& wa = mi.rcWork;
+            const int wa_w = std::max<int>(1, wa.right - wa.left);
+            const int wa_h = std::max<int>(1, wa.bottom - wa.top);
+            const int w = std::min<int>(static_cast<int>(std::lround(static_cast<float>(r.right - r.left) * k)), wa_w);
+            const int h = std::min<int>(static_cast<int>(std::lround(static_cast<float>(r.bottom - r.top) * k)), wa_h);
+            const int x = std::clamp<int>(r.left, wa.left, wa.right - w);
+            const int y = std::clamp<int>(r.top, wa.top, wa.bottom - h);
+            set_pos_for_dpi(HWND_TOPMOST, x, y, w, h, SWP_FRAMECHANGED, dpi_now);
             apply_height();
         }
         full_dirty_ = true;
@@ -1527,7 +1577,7 @@ private:
         cv.hit(r, IdCard, i);
 
         // Thumbnail (cropped or letterboxed through a reusable bitmap brush so the corners stay rounded)
-        const D2D1_RECT_F tr = rect(r.left + 6, r.top + 6, g.card_w - 12, g.thumb_h);
+        const D2D1_RECT_F tr = cv.snap(rect(r.left + 6, r.top + 6, g.card_w - 12, g.thumb_h));
         if (ID2D1Bitmap1* bmp = sh_.thumbs.get(it.pt.id)) {
             const ThumbFit fit = parse_thumb_fit(sh_.settings.thumb_fit);
             if (fit == ThumbFit::Contain) {
@@ -3152,7 +3202,9 @@ private:
             } else {
                 POINT c;
                 GetCursorPos(&c);
-                if (std::abs(c.x - drag_origin_.x) > GetSystemMetrics(SM_CXDRAG) || std::abs(c.y - drag_origin_.y) > GetSystemMetrics(SM_CYDRAG)) {
+                const UINT dpi = GetDpiForWindow(hwnd_);
+                if (std::abs(c.x - drag_origin_.x) > GetSystemMetricsForDpi(SM_CXDRAG, dpi) ||
+                    std::abs(c.y - drag_origin_.y) > GetSystemMetricsForDpi(SM_CYDRAG, dpi)) {
                     start_drag();
                     return;
                 }
@@ -3815,13 +3867,30 @@ private:
                 return 0;
             case WM_DPICHANGED: {
                 full_dirty_ = true;
+                if (placing_) {
+                    target_.sync_dpi();
+                    return 0; // our own SetWindowPos already sized the window for the new DPI
+                }
                 const RECT* r = reinterpret_cast<const RECT*>(lp);
+                if (fullscreen_) {
+                    // Keep covering the monitor rather than taking the scaled-down suggestion.
+                    MONITORINFO mi{.cbSize = sizeof(mi)};
+                    GetMonitorInfoW(MonitorFromRect(r, MONITOR_DEFAULTTONEAREST), &mi);
+                    const RECT& m = mi.rcMonitor;
+                    SetWindowPos(hwnd_, nullptr, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                    target_.sync_dpi();
+                    invalidate();
+                    return 0;
+                }
                 SetWindowPos(hwnd_, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+                target_.sync_dpi();
                 return 0;
             }
             case WM_GETMINMAXINFO: {
+                if (fullscreen_) return 0;
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
-                const float s = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
+                const UINT dpi = placing_dpi_ ? placing_dpi_ : GetDpiForWindow(hwnd_);
+                const float s = static_cast<float>(dpi > 0 ? dpi : 96u) / 96.0f;
                 mmi->ptMinTrackSize = {.x = static_cast<LONG>(520 * s), .y = static_cast<LONG>((HEADER_H + STATUS_H) * s)};
                 return 0;
             }
@@ -4043,7 +4112,10 @@ private:
     D2D1_RECT_F scroll_thumb_{};
 
     bool fullscreen_ = false;
+    bool placing_ = false;
+    UINT placing_dpi_ = 0;
     RECT restore_rect_{};
+    UINT restore_dpi_ = 96;
     bool in_sizemove_ = false;
     bool resize_pending_ = false;
 

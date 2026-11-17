@@ -307,6 +307,18 @@ public:
         return create_target();
     }
 
+    /// Refreshes `dpi_` and the D2D target bitmap when the window's DPI changes without a pixel resize.
+    bool sync_dpi() noexcept {
+        if (!hwnd_ || !ready()) return ready();
+        const auto dpi = static_cast<float>(GetDpiForWindow(hwnd_));
+        if (dpi <= 0.0f || dpi == dpi_) return true;
+        dpi_ = dpi;
+        dc_->SetTarget(nullptr);
+        target_.reset();
+        dirty_tracker_.reset();
+        return create_target();
+    }
+
     /// Draws and presents a frame. When `full_redraw` is false and both swap-chain buffers are synced,
     /// only the union of previous and current dirty regions is cleared, drawn clipped, and passed to `Present1`.
     /// Returns false if the device must be recovered.

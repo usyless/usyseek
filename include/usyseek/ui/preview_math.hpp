@@ -92,10 +92,10 @@ struct FitBox {
     const float avail_w = std::max(1.0f, area.width);
     const float avail_h = std::max(1.0f, area.height);
     const float s = std::min({1.0f, avail_w / nw, avail_h / nh});
-    const float w = std::max(1.0f, std::round(nw * s));
-    const float h = std::max(1.0f, std::round(nh * s));
-    const float x = std::round(area.left + ((avail_w - w) * 0.5f));
-    const float y = std::round(area.top + ((avail_h - h) * 0.5f));
+    const float w = std::max(1.0f, std::round(nw * s * safe_scale)) / safe_scale;
+    const float h = std::max(1.0f, std::round(nh * s * safe_scale)) / safe_scale;
+    const float x = std::round((area.left + ((avail_w - w) * 0.5f)) * safe_scale) / safe_scale;
+    const float y = std::round((area.top + ((avail_h - h) * 0.5f)) * safe_scale) / safe_scale;
     return FitBox{.left = x, .top = y, .width = w, .height = h};
 }
 
