@@ -34,17 +34,12 @@ inline bool tar_supports_7z() {
         std::error_code ec;
         if (!fs::exists(tar, ec)) return false;
         const std::wstring cmd = L"\"" + tar.wstring() + L"\" --version";
-        std::string output;
-        const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false}>(
+        const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false, .capture_stderr = false}>(
             ulp::win::proc::process_settings{
                 .commandline = cmd,
-                .on_stdout_line = [&](std::string_view line) {
-                    output.append(line);
-                    output.push_back('\n');
-                },
             });
         if (res.status != 0) return false;
-        return parse_tar_supports_7z(output);
+        return parse_tar_supports_7z(res.stdout_);
     }();
     return supported;
 }
@@ -252,17 +247,16 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
 
     const fs::path& tar = system_tar_path();
     const std::wstring tar_cmd = L"\"" + tar.wstring() + L"\" -xf \"" + archive.wstring() + L"\" -C \"" + staging.wstring() + L"\"";
-    std::string tar_err;
-    const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false}>(
+    const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false, .capture_stdout = false}>(
         ulp::win::proc::process_settings{
             .commandline = tar_cmd,
-            .on_stderr_line = [&](std::string_view line) {
-                if (!tar_err.empty()) tar_err += '\n';
-                tar_err.append(line);
-            },
         });
     if (res.status != 0) {
         fs::remove_all(staging, ec);
+        std::string_view tar_err = res.stderr_;
+        while (!tar_err.empty() && (tar_err.back() == '\r' || tar_err.back() == '\n' || tar_err.back() == ' ' || tar_err.back() == '\t')) {
+            tar_err.remove_suffix(1);
+        }
         err = L"Extraction failed (tar exited with code " + std::to_wstring(res.status) + L")" +
               (tar_err.empty() ? L"." : (L": " + to_wide(tar_err)));
         return false;

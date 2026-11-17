@@ -2818,7 +2818,7 @@ private:
         }
         append_venv_log(L"> " + disp);
         auto on_line = [this](std::string_view out) { append_venv_log(to_wide(out)); };
-        const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false}>(
+        const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false, .capture_stdout = false, .capture_stderr = false}>(
             ulp::win::proc::process_settings{
                 .commandline = full,
                 .on_stdout_line = on_line,
