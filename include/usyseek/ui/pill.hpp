@@ -1247,8 +1247,8 @@ private:
         const float ct = std::clamp(chip_anim_.value, 0.0f, 2.0f);
         for (int i = 0; i < 3; ++i) {
             const float act = std::max(0.0f, 1.0f - std::abs(ct - static_cast<float>(i)));
-            const float ha = hover_.alpha(IdChip, i);
-            if (act < 0.5f && ha > 0.002f) {
+            const float ha = hover_.alpha(IdChip, i) * indicator_hover_fade(act);
+            if (ha > 0.002f) {
                 if (glass_ui) {
                     const GlassStyle h_gs = make_control_glass_style(
                         cv.theme(), 14.0f, with_alpha(hex(0xffffff), dark ? 0.12f : 0.34f), ha, 0.0f, 7.0f, 1.06f);

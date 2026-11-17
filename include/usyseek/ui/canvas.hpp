@@ -22,6 +22,13 @@ namespace usyseek::ui {
     return {.left = lerp(a.left, b.left, t), .top = lerp(a.top, b.top, t), .right = lerp(a.right, b.right, t), .bottom = lerp(a.bottom, b.bottom, t)};
 }
 
+/// Hover multiplier for a segment while a sliding selection indicator covers `coverage` (0..1) of it.
+/// Stays at full strength until the indicator covers ~3/4 of the segment, then eases out, so the hover never pops.
+[[nodiscard]] inline float indicator_hover_fade(float coverage) noexcept {
+    const float x = std::clamp((1.0f - coverage) * 4.0f, 0.0f, 1.0f);
+    return x * x * (3.0f - (2.0f * x));
+}
+
 namespace glyph {
 inline constexpr wchar_t search = 0xE721;
 inline constexpr wchar_t settings = 0xE713;

@@ -971,7 +971,9 @@ private:
         const bool dark = cv.theme().dark_mode;
         for (int i = 0; i < 4; ++i) {
             const float act = std::clamp(1.0f - std::abs(t - static_cast<float>(i)), 0.0f, 1.0f);
-            if (const float ha = hover_alpha(tabs[i].id); act < 0.5f && ha > 0.002f) {
+            // Keep the hover under the sliding indicator and fade it only once the indicator covers most of the tab,
+            // so clicking a hovered tab doesn't drop its hover a frame or two into the slide.
+            if (const float ha = hover_alpha(tabs[i].id) * indicator_hover_fade(act); ha > 0.002f) {
                 if (glass_ui) {
                     const GlassStyle h_gs = make_control_glass_style(
                         cv.theme(), 10.0f, with_alpha(cv.theme().surface_high, dark ? 0.24f : 0.38f), ha, 0.6f, 8.0f, 1.07f);
