@@ -290,12 +290,18 @@ inline bool launch_staged_updater(const fs::path& staging_root, const fs::path& 
         std::wstring cmd = L"\"" + staged_exe.wstring() + L"\" " + args;
         STARTUPINFOW si{.cb = sizeof(STARTUPINFOW)};
         wil::unique_process_information pi;
-        if (!CreateProcessW(staged_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
-                            CREATE_UNICODE_ENVIRONMENT, nullptr, staging_root.c_str(), &si, &pi)) {
-            err = to_wide(win32_error_utf8(GetLastError()));
+        if (CreateProcessW(staged_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                           CREATE_UNICODE_ENVIRONMENT | CREATE_BREAKAWAY_FROM_JOB, nullptr,
+                           staging_root.c_str(), &si, &pi)) {
+            return true;
+        }
+        const DWORD e = GetLastError();
+        BOOL in_job = FALSE;
+        // If our parent job forbids breakaway (e.g. an older launcher), fall through to ShellExecuteEx("runas") to escape the job.
+        if (e != ERROR_ACCESS_DENIED || !IsProcessInJob(GetCurrentProcess(), nullptr, &in_job) || !in_job) {
+            err = to_wide(win32_error_utf8(e));
             return false;
         }
-        return true;
     }
 
     SHELLEXECUTEINFOW sei{

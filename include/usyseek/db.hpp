@@ -374,12 +374,12 @@ private:
     UsyQdrant* q_ = nullptr;
 };
 
-/// Job object that kills every assigned process when the last handle closes.
+/// Job object that kills every assigned process when the last handle closes, while permitting explicit breakaway.
 inline wil::unique_handle make_kill_on_close_job() {
     wil::unique_handle job{CreateJobObjectW(nullptr, nullptr)};
     if (job) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
         SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &info, sizeof(info));
     }
     return job;
