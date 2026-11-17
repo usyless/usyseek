@@ -6,6 +6,7 @@
 #include <shlobj.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include <rapidhash.h>
 #include <usyseek_version.h>
@@ -21,19 +23,24 @@ namespace usyseek {
 
 namespace fs = std::filesystem;
 
-inline constexpr wchar_t APP_NAME[] = L"usyseek";
-inline constexpr wchar_t APP_VERSION[] = USYSEEK_VERSION_WSTR;
+template <typename T, typename... Args>
+[[nodiscard]] constexpr std::array<T, sizeof...(Args)> make_array(Args&&... args) {
+    return {T{std::forward<Args>(args)}...};
+}
 
-inline constexpr wchar_t LAUNCHER_CLASS[] = L"usyseek.launcher";
-inline constexpr wchar_t LAUNCHER_MUTEX[] = L"Local\\usyseek.launcher";
-inline constexpr wchar_t PILL_CLASS[] = L"usyseek.pill";
-inline constexpr wchar_t SETTINGS_CLASS[] = L"usyseek.settings";
-inline constexpr wchar_t STATUS_SHM[] = L"Local\\usyseek.indexer.status";
-inline constexpr wchar_t INDEXER_MUTEX[] = L"Local\\usyseek.indexer";
-inline constexpr wchar_t INDEXER_STOP_EVENT[] = L"Local\\usyseek.indexer.stop";
-inline constexpr wchar_t INDEXER_DB_WANT_EVENT[] = L"Local\\usyseek.db.want";
-inline constexpr wchar_t NOTIFICATIONS_MUTEX[] = L"Local\\usyseek.notifications";
-inline constexpr wchar_t EVERYTHING_INSTANCE[] = L"uk.usyless.usyseek";
+inline constexpr const wchar_t* APP_NAME = L"usyseek";
+inline constexpr const wchar_t* APP_VERSION = USYSEEK_VERSION_WSTR;
+
+inline constexpr const wchar_t* LAUNCHER_CLASS = L"usyseek.launcher";
+inline constexpr const wchar_t* LAUNCHER_MUTEX = L"Local\\usyseek.launcher";
+inline constexpr const wchar_t* PILL_CLASS = L"usyseek.pill";
+inline constexpr const wchar_t* SETTINGS_CLASS = L"usyseek.settings";
+inline constexpr const wchar_t* STATUS_SHM = L"Local\\usyseek.indexer.status";
+inline constexpr const wchar_t* INDEXER_MUTEX = L"Local\\usyseek.indexer";
+inline constexpr const wchar_t* INDEXER_STOP_EVENT = L"Local\\usyseek.indexer.stop";
+inline constexpr const wchar_t* INDEXER_DB_WANT_EVENT = L"Local\\usyseek.db.want";
+inline constexpr const wchar_t* NOTIFICATIONS_MUTEX = L"Local\\usyseek.notifications";
+inline constexpr const wchar_t* EVERYTHING_INSTANCE = L"uk.usyless.usyseek";
 
 // WM_COPYDATA commands sent to the launcher window
 enum class Cmd : uint32_t {
@@ -95,16 +102,24 @@ inline UINT msg_open_notifications() noexcept {
 inline std::string to_utf8(std::wstring_view w) {
     if (w.empty()) return {};
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    std::string out(static_cast<size_t>(n), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), n, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string out;
+    out.resize_and_overwrite(static_cast<size_t>(n), [&](char* buf, size_t) noexcept {
+        const int written = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), buf, n, nullptr, nullptr);
+        return written > 0 ? static_cast<size_t>(written) : 0u;
+    });
     return out;
 }
 
 inline std::wstring to_wide(std::string_view s) {
     if (s.empty()) return {};
     const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    std::wstring out(static_cast<size_t>(n), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
+    if (n <= 0) return {};
+    std::wstring out;
+    out.resize_and_overwrite(static_cast<size_t>(n), [&](wchar_t* buf, size_t) noexcept {
+        const int written = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), buf, n);
+        return written > 0 ? static_cast<size_t>(written) : 0u;
+    });
     return out;
 }
 
@@ -146,20 +161,20 @@ inline std::wstring format_count(uint64_t n) {
 }
 
 inline std::wstring format_size(uint64_t bytes) {
-    wchar_t buf[32];
-    if (bytes >= (1ull << 30)) swprintf_s(buf, L"%.1f GB", static_cast<double>(bytes) / (1ull << 30));
-    else if (bytes >= (1ull << 20)) swprintf_s(buf, L"%.1f MB", static_cast<double>(bytes) / (1ull << 20));
-    else if (bytes >= 1024) swprintf_s(buf, L"%.0f KB", static_cast<double>(bytes) / 1024.0);
-    else swprintf_s(buf, L"%llu B", static_cast<unsigned long long>(bytes));
-    return buf;
+    std::array<wchar_t, 32> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    if (bytes >= (1ull << 30)) swprintf_s(buf.data(), buf.size(), L"%.1f GB", static_cast<double>(bytes) / (1ull << 30));
+    else if (bytes >= (1ull << 20)) swprintf_s(buf.data(), buf.size(), L"%.1f MB", static_cast<double>(bytes) / (1ull << 20));
+    else if (bytes >= 1024) swprintf_s(buf.data(), buf.size(), L"%.0f KB", static_cast<double>(bytes) / 1024.0);
+    else swprintf_s(buf.data(), buf.size(), L"%llu B", static_cast<unsigned long long>(bytes));
+    return buf.data();
 }
 
 inline std::wstring format_duration_ms(uint64_t ms) {
     const uint64_t s = ms / 1000;
-    wchar_t buf[32];
-    if (s >= 3600) swprintf_s(buf, L"%llu:%02llu:%02llu", s / 3600, (s / 60) % 60, s % 60);
-    else swprintf_s(buf, L"%llu:%02llu", s / 60, s % 60);
-    return buf;
+    std::array<wchar_t, 32> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    if (s >= 3600) swprintf_s(buf.data(), buf.size(), L"%llu:%02llu:%02llu", s / 3600, (s / 60) % 60, s % 60);
+    else swprintf_s(buf.data(), buf.size(), L"%llu:%02llu", s / 60, s % 60);
+    return buf.data();
 }
 
 inline int64_t unix_now() noexcept {
@@ -169,12 +184,12 @@ inline int64_t unix_now() noexcept {
 inline std::wstring format_ago(int64_t unix_time) {
     if (unix_time <= 0) return L"Never";
     const int64_t d = std::max<int64_t>(0, unix_now() - unix_time);
-    wchar_t buf[48];
     if (d < 60) return L"Just now";
-    if (d < 3600) swprintf_s(buf, L"%lld min ago", d / 60);
-    else if (d < 86400) swprintf_s(buf, L"%lld h ago", d / 3600);
-    else swprintf_s(buf, L"%lld d ago", d / 86400);
-    return buf;
+    std::array<wchar_t, 48> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    if (d < 3600) swprintf_s(buf.data(), buf.size(), L"%lld min ago", d / 60);
+    else if (d < 86400) swprintf_s(buf.data(), buf.size(), L"%lld h ago", d / 3600);
+    else swprintf_s(buf.data(), buf.size(), L"%lld d ago", d / 86400);
+    return buf.data();
 }
 
 inline int64_t filetime_to_unix(uint64_t ft) noexcept {
@@ -187,14 +202,20 @@ inline int64_t filetime_to_unix(uint64_t ft) noexcept {
 
 inline const fs::path& exe_dir() {
     static const fs::path p = [] {
-        std::wstring buf(MAX_PATH, L'\0');
+        std::wstring buf;
+        size_t cap = MAX_PATH;
         for (;;) {
-            const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
-            if (n < buf.size()) {
-                buf.resize(n);
-                break;
-            }
-            buf.resize(buf.size() * 2);
+            bool done = false;
+            buf.resize_and_overwrite(cap, [&](wchar_t* ptr, size_t n) noexcept {
+                const DWORD len = GetModuleFileNameW(nullptr, ptr, static_cast<DWORD>(n));
+                if (len < n) {
+                    done = true;
+                    return static_cast<size_t>(len);
+                }
+                return n;
+            });
+            if (done) break;
+            cap *= 2;
         }
         return fs::path{buf}.parent_path();
     }();
@@ -211,11 +232,26 @@ inline const fs::path& data_dir() {
     return p;
 }
 
-inline fs::path settings_path() { return data_dir() / L"settings.json"; }
-inline fs::path state_path() { return data_dir() / L"state.json"; }
-inline fs::path update_state_path() { return data_dir() / L"update.json"; }
-inline fs::path edge_data_dir() { return data_dir() / L"qdrant_edge"; }
-inline fs::path tags_db_path() { return data_dir() / L"tags.db"; }
+inline const fs::path& settings_path() {
+    static const fs::path p = data_dir() / L"settings.json";
+    return p;
+}
+inline const fs::path& state_path() {
+    static const fs::path p = data_dir() / L"state.json";
+    return p;
+}
+inline const fs::path& update_state_path() {
+    static const fs::path p = data_dir() / L"update.json";
+    return p;
+}
+inline const fs::path& edge_data_dir() {
+    static const fs::path p = data_dir() / L"qdrant_edge";
+    return p;
+}
+inline const fs::path& tags_db_path() {
+    static const fs::path p = data_dir() / L"tags.db";
+    return p;
+}
 
 /// True while an indexer process holds the indexer mutex or is being launched.
 inline bool is_indexer_db_wanted() noexcept {

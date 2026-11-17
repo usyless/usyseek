@@ -239,18 +239,18 @@ public:
             full_dirty_ = true;
         }
 
-        std::vector<D2D1_RECT_F> dirty_dips;
+        dirty_dips_scratch_.clear();
         if (!full_dirty_) {
-            dirty_dips = std::exchange(pending_dirty_, {});
-            if (hover_.in_anim.value != hover_.in_anim.target) queue_hover_dirty(dirty_dips, hover_.id, hover_.index, full_dirty_);
+            dirty_dips_scratch_.swap(pending_dirty_);
+            if (hover_.in_anim.value != hover_.in_anim.target) queue_hover_dirty(dirty_dips_scratch_, hover_.id, hover_.index, full_dirty_);
             if (hover_.prev_id != IdNone && hover_.out_anim.value != hover_.out_anim.target) {
-                queue_hover_dirty(dirty_dips, hover_.prev_id, hover_.prev_index, full_dirty_);
+                queue_hover_dirty(dirty_dips_scratch_, hover_.prev_id, hover_.prev_index, full_dirty_);
             }
             if (card_hover_.in_anim.value != card_hover_.in_anim.target) {
-                queue_hover_dirty(dirty_dips, card_hover_.id, card_hover_.index, full_dirty_);
+                queue_hover_dirty(dirty_dips_scratch_, card_hover_.id, card_hover_.index, full_dirty_);
             }
             if (card_hover_.prev_id != IdNone && card_hover_.out_anim.value != card_hover_.out_anim.target) {
-                queue_hover_dirty(dirty_dips, card_hover_.prev_id, card_hover_.prev_index, full_dirty_);
+                queue_hover_dirty(dirty_dips_scratch_, card_hover_.prev_id, card_hover_.prev_index, full_dirty_);
             }
         } else {
             pending_dirty_.clear();
@@ -268,29 +268,29 @@ public:
             if (tl.valid) curr_tip_dirty = tl.dirty;
         }
         if (!full_dirty_) {
-            if (curr_tip_dirty) dirty_dips.push_back(*curr_tip_dirty);
+            if (curr_tip_dirty) dirty_dips_scratch_.push_back(*curr_tip_dirty);
             if (last_tooltip_dirty_ && (!curr_tip_dirty || !rect_equal(*last_tooltip_dirty_, *curr_tip_dirty))) {
-                dirty_dips.push_back(*last_tooltip_dirty_);
+                dirty_dips_scratch_.push_back(*last_tooltip_dirty_);
             }
         }
 
         const bool request_full = std::exchange(full_dirty_, false);
-        std::vector<Hit> partial_hits;
+        partial_hits_.clear();
         bool drew_full = false;
-        const bool ok = target_.render_frame(request_full, dirty_dips, !in_sizemove_, [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
+        const bool ok = target_.render_frame(request_full, dirty_dips_scratch_, !in_sizemove_, [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
             if (full_frame) {
                 drew_full = true;
                 hits_.clear();
                 Canvas cv{target_, sh_.fonts, hits_, sh_.theme, clip};
                 draw(cv);
             } else {
-                Canvas cv{target_, sh_.fonts, partial_hits, sh_.theme, clip};
+                Canvas cv{target_, sh_.fonts, partial_hits_, sh_.theme, clip};
                 draw(cv);
             }
         });
         glass_.end_frame();
         if (!ok) recover();
-        if (!drew_full && !partial_hits.empty()) sync_card_overlay_hits(hits_, partial_hits);
+        if (!drew_full && !partial_hits_.empty()) sync_card_overlay_hits(hits_, partial_hits_);
         last_tooltip_dirty_ = curr_tip_dirty;
         rendering_ = false;
         anim_active_ = visible() && (anim || searching_ || loading_more_);
@@ -411,8 +411,9 @@ private:
         std::wstring meta;
         if (p.p.w && p.p.h) meta = std::to_wstring(p.p.w) + L"×" + std::to_wstring(p.p.h) + L"  •  ";
         meta += format_size(p.p.s);
-        it.meta = meta;
+        it.meta = std::move(meta);
         it.date = format_date(p.p.m);
+        it.tags_w.reserve(p.p.t.size());
         for (const auto& t : p.p.t) it.tags_w.push_back(to_wide(t));
         it.pt = std::move(p);
         return it;
@@ -442,7 +443,8 @@ private:
         const float s = static_cast<float>(dpi_x) / 96.0f;
         const int w = static_cast<int>((sh_.settings.pill_w > 0 ? sh_.settings.pill_w : DEFAULT_W) * s);
         const int h = static_cast<int>(current_height_dip() * s);
-        int x, y;
+        int x = 0;
+        int y = 0;
         if (sh_.settings.pill_x != INT32_MIN) {
             x = sh_.settings.pill_x;
             y = sh_.settings.pill_y;
@@ -522,7 +524,7 @@ private:
         queue_hover_dirty(pending_dirty_, id, idx, full_dirty_);
     }
 
-    static void sync_card_overlay_hits(std::vector<Hit>& hits, const std::vector<Hit>& partial_hits) {
+    static void sync_card_overlay_hits(std::vector<Hit>& hits, std::span<const Hit> partial_hits) {
         std::vector<int> touched_cards;
         for (const Hit& h : partial_hits) {
             if (h.id == IdCard && std::ranges::find(touched_cards, h.index) == touched_cards.end()) {
@@ -952,9 +954,9 @@ private:
             case IdTagBtn: title = L"Filter by tag"; return true;
             case IdZoomReset: {
                 title = L"Reset grid zoom (Ctrl+0)";
-                wchar_t zbuf[48];
-                swprintf_s(zbuf, L"Currently %.2gx — click to reset", effective_grid_zoom());
-                subtitle = zbuf;
+                std::array<wchar_t, 48> zbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+                swprintf_s(zbuf.data(), zbuf.size(), L"Currently %.2gx — click to reset", effective_grid_zoom());
+                subtitle = zbuf.data();
                 return true;
             }
             case IdNotifyBtn:
@@ -1162,10 +1164,10 @@ private:
         x -= 8;
 
         // Segmented filter chips
-        static constexpr const wchar_t* labels[] = {L"All", L"Images", L"Videos"};
-        float widths[3];
+        static constexpr std::array<const wchar_t*, 3> labels = {L"All", L"Images", L"Videos"};
+        std::array<float, 3> widths; // NOLINT(cppcoreguidelines-pro-type-member-init)
         float total = 6;
-        for (int i = 0; i < 3; ++i) {
+        for (size_t i = 0; i < labels.size(); ++i) {
             widths[i] = cv.measure(labels[i], Font::SmallSemi) + 26;
             total += widths[i];
         }
@@ -1186,9 +1188,9 @@ private:
         } else {
             cv.fill_round(seg, 17, with_alpha(cv.theme().surface_highest, 0.85f));
         }
-        D2D1_RECT_F chip_rects[3]{};
+        std::array<D2D1_RECT_F, 3> chip_rects{};
         float cx = x + 3;
-        for (int i = 0; i < 3; ++i) {
+        for (size_t i = 0; i < labels.size(); ++i) {
             chip_rects[i] = rect(cx, cy - 14, widths[i], 28);
             cx += widths[i];
         }
@@ -1307,9 +1309,9 @@ private:
             piece(error_, cv.theme().error);
         } else if (last_ms_ > 0 && expanded()) {
             sep();
-            wchar_t buf[48];
-            swprintf_s(buf, L"%.0f ms", last_ms_);
-            piece(buf, cv.theme().outline);
+            std::array<wchar_t, 48> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+            swprintf_s(buf.data(), buf.size(), L"%.0f ms", last_ms_);
+            piece(buf.data(), cv.theme().outline);
         }
         sep();
         piece(to_wide(sh_.settings.model_name), cv.theme().outline);
@@ -1626,7 +1628,7 @@ private:
         const wchar_t* desc;
         const wchar_t* insert;
     };
-    static constexpr HelpRow HELP_ROWS[] = {
+    static constexpr std::array<HelpRow, 7> HELP_ROWS = {{
         {L"free text", L"Semantic search by meaning (CLIP)", L""},
         {L"name:cat", L"File name contains prefix tokens", L"name:"},
         {L"tag:fav", L"Require tag (\"quotes\" for spaces)", L"tag:"},
@@ -1634,7 +1636,7 @@ private:
         {L"dir:C:\\Photos", L"Search inside folder (or in:, bare path)", L"dir:"},
         {L"similar:path", L"Visually similar to an indexed file", L"similar:"},
         {L"type:image", L"Filter media type (image or video)", L"type:image "},
-    };
+    }};
 
     void draw_help(Canvas& cv, D2D1_SIZE_F sz) {
         const float x = std::clamp(help_btn_x_ + 36.0f - HELP_W, 14.0f, std::max(14.0f, sz.width - HELP_W - 14.0f));
@@ -1750,8 +1752,9 @@ private:
             else if (!on && pos != t.end()) t.erase(pos);
             else continue;
             it.tags_w.clear();
+            it.tags_w.reserve(t.size());
             for (const auto& s : t) it.tags_w.push_back(to_wide(s));
-            changes.push_back({it.pt.id, it.pt.p.p, t});
+            changes.emplace_back(it.pt.id, it.pt.p.p, t);
         }
         if (changes.empty()) return;
         if (on && std::find(menu_tags_.begin(), menu_tags_.end(), tag) == menu_tags_.end()) menu_tags_.insert(menu_tags_.begin(), tag);
@@ -1845,14 +1848,14 @@ private:
             const wchar_t* label;
             const wchar_t* key;
         };
-        static constexpr Act acts[ActCount] = {
+        static constexpr std::array<Act, ActCount> acts = {{
             {glyph::open, L"Open", L"Enter"},
             {glyph::zoom, L"Preview", L"Space"},
             {glyph::folder, L"Show in Explorer", L"Ctrl+E"},
             {glyph::similar, L"Find similar", L"Ctrl+S"},
             {glyph::copy, L"Copy media", L"Ctrl+C"},
             {glyph::link, L"Copy path", L"Ctrl+Shift+C"},
-        };
+        }};
         float y = r.top + 6;
         for (int i = 0; i < ActCount; ++i) {
             const D2D1_RECT_F rr = rect(r.left + 6, y, MENU_W - 12, 36);
@@ -1942,7 +1945,7 @@ private:
 
     /// Copies the files themselves; a single still image also goes on as pixels so editors can paste it.
     /// Only the decode runs on a worker; the newest copy wins and reaches the clipboard from the UI thread.
-    void copy_media(const std::vector<const Item*>& sel) {
+    void copy_media(std::span<const Item* const> sel) {
         if (sel.empty()) return;
         std::vector<std::wstring> paths;
         paths.reserve(sel.size());
@@ -2860,7 +2863,7 @@ private:
                 return;
             case IdPvBar: return;
             case IdPvReveal: reveal_item_file(path); return;
-            case IdPvCopy: copy_media({&items_[preview_]}); return;
+            case IdPvCopy: copy_media(std::array<const Item*, 1>{&items_[preview_]}); return;
             case IdPvImage:
                 if (dbl) {
                     open_item_file(path);
@@ -2927,7 +2930,7 @@ private:
             if (shift) {
                 copy_item_text(item_path(it));
             } else {
-                copy_media({&it});
+                copy_media(std::array<const Item*, 1>{&it});
             }
         } else if (ctrl && vk == 'E') {
             reveal_item_file(item_path(it));
@@ -3802,11 +3805,13 @@ private:
     WindowTarget target_;
     LiquidGlassWindow glass_;
     std::vector<Hit> hits_;
+    std::vector<Hit> partial_hits_;
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
     bool rendering_ = false;
     bool dirty_ = false; // state changed since the last frame
     bool full_dirty_ = true;
     std::vector<D2D1_RECT_F> pending_dirty_;
+    std::vector<D2D1_RECT_F> dirty_dips_scratch_;
     std::optional<D2D1_RECT_F> last_tooltip_dirty_;
     ULONGLONG shown_tick_ = 0;
     ULONGLONG blur_hide_tick_ = 0;

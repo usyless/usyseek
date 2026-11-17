@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::Path;
 
 use qdrant_edge::{
@@ -7,22 +8,25 @@ use qdrant_edge::{
     TokenizerType, UpdateOperation, VectorStorageDatatype,
 };
 
-pub fn sanitize_collection_name(name: &str) -> Result<String, String> {
+fn is_unsafe_collection_char(c: char) -> bool {
+    matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()
+}
+
+pub fn sanitize_collection_name(name: &str) -> Result<Cow<'_, str>, String> {
     if name.is_empty() || name == "." || name == ".." {
         return Err("invalid collection name".into());
     }
+    if !name.chars().any(is_unsafe_collection_char) {
+        return Ok(Cow::Borrowed(name));
+    }
     let clean: String = name
         .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
+        .map(|c| if is_unsafe_collection_char(c) { '_' } else { c })
         .collect();
     if clean.is_empty() || clean == "." || clean == ".." {
         return Err("invalid collection name".into());
     }
-    Ok(clean)
+    Ok(Cow::Owned(clean))
 }
 
 pub fn shard_exists_on_disk(dir: &Path) -> bool {

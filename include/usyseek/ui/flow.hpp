@@ -1,13 +1,14 @@
 #pragma once
 
 #include <algorithm>
+#include <span>
 #include <vector>
 
 namespace usyseek::ui {
 
 struct FlowItem {
-    float width;
-    float height;
+    float width = 0.0f;
+    float height = 0.0f;
     bool grow = false;
 };
 
@@ -27,7 +28,7 @@ struct FlowResult {
 /// Places items left to right, starting a new line when the next item no longer fits in `avail`.
 /// An item wider than `avail` gets a line of its own, is clamped to `avail` and flagged `oversize`.
 /// Items marked `grow` share the unused width of their line equally.
-inline FlowResult flow_layout(const std::vector<FlowItem>& items, float gap_x, float gap_y, float avail) {
+inline FlowResult flow_layout(std::span<const FlowItem> items, float gap_x, float gap_y, float avail) {
     constexpr float tolerance = 0.001f;
     FlowResult result;
     result.placements.reserve(items.size());
@@ -58,7 +59,7 @@ inline FlowResult flow_layout(const std::vector<FlowItem>& items, float gap_x, f
         float x = 0.0f;
         for (size_t i = line_begin; i < line_end; ++i) {
             const float w = std::min(items[i].width, avail) + (items[i].grow ? extra : 0.0f);
-            result.placements.push_back({x, y, w, line, items[i].width > avail + tolerance});
+            result.placements.emplace_back(x, y, w, line, items[i].width > avail + tolerance);
             x += w + gap_x;
         }
 

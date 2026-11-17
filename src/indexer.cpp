@@ -26,12 +26,12 @@ using namespace usyseek;
 namespace {
 
 void wlog(const wchar_t* fmt, ...) {
-    wchar_t buf[2048];
-    va_list args;
+    std::array<wchar_t, 2048> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    va_list args{}; // NOLINT(cppcoreguidelines-init-variables)
     va_start(args, fmt);
-    _vsnwprintf_s(buf, _TRUNCATE, fmt, args);
+    _vsnwprintf_s(buf.data(), buf.size(), _TRUNCATE, fmt, args);
     va_end(args);
-    const std::string s = to_utf8(buf);
+    const std::string s = to_utf8(buf.data());
     std::fwrite(s.data(), 1, s.size(), stdout);
     std::fflush(stdout);
 }
@@ -154,12 +154,12 @@ struct Scope {
             for (int i = 0; i < 26; ++i) {
                 if (!(mask & (1u << i))) continue;
                 const wchar_t drive = static_cast<wchar_t>(L'A' + i);
-                const wchar_t root[] = {drive, L':', L'\\', 0};
-                if (GetDriveTypeW(root) != DRIVE_FIXED) continue;
+                const std::array<wchar_t, 4> root = {drive, L':', L'\\', 0};
+                if (GetDriveTypeW(root.data()) != DRIVE_FIXED) continue;
                 
                 // Check if the entire drive root (e.g. "D:\" or "D:") is in abs_excludes
-                const wchar_t probe[] = {drive, L':', L'\\', L'*', 0};
-                if (!excluded(probe)) {
+                const std::array<wchar_t, 5> probe = {drive, L':', L'\\', L'*', 0};
+                if (!excluded(std::wstring_view{probe.data(), 4})) {
                     out.insert(drive);
                 }
             }
@@ -167,8 +167,8 @@ struct Scope {
             for (const auto& i : includes) {
                 if (i.size() >= 2 && i[1] == L':') {
                     const wchar_t drive = static_cast<wchar_t>(towupper(i[0]));
-                    const wchar_t probe[] = {drive, L':', L'\\', L'*', 0};
-                    if (!excluded(probe)) {
+                    const std::array<wchar_t, 5> probe = {drive, L':', L'\\', L'*', 0};
+                    if (!excluded(std::wstring_view{probe.data(), 4})) {
                         out.insert(drive);
                     }
                 }
@@ -511,13 +511,12 @@ public:
             const std::uint64_t raw_size = Everything3_GetResultSize(raw, i);
             const std::uint64_t raw_dm = Everything3_GetResultDateModified(raw, i);
 
-            FileEntry e;
+            auto& e = out.emplace_back();
             e.path.assign(path_buf.data(), len);
             e.size = (raw_size == EVERYTHING3_UINT64_MAX) ? 0 : raw_size;
             e.mtime = (raw_dm == EVERYTHING3_UINT64_MAX) ? 0 : filetime_to_unix(raw_dm);
             e.kind = kind;
             e.id = rapidhash(lower_buf.data(), len * sizeof(wchar_t));
-            out.push_back(std::move(e));
         }
 
         if (!sorted_on_server && out.size() > 1) {
@@ -630,13 +629,13 @@ struct FailureCache {
     }
     void save() const {
         std::string out;
-        char prefix[96];
+        std::array<char, 96> prefix; // NOLINT(cppcoreguidelines-pro-type-member-init)
         for (const auto& [id, f] : entries) {
-            std::snprintf(prefix, sizeof(prefix), "%llu\t%lld\t%llu\t",
+            std::snprintf(prefix.data(), prefix.size(), "%llu\t%lld\t%llu\t",
                           static_cast<unsigned long long>(id),
                           static_cast<long long>(f.mtime),
                           static_cast<unsigned long long>(f.size));
-            out += prefix;
+            out += prefix.data();
             out += to_utf8(f.path);
             out += '\t';
             out += to_utf8(f.reason.empty() ? L"Decode failed" : f.reason);
@@ -704,8 +703,10 @@ struct DecodedItem {
 };
 
 std::vector<std::string> ancestors_of(std::wstring_view path) {
-    std::vector<std::string> out;
     const std::wstring l = lower(path);
+    const auto depth = static_cast<size_t>(std::ranges::count(l, L'\\'));
+    std::vector<std::string> out;
+    out.reserve(depth);
     for (size_t pos = l.find(L'\\'); pos != std::wstring::npos; pos = l.find(L'\\', pos + 1)) {
         out.push_back(to_utf8(std::wstring_view{l}.substr(0, pos)));
     }
@@ -801,6 +802,7 @@ struct PyVision {
     uint32_t shm_gen = 0;
     std::string shm_name;
     std::string read_buf;
+    std::string write_buf;
 
     PyVision() noexcept {
         cancel_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
@@ -967,13 +969,13 @@ struct PyVision {
 
 private:
     DWORD wait_ov(OVERLAPPED& ov, const char* crash_msg) {
-        HANDLE handles[4]{};
+        std::array<HANDLE, 4> handles; // NOLINT(cppcoreguidelines-pro-type-member-init)
         DWORD count = 0;
         handles[count++] = ov_event.get();
         handles[count++] = proc.hProcess;
         if (cancel_event) handles[count++] = cancel_event.get();
         if (g_stop) handles[count++] = g_stop;
-        const DWORD w = WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+        const DWORD w = WaitForMultipleObjects(count, handles.data(), FALSE, INFINITE);
         if (w != WAIT_OBJECT_0) {
             CancelIoEx(pipe.get(), &ov);
             DWORD dummy = 0;
@@ -992,17 +994,17 @@ private:
     template <typename Req>
     PyResp call(const Req& req) {
         if (is_cancelled()) throw std::runtime_error("Vision load cancelled");
-        std::string line;
-        (void)glz::write_json(req, line);
-        line.push_back('\n');
+        write_buf.clear();
+        (void)glz::write_json(req, write_buf);
+        write_buf.push_back('\n');
 
         size_t written = 0;
-        while (written < line.size()) {
+        while (written < write_buf.size()) {
             OVERLAPPED ov{};
             ov.hEvent = ov_event.get();
             ResetEvent(ov_event.get());
             DWORD n = 0;
-            if (!WriteFile(pipe.get(), line.data() + written, static_cast<DWORD>(line.size() - written), &n, &ov)) {
+            if (!WriteFile(pipe.get(), write_buf.data() + written, static_cast<DWORD>(write_buf.size() - written), &n, &ov)) {
                 if (GetLastError() != ERROR_IO_PENDING) throw std::runtime_error("Pipe write failed");
                 n = wait_ov(ov, "Python worker terminated unexpectedly");
             }
@@ -1011,10 +1013,10 @@ private:
 
         for (;;) {
             if (const auto nl = read_buf.find('\n'); nl != std::string::npos) {
-                std::string msg = read_buf.substr(0, nl);
-                read_buf.erase(0, nl + 1);
                 PyResp resp{};
-                if (glz::read<JSON_READ>(resp, msg)) {
+                const auto parse_err = glz::read<JSON_READ>(resp, std::string_view{read_buf.data(), nl});
+                read_buf.erase(0, nl + 1);
+                if (parse_err) {
                     throw std::runtime_error("Invalid response from Python worker");
                 }
                 if (!resp.ok) {
@@ -1022,17 +1024,17 @@ private:
                 }
                 return resp;
             }
-            char chunk[4096];
+            std::array<char, 4096> chunk; // NOLINT(cppcoreguidelines-pro-type-member-init)
             OVERLAPPED ov{};
             ov.hEvent = ov_event.get();
             ResetEvent(ov_event.get());
             DWORD n = 0;
-            if (!ReadFile(pipe.get(), chunk, sizeof(chunk), &n, &ov)) {
+            if (!ReadFile(pipe.get(), chunk.data(), static_cast<DWORD>(chunk.size()), &n, &ov)) {
                 if (GetLastError() != ERROR_IO_PENDING) throw std::runtime_error("Python worker closed pipe");
                 n = wait_ov(ov, "Python worker terminated unexpectedly");
             }
             if (n == 0) throw std::runtime_error("Python worker closed pipe");
-            read_buf.append(chunk, n);
+            read_buf.append(chunk.data(), n);
         }
     }
 };
@@ -1251,8 +1253,12 @@ int run_indexer(Settings& settings) {
     static const std::vector<std::string> empty_tags;
     found_ids.reserve(files.size());
     if (collection_exists) {
+        static constexpr std::array<std::string_view, 3> retrieve_fields = {"m", "s", "t"};
         constexpr size_t CHUNK = 1024;
         std::vector<uint64_t> ids;
+        ids.reserve(CHUNK);
+        std::unordered_map<uint64_t, MediaPayload> existing;
+        existing.reserve(CHUNK);
         bool retrieve_warned = false;
         for (size_t i = 0; i < files.size() && !stopping(); i += CHUNK) {
             const size_t end = std::min(files.size(), i + CHUNK);
@@ -1261,9 +1267,9 @@ int run_indexer(Settings& settings) {
                 ids.push_back(files[j].id);
                 found_ids.insert(files[j].id);
             }
-            std::unordered_map<uint64_t, MediaPayload> existing;
+            existing.clear();
             std::string ret_err;
-            if (auto pts = db.retrieve(coll, ids, {"m", "s", "t"}, &ret_err)) {
+            if (auto pts = db.retrieve(coll, ids, retrieve_fields, &ret_err)) {
                 for (auto& p : pts->points) existing.emplace(p.id, std::move(p.p));
             } else if (!stopping() && !retrieve_warned) {
                 retrieve_warned = true;
@@ -1347,13 +1353,14 @@ int run_indexer(Settings& settings) {
     pr.phase(Phase::Cleaning);
     failures.prune(scope);
     if (collection_exists) {
+        static constexpr std::array<std::string_view, 1> path_field = {"p"};
         std::optional<uint64_t> cursor;
         std::vector<uint64_t> stale;
         do {
             ScrollRequest req;
             req.limit = 4096;
             req.offset = cursor;
-            req.fields = {"p"};
+            req.fields = path_field;
             std::string scroll_err;
             auto page = db.scroll(coll, req, &scroll_err);
             if (!page) {
@@ -1587,6 +1594,8 @@ int run_indexer(Settings& settings) {
     uint64_t done_this_run = 0;
     uint64_t failed_this_run = 0;
     std::vector<DecodedItem> pending;
+    pending.reserve(batch);
+    std::vector<float> v;
 
     while (!stopping()) {
         // Gather up to `batch` frames
@@ -1655,7 +1664,7 @@ int run_indexer(Settings& settings) {
         size_t row = 0;
         for (const auto& it : pending) {
             const size_t n = it.data->frames.size();
-            std::vector<float> v(dim, 0.0f);
+            v.assign(dim, 0.0f);
             for (size_t k = 0; k < n; ++k, ++row) {
                 for (size_t c = 0; c < dim; ++c) v[c] += rows[row * dim + c];
             }

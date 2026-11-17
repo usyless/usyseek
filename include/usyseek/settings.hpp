@@ -2,6 +2,9 @@
 
 #include "common.hpp"
 
+#include <charconv>
+#include <memory>
+
 #include <glaze/glaze.hpp>
 
 namespace usyseek {
@@ -103,10 +106,11 @@ inline bool save_json_file(const fs::path& p, const T& value) {
 inline const std::vector<std::wstring>& locked_excludes() {
     static const std::vector<std::wstring> v = [] {
         std::vector<std::wstring> out;
+        out.reserve(4);
         std::wstring win = known_folder(FOLDERID_Windows);
         if (win.empty()) win = L"C:\\Windows";
-        out.push_back(win);
         const std::wstring drive = win.substr(0, 2);
+        out.push_back(std::move(win));
         out.push_back(drive + L"\\$Recycle.Bin");
         out.push_back(drive + L"\\System Volume Information");
         out.push_back(data_dir().wstring());
@@ -117,13 +121,14 @@ inline const std::vector<std::wstring>& locked_excludes() {
 
 inline std::vector<std::string> default_excludes() {
     std::vector<std::string> v;
+    v.reserve(7);
     for (auto id : {FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_ProgramData, FOLDERID_LocalAppData}) {
         auto p = known_folder(id);
         if (!p.empty()) v.push_back(to_utf8(p));
     }
-    v.push_back("*\\node_modules");
-    v.push_back("*\\.git");
-    v.push_back("*\\site-packages");
+    v.emplace_back("*\\node_modules");
+    v.emplace_back("*\\.git");
+    v.emplace_back("*\\site-packages");
     return v;
 }
 
@@ -132,10 +137,11 @@ inline bool is_startup_enabled() noexcept {
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &key) != ERROR_SUCCESS) {
         return false;
     }
-    wchar_t buf[MAX_PATH * 2]{};
-    DWORD sz = sizeof(buf);
+    std::array<wchar_t, MAX_PATH * 2> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    buf[0] = L'\0';
+    auto sz = static_cast<DWORD>(buf.size() * sizeof(wchar_t));
     DWORD type = 0;
-    const LSTATUS st = RegQueryValueExW(key, L"usyseek", nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz);
+    const LSTATUS st = RegQueryValueExW(key, L"usyseek", nullptr, &type, reinterpret_cast<LPBYTE>(buf.data()), &sz);
     RegCloseKey(key);
     return st == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ) && buf[0] != L'\0';
 }
@@ -215,18 +221,21 @@ inline std::vector<FailedFile> load_failed_files(std::string_view coll) {
         if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
         if (line.empty()) continue;
 
-        FailedFile f;
         // Tab-separated format: id \t mtime \t size \t path \t reason
         if (const auto t1 = line.find('\t'); t1 != std::string_view::npos) {
-            f.id = std::strtoull(std::string{line.substr(0, t1)}.c_str(), nullptr, 10);
+            FailedFile f;
+            const std::string_view s_id = line.substr(0, t1);
+            std::from_chars(s_id.data(), s_id.data() + s_id.size(), f.id);
             const auto r1 = line.substr(t1 + 1);
             const auto t2 = r1.find('\t');
             if (t2 == std::string_view::npos) continue;
-            f.mtime = std::strtoll(std::string{r1.substr(0, t2)}.c_str(), nullptr, 10);
+            const std::string_view s_mtime = r1.substr(0, t2);
+            std::from_chars(s_mtime.data(), s_mtime.data() + s_mtime.size(), f.mtime);
             const auto r2 = r1.substr(t2 + 1);
             const auto t3 = r2.find('\t');
             if (t3 == std::string_view::npos) continue;
-            f.size = std::strtoull(std::string{r2.substr(0, t3)}.c_str(), nullptr, 10);
+            const std::string_view s_size = r2.substr(0, t3);
+            std::from_chars(s_size.data(), s_size.data() + s_size.size(), f.size);
             const auto r3 = r2.substr(t3 + 1);
             const auto t4 = r3.find('\t');
             if (t4 == std::string_view::npos) {
@@ -259,11 +268,11 @@ inline std::wstring read_pe_version(const fs::path& exe) {
     DWORD dummy = 0;
     const DWORD sz = GetFileVersionInfoSizeW(exe.c_str(), &dummy);
     if (sz == 0) return {};
-    std::vector<uint8_t> buf(sz);
-    if (!GetFileVersionInfoW(exe.c_str(), 0, sz, buf.data())) return {};
+    auto buf = std::make_unique_for_overwrite<uint8_t[]>(sz); // NOLINT(modernize-avoid-c-arrays)
+    if (!GetFileVersionInfoW(exe.c_str(), 0, sz, buf.get())) return {};
     VS_FIXEDFILEINFO* ffi = nullptr;
     UINT len = 0;
-    if (!VerQueryValueW(buf.data(), L"\\", reinterpret_cast<void**>(&ffi), &len) || !ffi) return {};
+    if (!VerQueryValueW(buf.get(), L"\\", reinterpret_cast<void**>(&ffi), &len) || !ffi) return {};
     return std::to_wstring(HIWORD(ffi->dwFileVersionMS)) + L"." +
            std::to_wstring(LOWORD(ffi->dwFileVersionMS)) + L"." +
            std::to_wstring(HIWORD(ffi->dwFileVersionLS));
@@ -276,6 +285,12 @@ inline VenvInfo read_venv(const fs::path& venv) {
         info.portable = false;
         info.python_exe = (venv / L"Scripts" / L"python.exe").wstring();
         info.site_packages = (venv / L"Lib" / L"site-packages").wstring();
+        const auto trim_sv = [](std::string_view sv) noexcept {
+            const auto b = sv.find_first_not_of(" \t\r\n");
+            if (b == std::string_view::npos) return std::string_view{};
+            const auto e = sv.find_last_not_of(" \t\r\n");
+            return sv.substr(b, e - b + 1);
+        };
         std::string_view rest{*cfg};
         while (!rest.empty()) {
             const auto nl = rest.find('\n');
@@ -283,13 +298,11 @@ inline VenvInfo read_venv(const fs::path& venv) {
             rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
             const auto eq = line.find('=');
             if (eq == std::string_view::npos) continue;
-            auto key = to_wide(line.substr(0, eq));
-            auto val = to_wide(line.substr(eq + 1));
-            key = trim(key);
-            val = trim(val);
-            if (key == L"home") info.home = val;
-            else if (key == L"version" || key == L"version_info") {
-                if (info.version.empty() || key == L"version") info.version = val;
+            const std::string_view key = trim_sv(line.substr(0, eq));
+            const std::string_view val = trim_sv(line.substr(eq + 1));
+            if (key == "home") info.home = to_wide(val);
+            else if (key == "version" || key == "version_info") {
+                if (info.version.empty() || key == "version") info.version = to_wide(val);
             }
         }
         return info;

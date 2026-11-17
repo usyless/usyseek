@@ -13,8 +13,9 @@
 
 namespace usyseek::ui {
 
-inline fs::path themes_dir() {
-    return data_dir() / L"themes";
+inline const fs::path& themes_dir() {
+    static const fs::path p = data_dir() / L"themes";
+    return p;
 }
 
 inline std::string_view example_theme_json() noexcept {
@@ -67,7 +68,7 @@ inline std::string_view example_theme_json() noexcept {
 
 /// Ensures `data/themes/` exists and seeds `example-sakura.json` if no JSON themes exist yet.
 inline void ensure_themes_dir() {
-    const fs::path dir = themes_dir();
+    const fs::path& dir = themes_dir();
     std::error_code ec;
     const bool existed = fs::exists(dir, ec);
     fs::create_directories(dir, ec);
@@ -102,9 +103,11 @@ class ThemeCatalog {
 public:
     void reload(std::vector<std::string>* errors = nullptr) {
         entries_.clear();
-        for (const char* id : {"system", "accent", "dark", "light", "nord", "mocha", "oled", "liquid-glass"}) {
-            const Theme t = resolve_builtin_theme(id);
-            entries_.push_back({.id = t.id, .name = t.name, .custom = false, .path = {}, .spec = std::nullopt, .swatch = t.primary});
+        static constexpr std::array<std::string_view, 8> builtin_ids = {
+            "system", "accent", "dark", "light", "nord", "mocha", "oled", "liquid-glass"};
+        for (const std::string_view id : builtin_ids) {
+            Theme t = resolve_builtin_theme(id);
+            entries_.emplace_back(std::move(t.id), std::move(t.name), false, fs::path{}, std::nullopt, t.primary);
         }
 
         ensure_themes_dir();
@@ -130,10 +133,10 @@ public:
                 continue;
             }
             const std::string stem = to_utf8(p.stem().wstring());
-            const std::string id = "custom:" + stem;
-            const std::string disp = spec.name.empty() ? stem : spec.name;
+            std::string id = "custom:" + stem;
+            std::string disp = spec.name.empty() ? stem : spec.name;
             const Theme preview = apply_theme_spec(spec, id, disp);
-            entries_.push_back({.id = id, .name = disp, .custom = true, .path = p, .spec = std::move(spec), .swatch = preview.primary});
+            entries_.emplace_back(std::move(id), std::move(disp), true, p, std::move(spec), preview.primary);
         }
     }
 

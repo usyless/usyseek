@@ -25,7 +25,7 @@ public:
     Flow(float gap_x, float gap_y) noexcept : gap_x_{gap_x}, gap_y_{gap_y} {}
 
     void add(float w, float h, std::function<void(D2D1_RECT_F)> draw, bool grow = false) {
-        items_.push_back({w, h, grow});
+        items_.emplace_back(w, h, grow);
         draws_.push_back(std::move(draw));
     }
 
@@ -234,12 +234,12 @@ public:
             full_dirty_ = true;
         }
 
-        std::vector<D2D1_RECT_F> dirty_dips;
+        dirty_dips_scratch_.clear();
         if (!full_dirty_) {
-            dirty_dips = std::exchange(pending_dirty_, {});
-            if (hover_.in_anim.value != hover_.in_anim.target) queue_hover_dirty(dirty_dips, hover_.id, hover_.index, full_dirty_);
+            dirty_dips_scratch_.swap(pending_dirty_);
+            if (hover_.in_anim.value != hover_.in_anim.target) queue_hover_dirty(dirty_dips_scratch_, hover_.id, hover_.index, full_dirty_);
             if (hover_.prev_id != IdNone && hover_.out_anim.value != hover_.out_anim.target) {
-                queue_hover_dirty(dirty_dips, hover_.prev_id, hover_.prev_index, full_dirty_);
+                queue_hover_dirty(dirty_dips_scratch_, hover_.prev_id, hover_.prev_index, full_dirty_);
             }
         } else {
             pending_dirty_.clear();
@@ -257,13 +257,13 @@ public:
             if (tl.valid) curr_tip_dirty = tl.dirty;
         }
         if (!full_dirty_) {
-            if (curr_tip_dirty) dirty_dips.push_back(*curr_tip_dirty);
+            if (curr_tip_dirty) dirty_dips_scratch_.push_back(*curr_tip_dirty);
             if (last_tooltip_dirty_ && (!curr_tip_dirty || !rect_equal(*last_tooltip_dirty_, *curr_tip_dirty))) {
-                dirty_dips.push_back(*last_tooltip_dirty_);
+                dirty_dips_scratch_.push_back(*last_tooltip_dirty_);
             }
             if (glass_active()) {
                 const float scene_guard_y = tabs_height(target_.size().width) + 32.0f;
-                for (const D2D1_RECT_F& r : dirty_dips) {
+                for (const D2D1_RECT_F& r : dirty_dips_scratch_) {
                     if (r.top < scene_guard_y) {
                         full_dirty_ = true;
                         break;
@@ -273,15 +273,14 @@ public:
         }
 
         const bool request_full = std::exchange(full_dirty_, false);
-        std::vector<Hit> scratch_hits;
-        const bool ok = target_.render_frame(request_full, dirty_dips, !in_sizemove_, [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
+        const bool ok = target_.render_frame(request_full, dirty_dips_scratch_, !in_sizemove_, [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
             if (full_frame) {
                 hits_.clear();
                 Canvas cv{target_, sh_.fonts, hits_, sh_.theme, clip};
                 draw(cv);
             } else {
-                scratch_hits.clear();
-                Canvas cv{target_, sh_.fonts, scratch_hits, sh_.theme, clip};
+                scratch_hits_.clear();
+                Canvas cv{target_, sh_.fonts, scratch_hits_, sh_.theme, clip};
                 draw(cv);
             }
         });
@@ -825,7 +824,7 @@ private:
         int id;
     };
 
-    static std::array<TabDef, 4> tab_defs() noexcept {
+    static constexpr std::array<TabDef, 4> tab_defs() noexcept {
         return {{
             {glyph::clock, L"Embeddings & Progress", IdTab0},
             {glyph::settings, L"Application & Venv Settings", IdTab1},
@@ -835,7 +834,7 @@ private:
     }
 
     std::wstring tab_label(int i) const {
-        const auto tabs = tab_defs();
+        constexpr auto tabs = tab_defs();
         std::wstring s = tabs[static_cast<size_t>(i)].label;
         if (i == 2 && !sh_.notifications.empty()) {
             s += L" (" + format_count(sh_.notifications.size()) + L")";
@@ -844,10 +843,9 @@ private:
     }
 
     FlowResult tab_layout(float total_w) const {
-        std::vector<FlowItem> items;
-        items.reserve(4);
-        for (int i = 0; i < 4; ++i) {
-            items.push_back({sh_.fonts.measure(tab_label(i), Font::BodySemi) + 46.0f, TABS_H - 16.0f});
+        std::array<FlowItem, 4> items; // NOLINT(cppcoreguidelines-pro-type-member-init)
+        for (size_t i = 0; i < items.size(); ++i) {
+            items[i] = {sh_.fonts.measure(tab_label(static_cast<int>(i)), Font::BodySemi) + 46.0f, TABS_H - 16.0f, false};
         }
         return flow_layout(items, 8.0f, 8.0f, total_w - PAD * 2.0f);
     }
@@ -937,10 +935,10 @@ private:
         if (!glass_active()) {
             cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(cv.theme().surface_lowest, 0.75f));
         }
-        const auto tabs = tab_defs();
+        constexpr auto tabs = tab_defs();
         const FlowResult layout = tab_layout(sz.width);
-        D2D1_RECT_F rects[4]{};
-        for (int i = 0; i < 4; ++i) {
+        std::array<D2D1_RECT_F, 4> rects{};
+        for (size_t i = 0; i < rects.size(); ++i) {
             const FlowPlacement& p = layout.placements[i];
             rects[i] = rect(PAD + p.x, 8.0f + p.y, p.width, TABS_H - 16.0f);
         }
@@ -1319,7 +1317,7 @@ private:
     };
 
     float draw_storage_list_card(Canvas& cv, float x, float y, float w, const wchar_t* title, const wchar_t* caption,
-                                 const wchar_t* empty_msg, const std::vector<StorageRow>& rows, int refresh_id,
+                                 const wchar_t* empty_msg, std::span<const StorageRow> rows, int refresh_id,
                                  int use_id, int delete_id, int delete_disabled_id) {
         const float lx = x + 22.0f, rw = w - 44.0f;
         const float refresh_w = button_width(cv, L"Refresh", true, 96.0f);
@@ -1355,7 +1353,7 @@ private:
             const float badge_extra = (r.active && !badge_inline) ? 24.0f : 0.0f;
             const float text_h = title_h + badge_extra + 2.0f + sub_h;
             const float row_h = beside ? std::max(50.0f, 16.0f + text_h) : (16.0f + text_h + 8.0f + 30.0f);
-            lay.push_back({cy, row_h, title_w, title_h, sub_h, text_w, actions_w, beside, badge_inline});
+            lay.emplace_back(cy, row_h, title_w, title_h, sub_h, text_w, actions_w, beside, badge_inline);
             cy += row_h + 6.0f;
         }
 
@@ -1446,9 +1444,9 @@ private:
             std::wstring sub;
             if (running) {
                 if (d.rate > 0.05f) {
-                    wchar_t rbuf[64];
-                    swprintf_s(rbuf, L"%.1f files/s", d.rate);
-                    sub += rbuf;
+                    std::array<wchar_t, 64> rbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+                    swprintf_s(rbuf.data(), rbuf.size(), L"%.1f files/s", d.rate);
+                    sub += rbuf.data();
                     if (d.todo > d.processed) {
                         const uint64_t rem_ms = static_cast<uint64_t>((d.todo - d.processed) / d.rate * 1000.0f);
                         sub += L"  •  ETA " + format_duration_ms(rem_ms);
@@ -1467,8 +1465,8 @@ private:
 
             float pct = total > 0 ? static_cast<float>(embedded) / static_cast<float>(total) : (running ? 0.05f : 0.0f);
             pct = std::clamp(pct, 0.0f, 1.0f);
-            wchar_t pbuf[32];
-            swprintf_s(pbuf, L"%.1f%% completed", pct * 100.0f);
+            std::array<wchar_t, 32> pbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+            swprintf_s(pbuf.data(), pbuf.size(), L"%.1f%% completed", pct * 100.0f);
             const std::wstring cur = stopping ? L"Stopping indexer — finishing current batch…"
                                    : (running && d.current[0] ? (std::wstring{L"Processing: "} + d.current)
                                    : (running && d.message[0] ? std::wstring{d.message} : L"On-demand scanner idle — zero background GPU/RAM usage"));
@@ -1516,7 +1514,7 @@ private:
             flow_text(cv, status, sub, Font::Caption, cv.theme().on_surface_variant, rw, 22.0f);
 
             Flow progress_text{8.0f, 4.0f};
-            flow_text(cv, progress_text, pbuf, Font::Caption, cv.theme().outline, rw, 20.0f);
+            flow_text(cv, progress_text, pbuf.data(), Font::Caption, cv.theme().outline, rw, 20.0f);
             flow_text(cv, progress_text, cur, Font::MonoSmall, stopping ? cv.theme().amber : cv.theme().on_surface_variant, rw, 20.0f, true, Align::Right);
 
             Flow database{8.0f, 8.0f};
@@ -1579,6 +1577,7 @@ private:
                 float reason_h;
             };
             std::vector<FailedRow> rows;
+            rows.reserve(show_n);
             float cy = y + 16.0f + hd.h + 10.0f;
             for (size_t i = 0; i < show_n; ++i) {
                 const auto& ff = sh_.failed_files[i];
@@ -1710,10 +1709,10 @@ private:
                 const wchar_t* desc;
                 int id;
             };
-            const Radio radios[2] = {
+            const std::array<Radio, 2> radios = {{
                 {sh_.settings.whole_pc, L"Include the whole PC", L"All local fixed drives (minus exclusions)", IdScopeAll},
                 {!sh_.settings.whole_pc, L"Specify directories to include", L"Only scan the folders listed below", IdScopeCustom},
-            };
+            }};
             constexpr float radio_min_w = 300.0f;
             const float radio_h = std::max(radio_height(cv, radio_min_w, radios[0].title, radios[0].desc),
                                            radio_height(cv, radio_min_w, radios[1].title, radios[1].desc));
@@ -1753,6 +1752,9 @@ private:
                     empty_y = cy;
                     cy += empty_h + 4.0f;
                 }
+                include_paths.reserve(inc_n);
+                include_y.reserve(inc_n);
+                include_h.reserve(inc_n);
                 for (size_t i = 0; i < inc_n; ++i) {
                     include_paths.push_back(to_wide(sh_.settings.include_dirs[i]));
                     include_y.push_back(cy);
@@ -1843,12 +1845,12 @@ private:
             std::vector<ExcludeRow> rows;
             rows.reserve(locked.size() + sh_.settings.exclude_dirs.size());
             for (const auto& sys : locked) {
-                rows.push_back({sys, L"System", true, 0, 0.0f, 0.0f});
+                rows.emplace_back(sys, L"System", true, 0, 0.0f, 0.0f);
             }
             for (size_t i = 0; i < sh_.settings.exclude_dirs.size(); ++i) {
-                const std::wstring wex = to_wide(sh_.settings.exclude_dirs[i]);
+                std::wstring wex = to_wide(sh_.settings.exclude_dirs[i]);
                 const bool is_pat = wex.contains(L'*') || !(wex.size() >= 2 && wex[1] == L':');
-                rows.push_back({wex, is_pat ? L"Pattern" : L"Folder", false, static_cast<int>(i), 0.0f, 0.0f});
+                rows.emplace_back(std::move(wex), is_pat ? L"Pattern" : L"Folder", false, static_cast<int>(i), 0.0f, 0.0f);
             }
 
             const float input_y = y + 16.0f + hd.h + 10.0f;
@@ -2138,7 +2140,7 @@ private:
 
             Flow batch{5.0f, 8.0f};
             flow_text(cv, batch, L"Batch size:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 32.0f);
-            static constexpr uint32_t batches[] = {0, 32, 64, 128, 256};
+            static constexpr std::array<uint32_t, 5> batches = {0, 32, 64, 128, 256};
             for (const uint32_t b : batches) {
                 const std::wstring bl = b == 0 ? L"Auto (VRAM)" : std::to_wstring(b);
                 batch.add(button_width(cv, bl, false, b == 0 ? 92.0f : 44.0f), 32.0f, [&, b, bl](D2D1_RECT_F r) {
@@ -2300,16 +2302,16 @@ private:
             const float box_h = 8.0f + env_h + 2.0f + py_h + 2.0f + pkgs_h + 6.0f;
 
             // Portable Python (NuGet) row
-            static constexpr const char* versions[4] = {"3.14", "3.13", "3.12", "3.11"};
+            static constexpr std::array<const char*, 4> versions = {"3.14", "3.13", "3.12", "3.11"};
             const std::wstring dl_label = venv_view.total > 0 && venv_busy
                 ? (L"Downloading " + std::to_wstring(venv_view.done * 100 / venv_view.total) + L"%")
                 : L"Download & Use";
             Flow portable{8.0f, 8.0f};
             flow_text(cv, portable, L"Portable Python:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 30.0f);
-            for (int i = 0; i < 4; ++i) {
+            for (size_t i = 0; i < versions.size(); ++i) {
                 const bool on = sh_.settings.python_version == versions[i];
                 portable.add(52.0f, 30.0f, [&, i, on](D2D1_RECT_F r) {
-                    draw_button(cv, r, 0, to_wide(versions[i]), IdPyVerChip, i, on ? 1 : 0);
+                    draw_button(cv, r, 0, to_wide(versions[i]), IdPyVerChip, static_cast<int>(i), on ? 1 : 0);
                 });
             }
             portable.add(78.0f, 30.0f, [&](D2D1_RECT_F pvr) {
@@ -2323,15 +2325,15 @@ private:
             });
 
             // Torch installer backend row
-            const char* backends[4] = {"rocm", "cuda", "cpu", "manual"};
-            const wchar_t* blabels[4] = {L"AMD ROCm", L"NVIDIA CUDA", L"CPU", L"Manual"};
+            static constexpr std::array<const char*, 4> backends = {"rocm", "cuda", "cpu", "manual"};
+            static constexpr std::array<const wchar_t*, 4> blabels = {L"AMD ROCm", L"NVIDIA CUDA", L"CPU", L"Manual"};
             Flow backend{8.0f, 8.0f};
             flow_text(cv, backend, L"PyTorch stack:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 30.0f);
-            for (int i = 0; i < 4; ++i) {
+            for (size_t i = 0; i < backends.size(); ++i) {
                 const bool on = sh_.settings.torch_backend == backends[i];
                 const wchar_t* blabel = blabels[i];
                 backend.add(button_width(cv, blabel, false, i == 3 ? 78.0f : 98.0f), 30.0f, [&, i, on, blabel](D2D1_RECT_F r) {
-                    draw_button(cv, r, 0, blabel, IdBackendChip, i, on ? 1 : 0);
+                    draw_button(cv, r, 0, blabel, IdBackendChip, static_cast<int>(i), on ? 1 : 0);
                 });
             }
             if (sh_.settings.torch_backend == "rocm") {
@@ -2748,11 +2750,11 @@ private:
             fs::path local;
             bool present;
         };
-        const Item items[] = {
+        const std::array<Item, 2> items = {{
             {L"tokenizer.json", dir / (wname + L"-tokenizer.json"),
              fs::exists(dir / (wname + L"-tokenizer.json"), ec) || fs::exists(dir / L"tokenizer.json", ec)},
             {L"open_clip_model.safetensors", dir / (wname + L".safetensors"), fs::exists(dir / (wname + L".safetensors"), ec)},
-        };
+        }};
         for (const Item& item : items) {
             if (item.present) continue;
             report(model_job_, L"Downloading " + item.remote + L" from " + to_wide(repo) + L"…");
@@ -2804,12 +2806,15 @@ private:
                 });
     }
 
-    bool exec_logged(const fs::path& exe, const std::vector<std::wstring>& args) {
+    bool exec_logged(const fs::path& exe, std::span<const std::wstring_view> args) {
         std::wstring full = L"\"" + exe.wstring() + L"\"";
         std::wstring disp = exe.filename().wstring();
-        for (const auto& a : args) {
-            full += L" \"" + a + L"\"";
-            disp += L" " + a;
+        for (const std::wstring_view a : args) {
+            full += L" \"";
+            full += a;
+            full += L'"';
+            disp += L' ';
+            disp += a;
         }
         append_venv_log(L"> " + disp);
         auto on_line = [this](std::string_view out) { append_venv_log(to_wide(out)); };
@@ -2944,9 +2949,9 @@ private:
                 notify_async("error", "Venv", "Portable Python extraction failed", to_utf8(msg), "venv-setup");
                 return;
             }
-            wchar_t sys_dir[MAX_PATH]{};
-            GetSystemDirectoryW(sys_dir, MAX_PATH);
-            const bool tar_ok = exec_logged(fs::path{sys_dir} / L"tar.exe", {L"-xf", pkg.wstring(), L"-C", root.wstring(), L"tools"});
+            const std::wstring pkg_w = pkg.wstring();
+            const std::wstring root_w = root.wstring();
+            const bool tar_ok = exec_logged(system_tar_path(), make_array<std::wstring_view>(L"-xf", pkg_w, L"-C", root_w, L"tools"));
             fs::remove(pkg, ec);
             if (!tar_ok || !fs::exists(root / L"tools" / L"python.exe", ec)) {
                 report(venv_job_, L"Extraction failed: tools\\python.exe missing", true);
@@ -2960,7 +2965,7 @@ private:
 
         // Packages install straight into the portable interpreter (no venv)
         const fs::path py = root / L"tools" / L"python.exe";
-        if (!exec_logged(py, {L"-m", L"ensurepip", L"--upgrade"})) {
+        if (!exec_logged(py, make_array<std::wstring_view>(L"-m", L"ensurepip", L"--upgrade"))) {
             notify_async("error", "Venv", "ensurepip failed", "Could not bootstrap pip inside portable Python.", "venv-setup");
             return;
         }
@@ -2985,7 +2990,7 @@ private:
     }
 
     void install_packages_into(const VenvJobInputs& in, const fs::path& py) {
-        if (!exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"pip"})) {
+        if (!exec_logged(py, make_array<std::wstring_view>(L"-m", L"pip", L"install", L"--upgrade", L"pip"))) {
             notify_async("error", "Venv", "pip upgrade failed", "pip exited with an error while upgrading itself.", "venv-setup");
             return;
         }
@@ -2994,22 +2999,28 @@ private:
         if (!custom_args.empty()) {
             int argc = 0;
             LPWSTR* argv = CommandLineToArgvW(custom_args.c_str(), &argc);
-            std::vector<std::wstring> args = {L"-m", L"pip", L"install", L"--upgrade"};
+            std::vector<std::wstring_view> args = {L"-m", L"pip", L"install", L"--upgrade"};
+            if (argc > 0) args.reserve(4 + static_cast<size_t>(argc));
             for (int i = 0; i < argc; ++i) args.emplace_back(argv[i]);
-            if (argv) LocalFree(argv);
             torch_ok = exec_logged(py, args);
+            if (argv) LocalFree(argv);
         } else if (in.torch_backend == "manual") {
             append_venv_log(L"Manual PyTorch mode: skipping Torch install, installing requirements.txt…");
         } else if (in.torch_backend == "rocm") {
             const std::wstring arch = to_wide(in.rocm_arch.empty() ? "gfx1030" : in.rocm_arch);
-            torch_ok = exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", L"https://stable.repo.amd.com/rocm/whl-next/",
-                                        L"torch[device-" + arch + L"]", L"torchvision[device-" + arch + L"]", L"rocm[libraries,device-" + arch + L"]"});
+            const std::wstring pkg_torch = L"torch[device-" + arch + L"]";
+            const std::wstring pkg_tv = L"torchvision[device-" + arch + L"]";
+            const std::wstring pkg_rocm = L"rocm[libraries,device-" + arch + L"]";
+            torch_ok = exec_logged(py, make_array<std::wstring_view>(L"-m", L"pip", L"install", L"--upgrade", L"--index-url", L"https://stable.repo.amd.com/rocm/whl-next/",
+                                                                     pkg_torch, pkg_tv, pkg_rocm));
         } else if (in.torch_backend == "cuda") {
-            torch_ok = exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cuda", in.cuda_version)),
-                                        L"torch", L"torchvision"});
+            const std::wstring idx_url = to_wide(torch_index_url("cuda", in.cuda_version));
+            torch_ok = exec_logged(py, make_array<std::wstring_view>(L"-m", L"pip", L"install", L"--upgrade", L"--index-url", idx_url,
+                                                                     L"torch", L"torchvision"));
         } else {
-            torch_ok = exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"--index-url", to_wide(torch_index_url("cpu", "")),
-                                        L"torch", L"torchvision"});
+            const std::wstring idx_url = to_wide(torch_index_url("cpu", ""));
+            torch_ok = exec_logged(py, make_array<std::wstring_view>(L"-m", L"pip", L"install", L"--upgrade", L"--index-url", idx_url,
+                                                                     L"torch", L"torchvision"));
         }
         if (!torch_ok) {
             report(venv_job_, L"PyTorch installation failed — check settings and retry.", true);
@@ -3023,10 +3034,11 @@ private:
         }
         bool req_ok = false;
         if (fs::exists(req)) {
-            req_ok = exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"-r", req.wstring()});
+            const std::wstring req_w = req.wstring();
+            req_ok = exec_logged(py, make_array<std::wstring_view>(L"-m", L"pip", L"install", L"--upgrade", L"-r", req_w));
         } else {
             append_venv_log(L"requirements.txt not found; installing fallback package list…");
-            req_ok = exec_logged(py, {L"-m", L"pip", L"install", L"--upgrade", L"open-clip-torch", L"timm", L"safetensors", L"onnx", L"onnxscript"});
+            req_ok = exec_logged(py, make_array<std::wstring_view>(L"-m", L"pip", L"install", L"--upgrade", L"open-clip-torch", L"timm", L"safetensors", L"onnx", L"onnxscript"));
         }
         if (!req_ok) {
             report(venv_job_, L"Package installation failed — see error above.", true);
@@ -3530,13 +3542,15 @@ private:
                             }
                             const std::string coll = sh_.engine.collection();
                             if (db.ensure_collection_status(coll, 0) == Db::CollectionStatus::Ready) {
+                                static constexpr std::array<std::string_view, 1> tags_field = {"t"};
                                 constexpr size_t CHUNK = 1024;
                                 bool updated_coll = false;
+                                std::vector<uint64_t> present;
                                 for (size_t i = 0; i < missing_ids.size(); i += CHUNK) {
                                     const size_t n = std::min(CHUNK, missing_ids.size() - i);
-                                    const auto pts = db.retrieve(coll, std::span{missing_ids.data() + i, n}, {"t"});
+                                    const auto pts = db.retrieve(coll, std::span{missing_ids.data() + i, n}, tags_field);
                                     if (!pts || pts->points.empty()) continue;
-                                    std::vector<uint64_t> present;
+                                    present.clear();
                                     present.reserve(pts->points.size());
                                     for (const auto& p : pts->points) {
                                         if (!p.p.t.empty()) present.push_back(p.id);
@@ -3624,11 +3638,11 @@ private:
                 sh_.save();
                 break;
             case IdMinKbStep: {
-                static constexpr uint32_t steps[] = {0, 4, 16, 64, 256, 1024};
+                static constexpr std::array<uint32_t, 6> steps = {0, 4, 16, 64, 256, 1024};
                 uint32_t next = steps[0];
-                for (size_t i = 0; i < std::size(steps); ++i) {
+                for (size_t i = 0; i < steps.size(); ++i) {
                     if (sh_.settings.min_file_kb == steps[i]) {
-                        next = steps[(i + 1) % std::size(steps)];
+                        next = steps[(i + 1) % steps.size()];
                         break;
                     }
                 }
@@ -3738,11 +3752,11 @@ private:
                 sh_.refresh_theme(true, true);
                 break;
             case IdIdleStep: {
-                static constexpr int32_t steps[] = {0, 60, 180, 600, 1800, -1};
+                static constexpr std::array<int32_t, 6> steps = {0, 60, 180, 600, 1800, -1};
                 int32_t next = 0;
-                for (size_t i = 0; i < std::size(steps); ++i) {
+                for (size_t i = 0; i < steps.size(); ++i) {
                     if (sh_.settings.ui_idle_timeout_s == steps[i]) {
-                        next = steps[(i + 1) % std::size(steps)];
+                        next = steps[(i + 1) % steps.size()];
                         break;
                     }
                 }
@@ -3846,8 +3860,8 @@ private:
                 }
                 break;
             case IdBackendChip: {
-                static constexpr const char* b[4] = {"rocm", "cuda", "cpu", "manual"};
-                sh_.settings.torch_backend = b[std::clamp(idx, 0, 3)];
+                static constexpr std::array<const char*, 4> b = {"rocm", "cuda", "cpu", "manual"};
+                sh_.settings.torch_backend = b[static_cast<size_t>(std::clamp(idx, 0, 3))];
                 sh_.save();
                 break;
             }
@@ -3861,8 +3875,8 @@ private:
             case IdTorchField: focus_field(torch_field_); break;
             case IdPyVerField: focus_field(py_ver_field_); break;
             case IdPyVerChip: {
-                static constexpr const char* v[4] = {"3.14", "3.13", "3.12", "3.11"};
-                sh_.settings.python_version = v[std::clamp(idx, 0, 3)];
+                static constexpr std::array<const char*, 4> v = {"3.14", "3.13", "3.12", "3.11"};
+                sh_.settings.python_version = v[static_cast<size_t>(std::clamp(idx, 0, 3))];
                 py_ver_field_.set(to_wide(sh_.settings.python_version));
                 sh_.save();
                 break;
@@ -3914,7 +3928,8 @@ private:
                             return;
                         }
                     }
-                    if (!exec_logged(in.base_python, {L"-m", L"venv", vdir.wstring()})) {
+                    const std::wstring vdir_w = vdir.wstring();
+                    if (!exec_logged(in.base_python, make_array<std::wstring_view>(L"-m", L"venv", vdir_w))) {
                         notify_async("error", "Venv", "Failed to create Python venv",
                                      "Could not create virtual environment at '" + in.venv_dir + "'.", "venv-setup");
                         return;
@@ -4309,11 +4324,13 @@ private:
     wil::com_ptr<ID2D1Bitmap1> app_icon_;
     uint64_t app_icon_epoch_ = 0;
     std::vector<Hit> hits_;
+    std::vector<Hit> scratch_hits_;
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
     bool rendering_ = false;
     bool dirty_ = false; // state changed since the last frame
     bool full_dirty_ = true;
     std::vector<D2D1_RECT_F> pending_dirty_;
+    std::vector<D2D1_RECT_F> dirty_dips_scratch_;
     std::optional<D2D1_RECT_F> last_tooltip_dirty_;
     std::atomic<bool> redraw_posted_{false};
 

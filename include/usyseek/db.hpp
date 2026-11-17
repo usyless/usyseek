@@ -7,8 +7,10 @@
 #include <glaze/glaze.hpp>
 #include <wil/resource.h>
 
+#include <charconv>
 #include <mutex>
 #include <shared_mutex>
+#include <span>
 
 extern "C" {
 struct UsyQdrant;
@@ -82,7 +84,7 @@ struct QueryRequest {
     std::optional<float> threshold;
     std::optional<uint64_t> id;
     std::optional<DbFilter> filter;
-    std::vector<std::string> fields;
+    std::span<const std::string_view> fields;
 };
 
 struct ScrollRequest {
@@ -90,11 +92,11 @@ struct ScrollRequest {
     std::optional<uint64_t> offset;
     bool order_mtime = false;
     std::optional<DbFilter> filter;
-    std::vector<std::string> fields;
+    std::span<const std::string_view> fields;
 };
 
 struct FieldsRequest {
-    std::vector<std::string> fields;
+    std::span<const std::string_view> fields;
 };
 
 inline constexpr auto JSON_SKIP_NULL = glz::opts{.skip_null_members = true};
@@ -240,7 +242,7 @@ public:
         return parse_points(out.view(), error);
     }
 
-    std::optional<DbPoints> retrieve(std::string_view coll, std::span<const uint64_t> ids, const std::vector<std::string>& fields, std::string* error = nullptr) {
+    std::optional<DbPoints> retrieve(std::string_view coll, std::span<const uint64_t> ids, std::span<const std::string_view> fields, std::string* error = nullptr) {
         auto json = glz::write<JSON_SKIP_NULL>(FieldsRequest{fields});
         if (!json) {
             if (error) *error = "Failed to serialize retrieve request";
@@ -259,9 +261,9 @@ public:
         return parse_points(out.view(), error);
     }
 
-    bool set_tags(std::string_view coll, std::span<const uint64_t> ids, const std::vector<std::string>& tags, std::string* error = nullptr) {
+    bool set_tags(std::string_view coll, std::span<const uint64_t> ids, std::span<const std::string> tags, std::string* error = nullptr) {
         struct TagsOnly {
-            std::vector<std::string> t;
+            std::span<const std::string> t;
         };
         auto json = glz::write_json(TagsOnly{tags});
         if (!json) {
@@ -322,7 +324,10 @@ public:
         if (!q_) return std::nullopt;
         RustBuf out;
         if (usy_qd_count(q_, ustr(coll), &out.b) != 0) return std::nullopt;
-        return std::strtoull(out.str().c_str(), nullptr, 10);
+        const std::string_view sv = out.view();
+        uint64_t val = 0;
+        std::from_chars(sv.data(), sv.data() + sv.size(), val);
+        return val;
     }
 
     std::optional<std::vector<DbCollectionInfo>> list_collections(std::string* error = nullptr) {

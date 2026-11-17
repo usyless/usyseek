@@ -9,8 +9,9 @@
 
 namespace usyseek {
 
-inline fs::path notifications_path() {
-    return data_dir() / L"notifications.json";
+inline const fs::path& notifications_path() {
+    static const fs::path p = data_dir() / L"notifications.json";
+    return p;
 }
 
 /// Formats a Win32 error code into a readable single-line message.

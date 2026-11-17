@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
@@ -85,7 +86,7 @@ namespace detail {
         std::string_view suffix;
         Kind kind;
     };
-    static constexpr SuffixRule rules[] = {
+    static constexpr std::array<SuffixRule, 7> rules = {{
         {".safetensors.part", Kind::Partial},
         {".safetensors", Kind::Weights},
         {"-tokenizer.json.part", Kind::Partial},
@@ -93,7 +94,7 @@ namespace detail {
         {"-text.onnx.data", Kind::Onnx},
         {"-text.onnx.tmp", Kind::Partial},
         {"-text.onnx", Kind::Onnx},
-    };
+    }};
 
     std::map<std::string, ModelStorageInfo> by_name;
     for (const auto& entry : fs::directory_iterator(model_dir, fs::directory_options::skip_permission_denied, ec)) {
@@ -129,7 +130,7 @@ namespace detail {
 /// Returns the model-specific files belonging to `name` inside `model_dir` (never shared `tokenizer.json`).
 [[nodiscard]] inline std::vector<std::filesystem::path> model_storage_paths(const std::filesystem::path& model_dir, std::string_view name) {
     if (model_dir.empty() || !detail::valid_model_stem(name)) return {};
-    static constexpr std::string_view suffixes[] = {
+    static constexpr std::array<std::string_view, 7> suffixes = {
         ".safetensors",
         ".safetensors.part",
         "-tokenizer.json",
@@ -139,13 +140,13 @@ namespace detail {
         "-text.onnx.tmp",
     };
     std::vector<std::filesystem::path> paths;
-    paths.reserve(std::size(suffixes));
+    paths.reserve(suffixes.size());
+    std::string fname;
+    fname.reserve(name.size() + 24);
     for (std::string_view s : suffixes) {
-        std::string fname;
-        fname.reserve(name.size() + s.size());
-        fname.append(name);
+        fname.assign(name);
         fname.append(s);
-        paths.push_back(model_dir / detail::utf8_to_path(fname));
+        paths.emplace_back(model_dir / detail::utf8_to_path(fname));
     }
     return paths;
 }
@@ -189,13 +190,9 @@ inline bool delete_downloaded_model(const std::filesystem::path& model_dir, std:
         if (entry.is_symlink(dec) || !entry.is_directory(dec)) continue;
         const fs::path& dir = entry.path();
         if (!fs::is_regular_file(dir / "edge_config.json", dec) && !fs::is_directory(dir / "segments", dec)) continue;
-        const std::string name = detail::path_to_utf8(dir.filename());
+        std::string name = detail::path_to_utf8(dir.filename());
         if (!detail::valid_model_stem(name)) continue;
-        out.push_back(DbCollectionInfo{
-            .name = name,
-            .count = std::nullopt,
-            .bytes = detail::directory_bytes(dir),
-        });
+        out.emplace_back(std::move(name), std::nullopt, detail::directory_bytes(dir));
     }
     std::sort(out.begin(), out.end(), [](const DbCollectionInfo& a, const DbCollectionInfo& b) {
         return detail::ascii_iless(a.name, b.name);

@@ -5,8 +5,10 @@
 #include <winhttp.h>
 #include <wil/resource.h>
 
+#include <array>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <stop_token>
 
 namespace usyseek::http {
@@ -120,9 +122,9 @@ inline std::wstring win_error(const wchar_t* what, DWORD err = GetLastError()) {
 enum class OpStatus : uint8_t { Ok, Error, Cancelled };
 
 inline OpStatus wait_op(Response& r, HANDLE cancel_ev, DWORD& err) noexcept {
-    HANDLE hs[2]{r.state.op_done.get(), cancel_ev};
+    std::array<HANDLE, 2> hs{r.state.op_done.get(), cancel_ev};
     const DWORD n = cancel_ev ? 2u : 1u;
-    const DWORD w = WaitForMultipleObjects(n, hs, FALSE, INFINITE);
+    const DWORD w = WaitForMultipleObjects(n, hs.data(), FALSE, INFINITE);
     if (w == WAIT_OBJECT_0 + 1) {
         r.close();
         return OpStatus::Cancelled;
@@ -150,12 +152,17 @@ inline bool open(const std::wstring& url, uint64_t range_from, Response& r, std:
         return false;
     }
 
-    wchar_t host[256]{};
-    std::wstring path(url.size() + 1, L'\0');
+    std::array<wchar_t, 256> host; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    host[0] = L'\0';
+    std::wstring path;
+    path.resize_and_overwrite(url.size() + 1, [](wchar_t* p, size_t n) noexcept {
+        p[0] = L'\0';
+        return n;
+    });
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
-    uc.lpszHostName = host;
-    uc.dwHostNameLength = static_cast<DWORD>(std::size(host));
+    uc.lpszHostName = host.data();
+    uc.dwHostNameLength = static_cast<DWORD>(host.size());
     uc.lpszUrlPath = path.data();
     uc.dwUrlPathLength = static_cast<DWORD>(path.size());
     if (!WinHttpCrackUrl(url.c_str(), static_cast<DWORD>(url.size()), 0, &uc)) {
@@ -169,7 +176,7 @@ inline bool open(const std::wstring& url, uint64_t range_from, Response& r, std:
         return false;
     }
     WinHttpSetTimeouts(r.session.get(), 15'000, 15'000, 30'000, 30'000);
-    r.connection.reset(WinHttpConnect(r.session.get(), host, uc.nPort, 0));
+    r.connection.reset(WinHttpConnect(r.session.get(), host.data(), uc.nPort, 0));
     if (!r.connection) {
         error = win_error(L"Could not connect");
         return false;
@@ -226,10 +233,11 @@ inline bool open(const std::wstring& url, uint64_t range_from, Response& r, std:
     DWORD size = sizeof(r.status);
     WinHttpQueryHeaders(r.request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
                         &r.status, &size, WINHTTP_NO_HEADER_INDEX);
-    wchar_t len[32]{};
-    size = sizeof(len);
-    if (WinHttpQueryHeaders(r.request.get(), WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX, len, &size, WINHTTP_NO_HEADER_INDEX)) {
-        r.content_length = _wcstoui64(len, nullptr, 10);
+    std::array<wchar_t, 32> len; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    len[0] = L'\0';
+    size = static_cast<DWORD>(len.size() * sizeof(wchar_t));
+    if (WinHttpQueryHeaders(r.request.get(), WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX, len.data(), &size, WINHTTP_NO_HEADER_INDEX)) {
+        r.content_length = _wcstoui64(len.data(), nullptr, 10);
     }
     return true;
 }
@@ -276,12 +284,16 @@ inline std::optional<std::string> get(const std::wstring& url, size_t max_bytes 
     std::wstring error;
     if (!detail::open(url, 0, r, error) || r.status != 200) return std::nullopt;
     std::string out;
-    std::vector<char> buf(64u << 10);
+    if (r.content_length > 0 && r.content_length <= max_bytes) {
+        out.reserve(static_cast<size_t>(r.content_length));
+    }
+    constexpr DWORD CHUNK_CAP = 64u << 10;
+    auto buf = std::make_unique_for_overwrite<char[]>(CHUNK_CAP); // NOLINT(modernize-avoid-c-arrays)
     for (;;) {
         DWORD got = 0;
-        if (!detail::read_chunk(r, buf.data(), static_cast<DWORD>(buf.size()), got, error)) return std::nullopt;
+        if (!detail::read_chunk(r, buf.get(), CHUNK_CAP, got, error)) return std::nullopt;
         if (got == 0) break;
-        out.append(buf.data(), got);
+        out.append(buf.get(), got);
         if (out.size() > max_bytes) return std::nullopt;
     }
     return out;
@@ -330,16 +342,17 @@ inline Result download(const std::wstring& url, const fs::path& dest, const Prog
     }
 
     uint64_t done = have;
-    std::vector<char> buf(256u << 10);
+    constexpr DWORD CHUNK_CAP = 256u << 10;
+    auto buf = std::make_unique_for_overwrite<char[]>(CHUNK_CAP); // NOLINT(modernize-avoid-c-arrays)
     auto last_report = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     for (;;) {
         DWORD got = 0;
-        if (!detail::read_chunk(r, buf.data(), static_cast<DWORD>(buf.size()), got, res.error, cancel_ev.get())) {
+        if (!detail::read_chunk(r, buf.get(), CHUNK_CAP, got, res.error, cancel_ev.get())) {
             return fail(res.error);
         }
         if (got == 0) break;
         DWORD written = 0;
-        if (!WriteFile(file.get(), buf.data(), got, &written, nullptr) || written != got) {
+        if (!WriteFile(file.get(), buf.get(), got, &written, nullptr) || written != got) {
             return fail(L"Could not write " + part.filename().wstring() + L" (disk full?)");
         }
         done += got;

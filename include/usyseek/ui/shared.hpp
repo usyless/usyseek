@@ -33,10 +33,10 @@ inline std::wstring format_hotkey(uint32_t mods, uint32_t vk) {
     if (mods & MOD_ALT) t += L"Alt + ";
     if (mods & MOD_SHIFT) t += L"Shift + ";
     if (mods & MOD_WIN) t += L"Win + ";
-    wchar_t name[64]{};
-    if (vk == VK_SPACE) wcscpy_s(name, L"Space");
-    else GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16, name, 64);
-    return t + (name[0] ? name : L"Key");
+    std::array<wchar_t, 64> name{};
+    if (vk == VK_SPACE) wcscpy_s(name.data(), name.size(), L"Space");
+    else GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16, name.data(), static_cast<int>(name.size()));
+    return t + (name[0] ? name.data() : L"Key");
 }
 
 /// State and services shared by the pill and the settings window (UI thread only unless noted).
@@ -368,6 +368,8 @@ inline bool set_data_bytes(IDataObject* obj, CLIPFORMAT cf, const void* data, si
 inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring> paths) {
     std::vector<PIDLIST_ABSOLUTE> pidls;
     std::vector<std::wstring> found;
+    pidls.reserve(paths.size());
+    found.reserve(paths.size());
     for (const auto& p : paths) {
         if (PIDLIST_ABSOLUTE id = ILCreateFromPathW(p.c_str())) {
             pidls.push_back(id);
@@ -616,9 +618,10 @@ inline std::wstring format_date(int64_t unix) {
     SYSTEMTIME st;
     FileTimeToLocalFileTime(&f, &local);
     FileTimeToSystemTime(&local, &st);
-    wchar_t buf[64];
-    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, L"d MMM yyyy", buf, 64, nullptr);
-    return buf;
+    std::array<wchar_t, 64> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    buf[0] = L'\0';
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, L"d MMM yyyy", buf.data(), static_cast<int>(buf.size()), nullptr);
+    return buf.data();
 }
 
 /// Tag chip; returns its width.

@@ -1,6 +1,10 @@
 #include "check.hpp"
 #include "usyseek/path_rules.hpp"
 
+#include <array>
+#include <string_view>
+#include <vector>
+
 using usyseek::is_duplicate_path_rule;
 using usyseek::normalize_path_rule;
 
@@ -32,10 +36,10 @@ int main() {
 
     CHECK(!is_duplicate_path_rule(L"D:\\Media", list));
     CHECK(!is_duplicate_path_rule(L"D:\\Media\\Holiday\\2024", list));
-    CHECK(!is_duplicate_path_rule(L"D:\\Photo", {L"D:\\Photos"}));
-    CHECK(!is_duplicate_path_rule(L"D:\\Photos", {L"D:\\Photo"}));
+    CHECK(!is_duplicate_path_rule(L"D:\\Photo", std::array<std::wstring_view, 1>{L"D:\\Photos"}));
+    CHECK(!is_duplicate_path_rule(L"D:\\Photos", std::array<std::wstring_view, 1>{L"D:\\Photo"}));
     CHECK(!is_duplicate_path_rule(L"*\\cache", list));
-    CHECK(!is_duplicate_path_rule(L"D:\\Media\\Holiday", {}));
+    CHECK(!is_duplicate_path_rule(L"D:\\Media\\Holiday", std::array<std::wstring_view, 0>{}));
 
     const std::vector<std::wstring> included{L"D:\\Media\\Holiday", L"E:\\Backup"};
     CHECK(is_duplicate_path_rule(L"d:/media/holiday/", included));

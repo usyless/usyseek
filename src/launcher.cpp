@@ -67,12 +67,12 @@ public:
     int run() {
         SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
         for (;;) {
-            HANDLE handles[2];
+            std::array<HANDLE, 2> handles; // NOLINT(cppcoreguidelines-pro-type-member-init)
             DWORD n = 0;
             if (ui_.hProcess) handles[n++] = ui_.hProcess;
             if (indexer_.hProcess) handles[n++] = indexer_.hProcess;
 
-            const DWORD r = MsgWaitForMultipleObjectsEx(n, handles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            const DWORD r = MsgWaitForMultipleObjectsEx(n, handles.data(), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             if (r < WAIT_OBJECT_0 + n) {
                 on_process_exit(handles[r - WAIT_OBJECT_0]);
                 continue;
@@ -522,35 +522,35 @@ private:
             off.QuadPart = size.QuadPart - TAIL;
             SetFilePointerEx(f.get(), off, nullptr, FILE_BEGIN);
         }
-        const DWORD want = static_cast<DWORD>(std::min<LONGLONG>(size.QuadPart, TAIL));
-        std::string buf(want, '\0');
+        const auto want = static_cast<DWORD>(std::min<LONGLONG>(size.QuadPart, TAIL));
+        std::array<char, TAIL> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
         DWORD got = 0;
         if (!ReadFile(f.get(), buf.data(), want, &got, nullptr) || got == 0) return {};
-        buf.resize(got);
+        const std::string_view content{buf.data(), got};
 
-        std::string last_line;
-        std::string best_line;
+        std::string_view last_line;
+        std::string_view best_line;
         size_t pos = 0;
-        while (pos < buf.size()) {
-            const size_t nl = buf.find('\n', pos);
-            const size_t end = (nl == std::string::npos) ? buf.size() : nl;
-            std::string_view line{buf.data() + pos, end - pos};
+        while (pos < content.size()) {
+            const size_t nl = content.find('\n', pos);
+            const size_t end = (nl == std::string_view::npos) ? content.size() : nl;
+            std::string_view line = content.substr(pos, end - pos);
             while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.remove_suffix(1);
             while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.remove_prefix(1);
             if (!line.empty()) {
-                last_line.assign(line);
+                last_line = line;
                 if (line.contains("runtime error:") ||
                     line.contains("AddressSanitizer") ||
                     line.contains("UndefinedBehaviorSanitizer") ||
                     line.contains("ERROR:") ||
                     line.contains("[Error]")) {
-                    best_line.assign(line);
+                    best_line = line;
                 }
             }
-            if (nl == std::string::npos) break;
+            if (nl == std::string_view::npos) break;
             pos = nl + 1;
         }
-        std::string out = !best_line.empty() ? std::move(best_line) : std::move(last_line);
+        std::string out{!best_line.empty() ? best_line : last_line};
         if (out.size() > 220) {
             out.resize(217);
             out += "...";
@@ -565,25 +565,25 @@ private:
             const StatusData d = indexer_status_->read();
             if (stopping_index_) {
                 if (d.found > 0) {
-                    wchar_t pbuf[32];
+                    std::array<wchar_t, 32> pbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
                     const double pct = std::clamp(100.0 * static_cast<double>(d.embedded) / static_cast<double>(d.found), 0.0, 100.0);
-                    swprintf_s(pbuf, L"%.1f%%", pct);
-                    return std::wstring{L"Stopping indexer… ("} + format_count(d.embedded) + L" / " + format_count(d.found) + L" • " + pbuf + L")";
+                    swprintf_s(pbuf.data(), pbuf.size(), L"%.1f%%", pct);
+                    return std::wstring{L"Stopping indexer… ("} + format_count(d.embedded) + L" / " + format_count(d.found) + L" • " + pbuf.data() + L")";
                 }
                 return L"Stopping indexer…";
             }
             if (d.phase == Phase::Embedding || d.found > 0) {
-                wchar_t pbuf[32];
+                std::array<wchar_t, 32> pbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
                 const double pct = d.found > 0
                     ? std::clamp(100.0 * static_cast<double>(d.embedded) / static_cast<double>(d.found), 0.0, 100.0)
                     : 0.0;
-                swprintf_s(pbuf, L"%.1f%%", pct);
-                std::wstring line = std::wstring{L"Indexing "} + pbuf + (multiline ? L"\n" : L"  •  ") +
+                swprintf_s(pbuf.data(), pbuf.size(), L"%.1f%%", pct);
+                std::wstring line = std::wstring{L"Indexing "} + pbuf.data() + (multiline ? L"\n" : L"  •  ") +
                                     format_count(d.embedded) + L" / " + format_count(d.found);
                 if (d.rate > 0.05f) {
-                    wchar_t rbuf[32];
-                    swprintf_s(rbuf, L"%.1f/s", d.rate);
-                    line += std::wstring{L" • "} + rbuf;
+                    std::array<wchar_t, 32> rbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+                    swprintf_s(rbuf.data(), rbuf.size(), L"%.1f/s", d.rate);
+                    line += std::wstring{L" • "} + rbuf.data();
                     if (d.todo > d.processed) {
                         const uint64_t rem_ms = static_cast<uint64_t>((d.todo - d.processed) / d.rate * 1000.0f);
                         line += L" • ETA " + format_duration_ms(rem_ms);
@@ -625,11 +625,11 @@ private:
         if (s.hotkey_mods & MOD_ALT) t += L"Alt+";
         if (s.hotkey_mods & MOD_SHIFT) t += L"Shift+";
         if (s.hotkey_mods & MOD_WIN) t += L"Win+";
-        wchar_t name[64]{};
+        std::array<wchar_t, 64> name{};
         UINT sc = MapVirtualKeyW(s.hotkey_vk, MAPVK_VK_TO_VSC) << 16;
-        if (s.hotkey_vk == VK_SPACE) wcscpy_s(name, L"Space");
-        else GetKeyNameTextW(static_cast<LONG>(sc), name, 64);
-        return t + name;
+        if (s.hotkey_vk == VK_SPACE) wcscpy_s(name.data(), name.size(), L"Space");
+        else GetKeyNameTextW(static_cast<LONG>(sc), name.data(), static_cast<int>(name.size()));
+        return t + name.data();
     }
 
     void show_menu() {

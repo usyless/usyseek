@@ -22,11 +22,11 @@ inline ResizeMode parse_resize_mode(std::string_view s) noexcept {
     return ResizeMode::Squash;
 }
 
-inline constexpr std::wstring_view IMAGE_EXTS[] = {
+inline constexpr std::array<std::wstring_view, 17> IMAGE_EXTS = {
     L"jpg", L"jpeg", L"jpe", L"jfif", L"png", L"bmp", L"gif", L"tif", L"tiff", L"webp", L"heic", L"heif", L"avif", L"jxl", L"dng",
     L"svg", L"svgz",
 };
-inline constexpr std::wstring_view VIDEO_EXTS[] = {
+inline constexpr std::array<std::wstring_view, 12> VIDEO_EXTS = {
     L"mp4", L"m4v", L"mov", L"mkv", L"webm", L"avi", L"wmv", L"mpg", L"mpeg", L"ts", L"m2ts", L"3gp",
 };
 
@@ -159,7 +159,7 @@ public:
         out.duration_ms = duration / 10'000;
 
         const uint32_t n = duration > 0 ? std::max(1u, frame_count) : 1;
-        std::vector<uint8_t> bgrx(static_cast<size_t>(w) * h * 4);
+        bgrx_buf_.resize(static_cast<size_t>(w) * h * 4);
         bool saw_frame = false;
         bool seek_failed = false;
         for (uint32_t k = 0; k < n; ++k) {
@@ -180,10 +180,10 @@ public:
                 if (FAILED(reader->ReadSample(stream, 0, nullptr, &flags, &ts, &sample))) break;
                 if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
             }
-            if (!sample || !copy_sample(sample.get(), w, h, bgrx)) continue;
+            if (!sample || !copy_sample(sample.get(), w, h, bgrx_buf_)) continue;
 
             wil::com_ptr<IWICBitmap> bmp;
-            if (FAILED(wic_->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGR, w * 4, static_cast<UINT>(bgrx.size()), bgrx.data(), &bmp))) continue;
+            if (FAILED(wic_->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGR, w * 4, static_cast<UINT>(bgrx_buf_.size()), bgrx_buf_.data(), &bmp))) continue;
             Frame f;
             if (!resize(bmp.get(), w, h, orient, f)) continue;
             saw_frame = true;
@@ -237,9 +237,7 @@ private:
         }
         if (targets.empty()) return std::nullopt;
 
-        std::vector<uint8_t> canvas(static_cast<size_t>(cw) * ch * 4, 0);
-        std::vector<uint8_t> prev_canvas;
-        std::vector<uint8_t> frame_buf;
+        gif_canvas_.assign(static_cast<size_t>(cw) * ch * 4, 0);
         std::vector<Frame> sampled;
         std::vector<double> lumas;
         sampled.reserve(targets.size());
@@ -263,21 +261,21 @@ private:
                 }
             }
 
-            if (disposal == 3) prev_canvas = canvas;
+            if (disposal == 3) gif_prev_canvas_ = gif_canvas_;
 
             wil::com_ptr<IWICFormatConverter> conv;
             if (FAILED(wic_->CreateFormatConverter(&conv))) continue;
             if (FAILED(conv->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) continue;
             const size_t fstride = static_cast<size_t>(fw) * 4;
             if (static_cast<uint64_t>(fstride) * fh > (512ull << 20)) continue;
-            frame_buf.resize(fstride * fh);
-            if (FAILED(conv->CopyPixels(nullptr, static_cast<UINT>(fstride), static_cast<UINT>(frame_buf.size()), frame_buf.data()))) continue;
+            frame_buf_.resize(fstride * fh);
+            if (FAILED(conv->CopyPixels(nullptr, static_cast<UINT>(fstride), static_cast<UINT>(frame_buf_.size()), frame_buf_.data()))) continue;
 
             const UINT copy_w = left < cw ? std::min(fw, cw - left) : 0;
             const UINT copy_h = top < ch ? std::min(fh, ch - top) : 0;
             for (UINT y = 0; y < copy_h; ++y) {
-                const uint8_t* src = frame_buf.data() + static_cast<size_t>(y) * fstride;
-                uint8_t* dst = canvas.data() + (static_cast<size_t>(top + y) * cw + left) * 4;
+                const uint8_t* src = frame_buf_.data() + static_cast<size_t>(y) * fstride;
+                uint8_t* dst = gif_canvas_.data() + (static_cast<size_t>(top + y) * cw + left) * 4;
                 for (UINT x = 0; x < copy_w; ++x, src += 4, dst += 4) {
                     const uint8_t a = src[3];
                     if (a == 255) {
@@ -295,7 +293,7 @@ private:
             if (next_target < targets.size() && i == targets[next_target]) {
                 ++next_target;
                 wil::com_ptr<IWICBitmap> bmp;
-                if (SUCCEEDED(wic_->CreateBitmapFromMemory(cw, ch, GUID_WICPixelFormat32bppPBGRA, cw * 4, static_cast<UINT>(canvas.size()), canvas.data(), &bmp))) {
+                if (SUCCEEDED(wic_->CreateBitmapFromMemory(cw, ch, GUID_WICPixelFormat32bppPBGRA, cw * 4, static_cast<UINT>(gif_canvas_.size()), gif_canvas_.data(), &bmp))) {
                     Frame f;
                     if (resize(bmp.get(), cw, ch, WICBitmapTransformRotate0, f)) {
                         lumas.push_back(mean_luma(f.rgb));
@@ -306,10 +304,10 @@ private:
 
             if (disposal == 2) {
                 for (UINT y = 0; y < copy_h; ++y) {
-                    std::memset(canvas.data() + (static_cast<size_t>(top + y) * cw + left) * 4, 0, static_cast<size_t>(copy_w) * 4);
+                    std::memset(gif_canvas_.data() + (static_cast<size_t>(top + y) * cw + left) * 4, 0, static_cast<size_t>(copy_w) * 4);
                 }
             } else if (disposal == 3) {
-                canvas.swap(prev_canvas);
+                gif_canvas_.swap(gif_prev_canvas_);
             }
         }
 
@@ -383,7 +381,7 @@ private:
         return ok;
     }
 
-    static double mean_luma(const std::vector<uint8_t>& rgb) noexcept {
+    static double mean_luma(std::span<const uint8_t> rgb) noexcept {
         constexpr size_t step = 21; // every 7th RGB pixel is plenty
         uint64_t sum = 0;
         for (size_t i = 0; i + 2 < rgb.size(); i += step) sum += (rgb[i] * 77u + rgb[i + 1] * 150u + rgb[i + 2] * 29u) >> 8;
@@ -454,16 +452,17 @@ private:
             final_src = rot.get();
         }
 
-        out.rgb.assign(static_cast<size_t>(S) * S * 3, 0);
         const UINT stride = S * 3;
         if (mode_ == ResizeMode::Longest) {
+            out.rgb.assign(static_cast<size_t>(S) * S * 3, 0);
             const size_t x0 = (S - sw) / 2, y0 = (S - sh) / 2;
             const size_t row = static_cast<size_t>(sw) * 3;
-            std::vector<uint8_t> tmp(row * sh);
-            if (FAILED(final_src->CopyPixels(nullptr, sw * 3, static_cast<UINT>(tmp.size()), tmp.data()))) return false;
-            for (size_t y = 0; y < sh; ++y) std::memcpy(out.rgb.data() + (y0 + y) * stride + x0 * 3, tmp.data() + y * row, row);
+            resize_tmp_.resize(row * sh);
+            if (FAILED(final_src->CopyPixels(nullptr, sw * 3, static_cast<UINT>(resize_tmp_.size()), resize_tmp_.data()))) return false;
+            for (size_t y = 0; y < sh; ++y) std::memcpy(out.rgb.data() + (y0 + y) * stride + x0 * 3, resize_tmp_.data() + y * row, row);
             return true;
         }
+        out.rgb.resize(static_cast<size_t>(S) * S * 3);
         const WICRect rc{static_cast<INT>((sw - S) / 2), static_cast<INT>((sh - S) / 2), static_cast<INT>(S), static_cast<INT>(S)};
         return SUCCEEDED(final_src->CopyPixels(&rc, stride, static_cast<UINT>(out.rgb.size()), out.rgb.data()));
     }
@@ -471,6 +470,11 @@ private:
     wil::com_ptr<IWICImagingFactory> wic_;
     uint32_t size_;
     ResizeMode mode_;
+    std::vector<uint8_t> bgrx_buf_;
+    std::vector<uint8_t> gif_canvas_;
+    std::vector<uint8_t> gif_prev_canvas_;
+    std::vector<uint8_t> frame_buf_;
+    std::vector<uint8_t> resize_tmp_;
 };
 
 } // namespace usyseek::media

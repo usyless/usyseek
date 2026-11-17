@@ -4,6 +4,7 @@
 #include "tag_store.hpp"
 
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,22 +29,19 @@ inline bool backfill_collection(Db& db, TagStore& store, std::string_view coll, 
     if (!done) return false;
     if (*done) return true;
 
+    static constexpr std::array<std::string_view, 2> fields = {"p", "t"};
     std::vector<TaggedFileEntry> batch;
     std::optional<uint64_t> cursor;
     do {
         ScrollRequest req;
         req.limit = 4096;
         req.offset = cursor;
-        req.fields = {"p", "t"};
+        req.fields = fields;
         auto page = db.scroll(coll, req, error);
         if (!page) return false;
         for (auto& pt : page->points) {
             if (pt.p.t.empty()) continue;
-            batch.push_back({
-                .id = pt.id,
-                .path = std::move(pt.p.p),
-                .tags = std::move(pt.p.t),
-            });
+            batch.emplace_back(pt.id, std::move(pt.p.p), std::move(pt.p.t));
         }
         cursor = page->next;
     } while (cursor);

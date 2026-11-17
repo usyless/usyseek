@@ -100,7 +100,7 @@ public:
             DWRITE_FONT_WEIGHT weight;
             bool wrap;
         };
-        const Def defs[] = {
+        const std::array<Def, 17> defs = {{
             {Font::Body, &text, 13.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
             {Font::BodySemi, &text, 13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false},
             {Font::BodyWrap, &text, 13.0f, DWRITE_FONT_WEIGHT_NORMAL, true},
@@ -118,7 +118,7 @@ public:
             {Font::Icon, &icon, 16.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
             {Font::IconSmall, &icon, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
             {Font::IconLarge, &icon, 20.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
-        };
+        }};
         for (const auto& d : defs) {
             wil::com_ptr<IDWriteTextFormat> fmt;
             if (FAILED(dw->CreateTextFormat(d.family->c_str(), nullptr, d.weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, d.size, L"en-us", &fmt))) return false;
@@ -297,7 +297,7 @@ public:
             r.bottom = std::min(r.bottom, c.bottom);
         }
         if (r.left < r.right && r.top < r.bottom) {
-            hits_.push_back({r, id, index});
+            hits_.emplace_back(r, id, index);
         }
     }
 
@@ -349,8 +349,8 @@ public:
     }
 
     void icon(wchar_t g, D2D1_RECT_F r, D2D1_COLOR_F c, Font f = Font::Icon) noexcept {
-        const wchar_t s[2] = {g, 0};
-        text(std::wstring_view{s, 1}, r, f, c, Align::Center);
+        const std::array<wchar_t, 2> s = {g, 0};
+        text(std::wstring_view{s.data(), 1}, r, f, c, Align::Center);
     }
 
     float measure(std::wstring_view s, Font f) {
@@ -443,7 +443,7 @@ private:
     std::vector<D2D1_RECT_F> clips_;
 };
 
-inline const Hit* hit_test(const std::vector<Hit>& hits, D2D1_POINT_2F p) noexcept {
+inline const Hit* hit_test(std::span<const Hit> hits, D2D1_POINT_2F p) noexcept {
     for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
         if (contains(it->r, p)) return &*it;
     }

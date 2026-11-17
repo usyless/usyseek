@@ -104,15 +104,16 @@ private:
         wil::com_ptr<IDXGIAdapter1> adapter = window_adapter(factory.get(), hint);
         if (!adapter) factory->EnumAdapters1(0, &adapter);
 
-        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+        static constexpr std::array<D3D_FEATURE_LEVEL, 4> levels = {
+            D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
         const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         HRESULT hr = E_FAIL;
         warp_ = false;
-        if (adapter) hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels, 4, D3D11_SDK_VERSION, &d3d_, nullptr, &d3d_ctx_);
-        if (FAILED(hr)) hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 4, D3D11_SDK_VERSION, &d3d_, nullptr, &d3d_ctx_);
+        if (adapter) hr = D3D11CreateDevice(adapter.get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, levels.data(), static_cast<UINT>(levels.size()), D3D11_SDK_VERSION, &d3d_, nullptr, &d3d_ctx_);
+        if (FAILED(hr)) hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels.data(), static_cast<UINT>(levels.size()), D3D11_SDK_VERSION, &d3d_, nullptr, &d3d_ctx_);
         if (FAILED(hr)) {
             warp_ = true;
-            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, levels, 4, D3D11_SDK_VERSION, &d3d_, nullptr, &d3d_ctx_);
+            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, levels.data(), static_cast<UINT>(levels.size()), D3D11_SDK_VERSION, &d3d_, nullptr, &d3d_ctx_);
         }
         if (FAILED(hr)) return false;
 
@@ -284,28 +285,28 @@ public:
         const float s = scale();
         if (capture_) full_redraw = true;
 
-        std::vector<PixelRect> curr_px;
+        curr_px_.clear();
         if (!full_redraw) {
-            curr_px.reserve(dirty_dips.size());
+            curr_px_.reserve(dirty_dips.size());
             for (const D2D1_RECT_F& r : dirty_dips) {
                 const PixelRect px = dip_to_pixel_rect(r.left, r.top, r.right, r.bottom, s, w_, h_, 2.0f);
-                if (!px.empty()) curr_px.push_back(px);
+                if (!px.empty()) curr_px_.push_back(px);
             }
         }
 
-        const FlipDirtyTracker::Plan p = dirty_tracker_.plan(full_redraw, curr_px, w_, h_);
+        const FlipDirtyTracker::Plan p = dirty_tracker_.plan(full_redraw, curr_px_, w_, h_);
         if (p.skip) return true;
 
-        std::vector<RECT> present_rects;
+        present_rects_.clear();
         dc_->BeginDraw();
         dc_->SetTransform(D2D1::Matrix3x2F::Identity());
         if (p.full) {
             dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
             draw_fn(std::nullopt, true);
         } else {
-            present_rects.reserve(p.render_rects.size());
+            present_rects_.reserve(p.render_rects.size());
             for (const PixelRect& pr : p.render_rects) {
-                present_rects.push_back(RECT{.left = pr.left, .top = pr.top, .right = pr.right, .bottom = pr.bottom});
+                present_rects_.emplace_back(pr.left, pr.top, pr.right, pr.bottom);
                 const D2D1_RECT_F clip = D2D1::RectF(
                     static_cast<float>(pr.left) / s,
                     static_cast<float>(pr.top) / s,
@@ -330,8 +331,8 @@ public:
             }
             DXGI_PRESENT_PARAMETERS params{};
             if (!p.full) {
-                params.DirtyRectsCount = static_cast<UINT>(present_rects.size());
-                params.pDirtyRects = present_rects.data();
+                params.DirtyRectsCount = static_cast<UINT>(present_rects_.size());
+                params.pDirtyRects = present_rects_.data();
             }
             hr = swap_->Present1(vsync ? 1 : 0, 0, &params);
             if (SUCCEEDED(hr) && liquid_glass_ && !vsync && dcomp_) {
@@ -389,8 +390,8 @@ private:
             uint8_t* dst = px.data() + static_cast<size_t>(y) * desc.Width * 4;
             for (UINT x = 0; x < desc.Width; ++x) {
                 const uint8_t a = src[x * 4 + 3];
-                const uint8_t bg[3] = {0x1a, 0x18, 0x1c};
-                for (int c = 0; c < 3; ++c) dst[x * 4 + c] = static_cast<uint8_t>(src[x * 4 + c] + bg[c] * (255 - a) / 255);
+                static constexpr std::array<uint8_t, 3> bg = {0x1a, 0x18, 0x1c};
+                for (size_t c = 0; c < 3; ++c) dst[x * 4 + c] = static_cast<uint8_t>(src[x * 4 + c] + bg[c] * (255 - a) / 255);
                 dst[x * 4 + 3] = 255;
             }
         }
@@ -424,6 +425,8 @@ private:
     float dpi_ = 96.0f;
     uint64_t epoch_ = 0;
     FlipDirtyTracker dirty_tracker_;
+    std::vector<PixelRect> curr_px_;
+    std::vector<RECT> present_rects_;
     std::optional<fs::path> capture_;
     bool capture_ok_ = false;
     bool liquid_glass_ = false;

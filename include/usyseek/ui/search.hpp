@@ -233,9 +233,9 @@ public:
             const auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
             const std::array<int64_t, 2> shape = {1, static_cast<int64_t>(model->ctx)};
             Ort::Value input = Ort::Value::CreateTensor<int64_t>(mem, ids.data(), ids.size(), shape.data(), shape.size());
-            const char* in_names[] = {model->in_name.c_str()};
-            const char* out_names[] = {model->out_name.c_str()};
-            auto out = model->session->Run(Ort::RunOptions{nullptr}, in_names, &input, 1, out_names, 1);
+            const std::array<const char*, 1> in_names = {model->in_name.c_str()};
+            const std::array<const char*, 1> out_names = {model->out_name.c_str()};
+            auto out = model->session->Run(Ort::RunOptions{nullptr}, in_names.data(), &input, 1, out_names.data(), 1);
             const float* p = out[0].GetTensorData<float>();
             const size_t n = out[0].GetTensorTypeAndShapeInfo().GetElementCount();
             std::vector<float> v(p, p + n);
@@ -365,9 +365,9 @@ private:
             if (CreateProcessW(idx_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, exe_dir().c_str(), &si, &pi)) {
                 if (job) AssignProcessToJobObject(job.get(), pi.hProcess);
                 ResumeThread(pi.hThread);
-                HANDLE waits[2]{pi.hProcess, stop_evt_.get()};
+                std::array<HANDLE, 2> waits{pi.hProcess, stop_evt_.get()};
                 const DWORD n = stop_evt_ ? 2u : 1u;
-                WaitForMultipleObjects(n, waits, FALSE, 180'000);
+                WaitForMultipleObjects(n, waits.data(), FALSE, 180'000);
             }
             if (stopping_.load(std::memory_order_acquire)) {
                 throw std::runtime_error("Model loading cancelled");
@@ -694,7 +694,8 @@ private:
         f.dirs = q.dirs;
         f.names = q.names;
         const bool has_filter = f.kind || !f.tags_all.empty() || !f.tags_none.empty() || !f.dirs.empty() || !f.names.empty();
-        const std::vector<std::string> fields = {"p", "n", "k", "m", "s", "w", "h", "d", "t"};
+        static constexpr std::array<std::string_view, 9> fields = {"p", "n", "k", "m", "s", "w", "h", "d", "t"};
+        static constexpr std::array<std::string_view, 1> kind_field = {"k"};
         const std::string& coll = s.model_name;
         std::string err;
 
@@ -709,7 +710,7 @@ private:
             uint64_t self_id = 0;
             if (q.similar) {
                 self_id = path_id(*q.similar);
-                if (db_.retrieve(coll, std::span{&self_id, 1}, {"k"}).value_or(DbPoints{}).points.empty()) {
+                if (db_.retrieve(coll, std::span{&self_id, 1}, kind_field).value_or(DbPoints{}).points.empty()) {
                     res->error = L"Not indexed yet";
                     return res;
                 }

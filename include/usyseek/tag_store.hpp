@@ -3,10 +3,13 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <concepts>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <optional>
+#include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -100,14 +103,16 @@ public:
     }
 
     /// Replaces the tag set for `id` (deleting the file row when `tags` has no non-empty entries).
-    bool set_file_tags(uint64_t id, std::string_view path_utf8, const std::vector<std::string>& tags, std::string* error = nullptr) {
+    template <std::ranges::input_range R>
+        requires std::convertible_to<std::ranges::range_reference_t<R>, std::string_view>
+    bool set_file_tags(uint64_t id, std::string_view path_utf8, const R& tags, std::string* error = nullptr) {
         std::lock_guard lk{mx_};
         if (!require_open_locked(error)) return false;
 
         std::vector<std::string_view> clean;
-        clean.reserve(tags.size());
-        for (const std::string& t : tags) {
-            if (!t.empty()) clean.push_back(t);
+        if constexpr (std::ranges::sized_range<R>) clean.reserve(std::ranges::size(tags));
+        for (const std::string_view t : tags) {
+            if (!t.empty()) clean.emplace_back(t);
         }
 
         return with_tx_locked([&] {
@@ -134,7 +139,7 @@ public:
     }
 
     /// Unions `entries` into the store inside a single transaction (ignores entries with no tags).
-    bool merge_batch(const std::vector<TaggedFileEntry>& entries, std::string* error = nullptr) {
+    bool merge_batch(std::span<const TaggedFileEntry> entries, std::string* error = nullptr) {
         std::lock_guard lk{mx_};
         if (!require_open_locked(error)) return false;
         if (entries.empty()) return true;
@@ -181,7 +186,7 @@ public:
         }, error);
     }
 
-    bool remove_ids(const std::vector<uint64_t>& ids, std::string* error = nullptr) {
+    bool remove_ids(std::span<const uint64_t> ids, std::string* error = nullptr) {
         std::lock_guard lk{mx_};
         if (!require_open_locked(error)) return false;
         if (ids.empty()) return true;
@@ -264,10 +269,9 @@ public:
             const int t_len = sqlite3_column_bytes(st.s, 2);
 
             if (out.empty() || out.back().id != id) {
-                TaggedFileEntry e;
+                auto& e = out.emplace_back();
                 e.id = id;
                 if (p_txt && p_len > 0) e.path.assign(p_txt, static_cast<size_t>(p_len));
-                out.push_back(std::move(e));
             }
             if (t_txt && t_len > 0) {
                 out.back().tags.emplace_back(t_txt, static_cast<size_t>(t_len));
@@ -315,7 +319,9 @@ public:
             }
         };
         add_size(path_);
-        add_size(std::filesystem::path{path_.native() + std::filesystem::path{"-wal"}.native()});
+        std::filesystem::path wal_path = path_;
+        wal_path += L"-wal";
+        add_size(wal_path);
         return out;
     }
 

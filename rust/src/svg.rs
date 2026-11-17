@@ -1,5 +1,6 @@
 //! SVG rasterisation through resvg, shared by the indexer (embedding input) and the UI (thumbnails).
 
+use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -41,10 +42,13 @@ fn render(path: &str, box_w: u32, box_h: u32, fit: u32, background: u32) -> Resu
         return Err("invalid target size".into());
     }
     let path = Path::new(path);
-    if std::fs::metadata(path).map_err(err)?.len() > MAX_SVG_BYTES {
+    let mut file = std::fs::File::open(path).map_err(err)?;
+    let file_len = file.metadata().map_err(err)?.len();
+    if file_len > MAX_SVG_BYTES {
         return Err("SVG file too large".into());
     }
-    let data = std::fs::read(path).map_err(err)?;
+    let mut data = Vec::with_capacity(file_len as usize);
+    file.read_to_end(&mut data).map_err(err)?;
 
     let opt = usvg::Options {
         resources_dir: path.parent().map(Path::to_path_buf),

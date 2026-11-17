@@ -35,15 +35,15 @@ inline bool is_valid_severity(std::string_view s) noexcept {
 inline uint64_t apply_notification(NotificationStoreData& store, std::string_view severity, std::string_view source,
                                    std::string_view title, std::string_view detail, std::string_view key,
                                    int64_t unix_ts, size_t max_items = MAX_NOTIFICATIONS) {
-    const std::string sev = is_valid_severity(severity) ? std::string{severity} : std::string{"error"};
+    const std::string_view sev = is_valid_severity(severity) ? severity : std::string_view{"error"};
     if (!key.empty()) {
         const auto it = std::ranges::find_if(store.items, [&](const Notification& n) {
             return n.key == key && n.source == source;
         });
         if (it != store.items.end()) {
-            it->severity = sev;
-            it->title = std::string{title};
-            it->detail = std::string{detail};
+            it->severity.assign(sev);
+            it->title.assign(title);
+            it->detail.assign(detail);
             it->unix_ts = unix_ts;
             if (it->count < UINT32_MAX) ++it->count;
             const uint64_t id = it->id;
@@ -54,16 +54,16 @@ inline uint64_t apply_notification(NotificationStoreData& store, std::string_vie
 
     if (store.next_id == 0) store.next_id = 1;
     const uint64_t id = store.next_id++;
-    Notification n;
-    n.id = id;
-    n.unix_ts = unix_ts;
-    n.severity = sev;
-    n.source = std::string{source};
-    n.title = std::string{title};
-    n.detail = std::string{detail};
-    n.key = std::string{key};
-    n.count = 1;
-    store.items.insert(store.items.begin(), std::move(n));
+    store.items.emplace(store.items.begin(), Notification{
+        .id = id,
+        .unix_ts = unix_ts,
+        .severity = std::string{sev},
+        .source = std::string{source},
+        .title = std::string{title},
+        .detail = std::string{detail},
+        .key = std::string{key},
+        .count = 1,
+    });
     if (max_items > 0 && store.items.size() > max_items) {
         store.items.resize(max_items);
     }

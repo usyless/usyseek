@@ -137,12 +137,12 @@ public:
 
     /// UI thread: turn finished decodes into device bitmaps.
     bool process(ID2D1DeviceContext* dc) {
-        std::vector<Done> done;
+        done_scratch_.clear();
         {
             std::lock_guard lk{m_};
-            done.swap(done_);
+            done_scratch_.swap(done_);
         }
-        for (auto& d : done) {
+        for (auto& d : done_scratch_) {
             if (d.pixels.empty()) {
                 failed_.insert(d.id);
                 continue;
@@ -165,7 +165,7 @@ public:
                 }
             }
         }
-        return !done.empty();
+        return !done_scratch_.empty();
     }
 
     /// Device lost / recreated: every bitmap belongs to the old device.
@@ -309,6 +309,7 @@ private:
     std::deque<Req> queue_;
     std::unordered_set<uint64_t> pending_;
     std::vector<Done> done_;
+    std::vector<Done> done_scratch_;
     bool stopping_ = false;
     std::vector<std::jthread> workers_;
 

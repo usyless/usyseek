@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -155,7 +156,7 @@ struct UpdateState {
 }
 
 /// Picks the best release archive matching the host's extraction capability (`.7z` if supported, else `.zip`).
-[[nodiscard]] inline std::optional<GithubAsset> pick_release_asset(const std::vector<GithubAsset>& assets, bool prefer_7z) {
+[[nodiscard]] inline std::optional<GithubAsset> pick_release_asset(std::span<const GithubAsset> assets, bool prefer_7z) {
     const auto ends_with_ci = [](std::string_view s, std::string_view suffix) {
         if (s.size() < suffix.size()) return false;
         const std::string_view tail = s.substr(s.size() - suffix.size());

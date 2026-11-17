@@ -100,7 +100,7 @@ fn migrate_collection(coll_dir: &Path, edge_root: &Path, force: bool) -> Result<
 
     let dim = read_vector_dim_from_config(coll_dir)?;
     let clean_name = sanitize_collection_name(name)?;
-    let dest_dir = edge_root.join(&clean_name);
+    let dest_dir = edge_root.join(clean_name.as_ref());
 
     if dest_dir.exists() && shard_exists_on_disk(&dest_dir) {
         if !force {

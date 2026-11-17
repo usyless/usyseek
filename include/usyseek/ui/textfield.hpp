@@ -123,9 +123,10 @@ public:
             const auto [a, b] = sel();
             UINT32 count = 0;
             layout->HitTestTextRange(static_cast<UINT32>(a), static_cast<UINT32>(b - a), 0, 0, nullptr, 0, &count);
-            std::vector<DWRITE_HIT_TEST_METRICS> ranges(count);
-            if (count && SUCCEEDED(layout->HitTestTextRange(static_cast<UINT32>(a), static_cast<UINT32>(b - a), 0, 0, ranges.data(), count, &count))) {
-                for (const auto& m : ranges) {
+            sel_ranges_.resize(count);
+            if (count && SUCCEEDED(layout->HitTestTextRange(static_cast<UINT32>(a), static_cast<UINT32>(b - a), 0, 0, sel_ranges_.data(), count, &count))) {
+                for (UINT32 idx = 0; idx < count; ++idx) {
+                    const auto& m = sel_ranges_[idx];
                     cv.fill(D2D1::RectF(r.left + m.left - scroll_, r.top + m.top, r.left + m.left + m.width - scroll_, r.top + m.top + m.height), with_alpha(cv.theme().primary, 0.35f));
                 }
             }
@@ -195,6 +196,7 @@ private:
     float cached_h_ = 0.0f;
     std::wstring cached_text_;
     wil::com_ptr<IDWriteTextLayout> cached_layout_;
+    std::vector<DWRITE_HIT_TEST_METRICS> sel_ranges_;
 };
 
 } // namespace usyseek::ui

@@ -29,8 +29,10 @@ inline constexpr uint32_t WHITE = 0xFFFFFFFFu;
 inline bool is_svg(std::wstring_view path) {
     const auto dot = path.find_last_of(L'.');
     if (dot == std::wstring_view::npos) return false;
-    const std::wstring ext = lower(path.substr(dot + 1));
-    return ext == L"svg" || ext == L"svgz";
+    const std::wstring_view ext = path.substr(dot + 1);
+    if (ext.size() != 3 && ext.size() != 4) return false;
+    const auto eq_ci = [](wchar_t a, wchar_t b) { return (a >= L'A' && a <= L'Z' ? static_cast<wchar_t>(a + (L'a' - L'A')) : a) == b; };
+    return eq_ci(ext[0], L's') && eq_ci(ext[1], L'v') && eq_ci(ext[2], L'g') && (ext.size() == 3 || eq_ci(ext[3], L'z'));
 }
 
 struct Raster {

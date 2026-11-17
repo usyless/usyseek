@@ -32,15 +32,15 @@ inline constexpr GUID GUID_UsyseekLiquidGlassPS = {
 
 /// Constant buffer matching `cbuffer LiquidGlassParams : register(b0)` in the D2D shader.
 struct alignas(16) LiquidGlassShaderParams {
-    float panel_rect[4]{};     // left, top, width, height (DIPs)
-    float src_bounds[4]{};     // minX, minY, maxX, maxY (DIPs)
-    float tint_color[4]{};     // r, g, b, a
-    float refract_params[4]{}; // refThickness, refFactor, refDispersion, dispersionRange
-    float fresnel_params[4]{}; // fresnelRange, fresnelHardness, fresnelFactor, magnification
-    float glare_params[4]{};   // glareRange, glareHardness, glareFactor, glareAngleDeg
-    float shape_params[4]{};   // glareConvergence, glareOppositeFactor, cornerRadiusDip, roundnessN
-    float misc_params[4]{};    // dpr, forceOpaque, edgeAaPx, shapeMarginDip
-    float extra_params[4]{};   // opacity, reserved, reserved, reserved
+    std::array<float, 4> panel_rect{};     // left, top, width, height (DIPs)
+    std::array<float, 4> src_bounds{};     // minX, minY, maxX, maxY (DIPs)
+    std::array<float, 4> tint_color{};     // r, g, b, a
+    std::array<float, 4> refract_params{}; // refThickness, refFactor, refDispersion, dispersionRange
+    std::array<float, 4> fresnel_params{}; // fresnelRange, fresnelHardness, fresnelFactor, magnification
+    std::array<float, 4> glare_params{};   // glareRange, glareHardness, glareFactor, glareAngleDeg
+    std::array<float, 4> shape_params{};   // glareConvergence, glareOppositeFactor, cornerRadiusDip, roundnessN
+    std::array<float, 4> misc_params{};    // dpr, forceOpaque, edgeAaPx, shapeMarginDip
+    std::array<float, 4> extra_params{};   // opacity, reserved, reserved, reserved
 };
 static_assert(sizeof(LiquidGlassShaderParams) == 144);
 
@@ -390,14 +390,14 @@ public:
   </Property>
 </Effect>)";
 
-        const D2D1_PROPERTY_BINDING bindings[] = {
+        const std::array<D2D1_PROPERTY_BINDING, 1> bindings = {{
             D2D1_BLOB_TYPE_BINDING(L"Params", &LiquidGlassEffectImpl::set_params, &LiquidGlassEffectImpl::get_params),
-        };
+        }};
         const HRESULT hr = factory->RegisterEffectFromString(
             CLSID_UsyseekLiquidGlass,
             xml,
-            bindings,
-            static_cast<UINT32>(std::size(bindings)),
+            bindings.data(),
+            static_cast<UINT32>(bindings.size()),
             &LiquidGlassEffectImpl::create_effect);
         if (SUCCEEDED(hr)) {
             registered.push_back(factory);

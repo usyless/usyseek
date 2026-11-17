@@ -18,16 +18,19 @@ namespace usyseek {
 inline constexpr std::wstring_view GITHUB_LATEST_RELEASE_URL = L"https://api.github.com/repos/usyless/usyseek/releases/latest";
 inline constexpr std::wstring_view GITHUB_RELEASES_PAGE_URL = L"https://github.com/usyless/usyseek/releases";
 
-inline fs::path system_tar_path() {
-    std::array<wchar_t, MAX_PATH> sys_dir{};
-    GetSystemDirectoryW(sys_dir.data(), static_cast<UINT>(sys_dir.size()));
-    return fs::path{sys_dir.data()} / L"tar.exe";
+inline const fs::path& system_tar_path() {
+    static const fs::path p = [] {
+        std::array<wchar_t, MAX_PATH> sys_dir; // NOLINT(cppcoreguidelines-pro-type-member-init)
+        const UINT n = GetSystemDirectoryW(sys_dir.data(), static_cast<UINT>(sys_dir.size()));
+        return fs::path{std::wstring_view{sys_dir.data(), n < sys_dir.size() ? n : 0}} / L"tar.exe";
+    }();
+    return p;
 }
 
 /// True when the system `tar.exe` (`bsdtar` / `libarchive`) supports extracting `.7z` archives (Windows 11 23H2+).
 inline bool tar_supports_7z() {
     static const bool supported = [] {
-        const fs::path tar = system_tar_path();
+        const fs::path& tar = system_tar_path();
         std::error_code ec;
         if (!fs::exists(tar, ec)) return false;
         const std::wstring cmd = L"\"" + tar.wstring() + L"\" --version";
@@ -125,29 +128,30 @@ inline std::string sha256_file_hex(const fs::path& path, std::wstring& err) {
         return {};
     }
 
-    std::vector<uint8_t> hash_obj(hash_obj_len);
+    auto hash_obj = std::make_unique_for_overwrite<uint8_t[]>(hash_obj_len); // NOLINT(modernize-avoid-c-arrays)
     BCRYPT_HASH_HANDLE hash = nullptr;
-    if (!BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, hash_obj.data(), hash_obj_len, nullptr, 0, 0))) {
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, hash_obj.get(), hash_obj_len, nullptr, 0, 0))) {
         err = L"Could not create SHA-256 hash.";
         return {};
     }
     const auto close_hash = wil::scope_exit([&] { BCryptDestroyHash(hash); });
 
-    std::vector<uint8_t> buf(65536);
+    constexpr DWORD BUF_CAP = 65536;
+    auto buf = std::make_unique_for_overwrite<uint8_t[]>(BUF_CAP); // NOLINT(modernize-avoid-c-arrays)
     for (;;) {
         DWORD got = 0;
-        if (!ReadFile(file.get(), buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr)) {
+        if (!ReadFile(file.get(), buf.get(), BUF_CAP, &got, nullptr)) {
             err = L"Failed while reading archive for checksum verification.";
             return {};
         }
         if (got == 0) break;
-        if (!BCRYPT_SUCCESS(BCryptHashData(hash, buf.data(), got, 0))) {
+        if (!BCRYPT_SUCCESS(BCryptHashData(hash, buf.get(), got, 0))) {
             err = L"SHA-256 hashing failed.";
             return {};
         }
     }
 
-    std::array<uint8_t, 32> digest{};
+    std::array<uint8_t, 32> digest; // NOLINT(cppcoreguidelines-pro-type-member-init)
     if (!BCRYPT_SUCCESS(BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0))) {
         err = L"Could not finalize SHA-256 hash.";
         return {};
@@ -193,8 +197,9 @@ inline bool is_dir_writable(const fs::path& dir) {
     return false;
 }
 
-inline fs::path update_work_dir() {
-    return data_dir() / L"update";
+inline const fs::path& update_work_dir() {
+    static const fs::path p = data_dir() / L"update";
+    return p;
 }
 
 inline bool download_and_stage_update(const UpdateState& st, fs::path& out_staging_root, std::wstring& err,
@@ -205,7 +210,7 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
         return false;
     }
 
-    const fs::path work_dir = update_work_dir();
+    const fs::path& work_dir = update_work_dir();
     const fs::path archive = work_dir / to_wide(st.asset_name);
     const fs::path staging = work_dir / L"staging";
     std::error_code ec;
@@ -245,7 +250,7 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
         return false;
     }
 
-    const fs::path tar = system_tar_path();
+    const fs::path& tar = system_tar_path();
     const std::wstring tar_cmd = L"\"" + tar.wstring() + L"\" -xf \"" + archive.wstring() + L"\" -C \"" + staging.wstring() + L"\"";
     std::string tar_err;
     const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false}>(
