@@ -89,10 +89,12 @@ class Fonts {
 public:
     bool init(IDWriteFactory3* dw) {
         dw_ = dw;
-        const std::wstring text = pick(L"Segoe UI Variable Text", L"Segoe UI");
-        const std::wstring disp = pick(L"Segoe UI Variable Display", L"Segoe UI");
-        const std::wstring mono = pick(L"Cascadia Mono", L"Consolas");
-        const std::wstring icon = pick(L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
+        wil::com_ptr<IDWriteFontCollection> sys;
+        if (dw_) dw_->GetSystemFontCollection(&sys);
+        const std::wstring text = pick(sys.get(), L"Segoe UI Variable Text", L"Segoe UI");
+        const std::wstring disp = pick(sys.get(), L"Segoe UI Variable Display", L"Segoe UI");
+        const std::wstring mono = pick(sys.get(), L"Cascadia Mono", L"Consolas");
+        const std::wstring icon = pick(sys.get(), L"Segoe Fluent Icons", L"Segoe MDL2 Assets");
 
         struct Def {
             Font f;
@@ -100,25 +102,26 @@ public:
             float size;
             DWRITE_FONT_WEIGHT weight;
             bool wrap;
+            bool is_icon;
         };
         const std::array<Def, 17> defs = {{
-            {.f = Font::Body, .family = &text, .size = 13.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
-            {.f = Font::BodySemi, .family = &text, .size = 13.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false},
-            {.f = Font::BodyWrap, .family = &text, .size = 13.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = true},
-            {.f = Font::Large, .family = &disp, .size = 15.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false},
-            {.f = Font::Input, .family = &text, .size = 17.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
-            {.f = Font::Small, .family = &text, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
-            {.f = Font::SmallSemi, .family = &text, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false},
-            {.f = Font::SmallWrap, .family = &text, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = true},
-            {.f = Font::Caption, .family = &text, .size = 11.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
-            {.f = Font::Label, .family = &text, .size = 11.0f, .weight = DWRITE_FONT_WEIGHT_BOLD, .wrap = false},
-            {.f = Font::Mono, .family = &mono, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
-            {.f = Font::MonoSmall, .family = &mono, .size = 11.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
-            {.f = Font::Title, .family = &disp, .size = 17.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false},
-            {.f = Font::Hero, .family = &disp, .size = 32.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false},
-            {.f = Font::Icon, .family = &icon, .size = 16.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
-            {.f = Font::IconSmall, .family = &icon, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
-            {.f = Font::IconLarge, .family = &icon, .size = 20.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
+            {.f = Font::Body, .family = &text, .size = 13.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = false},
+            {.f = Font::BodySemi, .family = &text, .size = 13.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false, .is_icon = false},
+            {.f = Font::BodyWrap, .family = &text, .size = 13.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = true, .is_icon = false},
+            {.f = Font::Large, .family = &disp, .size = 15.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false, .is_icon = false},
+            {.f = Font::Input, .family = &text, .size = 17.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = false},
+            {.f = Font::Small, .family = &text, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = false},
+            {.f = Font::SmallSemi, .family = &text, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false, .is_icon = false},
+            {.f = Font::SmallWrap, .family = &text, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = true, .is_icon = false},
+            {.f = Font::Caption, .family = &text, .size = 11.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = false},
+            {.f = Font::Label, .family = &text, .size = 11.0f, .weight = DWRITE_FONT_WEIGHT_BOLD, .wrap = false, .is_icon = false},
+            {.f = Font::Mono, .family = &mono, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = false},
+            {.f = Font::MonoSmall, .family = &mono, .size = 11.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = false},
+            {.f = Font::Title, .family = &disp, .size = 17.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false, .is_icon = false},
+            {.f = Font::Hero, .family = &disp, .size = 32.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false, .is_icon = false},
+            {.f = Font::Icon, .family = &icon, .size = 16.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = true},
+            {.f = Font::IconSmall, .family = &icon, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = true},
+            {.f = Font::IconLarge, .family = &icon, .size = 20.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false, .is_icon = true},
         },};
         for (const auto& d : defs) {
             wil::com_ptr<IDWriteTextFormat> fmt;
@@ -131,6 +134,7 @@ public:
                     const DWRITE_TRIMMING trim{.granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER, .delimiter = 0, .delimiterCount = 0};
                     fmt->SetTrimming(&trim, ellipsis.get());
                 }
+                if (!d.is_icon) center_cap_metrics(sys.get(), fmt.get(), *d.family, d.weight, d.size);
             }
             formats_[static_cast<size_t>(d.f)] = std::move(fmt);
         }
@@ -199,14 +203,41 @@ public:
     }
 
 private:
-    std::wstring pick(const wchar_t* preferred, const wchar_t* fallback) {
-        wil::com_ptr<IDWriteFontCollection> sys;
-        if (SUCCEEDED(dw_->GetSystemFontCollection(&sys))) {
+    static std::wstring pick(IDWriteFontCollection* sys, const wchar_t* preferred, const wchar_t* fallback) {
+        if (sys) {
             UINT32 idx = 0;
             BOOL exists = FALSE;
             if (SUCCEEDED(sys->FindFamilyName(preferred, &idx, &exists)) && exists) return preferred;
         }
         return fallback;
+    }
+
+    /// Balances DirectWrite's line baseline so cap height sits symmetrically inside single-line boxes
+    /// instead of looking shifted downward by Segoe / Cascadia Mono's extra ascent headroom.
+    void center_cap_metrics(IDWriteFontCollection* sys, IDWriteTextFormat* fmt, const std::wstring& family, DWRITE_FONT_WEIGHT weight, float size) const noexcept {
+        if (!sys || !fmt || !dw_) return;
+        UINT32 idx = 0;
+        BOOL exists = FALSE;
+        if (FAILED(sys->FindFamilyName(family.c_str(), &idx, &exists)) || !exists) return;
+        wil::com_ptr<IDWriteFontFamily> fam;
+        wil::com_ptr<IDWriteFont> font;
+        if (FAILED(sys->GetFontFamily(idx, &fam)) ||
+            FAILED(fam->GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, &font))) {
+            return;
+        }
+        DWRITE_FONT_METRICS fm{};
+        font->GetMetrics(&fm);
+        if (fm.designUnitsPerEm == 0 || fm.capHeight == 0) return;
+
+        wil::com_ptr<IDWriteTextLayout> layout;
+        if (FAILED(dw_->CreateTextLayout(L"H", 1, fmt, 1000.0f, 1000.0f, &layout))) return;
+        DWRITE_LINE_METRICS lm{};
+        UINT32 count = 0;
+        if (FAILED(layout->GetLineMetrics(&lm, 1, &count)) || count == 0 || lm.height <= 0.0f) return;
+
+        const float cap_h = static_cast<float>(fm.capHeight) * size / static_cast<float>(fm.designUnitsPerEm);
+        if (lm.height <= cap_h) return;
+        fmt->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, lm.height, (lm.height + cap_h) * 0.5f);
     }
 
     IDWriteFactory3* dw_ = nullptr;
