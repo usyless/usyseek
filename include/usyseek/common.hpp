@@ -9,7 +9,6 @@
 #include <array>
 #include <charconv>
 #include <chrono>
-#include <compare>
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
@@ -146,7 +145,7 @@ inline std::wstring trim(std::wstring_view s) {
 /// Normalises a directory for comparisons and the ancestor index: lowercase, no trailing backslash.
 inline std::wstring normalise_dir(std::wstring_view d) {
     std::wstring s = lower(trim(d));
-    std::replace(s.begin(), s.end(), L'/', L'\\');
+    std::ranges::replace(s, L'/', L'\\');
     if (s.starts_with(L"\\\\?\\")) s.erase(0, 4);
     while (s.size() > 2 && s.back() == L'\\') s.pop_back();
     if (s.size() == 3 && s[1] == L':' && s[2] == L'\\') s.pop_back();

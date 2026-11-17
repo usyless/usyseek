@@ -13,6 +13,7 @@
 #include <deque>
 #include <future>
 #include <mutex>
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -110,7 +111,7 @@ struct Scope {
                 abs_excludes.push_back(normalise_dir(raw));
             } else {
                 std::wstring n = lower(raw);
-                std::replace(n.begin(), n.end(), L'/', L'\\');
+                std::ranges::replace(n, L'/', L'\\');
                 while (n.starts_with(L'*') || n.starts_with(L'\\')) n.erase(0, 1);
                 while (n.ends_with(L'*') || n.ends_with(L'\\')) n.pop_back();
                 if (!n.empty()) name_excludes.push_back(L"\\" + n + L"\\");
@@ -817,7 +818,7 @@ struct PyVision {
 
     void cancel() noexcept {
         if (cancel_event) SetEvent(cancel_event.get());
-        std::lock_guard lk{proc_mu};
+        std::scoped_lock lk{proc_mu};
         cancelled = true;
         if (job) TerminateJobObject(job.get(), 0);
         else if (proc.hProcess) TerminateProcess(proc.hProcess, 0);
@@ -883,7 +884,7 @@ struct PyVision {
         SetProcessInformation(pi.hProcess, ProcessPowerThrottling, &throttling, sizeof(throttling));
         SetPriorityClass(pi.hProcess, ABOVE_NORMAL_PRIORITY_CLASS);
         {
-            std::lock_guard lk{proc_mu};
+            std::scoped_lock lk{proc_mu};
             if (cancelled) {
                 if (new_job) TerminateJobObject(new_job.get(), 0);
                 else TerminateProcess(pi.hProcess, 0);

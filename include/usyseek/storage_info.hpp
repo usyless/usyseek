@@ -121,7 +121,7 @@ namespace detail {
 
     out.reserve(by_name.size());
     for (auto& [_, info] : by_name) out.push_back(std::move(info));
-    std::sort(out.begin(), out.end(), [](const ModelStorageInfo& a, const ModelStorageInfo& b) {
+    std::ranges::sort(out, [](const ModelStorageInfo& a, const ModelStorageInfo& b) {
         return detail::ascii_iless(a.name, b.name);
     });
     return out;
@@ -194,7 +194,7 @@ inline bool delete_downloaded_model(const std::filesystem::path& model_dir, std:
         if (!detail::valid_model_stem(name)) continue;
         out.emplace_back(std::move(name), std::nullopt, detail::directory_bytes(dir));
     }
-    std::sort(out.begin(), out.end(), [](const DbCollectionInfo& a, const DbCollectionInfo& b) {
+    std::ranges::sort(out, [](const DbCollectionInfo& a, const DbCollectionInfo& b) {
         return detail::ascii_iless(a.name, b.name);
     });
     return out;

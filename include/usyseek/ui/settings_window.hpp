@@ -10,6 +10,8 @@
 
 #include <shobjidl.h>
 
+#include <algorithm>
+
 namespace usyseek {
 
 struct NugetVersionIndex {
@@ -453,12 +455,12 @@ private:
             for (std::wstring_view want : {L"torch-", L"open_clip_torch-", L"timm-", L"safetensors-", L"onnxruntime-"}) {
                 if (_wcsnicmp(stem.c_str(), want.data(), want.size()) == 0) {
                     std::wstring label = stem;
-                    std::replace(label.begin(), label.end(), L'_', L'-');
+                    std::ranges::replace(label, L'_', L'-');
                     found.push_back(std::move(label));
                 }
             }
         }
-        std::sort(found.begin(), found.end());
+        std::ranges::sort(found);
         for (size_t i = 0; i < found.size(); ++i) {
             if (i) venv_pkgs_ += L", ";
             venv_pkgs_ += found[i];
@@ -641,7 +643,7 @@ private:
         cv.hit(r, id, idx);
     }
 
-    float text_height(Canvas& cv, std::wstring_view s, Font f, float w, float min_h) {
+    static float text_height(Canvas& cv, std::wstring_view s, Font f, float w, float min_h) {
         return std::max(min_h, cv.measure_height(s, f, w));
     }
 
@@ -649,25 +651,25 @@ private:
         return text_height(cv, message, Font::Caption, row_w - 22.0f, 20.0f);
     }
 
-    void draw_error_row(Canvas& cv, std::wstring_view message, float x, float y, float row_w, float h) {
+    static void draw_error_row(Canvas& cv, std::wstring_view message, float x, float y, float row_w, float h) {
         cv.icon(glyph::warning, rect(x, y, 18.0f, 20.0f), cv.theme().error, Font::IconSmall);
         cv.text_wrap(message, rect(x + 22.0f, y, row_w - 22.0f, h), Font::Caption, cv.theme().error);
     }
 
-    float mono_row_height(Canvas& cv, std::wstring_view s, float text_w, float min_h) {
+    static float mono_row_height(Canvas& cv, std::wstring_view s, float text_w, float min_h) {
         return std::max(min_h, 12.0f + cv.measure_height(s, Font::MonoSmall, text_w));
     }
 
-    float button_width(Canvas& cv, std::wstring_view label, bool has_icon, float min_w) {
+    static float button_width(Canvas& cv, std::wstring_view label, bool has_icon, float min_w) {
         return std::max(min_w, cv.measure(label, Font::SmallSemi) + (has_icon ? 24.0f : 0.0f) + 28.0f);
     }
 
-    void text_middle(Canvas& cv, std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c) {
+    static void text_middle(Canvas& cv, std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c) {
         const float th = cv.measure_height(s, f, width(r));
         cv.text_wrap(s, rect(r.left, r.top + std::max(0.0f, (height(r) - th) * 0.5f), width(r), th), f, c);
     }
 
-    void flow_text(Canvas& cv, Flow& flow, std::wstring_view s, Font f, D2D1_COLOR_F c, float avail, float line_h,
+    static void flow_text(Canvas& cv, Flow& flow, std::wstring_view s, Font f, D2D1_COLOR_F c, float avail, float line_h,
                    bool grow = false, Align a = Align::Left) {
         const float natural = cv.measure(s, f) + 4.0f;
         if (natural <= avail) {
