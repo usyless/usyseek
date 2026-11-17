@@ -2999,9 +2999,11 @@ private:
         if (!custom_args.empty()) {
             int argc = 0;
             LPWSTR* argv = CommandLineToArgvW(custom_args.c_str(), &argc);
-            std::vector<std::wstring_view> args = {L"-m", L"pip", L"install", L"--upgrade"};
-            if (argc > 0) args.reserve(4 + static_cast<size_t>(argc));
-            for (int i = 0; i < argc; ++i) args.emplace_back(argv[i]);
+            static constexpr std::array<std::wstring_view, 4> base_args = {L"-m", L"pip", L"install", L"--upgrade"};
+            std::vector<std::wstring_view> args;
+            args.reserve(base_args.size() + (argv && argc > 0 ? static_cast<size_t>(argc) : 0));
+            args.insert(args.end(), base_args.begin(), base_args.end());
+            for (int i = 0; argv && i < argc; ++i) args.emplace_back(argv[i]);
             torch_ok = exec_logged(py, args);
             if (argv) LocalFree(argv);
         } else if (in.torch_backend == "manual") {

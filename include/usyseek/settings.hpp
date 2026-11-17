@@ -122,8 +122,14 @@ inline const std::vector<std::wstring>& locked_excludes() {
 inline std::vector<std::string> default_excludes() {
     std::vector<std::string> v;
     v.reserve(7);
-    for (auto id : {FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_ProgramData, FOLDERID_LocalAppData}) {
-        auto p = known_folder(id);
+    static constexpr std::array<const KNOWNFOLDERID*, 4> folders = {
+        &FOLDERID_ProgramFiles,
+        &FOLDERID_ProgramFilesX86,
+        &FOLDERID_ProgramData,
+        &FOLDERID_LocalAppData,
+    };
+    for (const KNOWNFOLDERID* id : folders) {
+        auto p = known_folder(*id);
         if (!p.empty()) v.push_back(to_utf8(p));
     }
     v.emplace_back("*\\node_modules");
