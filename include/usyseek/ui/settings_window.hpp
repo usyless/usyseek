@@ -939,7 +939,7 @@ private:
         }
         constexpr auto tabs = tab_defs();
         const FlowResult layout = tab_layout(sz.width);
-        std::array<D2D1_RECT_F, 4> rects{};
+        std::array<D2D1_RECT_F, 4> rects; // NOLINT(cppcoreguidelines-pro-type-member-init)
         for (size_t i = 0; i < rects.size(); ++i) {
             const FlowPlacement& p = layout.placements[i];
             rects[i] = rect(PAD + p.x, 8.0f + p.y, p.width, TABS_H - 16.0f);
@@ -2090,12 +2090,12 @@ private:
             // What is on disk for the selected model, and a way to fetch what is missing
             const ModelFiles& mf = model_files_;
             const JobView fetch_view = view(model_job_);
-            const auto badge = [&cv](Flow& flow, FixedWString<48> text, D2D1_COLOR_F col) {
+            const auto badge = [&cv](Flow& flow, std::wstring_view text, D2D1_COLOR_F col) {
                 const float bw = cv.measure(text, Font::Caption) + 28.0f;
-                flow.add(bw, 22.0f, [&cv, text, col, bw](D2D1_RECT_F br) {
+                flow.add(bw, 22.0f, [&cv, txt = FixedWString<48>{text}, col, bw](D2D1_RECT_F br) {
                     cv.fill_round(br, 11.0f, with_alpha(col, 0.15f));
                     cv.fill_circle({br.left + 11.0f, br.top + 11.0f}, 3.5f, col);
-                    cv.text(text, rect(br.left + 20.0f, br.top, bw - 22.0f, 22.0f), Font::Caption, col);
+                    cv.text(txt, rect(br.left + 20.0f, br.top, bw - 22.0f, 22.0f), Font::Caption, col);
                 });
             };
             Flow files{8.0f, 6.0f};

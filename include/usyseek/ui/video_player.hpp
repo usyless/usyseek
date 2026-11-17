@@ -19,7 +19,6 @@
 #include <optional>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace usyseek::ui {
 
@@ -27,7 +26,7 @@ namespace usyseek::ui {
 /// Filters high-frequency timer/progress events and stops posting immediately on detach().
 class MediaEngineNotify final : public IMFMediaEngineNotify {
 public:
-    MediaEngineNotify(HWND hwnd, UINT msg) noexcept : hwnd_{hwnd}, msg_{msg} {}
+    MediaEngineNotify(HWND hwnd, UINT msg) noexcept : hwnd_{hwnd}, msg_{msg} {} // NOLINT(cppcoreguidelines-pro-type-member-init)
     MediaEngineNotify(const MediaEngineNotify&) = delete;
     MediaEngineNotify& operator=(const MediaEngineNotify&) = delete;
     MediaEngineNotify(MediaEngineNotify&&) = delete;
@@ -77,6 +76,12 @@ public:
         return n;
     }
 
+    void clear() noexcept {
+        const std::scoped_lock lk{mtx_};
+        posted_ = false;
+        event_count_ = 0;
+    }
+
     STDMETHODIMP EventNotify(DWORD event, DWORD_PTR /*param1*/, DWORD /*param2*/) noexcept override {
         if (!is_significant_event(event)) return S_OK;
 
@@ -123,7 +128,7 @@ private:
     std::mutex mtx_;
     HWND hwnd_ = nullptr;
     UINT msg_ = 0;
-    std::array<DWORD, 256> events_{};
+    std::array<DWORD, 256> events_; // NOLINT(cppcoreguidelines-pro-type-member-init)
     size_t event_count_ = 0;
     bool posted_ = false;
 };
@@ -250,7 +255,7 @@ public:
     /// Returns true if visible state changed.
     bool process_events() noexcept {
         if (!notify_cb_) return false;
-        std::array<DWORD, 256> events{};
+        std::array<DWORD, 256> events; // NOLINT(cppcoreguidelines-pro-type-member-init)
         const size_t n = notify_cb_->drain(events);
         if (n == 0 || !engine_ || phase_ == LoadPhase::Idle) return false;
 
@@ -633,10 +638,7 @@ private:
             engine_->Pause();
             engine_->SetSource(nullptr);
         }
-        if (notify_cb_) {
-            std::array<DWORD, 256> dummy{};
-            (void)notify_cb_->drain(dummy);
-        }
+        if (notify_cb_) notify_cb_->clear();
         reset_source_state();
     }
 

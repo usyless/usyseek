@@ -223,7 +223,7 @@ public:
             model = model_;
         }
 
-        std::array<int64_t, 256> stack_ids{};
+        std::array<int64_t, 256> stack_ids; // NOLINT(cppcoreguidelines-pro-type-member-init)
         std::vector<int64_t> heap_ids;
         int64_t* ids_ptr = stack_ids.data();
         if (model->ctx > stack_ids.size()) {

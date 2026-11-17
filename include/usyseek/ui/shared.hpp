@@ -33,9 +33,12 @@ inline FixedWString<96> format_hotkey(uint32_t mods, uint32_t vk) noexcept {
     if (mods & MOD_ALT) t.append(L"Alt + ");
     if (mods & MOD_SHIFT) t.append(L"Shift + ");
     if (mods & MOD_WIN) t.append(L"Win + ");
-    std::array<wchar_t, 64> name{};
-    if (vk == VK_SPACE) wcscpy_s(name.data(), name.size(), L"Space");
-    else GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16, name.data(), static_cast<int>(name.size()));
+    std::array<wchar_t, 64> name; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    if (vk == VK_SPACE) {
+        wcscpy_s(name.data(), name.size(), L"Space");
+    } else if (GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16, name.data(), static_cast<int>(name.size())) == 0) {
+        name[0] = L'\0';
+    }
     t.append(name[0] ? name.data() : L"Key");
     return t;
 }

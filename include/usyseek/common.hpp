@@ -162,15 +162,39 @@ inline uint64_t path_id(std::wstring_view path) {
 template <typename Char, size_t N>
 struct FixedBasicString {
     static_assert(N > 0);
-    std::array<Char, N> buf{};
+    std::array<Char, N> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
     size_t len = 0;
 
-    constexpr FixedBasicString() noexcept = default;
-    constexpr FixedBasicString(std::basic_string_view<Char> sv) noexcept { assign(sv); }
+    constexpr FixedBasicString() noexcept {
+        if (std::is_constant_evaluated()) buf.fill(Char{});
+        buf[0] = Char{};
+    }
+    constexpr FixedBasicString(const FixedBasicString& other) noexcept {
+        if (std::is_constant_evaluated()) buf.fill(Char{});
+        assign(other.view());
+    }
+    constexpr FixedBasicString& operator=(const FixedBasicString& other) noexcept {
+        if (this != &other) assign(other.view());
+        return *this;
+    }
+    constexpr FixedBasicString(FixedBasicString&& other) noexcept {
+        if (std::is_constant_evaluated()) buf.fill(Char{});
+        assign(other.view());
+    }
+    constexpr FixedBasicString& operator=(FixedBasicString&& other) noexcept {
+        if (this != &other) assign(other.view());
+        return *this;
+    }
+    constexpr ~FixedBasicString() noexcept = default;
+    constexpr FixedBasicString(std::basic_string_view<Char> sv) noexcept {
+        if (std::is_constant_evaluated()) buf.fill(Char{});
+        assign(sv);
+    }
     constexpr FixedBasicString(const Char* s) noexcept
         : FixedBasicString(s ? std::basic_string_view<Char>{s} : std::basic_string_view<Char>{}) {}
     template <size_t M>
     constexpr FixedBasicString(const FixedBasicString<Char, M>& other) noexcept {
+        if (std::is_constant_evaluated()) buf.fill(Char{});
         assign(other.view());
     }
 

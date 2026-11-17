@@ -232,7 +232,7 @@ inline D2D1_RECT_F snap(D2D1_RECT_F r) noexcept { return D2D1::RectF(std::round(
 /// Immediate-mode drawing helpers over one device context, plus hit-region recording.
 class Canvas {
 public:
-    Canvas(WindowTarget& target, Fonts& fonts, std::vector<Hit>& hits, const Theme& theme,
+    Canvas(WindowTarget& target, Fonts& fonts, std::vector<Hit>& hits, const Theme& theme, // NOLINT(cppcoreguidelines-pro-type-member-init)
            std::optional<D2D1_RECT_F> dirty_clip = std::nullopt, float opacity = 1.0f) noexcept
         : target_{target}, dc_{target.dc()}, fonts_{fonts}, hits_{hits}, theme_{theme},
           dirty_clip_{dirty_clip}, opacity_{std::clamp(opacity, 0.0f, 1.0f)} {}
@@ -399,7 +399,7 @@ public:
     void push_clip(D2D1_RECT_F r) noexcept {
         dc_->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED);
         if (clip_depth_ > 0) {
-            const D2D1_RECT_F& c = clips_[clip_depth_ - 1];
+            const D2D1_RECT_F& c = clips_[std::min(clip_depth_, clips_.size()) - 1];
             r.left = std::max(r.left, c.left);
             r.top = std::max(r.top, c.top);
             r.right = std::min(r.right, c.right);
@@ -444,7 +444,7 @@ private:
     float opacity_ = 1.0f;
     D2D1_COLOR_F last_color_{};
     bool has_color_ = false;
-    std::array<D2D1_RECT_F, 8> clips_{};
+    std::array<D2D1_RECT_F, 8> clips_; // NOLINT(cppcoreguidelines-pro-type-member-init)
     size_t clip_depth_ = 0;
 };
 

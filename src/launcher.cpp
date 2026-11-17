@@ -633,10 +633,13 @@ private:
         if (s.hotkey_mods & MOD_ALT) t += L"Alt+";
         if (s.hotkey_mods & MOD_SHIFT) t += L"Shift+";
         if (s.hotkey_mods & MOD_WIN) t += L"Win+";
-        std::array<wchar_t, 64> name{};
+        std::array<wchar_t, 64> name; // NOLINT(cppcoreguidelines-pro-type-member-init)
         UINT sc = MapVirtualKeyW(s.hotkey_vk, MAPVK_VK_TO_VSC) << 16;
-        if (s.hotkey_vk == VK_SPACE) wcscpy_s(name.data(), name.size(), L"Space");
-        else GetKeyNameTextW(static_cast<LONG>(sc), name.data(), static_cast<int>(name.size()));
+        if (s.hotkey_vk == VK_SPACE) {
+            wcscpy_s(name.data(), name.size(), L"Space");
+        } else if (GetKeyNameTextW(static_cast<LONG>(sc), name.data(), static_cast<int>(name.size())) == 0) {
+            name[0] = L'\0';
+        }
         return t + name.data();
     }
 

@@ -1195,7 +1195,7 @@ private:
         } else {
             cv.fill_round(seg, 17, with_alpha(cv.theme().surface_highest, 0.85f));
         }
-        std::array<D2D1_RECT_F, 3> chip_rects{};
+        std::array<D2D1_RECT_F, 3> chip_rects; // NOLINT(cppcoreguidelines-pro-type-member-init)
         float cx = x + 3;
         for (size_t i = 0; i < labels.size(); ++i) {
             chip_rects[i] = rect(cx, cy - 14, widths[i], 28);
