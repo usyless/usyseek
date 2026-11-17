@@ -518,7 +518,7 @@ private:
 
     void worker_loop(const std::stop_token& st) {
         const ulp::win::COMWrapper<false> com{
-            static_cast<DWORD>(COINIT_APARTMENTTHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
+            static_cast<DWORD>(COINIT_MULTITHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 
         wil::com_ptr<IWICImagingFactory> wic;
@@ -694,6 +694,7 @@ private:
         // Streaming loop for giant multi-hundred-MB GIFs
         UINT next_idx = 0;
         uint64_t seen_seek_seq = 0;
+        bool any_stream_frame = false;
         while (!aborted()) {
             std::optional<size_t> seek_to;
             {
@@ -728,7 +729,10 @@ private:
             const bool ok = decode_one(next_idx, true, f);
             next_idx = (next_idx + 1) % total;
             if (!ok) {
-                if (next_idx == 0) return;
+                if (next_idx == 0) {
+                    if (!any_stream_frame && !aborted()) mark_static(job.gen, true);
+                    return;
+                }
                 continue;
             }
 
@@ -739,6 +743,7 @@ private:
                 if (session_.seek_seq != seen_seek_seq) continue;
                 const bool was_empty = session_.stream_queue_.empty();
                 session_.stream_queue_.push_back(std::move(f));
+                any_stream_frame = true;
                 notify = was_empty;
             }
             if (notify) post_signal();

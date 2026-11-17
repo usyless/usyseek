@@ -24,9 +24,13 @@ struct Raster {
 
 /// Decodes the first frame of an image with WIC, upright (EXIF orientation applied) and scaled down to fit
 /// `max_px` on its longer side (0 = native size). Any thread with COM initialised.
-inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px, bool premultiplied) {
-    wil::com_ptr<IWICImagingFactory> wic;
-    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) return std::nullopt;
+inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px, bool premultiplied, IWICImagingFactory* shared_wic = nullptr) {
+    wil::com_ptr<IWICImagingFactory> owned_wic;
+    IWICImagingFactory* wic = shared_wic;
+    if (!wic) {
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&owned_wic)))) return std::nullopt;
+        wic = owned_wic.get();
+    }
     wil::com_ptr<IWICBitmapDecoder> dec;
     if (FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) return std::nullopt;
     wil::com_ptr<IWICBitmapFrameDecode> frame;
@@ -152,7 +156,13 @@ public:
             }
             wil::com_ptr<ID2D1Bitmap1> bmp;
             const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-            if (FAILED(dc->CreateBitmap(D2D1::SizeU(d.w, d.h), d.pixels.data(), d.w * 4, &props, &bmp))) continue;
+            const HRESULT hr = dc->CreateBitmap(D2D1::SizeU(d.w, d.h), d.pixels.data(), d.w * 4, &props, &bmp);
+            if (FAILED(hr)) {
+                if (hr != D2DERR_RECREATE_TARGET && hr != DXGI_ERROR_DEVICE_REMOVED && hr != DXGI_ERROR_DEVICE_RESET) {
+                    failed_.insert(d.id);
+                }
+                continue;
+            }
             if (const auto existing = bitmaps_.find(d.id); existing != bitmaps_.end()) {
                 if (d.px >= existing->second.px) {
                     existing->second.bmp = std::move(bmp);
@@ -183,6 +193,7 @@ public:
             const std::scoped_lock lk{m_};
             for (const auto& q : queue_) pending_.erase(q.id);
             queue_.clear();
+            done_.clear();
         }
         reset_gpu();
         failed_.clear();
@@ -213,8 +224,12 @@ private:
     };
 
     void worker(const std::stop_token& st) {
-        const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_APARTMENTTHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
+        const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        wil::com_ptr<IWICImagingFactory> wic;
+        if (full_) {
+            CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+        }
         while (!st.stop_requested()) {
             Req r;
             {
@@ -226,7 +241,15 @@ private:
             }
             Done d{.id = r.id};
             d.px = r.px;
-            if (!full_ || !load_full(r, d)) load(r, d);
+            if (full_) {
+                if (svg::is_svg(r.path)) {
+                    load_svg(r, d);
+                } else {
+                    (void)load_full(r, d, wic.get());
+                }
+            } else {
+                load(r, d);
+            }
             {
                 const std::scoped_lock lk{m_};
                 pending_.erase(r.id);
@@ -253,9 +276,9 @@ private:
         d.h = raster->height;
     }
 
-    static bool load_full(const Req& r, Done& d) {
+    static bool load_full(const Req& r, Done& d, IWICImagingFactory* wic) {
         if (svg::is_svg(r.path)) return false;
-        auto img = decode_image(r.path, r.px, true);
+        auto img = decode_image(r.path, r.px, true, wic);
         if (!img) return false;
         d.w = img->w;
         d.h = img->h;

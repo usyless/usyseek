@@ -652,9 +652,13 @@ private:
 
     bool ensure_target() {
         if (target_.ready() && gfx_epoch_ == sh_.gfx.epoch()) return true;
-        if (target_.ready() && gfx_epoch_ != sh_.gfx.epoch()) target_.release();
+        if (target_.ready() && gfx_epoch_ != sh_.gfx.epoch()) {
+            target_.release();
+            preview_gpu_reset_ = true;
+        }
         if (!sh_.gfx.ready() || sh_.gfx.device_lost()) {
             reset_preview_gpu();
+            preview_gpu_reset_ = true;
             if (!sh_.gfx.recover(hwnd_)) {
                 SetTimer(hwnd_, TIMER_DEVICE, 250, nullptr);
                 return false;
@@ -665,12 +669,22 @@ private:
             return false;
         }
         gfx_epoch_ = sh_.gfx.epoch();
+        if (deferred_thumbs_) {
+            deferred_thumbs_ = false;
+            (void)sh_.thumbs.process(target_.dc());
+            const bool previews = sh_.previews.process(target_.dc());
+            if (preview_ < 0 && previews) sh_.previews.clear();
+        }
+        if (std::exchange(preview_gpu_reset_, false) && preview_valid() && items_[preview_].pt.p.k != 1) {
+            request_preview();
+        }
         return true;
     }
 
     void recover() {
         // Present failed: device removed/reset or adapter gone. Rebuild everything on the next frame.
         reset_preview_gpu();
+        preview_gpu_reset_ = preview_valid();
         glass_.release();
         sh_.desktop_dupl.reset();
         target_.release();
@@ -762,7 +776,11 @@ public:
     }
 
     void on_thumbs() {
-        if (!target_.ready()) return;
+        if (!target_.ready()) {
+            deferred_thumbs_ = true;
+            return;
+        }
+        deferred_thumbs_ = false;
         const bool thumbs = sh_.thumbs.process(target_.dc());
         const bool previews = sh_.previews.process(target_.dc());
         // A full-size decode that lands after the viewer closed is not kept around
@@ -2049,7 +2067,7 @@ private:
         copy_decoding_ = decode;
         ++sh_.background_jobs;
         copy_workers_[id] = std::jthread([this, id, decode, paths = std::move(paths)](const std::stop_token& stop) mutable {
-            const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_APARTMENTTHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
+            const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
             const auto payload = std::make_shared<ClipboardPayload>();
             if (!stop.stop_requested()) {
                 std::optional<Raster> image;
@@ -2421,7 +2439,9 @@ private:
         const UINT px = preview_px();
         const auto want = [&](int k) {
             if (k >= 0 && std::cmp_less(k, items_.size())) {
-                sh_.previews.request(items_[static_cast<size_t>(k)].pt.id, item_path(items_[static_cast<size_t>(k)]), px);
+                const Item& target = items_[static_cast<size_t>(k)];
+                if (target.pt.p.k == 1) return;
+                sh_.previews.request(target.pt.id, item_path(target), px);
             }
         };
         // Newest requests are served first: neighbours, then the shown one
@@ -4033,6 +4053,8 @@ private:
     bool swallow_dbl_ = false;
 
     uint64_t gfx_epoch_ = 0;
+    bool deferred_thumbs_ = false;
+    bool preview_gpu_reset_ = false;
     bool video_timer_active_ = false;
     bool dragging_seek_ = false;
     bool dragging_volume_ = false;

@@ -242,7 +242,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         pill.reset_preview_gpu();
     };
     sh.thumbs.start(pill.hwnd(), WM_APP_THUMBS);
-    sh.previews.start(pill.hwnd(), WM_APP_THUMBS, 1);
+    sh.previews.start(pill.hwnd(), WM_APP_THUMBS, 2);
 
     sh.engine.on_result = [&](std::unique_ptr<SearchResult> r) {
         const HWND hwnd = sh.call_hwnd.load(std::memory_order_acquire);
