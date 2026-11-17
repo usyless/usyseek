@@ -250,7 +250,7 @@ private:
             push_notification_to_disk(
                 "error", "Launcher", ulp::str::concat_strings("Failed to start ", name),
                 win32_error_utf8(err), ulp::str::concat_strings("spawn-", name), true);
-            show_balloon(APP_NAME, ulp::str::concat_strings(L"Failed to start ", exe.filename().wstring(), L": ", to_wide(win32_error_utf8(err))).c_str(), NIIF_ERROR, BalloonTarget::Notifications);
+            show_balloon(APP_NAME, ulp::str::concat_strings(L"Failed to start ", exe.filename().wstring(), L": ", to_wide(win32_error_utf8(err))), NIIF_ERROR, BalloonTarget::Notifications);
             return {};
         }
         AssignProcessToJobObject(job_.get(), pi.hProcess);
@@ -436,7 +436,7 @@ private:
                         "indexer-exit", true);
                 }
                 if (!is_ui_running()) {
-                    show_balloon(APP_NAME, msg.c_str(), NIIF_ERROR, BalloonTarget::Notifications);
+                    show_balloon(APP_NAME, msg, NIIF_ERROR, BalloonTarget::Notifications);
                 }
             }
             notify_ui();
