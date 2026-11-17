@@ -305,7 +305,7 @@ inline std::optional<std::string> get(const std::wstring& url, size_t max_bytes 
 /// only ever exists whole; an interrupted or cancelled download leaves the part file and resumes from it next time.
 inline Result download(const std::wstring& url, const fs::path& dest, const Progress& progress = {}, const std::stop_token& stop = {}) {
     Result res;
-    const fs::path part = dest.wstring() + L".part";
+    const fs::path part = ulp::str::concat_strings(dest.wstring(), L".part");
     std::error_code ec;
     uint64_t have = fs::exists(part, ec) ? fs::file_size(part, ec) : 0;
     if (ec) have = 0;
@@ -336,11 +336,11 @@ inline Result download(const std::wstring& url, const fs::path& dest, const Prog
 
     wil::unique_hfile file{CreateFileW(part.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, have > 0 ? OPEN_EXISTING : CREATE_ALWAYS,
                                        FILE_ATTRIBUTE_NORMAL, nullptr)};
-    if (!file) return fail(L"Could not write " + part.filename().wstring());
+    if (!file) return fail(ulp::str::concat_strings(L"Could not write ", part.filename().wstring()));
     if (have > 0) {
         LARGE_INTEGER pos{};
         pos.QuadPart = static_cast<LONGLONG>(have);
-        if (!SetFilePointerEx(file.get(), pos, nullptr, FILE_BEGIN)) return fail(L"Could not resume " + part.filename().wstring());
+        if (!SetFilePointerEx(file.get(), pos, nullptr, FILE_BEGIN)) return fail(ulp::str::concat_strings(L"Could not resume ", part.filename().wstring()));
     }
 
     uint64_t done = have;
@@ -355,7 +355,7 @@ inline Result download(const std::wstring& url, const fs::path& dest, const Prog
         if (got == 0) break;
         DWORD written = 0;
         if (!WriteFile(file.get(), buf.get(), got, &written, nullptr) || written != got) {
-            return fail(L"Could not write " + part.filename().wstring() + L" (disk full?)");
+            return fail(ulp::str::concat_strings(L"Could not write ", part.filename().wstring(), L" (disk full?)"));
         }
         done += got;
         if (const auto now = std::chrono::steady_clock::now(); progress && now - last_report >= std::chrono::milliseconds(100)) {
@@ -368,7 +368,7 @@ inline Result download(const std::wstring& url, const fs::path& dest, const Prog
     if (progress) progress(done, total);
 
     file.reset();
-    if (!MoveFileExW(part.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING)) return fail(L"Could not create " + dest.filename().wstring());
+    if (!MoveFileExW(part.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING)) return fail(ulp::str::concat_strings(L"Could not create ", dest.filename().wstring()));
     res.ok = true;
     return res;
 }

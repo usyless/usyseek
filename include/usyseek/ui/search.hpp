@@ -280,7 +280,12 @@ private:
     };
     static ModelPaths model_paths(const fs::path& dir, const std::string& name) {
         const std::wstring w = to_wide(name);
-        return {dir / (w + L".safetensors"), dir / (w + L"-text.onnx"), dir / (w + L"-tokenizer.json"), dir / L"tokenizer.json"};
+        return {
+            dir / ulp::str::concat_strings(w, L".safetensors"),
+            dir / ulp::str::concat_strings(w, L"-text.onnx"),
+            dir / ulp::str::concat_strings(w, L"-tokenizer.json"),
+            dir / L"tokenizer.json",
+        };
     }
 
     /// Size and modification time of every file a load depends on (0 = missing).
@@ -356,13 +361,13 @@ private:
         const fs::path& tok = !fs::exists(paths.tokenizer, ec) && fs::exists(paths.shared_tokenizer, ec) ? paths.shared_tokenizer : paths.tokenizer;
         if (!fs::exists(paths.onnx, ec)) {
             if (!fs::exists(paths.weights, ec)) {
-                throw std::runtime_error("Model weights missing (" + to_utf8(paths.weights.filename().wstring()) + ") - download the model in Settings");
+                throw std::runtime_error(ulp::str::concat_strings("Model weights missing (", to_utf8(paths.weights.filename().wstring()), ") - download the model in Settings"));
             }
             state_ = State::Exporting;
             notify();
 
             const fs::path idx_exe = exe_dir() / L"usyseek-indexer.exe";
-            std::wstring cmd = L"\"" + idx_exe.wstring() + L"\" --export-text";
+            std::wstring cmd = ulp::str::concat_strings(L"\"", idx_exe.wstring(), L"\" --export-text");
             STARTUPINFOW si{sizeof(si)};
             si.dwFlags = STARTF_USESHOWWINDOW;
             si.wShowWindow = SW_HIDE;
@@ -385,7 +390,7 @@ private:
             }
         }
         if (!fs::exists(tok, ec)) {
-            throw std::runtime_error("Tokenizer missing (" + to_utf8(tok.filename().wstring()) + ") - download the model in Settings");
+            throw std::runtime_error(ulp::str::concat_strings("Tokenizer missing (", to_utf8(tok.filename().wstring()), ") - download the model in Settings"));
         }
 
         if (!env_) env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_ERROR, "usyseek");
@@ -407,7 +412,7 @@ private:
         RustBuf terr;
         const std::string tok_path = to_utf8(tok.wstring());
         model->tok = usy_tok_load(ustr(tok_path), model->ctx, &terr.b);
-        if (!model->tok) throw std::runtime_error("Tokenizer failed to load: " + terr.str());
+        if (!model->tok) throw std::runtime_error(ulp::str::concat_strings("Tokenizer failed to load: ", terr.str()));
         return model;
     }
 
@@ -687,7 +692,7 @@ private:
 
         ParsedQuery q = parse_query(r.query);
         if (q.unknown_type) {
-            res->error = L"Unknown type filter 'type:" + *q.unknown_type + L"' (use image or video)";
+            res->error = ulp::str::concat_strings(L"Unknown type filter 'type:", *q.unknown_type, L"' (use image or video)");
             return res;
         }
         if (q.empty()) return res;

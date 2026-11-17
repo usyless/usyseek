@@ -343,7 +343,7 @@ public:
         }
         std::vector<DbCollectionInfo> list;
         if (const auto err = glz::read<JSON_READ>(list, out.view(), read_ctx_tls())) {
-            if (error) *error = "Failed to parse collections list: " + glz::format_error(err, out.view());
+            if (error) *error = ulp::str::concat_strings("Failed to parse collections list: ", glz::format_error(err, out.view()));
             return std::nullopt;
         }
         return list;
@@ -378,7 +378,7 @@ private:
     static std::optional<DbPoints> parse_points(std::string_view json, std::string* error = nullptr) {
         DbPoints pts;
         if (const auto err = glz::read<JSON_READ>(pts, json, read_ctx_tls())) {
-            if (error) *error = "Failed to parse database response: " + glz::format_error(err, json);
+            if (error) *error = ulp::str::concat_strings("Failed to parse database response: ", glz::format_error(err, json));
             return std::nullopt;
         }
         return pts;

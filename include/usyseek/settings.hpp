@@ -114,8 +114,8 @@ inline const std::vector<std::wstring>& locked_excludes() {
         if (win.empty()) win = L"C:\\Windows";
         const std::wstring drive = win.substr(0, 2);
         out.push_back(std::move(win));
-        out.push_back(drive + L"\\$Recycle.Bin");
-        out.push_back(drive + L"\\System Volume Information");
+        out.push_back(ulp::str::concat_strings(drive, L"\\$Recycle.Bin"));
+        out.push_back(ulp::str::concat_strings(drive, L"\\System Volume Information"));
         out.push_back(data_dir().wstring());
         return out;
     }();
@@ -163,7 +163,7 @@ inline bool set_startup_enabled(bool enable) {
     LSTATUS st = ERROR_SUCCESS;
     if (enable) {
         const fs::path exe = exe_dir() / L"usyseek.exe";
-        const std::wstring cmd = L"\"" + exe.wstring() + L"\"";
+        const std::wstring cmd = ulp::str::concat_strings(L"\"", exe.wstring(), L"\"");
         st = RegSetValueExW(key, L"usyseek", 0, REG_SZ, reinterpret_cast<const BYTE*>(cmd.c_str()),
                             static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
     } else {
@@ -215,7 +215,7 @@ struct FailedFile {
 };
 
 inline fs::path failed_path(std::string_view coll) {
-    return data_dir() / (L"failed-" + to_wide(coll) + L".txt");
+    return data_dir() / ulp::str::concat_strings(L"failed-", to_wide(coll), L".txt");
 }
 
 inline std::vector<FailedFile> load_failed_files(std::string_view coll) {

@@ -123,17 +123,17 @@ public:
         for (const fs::path& p : files) {
             const auto bytes = ulp::fs::read_as_bytes(p);
             if (!bytes) {
-                if (errors) errors->push_back("Could not read theme file: " + to_utf8(p.filename().wstring()));
+                if (errors) errors->push_back(ulp::str::concat_strings("Could not read theme file: ", to_utf8(p.filename().wstring())));
                 continue;
             }
             ThemeSpec spec;
             const auto err = glz::read<JSON_READ>(spec, *bytes);
             if (err) {
-                if (errors) errors->push_back("Invalid JSON in theme file: " + to_utf8(p.filename().wstring()));
+                if (errors) errors->push_back(ulp::str::concat_strings("Invalid JSON in theme file: ", to_utf8(p.filename().wstring())));
                 continue;
             }
             const std::string stem = to_utf8(p.stem().wstring());
-            std::string id = "custom:" + stem;
+            std::string id = ulp::str::concat_strings("custom:", stem);
             std::string disp = spec.name.empty() ? stem : spec.name;
             const Theme preview = apply_theme_spec(spec, id, disp);
             entries_.emplace_back(std::move(id), std::move(disp), true, p, std::move(spec), preview.primary);

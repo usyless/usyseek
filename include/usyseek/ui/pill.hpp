@@ -1614,15 +1614,15 @@ private:
     void accept_dropdown(int index) {
         if (index < 0 || index >= static_cast<int>(drop_items_.size())) return;
         const std::wstring tag = to_wide(drop_items_[index].v);
-        const std::wstring value = tag.contains(L' ') ? L"\"" + tag + L"\"" : tag;
+        const std::wstring value = tag.contains(L' ') ? ulp::str::concat_strings(L"\"", tag, L"\"") : tag;
         if (auto tok = tag_token()) {
             size_t end = field_.caret;
             while (end < field_.text.size() && !iswspace(field_.text[end])) ++end;
-            field_.replace_range(tok->second, end - tok->second, value + L" ");
+            field_.replace_range(tok->second, end - tok->second, ulp::str::concat_strings(value, L" "));
         } else {
             std::wstring t = trim(field_.text);
-            if (!t.empty()) t += L' ';
-            t += L"tag:" + value + L" ";
+            if (!t.empty()) t.push_back(L' ');
+            append_to(t, L"tag:", value, L" ");
             field_.replace_all(t);
         }
         drop_open_ = false;
@@ -1843,14 +1843,14 @@ private:
     void open_item_file(const std::wstring& path) {
         std::string err;
         if (!open_file(path, &err)) {
-            sh_.notify("error", "Open File", "Failed to open file", err + ": " + to_utf8(path), "open-file");
+            sh_.notify("error", "Open File", "Failed to open file", ulp::str::concat_strings(err, ": ", to_utf8(path)), "open-file");
         }
     }
 
     void reveal_item_file(const std::wstring& path) {
         std::string err;
         if (!reveal_in_explorer(path, &err)) {
-            sh_.notify("error", "Explorer", "Failed to reveal file in Explorer", err + ": " + to_utf8(path), "reveal-file");
+            sh_.notify("error", "Explorer", "Failed to reveal file in Explorer", ulp::str::concat_strings(err, ": ", to_utf8(path)), "reveal-file");
         }
     }
 
@@ -1977,7 +1977,7 @@ private:
     }
 
     void find_similar(const Item& it) {
-        field_.replace_all(L"similar:" + item_path(it));
+        field_.replace_all(ulp::str::concat_strings(L"similar:", item_path(it)));
         field_.focused = true;
         run_search(0);
     }
@@ -2014,7 +2014,7 @@ private:
                         const std::string p_utf8 = to_utf8(paths[0]);
                         sh_.call([this, p_utf8] {
                             sh_.notify("warning", "Clipboard", "Copied file link only (image decode failed)",
-                                p_utf8 + " exceeded pixel limits or could not be decoded for bitmap paste.", "clipboard-decode");
+                                ulp::str::concat_strings(p_utf8, " exceeded pixel limits or could not be decoded for bitmap paste."), "clipboard-decode");
                         });
                     }
                     if (lower(fs::path{paths[0]}.extension().wstring()) == L".png") png = paths[0];
@@ -2213,8 +2213,8 @@ private:
         if (gif_.process_worker_signal()) {
             if (!had_static_err && gif_.static_fallback_error()) {
                 sh_.notify("warning", "Preview", "Animated GIF playback unavailable",
-                    "Could not decode animated GIF frames; displaying static thumbnail instead (" +
-                        to_utf8(item_path(items_[preview_])) + ").",
+                    ulp::str::concat_strings("Could not decode animated GIF frames; displaying static thumbnail instead (",
+                        to_utf8(item_path(items_[preview_])), ")."),
                     "preview-gif");
             }
             sync_preview_timers();
@@ -2240,8 +2240,8 @@ private:
         const bool changed = video_.process_events();
         if (!had_failed && video_.failed() && preview_valid() && items_[preview_].pt.p.k == 1) {
             sh_.notify("warning", "Preview", "Inline video playback failed",
-                "Could not play video inline (" + to_utf8(item_path(items_[preview_])) +
-                    "). Click Play to open in your default media player.",
+                ulp::str::concat_strings("Could not play video inline (", to_utf8(item_path(items_[preview_])),
+                    "). Click Play to open in your default media player."),
                 "preview-video");
         }
         if (!preview_valid() || items_[preview_].pt.p.k != 1) {

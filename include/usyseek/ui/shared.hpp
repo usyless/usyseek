@@ -284,7 +284,7 @@ struct Shared {
 
     void save() {
         if (!test_mode && !save_settings(settings)) {
-            notify("error", "Settings", "Failed to save settings", "Could not write settings.json (" + win32_error_utf8(GetLastError()) + ").", "save-settings");
+            notify("error", "Settings", "Failed to save settings", ulp::str::concat_strings("Could not write settings.json (", win32_error_utf8(GetLastError()), ")."), "save-settings");
         }
         engine.set_settings(settings);
     }
@@ -561,7 +561,7 @@ inline wil::com_ptr<IDataObjectAsyncCapability> drag_media(HWND hwnd, std::span<
     DWORD effect = DROPEFFECT_NONE;
     const HRESULT hr = SHDoDragDrop(hwnd, obj.get(), nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
     if (FAILED(hr) && error) {
-        *error = "Drag-and-drop failed (" + win32_error_utf8(static_cast<DWORD>(hr)) + ").";
+        *error = ulp::str::concat_strings("Drag-and-drop failed (", win32_error_utf8(static_cast<DWORD>(hr)), ").");
     }
     BOOL in_operation = FALSE;
     if (SUCCEEDED(async->InOperation(&in_operation)) && in_operation) return async;

@@ -33,7 +33,7 @@ inline bool tar_supports_7z() {
         const fs::path& tar = system_tar_path();
         std::error_code ec;
         if (!fs::exists(tar, ec)) return false;
-        const std::wstring cmd = L"\"" + tar.wstring() + L"\" --version";
+        const std::wstring cmd = ulp::str::concat_strings(L"\"", tar.wstring(), L"\" --version");
         const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false, .capture_stderr = false}>(
             ulp::win::proc::process_settings{
                 .commandline = cmd,
@@ -211,14 +211,14 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
     std::error_code ec;
     fs::create_directories(work_dir, ec);
     if (ec) {
-        err = L"Could not create update folder: " + to_wide(ec.message());
+        err = ulp::str::concat_strings(L"Could not create update folder: ", to_wide(ec.message()));
         return false;
     }
 
-    if (status_cb) status_cb(L"Downloading " + to_wide(st.asset_name) + L"…");
+    if (status_cb) status_cb(ulp::str::concat_strings(L"Downloading ", to_wide(st.asset_name), L"…"));
     const http::Result dl = http::download(to_wide(st.asset_url), archive, progress, stop);
     if (!dl.ok) {
-        err = dl.cancelled ? L"Download cancelled — it can resume next time." : (L"Download failed: " + dl.error);
+        err = dl.cancelled ? std::wstring{L"Download cancelled — it can resume next time."} : ulp::str::concat_strings(L"Download failed: ", dl.error);
         return false;
     }
 
@@ -232,7 +232,7 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
         }
         if (got != st.asset_sha256) {
             fs::remove(archive, ec);
-            err = L"Downloaded file checksum mismatch (expected " + to_wide(st.asset_sha256) + L").";
+            err = ulp::str::concat_strings(L"Downloaded file checksum mismatch (expected ", to_wide(st.asset_sha256), L").");
             return false;
         }
     }
@@ -241,12 +241,12 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
     fs::remove_all(staging, ec);
     fs::create_directories(staging, ec);
     if (ec) {
-        err = L"Could not prepare staging directory: " + to_wide(ec.message());
+        err = ulp::str::concat_strings(L"Could not prepare staging directory: ", to_wide(ec.message()));
         return false;
     }
 
     const fs::path& tar = system_tar_path();
-    const std::wstring tar_cmd = L"\"" + tar.wstring() + L"\" -xf \"" + archive.wstring() + L"\" -C \"" + staging.wstring() + L"\"";
+    const std::wstring tar_cmd = ulp::str::concat_strings(L"\"", tar.wstring(), L"\" -xf \"", archive.wstring(), L"\" -C \"", staging.wstring(), L"\"");
     const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false, .capture_stdout = false}>(
         ulp::win::proc::process_settings{
             .commandline = tar_cmd,
