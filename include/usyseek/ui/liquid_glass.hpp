@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -51,7 +52,7 @@ struct alignas(16) LiquidGlassShaderParams {
     std::array<float, 4> fresnel_params{}; // fresnelRange, fresnelHardness, fresnelFactor, magnification
     std::array<float, 4> glare_params{};   // glareRange, glareHardness, glareFactor, glareAngleDeg
     std::array<float, 4> shape_params{};   // glareConvergence, glareOppositeFactor, cornerRadiusDip, roundnessN
-    std::array<float, 4> misc_params{};    // dpr, forceOpaque, edgeAaPx, shapeMarginDip
+    std::array<float, 4> misc_params{};    // dpr (overridden from the effect context), forceOpaque, edgeAaPx, shapeMarginDip
     std::array<float, 4> extra_params{};   // opacity, reserved, reserved, reserved
 };
 static_assert(sizeof(LiquidGlassShaderParams) == 144);
@@ -85,7 +86,7 @@ namespace detail {
 
 // HLSL shader implementing the LiquidGlassWinUI material algorithms (superellipse SDF,
 // analytical gradient normal, Snell's-law refraction, 7-tap spectral dispersion,
-// Fresnel rim, and directional specular glare) in Direct2D DIP/scene coordinates.
+// Fresnel rim, and directional specular glare). Parameters are in DIPs; scene positions arrive in pixels.
 inline constexpr const char* LIQUID_GLASS_HLSL = R"hlsl(
 #define PI 3.14159265359
 
@@ -156,13 +157,15 @@ float2 RoundedRectUnitNormal(float2 fragCoord, float2 center, float2 halfPx, flo
     return sgn * local;
 }
 
-float4 SampleAtDip(float2 targetDip, float4 scenePos, float4 uv0, float dpr, float forceOpaque)
+// D2D runs effect shaders in pixel space: SCENE_POSITION is in physical pixels and uv0.zw is the uv step per
+// pixel. Everything in the constant buffer is in DIPs, so positions are converted once via sceneDip = px / dpr.
+float4 SampleAtDip(float2 targetDip, float2 sceneDip, float4 uv0, float dpr, float forceOpaque)
 {
     float2 pad = 0.5 / max(dpr, 1.0);
     float2 lo = srcBounds.xy + pad;
     float2 hi = max(lo, srcBounds.zw - pad);
     float2 clampedDip = clamp(targetDip, lo, hi);
-    float2 sampleUv = uv0.xy + uv0.zw * (clampedDip - scenePos.xy);
+    float2 sampleUv = uv0.xy + uv0.zw * ((clampedDip - sceneDip) * dpr);
     float4 c = InputTexture0.Sample(InputSampler0, sampleUv);
     if (forceOpaque > 0.5)
     {
@@ -185,10 +188,11 @@ float EdgeSlopeFactor(float depthPx, float thicknessPx, float ior)
 
 float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET
 {
-    float dpr = max(miscParams.x, 1.0);
+    float dpr = max(miscParams.x, 0.25);
     float forceOpaque = miscParams.y;
+    float2 sceneDip = scenePos.xy / dpr;
     float2 res = max(panelRect.zw * dpr, float2(2.0, 2.0));
-    float2 fragCoord = (scenePos.xy - panelRect.xy) * dpr;
+    float2 fragCoord = (sceneDip - panelRect.xy) * dpr;
     float2 center = res * 0.5;
     float margin = max(miscParams.w * dpr, 0.0);
     float2 halfPx = max(res * 0.5 - margin, 1.0);
@@ -236,7 +240,7 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
 
         float2 panelCenterDip = panelRect.xy + panelRect.zw * 0.5;
         float mag = max(fresnelParams.w, 1.0);
-        float2 zoomedDip = panelCenterDip + (scenePos.xy - panelCenterDip) / mag;
+        float2 zoomedDip = panelCenterDip + (sceneDip - panelCenterDip) / mag;
 
         float3 accRgb = 0.0;
         float accA = 0.0;
@@ -244,7 +248,7 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
         for (int ti = 0; ti < 8; ti++)
         {
             float f = ((float)ti / 7.0) - 0.5;
-            float4 tap = SampleAtDip(zoomedDip + offDip + offSpreadDip * f, scenePos, uv0, dpr, forceOpaque);
+            float4 tap = SampleAtDip(zoomedDip + offDip + offSpreadDip * f, sceneDip, uv0, dpr, forceOpaque);
             accRgb += tap.rgb;
             accA += tap.a;
         }
@@ -265,12 +269,12 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
             dispDip *= min(1.0, maxHalfDip / max(dLen, 1e-6));
             float2 baseDip = zoomedDip + offDip;
 
-            float4 sRed    = SampleAtDip(baseDip + dispDip,               scenePos, uv0, dpr, forceOpaque);
-            float4 sOrange = SampleAtDip(baseDip + dispDip * (2.0 / 3.0), scenePos, uv0, dpr, forceOpaque);
-            float4 sYellow = SampleAtDip(baseDip + dispDip * (1.0 / 3.0), scenePos, uv0, dpr, forceOpaque);
-            float4 sCyan   = SampleAtDip(baseDip - dispDip * (1.0 / 3.0), scenePos, uv0, dpr, forceOpaque);
-            float4 sBlue   = SampleAtDip(baseDip - dispDip * (2.0 / 3.0), scenePos, uv0, dpr, forceOpaque);
-            float4 sPurple = SampleAtDip(baseDip - dispDip,               scenePos, uv0, dpr, forceOpaque);
+            float4 sRed    = SampleAtDip(baseDip + dispDip,               sceneDip, uv0, dpr, forceOpaque);
+            float4 sOrange = SampleAtDip(baseDip + dispDip * (2.0 / 3.0), sceneDip, uv0, dpr, forceOpaque);
+            float4 sYellow = SampleAtDip(baseDip + dispDip * (1.0 / 3.0), sceneDip, uv0, dpr, forceOpaque);
+            float4 sCyan   = SampleAtDip(baseDip - dispDip * (1.0 / 3.0), sceneDip, uv0, dpr, forceOpaque);
+            float4 sBlue   = SampleAtDip(baseDip - dispDip * (2.0 / 3.0), sceneDip, uv0, dpr, forceOpaque);
+            float4 sPurple = SampleAtDip(baseDip - dispDip,               sceneDip, uv0, dpr, forceOpaque);
 
             float3 disp;
             disp.r = (sRed.r + sOrange.r + sYellow.r) / 3.5 + sPurple.r / 7.0;
@@ -432,16 +436,16 @@ public:
     }
 
     HRESULT set_params(const BYTE* data, UINT32 size) noexcept {
-        if (!data || size != sizeof(params_)) return E_INVALIDARG;
-        std::memcpy(&params_, data, sizeof(params_));
+        if (!data || size != params_.size()) return E_INVALIDARG;
+        std::memcpy(params_.data(), data, params_.size());
         return S_OK;
     }
 
     HRESULT get_params(BYTE* data, UINT32 size, UINT32* actual) const noexcept {
-        if (actual) *actual = sizeof(params_);
+        if (actual) *actual = static_cast<UINT32>(params_.size());
         if (!data) return S_OK;
-        if (size < sizeof(params_)) return E_NOT_SUFFICIENT_BUFFER;
-        std::memcpy(data, &params_, sizeof(params_));
+        if (size < params_.size()) return E_NOT_SUFFICIENT_BUFFER;
+        std::memcpy(data, params_.data(), params_.size());
         return S_OK;
     }
 
@@ -475,6 +479,7 @@ public:
     // ID2D1EffectImpl
     IFACEMETHODIMP Initialize(ID2D1EffectContext* ctx, ID2D1TransformGraph* graph) noexcept override {
         if (!ctx || !graph) return E_INVALIDARG;
+        ctx_ = ctx;
         if (!ctx->IsShaderLoaded(GUID_UsyseekLiquidGlassPS)) {
             static const wil::com_ptr<ID3DBlob> ps = detail::compile_liquid_glass_ps();
             if (!ps) return E_FAIL;
@@ -489,7 +494,15 @@ public:
 
     IFACEMETHODIMP PrepareForRender(D2D1_CHANGE_TYPE) noexcept override {
         if (!draw_info_) return E_UNEXPECTED;
-        return draw_info_->SetPixelShaderConstantBuffer(reinterpret_cast<const BYTE*>(&params_), sizeof(params_));
+        LiquidGlassShaderParams p{};
+        std::memcpy(&p, params_.data(), params_.size());
+        if (ctx_) {
+            float dpi_x = 96.0f;
+            float dpi_y = 96.0f;
+            ctx_->GetDpi(&dpi_x, &dpi_y);
+            if (dpi_x > 0.0f) p.misc_params[0] = dpi_x / 96.0f; // DIP -> pixel scale of this render
+        }
+        return draw_info_->SetPixelShaderConstantBuffer(reinterpret_cast<const BYTE*>(&p), sizeof(p));
     }
 
     IFACEMETHODIMP SetGraph(ID2D1TransformGraph*) noexcept override { return E_NOTIMPL; }
@@ -536,8 +549,10 @@ private:
     ~LiquidGlassEffectImpl() = default;
 
     volatile long refs_ = 1;
+    wil::com_ptr<ID2D1EffectContext> ctx_;
     wil::com_ptr<ID2D1DrawInfo> draw_info_;
-    LiquidGlassShaderParams params_{};
+    // Raw bytes (not the 16-byte-aligned struct) so the COM object needs no over-alignment padding.
+    std::array<std::byte, sizeof(LiquidGlassShaderParams)> params_{};
 };
 
 /// Captures the live monitor desktops on the GPU via DXGI Output Duplication.
