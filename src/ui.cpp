@@ -398,7 +398,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         const fs::path launcher_exe = exe_dir() / L"usyseek.exe";
         std::error_code ec;
         if (fs::exists(launcher_exe, ec)) {
-            std::wstring cmd = L"\"" + launcher_exe.wstring() + L"\"";
+            std::wstring cmd = ulp::str::concat_strings(L"\"", launcher_exe.wstring(), L"\"");
             STARTUPINFOW si{sizeof(si)};
             wil::unique_process_information pi;
             if (CreateProcessW(launcher_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, exe_dir().c_str(), &si, &pi)) {

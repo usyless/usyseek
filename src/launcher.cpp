@@ -211,8 +211,8 @@ private:
                     ver = to_wide(std::string_view{static_cast<const char*>(cds->lpData), cds->cbData});
                 }
                 const std::wstring body = ver.empty()
-                    ? L"A new version of usyseek is available. Click to view in About."
-                    : (L"usyseek " + ver + L" is available. Click to view in About.");
+                    ? std::wstring{L"A new version of usyseek is available. Click to view in About."}
+                    : ulp::str::concat_strings(L"usyseek ", ver, L" is available. Click to view in About.");
                 show_balloon(APP_NAME, body, NIIF_INFO, BalloonTarget::About);
                 return TRUE;
             }
@@ -248,9 +248,9 @@ private:
             const DWORD err = GetLastError();
             const std::string name = to_utf8(exe.filename().wstring());
             push_notification_to_disk(
-                "error", "Launcher", "Failed to start " + name,
-                win32_error_utf8(err), "spawn-" + name, true);
-            show_balloon(APP_NAME, (L"Failed to start " + exe.filename().wstring() + L": " + to_wide(win32_error_utf8(err))).c_str(), NIIF_ERROR, BalloonTarget::Notifications);
+                "error", "Launcher", ulp::str::concat_strings("Failed to start ", name),
+                win32_error_utf8(err), ulp::str::concat_strings("spawn-", name), true);
+            show_balloon(APP_NAME, ulp::str::concat_strings(L"Failed to start ", exe.filename().wstring(), L": ", to_wide(win32_error_utf8(err))).c_str(), NIIF_ERROR, BalloonTarget::Notifications);
             return {};
         }
         AssignProcessToJobObject(job_.get(), pi.hProcess);
@@ -486,7 +486,7 @@ private:
         failed_vk_ = settings_.hotkey_vk;
         push_notification_to_disk(
             "warning", "Hotkeys", "Global shortcut is already in use",
-            to_utf8(hotkey_text(settings_)) + " could not be registered because another application already owns it. Pick a different shortcut in Settings.",
+            ulp::str::concat_strings(to_utf8(hotkey_text(settings_)), " could not be registered because another application already owns it. Pick a different shortcut in Settings."),
             "hotkey-unavailable", true);
         if (!already_reported) {
             show_balloon(APP_NAME, L"The search shortcut is already used by another app. Pick a different one in Settings.", NIIF_WARNING, BalloonTarget::Settings);
@@ -627,20 +627,21 @@ private:
         Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 
-    static std::wstring hotkey_text(const Settings& s) {
-        std::wstring t;
-        if (s.hotkey_mods & MOD_CONTROL) t += L"Ctrl+";
-        if (s.hotkey_mods & MOD_ALT) t += L"Alt+";
-        if (s.hotkey_mods & MOD_SHIFT) t += L"Shift+";
-        if (s.hotkey_mods & MOD_WIN) t += L"Win+";
+    static FixedWString<96> hotkey_text(const Settings& s) noexcept {
+        FixedWString<96> t;
+        if (s.hotkey_mods & MOD_CONTROL) t.append(L"Ctrl+");
+        if (s.hotkey_mods & MOD_ALT) t.append(L"Alt+");
+        if (s.hotkey_mods & MOD_SHIFT) t.append(L"Shift+");
+        if (s.hotkey_mods & MOD_WIN) t.append(L"Win+");
         std::array<wchar_t, 64> name; // NOLINT(cppcoreguidelines-pro-type-member-init)
-        UINT sc = MapVirtualKeyW(s.hotkey_vk, MAPVK_VK_TO_VSC) << 16;
+        const UINT sc = MapVirtualKeyW(s.hotkey_vk, MAPVK_VK_TO_VSC) << 16;
         if (s.hotkey_vk == VK_SPACE) {
             wcscpy_s(name.data(), name.size(), L"Space");
         } else if (GetKeyNameTextW(static_cast<LONG>(sc), name.data(), static_cast<int>(name.size())) == 0) {
             name[0] = L'\0';
         }
-        return t + name.data();
+        t.append(name.data());
+        return t;
     }
 
     void show_menu() {
@@ -650,7 +651,7 @@ private:
         AppendMenuW(menu.get(), MF_STRING | MF_DISABLED, 0, header.c_str());
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
         std::wstring search = L"Open Search";
-        if (settings_.hotkey_enabled && hotkey_state_ == HotkeyState::Registered) search += L"\t" + hotkey_text(settings_);
+        if (settings_.hotkey_enabled && hotkey_state_ == HotkeyState::Registered) append_to(search, L"\t", hotkey_text(settings_));
         AppendMenuW(menu.get(), MF_STRING, IdSearch, search.c_str());
         AppendMenuW(menu.get(), MF_STRING, IdSettings, L"Open Settings");
         const bool ui_alive = is_ui_running();
@@ -713,7 +714,7 @@ int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::pat
             const DWORD err = GetLastError();
             if (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION || err == ERROR_ACCESS_DENIED) {
                 if (attempt >= 5) {
-                    const fs::path backup = dst.wstring() + L".old";
+                    const fs::path backup = ulp::str::concat_strings(dst.wstring(), L".old");
                     if (MoveFileExW(dst.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING)) {
                         MoveFileExW(backup.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
                         if (CopyFileW(src.c_str(), dst.c_str(), FALSE)) return true;
@@ -729,7 +730,7 @@ int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::pat
 
     for (const auto& entry : fs::recursive_directory_iterator(staging_root, ec)) {
         if (ec) {
-            MessageBoxW(nullptr, (L"Failed to read update staging directory: " + to_wide(ec.message())).c_str(),
+            MessageBoxW(nullptr, ulp::str::concat_strings(L"Failed to read update staging directory: ", to_wide(ec.message())).c_str(),
                         APP_NAME, MB_ICONERROR | MB_OK);
             return 1;
         }
@@ -742,14 +743,15 @@ int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::pat
         if (entry.is_directory(ec)) {
             fs::create_directories(dst, ec);
             if (ec) {
-                MessageBoxW(nullptr, (L"Could not create directory " + dst.wstring()).c_str(), APP_NAME, MB_ICONERROR | MB_OK);
+                MessageBoxW(nullptr, ulp::str::concat_strings(L"Could not create directory ", dst.wstring()).c_str(), APP_NAME, MB_ICONERROR | MB_OK);
                 return 1;
             }
         } else if (entry.is_regular_file(ec)) {
             fs::create_directories(dst.parent_path(), ec);
             if (!copy_one(entry.path(), dst)) {
-                const std::wstring msg = L"Could not update " + dst.filename().wstring() +
-                                         L" (" + to_wide(win32_error_utf8(GetLastError())) + L").";
+                const std::wstring msg = ulp::str::concat_strings(
+                    L"Could not update ", dst.filename().wstring(),
+                    L" (", to_wide(win32_error_utf8(GetLastError())), L").");
                 MessageBoxW(nullptr, msg.c_str(), APP_NAME, MB_ICONERROR | MB_OK);
                 return 1;
             }
@@ -758,13 +760,14 @@ int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::pat
 
     const fs::path next_exe = target_dir / L"usyseek.exe";
     const fs::path update_dir = target_dir / L"data" / L"update";
-    std::wstring cmd = L"\"" + next_exe.wstring() + L"\" --cleanup-update \"" + update_dir.wstring() + L"\"";
-    if (open_about) cmd += L" --open-about";
+    std::wstring cmd = ulp::str::concat_strings(
+        L"\"", next_exe.wstring(), L"\" --cleanup-update \"", update_dir.wstring(), L"\"",
+        open_about ? L" --open-about" : L"");
     STARTUPINFOW si{.cb = sizeof(STARTUPINFOW)};
     wil::unique_process_information pi;
     if (!CreateProcessW(next_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
                         CREATE_UNICODE_ENVIRONMENT, nullptr, target_dir.c_str(), &si, &pi)) {
-        MessageBoxW(nullptr, (L"Update was installed, but usyseek.exe could not restart: " + to_wide(win32_error_utf8(GetLastError()))).c_str(),
+        MessageBoxW(nullptr, ulp::str::concat_strings(L"Update was installed, but usyseek.exe could not restart: ", to_wide(win32_error_utf8(GetLastError()))).c_str(),
                     APP_NAME, MB_ICONWARNING | MB_OK);
         return 1;
     }

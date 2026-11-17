@@ -114,7 +114,7 @@ struct Scope {
                 std::ranges::replace(n, L'/', L'\\');
                 while (n.starts_with(L'*') || n.starts_with(L'\\')) n.erase(0, 1);
                 while (n.ends_with(L'*') || n.ends_with(L'\\')) n.pop_back();
-                if (!n.empty()) name_excludes.push_back(L"\\" + n + L"\\");
+                if (!n.empty()) name_excludes.push_back(ulp::str::concat_strings(L"\\", n, L"\\"));
             }
         };
         for (const auto& d : locked_excludes()) add_exclude(d);
@@ -195,12 +195,12 @@ struct Scope {
             q += L" <";
             for (size_t i = 0; i < includes.size(); ++i) {
                 if (i) q += L'|';
-                q += L"path:\"" + includes[i] + L"\\\"";
+                append_to(q, L"path:\"", includes[i], L"\\\"");
             }
             q += L'>';
         }
-        for (const auto& e : abs_excludes) q += L" !path:\"" + e + L"\\\"";
-        for (const auto& n : name_excludes) q += L" !path:\"" + n + L"\"";
+        for (const auto& e : abs_excludes) append_to(q, L" !path:\"", e, L"\\\"");
+        for (const auto& n : name_excludes) append_to(q, L" !path:\"", n, L"\"");
         return q;
     }
 
@@ -218,7 +218,8 @@ struct Scope {
         for (const auto& n : name_excludes) {
             // n is stored as "\name\" -> Everything folder filter wants "**\name" or just "name"
             if (n.size() > 2) {
-                append(L"**\\" + std::wstring{n.substr(1, n.size() - 2)});
+                if (!out.empty()) out.push_back(L';');
+                append_to(out, L"**\\", std::wstring_view{n}.substr(1, n.size() - 2));
             }
         }
         return out;
@@ -552,26 +553,27 @@ std::vector<FileEntry> walk_dirs(const Scope& scope) {
         const std::wstring dir = std::move(stack.back());
         stack.pop_back();
         WIN32_FIND_DATAW fd;
-        wil::unique_hfind h{FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH)};
+        wil::unique_hfind h{FindFirstFileExW(ulp::str::concat_strings(dir, L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH)};
         if (!h) {
             const DWORD err = GetLastError();
             if (err != ERROR_FILE_NOT_FOUND && err != ERROR_NO_MORE_FILES) {
                 const std::string utf8_dir = to_utf8(dir);
                 push_notification_to_disk(
                     "warning", "Indexer", "Could not read folder",
-                    utf8_dir + ": " + win32_error_utf8(err), "walk-" + utf8_dir, true);
+                    ulp::str::concat_strings(utf8_dir, ": ", win32_error_utf8(err)),
+                    ulp::str::concat_strings("walk-", utf8_dir), true);
             }
             continue;
         }
         do {
             if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == 0 || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0))) continue;
-            std::wstring path = dir + L"\\" + fd.cFileName;
+            std::wstring path = ulp::str::concat_strings(dir, L"\\", fd.cFileName);
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
                 ++reparse_skipped;
                 continue;
             }
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                if (!scope.excluded(path + L"\\x")) stack.push_back(std::move(path));
+                if (!scope.excluded(ulp::str::concat_strings(path, L"\\x"))) stack.push_back(std::move(path));
                 continue;
             }
             FileEntry e;
@@ -862,9 +864,10 @@ struct PyVision {
         ov_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
         wil::unique_handle new_job = make_kill_on_close_job();
 
-        std::wstring cmd = L"\"" + venv.python_exe + L"\" -u \"" + worker_script.wstring() + L"\" --worker \"" + pipe_name + L"\"";
+        std::wstring cmd = ulp::str::concat_strings(
+            L"\"", venv.python_exe, L"\" -u \"", worker_script.wstring(), L"\" --worker \"", pipe_name, L"\"");
         if (!settings.vision_script.empty()) {
-            cmd += L" \"" + to_wide(settings.vision_script) + L"\"";
+            append_to(cmd, L" \"", to_wide(settings.vision_script), L"\"");
         }
 
         STARTUPINFOW si{sizeof(si)};
@@ -911,7 +914,7 @@ struct PyVision {
         size = r.info.size;
         dim = r.info.dim;
         mode = media::parse_resize_mode(r.info.resize_mode);
-        device = to_wide(r.info.device + " \xc2\xb7 " + r.info.backend);
+        device = to_wide(ulp::str::concat_strings(r.info.device, " \xc2\xb7 ", r.info.backend));
         if (r.info.fallback_cpu) {
             push_notification_to_disk(
                 "warning", "Compute", "GPU unavailable — indexing on CPU",
@@ -1052,7 +1055,9 @@ int export_text_only(const Settings& settings) {
     const fs::path script = settings.vision_script.empty() ? exe_dir() / L"python" / L"usyseek_vision.py" : fs::path{to_wide(settings.vision_script)};
     if (!fs::exists(script, ec)) return 1;
 
-    std::wstring cmd = L"\"" + venv.python_exe + L"\" -u \"" + script.wstring() + L"\" --export-text \"" + to_wide(settings.model_dir) + L"\" \"" + to_wide(settings.model_name) + L"\"";
+    std::wstring cmd = ulp::str::concat_strings(
+        L"\"", venv.python_exe, L"\" -u \"", script.wstring(),
+        L"\" --export-text \"", to_wide(settings.model_dir), L"\" \"", to_wide(settings.model_name), L"\"");
     wil::unique_handle job = make_kill_on_close_job();
     STARTUPINFOW si{sizeof(si)};
     si.dwFlags |= STARTF_USESHOWWINDOW;
@@ -1273,7 +1278,7 @@ int run_indexer(Settings& settings) {
             } else if (!stopping() && !retrieve_warned) {
                 retrieve_warned = true;
                 push_notification_to_disk("warning", "Database", "Could not read existing metadata from Qdrant",
-                    ret_err + " (Some unchanged files may be re-embedded.)", "indexer-retrieve");
+                    ulp::str::concat_strings(ret_err, " (Some unchanged files may be re-embedded.)"), "indexer-retrieve");
             }
             for (size_t j = i; j < end; ++j) {
                 auto& f = files[j];
@@ -1409,7 +1414,7 @@ int run_indexer(Settings& settings) {
     });
     pr.d.todo = todo.size();
 
-    const fs::path onnx = fs::path{to_wide(settings.model_dir)} / (to_wide(settings.model_name) + L"-text.onnx");
+    const fs::path onnx = fs::path{to_wide(settings.model_dir)} / ulp::str::concat_strings(to_wide(settings.model_name), L"-text.onnx");
     std::error_code onnx_ec;
     if (todo.empty() || stopping()) {
         std::string export_err;
@@ -1504,7 +1509,7 @@ int run_indexer(Settings& settings) {
             } catch (const std::exception& e) {
                 std::printf("benchmark_batch failed: %s\n", e.what());
                 push_notification_to_disk("warning", "Indexer", "Auto-batch benchmark failed",
-                    std::string{"Using fallback batch size 16: "} + e.what(), "indexer-autobatch");
+                    ulp::str::concat_strings("Using fallback batch size 16: ", e.what()), "indexer-autobatch");
                 batch = 16;
             }
             cached.auto_batch = batch;
@@ -1776,7 +1781,7 @@ int wmain(int argc, wchar_t** argv) {
     g_progress.block = StatusBlock::create();
     if (!g_progress.block) {
         push_notification_to_disk("warning", "Indexer", "Progress shared memory unavailable",
-            "Live indexing progress cannot be shown in Settings (" + win32_error_utf8() + ").", "indexer-shm");
+            ulp::str::concat_strings("Live indexing progress cannot be shown in Settings (", win32_error_utf8(), ")."), "indexer-shm");
     }
     g_progress.d.pid = GetCurrentProcessId();
     g_progress.d.started_unix = unix_now();
