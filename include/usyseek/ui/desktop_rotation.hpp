@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace usyseek::ui {
@@ -67,6 +69,23 @@ struct Affine2D {
 
 [[nodiscard]] constexpr bool int_rect_empty(IntRect r) noexcept {
     return r.right <= r.left || r.bottom <= r.top;
+}
+
+/// Writes `a` minus `b` into `out` as up to four non-overlapping rects (top band, bottom band, left, right) and
+/// returns how many were written.
+constexpr size_t int_rect_subtract(IntRect a, IntRect b, std::array<IntRect, 4>& out) noexcept {
+    if (int_rect_empty(a)) return 0;
+    const IntRect cut = int_rect_intersect(a, b);
+    if (int_rect_empty(cut)) {
+        out[0] = a;
+        return 1;
+    }
+    size_t n = 0;
+    if (cut.top > a.top) out[n++] = {.left = a.left, .top = a.top, .right = a.right, .bottom = cut.top};
+    if (cut.bottom < a.bottom) out[n++] = {.left = a.left, .top = cut.bottom, .right = a.right, .bottom = a.bottom};
+    if (cut.left > a.left) out[n++] = {.left = a.left, .top = cut.top, .right = cut.left, .bottom = cut.bottom};
+    if (cut.right < a.right) out[n++] = {.left = cut.right, .top = cut.top, .right = a.right, .bottom = cut.bottom};
+    return n;
 }
 
 } // namespace usyseek::ui

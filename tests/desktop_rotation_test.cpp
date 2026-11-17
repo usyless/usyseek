@@ -59,5 +59,21 @@ int main() {
     CHECK((int_rect_intersect(IntRect{0, 0, 10, 10}, IntRect{5, 5, 20, 20}) == IntRect{5, 5, 10, 10}));
     CHECK(int_rect_empty(int_rect_intersect(IntRect{0, 0, 10, 10}, IntRect{10, 0, 20, 10})));
 
+    // Subtraction: a hole in the middle leaves four bands covering exactly the rest.
+    std::array<IntRect, 4> parts{};
+    const size_t n = int_rect_subtract(IntRect{.left = 0, .top = 0, .right = 100, .bottom = 100}, IntRect{.left = 40, .top = 40, .right = 60, .bottom = 60}, parts);
+    CHECK(n == 4);
+    long area = 0;
+    for (size_t i = 0; i < n; ++i) {
+        CHECK(int_rect_empty(int_rect_intersect(parts[i], IntRect{40, 40, 60, 60})));
+        area += (parts[i].right - parts[i].left) * (parts[i].bottom - parts[i].top);
+    }
+    CHECK(area == (100 * 100) - (20 * 20));
+    CHECK(int_rect_subtract(IntRect{0, 0, 10, 10}, IntRect{20, 20, 30, 30}, parts) == 1);
+    CHECK((parts[0] == IntRect{0, 0, 10, 10}));
+    CHECK(int_rect_subtract(IntRect{0, 0, 10, 10}, IntRect{-5, -5, 15, 15}, parts) == 0);
+    CHECK(int_rect_subtract(IntRect{0, 0, 10, 10}, IntRect{5, -5, 15, 15}, parts) == 1);
+    CHECK((parts[0] == IntRect{0, 0, 5, 10}));
+
     return usyseek::test::failures != 0;
 }

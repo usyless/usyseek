@@ -612,21 +612,23 @@ public:
         epoch_ = 0;
     }
 
-    /// Stops acquiring new frames (outputs that have none yet still get one) until the matching `end_freeze`.
-    /// Used while a glass window is dragged: the window is capture-excluded so the desktop behind it doesn't change,
-    /// and Windows can bake the cursor into duplicated frames during a move loop. Every output is refreshed first so
-    /// the frozen frames are current.
-    void begin_freeze(Gfx& gfx) {
-        if (freeze_depth_++ > 0 || !gfx.ready()) return;
+    /// Marks a glass window move-size loop until the matching `end_drag`. During one, Windows can draw the cursor
+    /// into duplicated frames, so captures keep updating live but never copy the pixels around the cursor; those
+    /// keep their last cursor-free contents and are refreshed once the cursor moves off them (that repaint shows up
+    /// as a dirty rect). Every output is refreshed first so monitors the window is dragged onto are already current.
+    void begin_drag(Gfx& gfx) {
+        if (drag_depth_++ > 0 || !gfx.ready()) return;
         sync_epoch(gfx);
+        has_last_cursor_ = false;
+        const std::optional<RECT> mask = cursor_mask();
         const ULONGLONG now = GetTickCount64();
         mons_scratch_.clear();
         EnumDisplayMonitors(nullptr, nullptr, &collect_monitor, reinterpret_cast<LPARAM>(&mons_scratch_));
-        for (const HMONITOR mon : mons_scratch_) (void)poll_output(gfx, mon, now, true);
+        for (const HMONITOR mon : mons_scratch_) (void)poll_output(gfx, mon, now, mask ? &*mask : nullptr);
     }
 
-    void end_freeze() noexcept {
-        if (freeze_depth_ > 0) --freeze_depth_;
+    void end_drag() noexcept {
+        if (drag_depth_ > 0) --drag_depth_;
     }
 
     /// Polls every output that `screen_rc` overlaps (without blocking, or with a brief wait on initial acquire).
@@ -642,9 +644,10 @@ public:
             mons_scratch_.push_back(MonitorFromRect(&screen_rc, MONITOR_DEFAULTTONEAREST));
         }
 
+        const std::optional<RECT> mask = drag_depth_ > 0 ? cursor_mask() : std::nullopt;
         bool all_ok = true;
         for (const HMONITOR mon : mons_scratch_) {
-            if (const OutputState* st = poll_output(gfx, mon, now_tick, freeze_depth_ == 0)) {
+            if (const OutputState* st = poll_output(gfx, mon, now_tick, mask ? &*mask : nullptr)) {
                 out.push_back(st);
             } else {
                 all_ok = false;
@@ -674,10 +677,67 @@ private:
         return TRUE;
     }
 
-    const OutputState* poll_output(Gfx& gfx, HMONITOR mon, ULONGLONG now_tick, bool acquire) {
+    /// Screen-space area the cursor may have been drawn into since the last poll (previous and current cursor
+    /// boxes, padded for the drop shadow), or nullopt when the cursor is hidden.
+    std::optional<RECT> cursor_mask() noexcept {
+        CURSORINFO ci{.cbSize = sizeof(CURSORINFO)};
+        if (!GetCursorInfo(&ci) || (ci.flags & CURSOR_SHOWING) == 0 || !ci.hCursor) {
+            has_last_cursor_ = false;
+            return std::nullopt;
+        }
+        if (ci.hCursor != cursor_handle_) {
+            ICONINFO ii{};
+            if (!GetIconInfo(ci.hCursor, &ii)) return std::nullopt;
+            BITMAP bm{};
+            const HBITMAP shape = ii.hbmColor ? ii.hbmColor : ii.hbmMask;
+            const bool ok = shape && GetObjectW(shape, sizeof(bm), &bm) != 0;
+            if (ii.hbmColor) DeleteObject(ii.hbmColor);
+            if (ii.hbmMask) DeleteObject(ii.hbmMask);
+            if (!ok) return std::nullopt;
+            cursor_handle_ = ci.hCursor;
+            cursor_hotspot_ = {.x = static_cast<LONG>(ii.xHotspot), .y = static_cast<LONG>(ii.yHotspot)};
+            // Monochrome cursors stack the AND and XOR masks vertically in one bitmap.
+            cursor_size_ = {.cx = bm.bmWidth, .cy = ii.hbmColor ? bm.bmHeight : bm.bmHeight / 2};
+        }
+        const RECT cur{
+            .left = ci.ptScreenPos.x - cursor_hotspot_.x,
+            .top = ci.ptScreenPos.y - cursor_hotspot_.y,
+            .right = ci.ptScreenPos.x - cursor_hotspot_.x + cursor_size_.cx,
+            .bottom = ci.ptScreenPos.y - cursor_hotspot_.y + cursor_size_.cy,
+        };
+        RECT mask = cur;
+        if (has_last_cursor_) UnionRect(&mask, &cur, &last_cursor_);
+        last_cursor_ = cur;
+        has_last_cursor_ = true;
+        const LONG pad = std::max<LONG>(8, std::max(cursor_size_.cx, cursor_size_.cy) / 4);
+        InflateRect(&mask, pad, pad);
+        return mask;
+    }
+
+    /// Texture-space bounds of an output's duplication frames (the panel's native orientation).
+    [[nodiscard]] static IntRect native_bounds(const OutputState& st) noexcept {
+        const bool swap = st.rotation == DesktopRotation::Rot90 || st.rotation == DesktopRotation::Rot270;
+        return {.left = 0, .top = 0, .right = static_cast<long>(swap ? st.tex_h : st.tex_w),
+                .bottom = static_cast<long>(swap ? st.tex_w : st.tex_h),};
+    }
+
+    /// `screen_rc` mapped into an output's native texture space (empty when it misses the output).
+    [[nodiscard]] static IntRect screen_to_native(const OutputState& st, const RECT& screen_rc) noexcept {
+        const IntRect local = st.tex_rect_for(screen_rc);
+        if (int_rect_empty(local)) return {};
+        return int_rect_intersect(desktop_to_tex(local, st.rotation, st.desk_w(), st.desk_h()), native_bounds(st));
+    }
+
+    static void copy_region(Gfx& gfx, ID3D11Texture2D* dst, ID3D11Texture2D* src, const IntRect& r) noexcept {
+        const D3D11_BOX box{.left = static_cast<UINT>(r.left), .top = static_cast<UINT>(r.top), .front = 0,
+                            .right = static_cast<UINT>(r.right), .bottom = static_cast<UINT>(r.bottom), .back = 1,};
+        gfx.d3d_context()->CopySubresourceRegion(dst, 0, box.left, box.top, 0, src, 0, &box);
+    }
+
+    /// `mask` (screen space, may be null) is left uncopied whenever the output already holds a frame.
+    const OutputState* poll_output(Gfx& gfx, HMONITOR mon, ULONGLONG now_tick, const RECT* mask) {
         OutputState* st = find_or_create(mon);
         if (!ensure_duplication(gfx, *st, now_tick)) return st->has_frame ? st : nullptr;
-        if (!acquire && st->has_frame) return st;
 
         for (int attempt = 0; attempt < 4; ++attempt) {
             DXGI_OUTDUPL_FRAME_INFO info{};
@@ -708,14 +768,20 @@ private:
             const bool rotated = st->rotation != DesktopRotation::Identity;
             ID3D11Texture2D* dst = rotated ? st->native_tex.get() : st->desktop_tex.get();
             const bool full = delta.dirty_all || copy_rects_.size() > MAX_REGION_COPIES;
-            if (full) {
+            const IntRect masked = (mask && st->has_frame) ? screen_to_native(*st, *mask) : IntRect{};
+            if (full && int_rect_empty(masked)) {
                 gfx.d3d_context()->CopyResource(dst, tex.get());
             } else {
+                if (full) {
+                    const IntRect b = native_bounds(*st);
+                    copy_rects_.assign(1, RECT{.left = b.left, .top = b.top, .right = b.right, .bottom = b.bottom});
+                }
                 // Only changed regions differ from the previous frame already held in `dst`.
+                std::array<IntRect, 4> pieces{};
                 for (const RECT& r : copy_rects_) {
-                    const D3D11_BOX box{.left = static_cast<UINT>(r.left), .top = static_cast<UINT>(r.top), .front = 0,
-                                        .right = static_cast<UINT>(r.right), .bottom = static_cast<UINT>(r.bottom), .back = 1,};
-                    gfx.d3d_context()->CopySubresourceRegion(dst, 0, box.left, box.top, 0, tex.get(), 0, &box);
+                    const IntRect ir{.left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom};
+                    const size_t n = int_rect_subtract(ir, masked, pieces);
+                    for (size_t i = 0; i < n; ++i) copy_region(gfx, dst, tex.get(), pieces[i]);
                 }
             }
             if (rotated && !rotate_into_desktop(*st, full ? nullptr : &delta.dirty_rects)) {
@@ -739,10 +805,8 @@ private:
         copy_rects_.clear();
         if (meta_bytes == 0) return false;
         metadata_buf_.resize(meta_bytes);
-        const bool swap = st.rotation == DesktopRotation::Rot90 || st.rotation == DesktopRotation::Rot270;
-        const RECT bounds{.left = 0, .top = 0,
-                          .right = static_cast<LONG>(swap ? st.tex_h : st.tex_w),
-                          .bottom = static_cast<LONG>(swap ? st.tex_w : st.tex_h),};
+        const IntRect nb = native_bounds(st);
+        const RECT bounds{.left = nb.left, .top = nb.top, .right = nb.right, .bottom = nb.bottom};
         const auto add = [&](const RECT& r) {
             RECT c{};
             if (!IntersectRect(&c, &r, &bounds)) return;
@@ -936,7 +1000,12 @@ private:
     std::vector<HMONITOR> mons_scratch_;
     std::vector<RECT> copy_rects_; // texture-space regions to copy for the frame being acquired
     FrameDelta scratch_delta_;     // swapped with the evicted history slot, so rect storage is recycled
-    int freeze_depth_ = 0;
+    int drag_depth_ = 0;
+    HCURSOR cursor_handle_ = nullptr;
+    POINT cursor_hotspot_{};
+    SIZE cursor_size_{};
+    RECT last_cursor_{};
+    bool has_last_cursor_ = false;
     wil::com_ptr<ID2D1DeviceContext> rot_dc_; // only created once a rotated output is duplicated
     uint64_t epoch_ = 0;
     uint64_t next_tex_id_ = 0;
@@ -968,7 +1037,7 @@ public:
         origin_override_.reset();
         seeded_gdi_ = false;
         scene_active_ = false;
-        end_freeze();
+        end_drag();
         sizemove_ = false;
         win_bmp_w_ = win_bmp_h_ = 0;
         cached_glass_w_ = cached_glass_h_ = 0;
@@ -980,15 +1049,15 @@ public:
     }
 
     void set_origin_override(std::optional<POINT> pt) noexcept { origin_override_ = pt; }
-    /// Enters/leaves a window move-size loop; while in one the shared duplicator stops acquiring frames.
+    /// Enters/leaves a window move-size loop; while in one the shared duplicator masks the cursor out of captures.
     void set_sizemove(bool on, DesktopDuplicator& dupl, Gfx& gfx) {
         if (on == sizemove_) return;
         sizemove_ = on;
         if (on) {
-            dupl.begin_freeze(gfx);
-            frozen_dupl_ = &dupl;
+            dupl.begin_drag(gfx);
+            drag_dupl_ = &dupl;
         } else {
-            end_freeze();
+            end_drag();
         }
     }
     [[nodiscard]] POINT last_rendered_origin() const noexcept { return last_rendered_origin_; }
@@ -1153,9 +1222,9 @@ public:
     }
 
 private:
-    void end_freeze() noexcept {
-        if (frozen_dupl_) frozen_dupl_->end_freeze();
-        frozen_dupl_ = nullptr;
+    void end_drag() noexcept {
+        if (drag_dupl_) drag_dupl_->end_drag();
+        drag_dupl_ = nullptr;
     }
 
     struct GlassCacheKey {
@@ -1760,7 +1829,7 @@ private:
     bool seeded_gdi_ = false;
     bool scene_active_ = false;
     bool sizemove_ = false;
-    DesktopDuplicator* frozen_dupl_ = nullptr; // set while this window holds a duplicator freeze
+    DesktopDuplicator* drag_dupl_ = nullptr; // set while this window holds a duplicator drag
 };
 
 [[nodiscard]] inline GlassStyle make_desktop_glass_style(const Theme& t, float corner_radius, bool fullscreen = false) noexcept {
