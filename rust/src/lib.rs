@@ -995,8 +995,9 @@ pub unsafe extern "C" fn usy_tok_encode(t: *mut UsyTokenizer, text: UsyStr, ids:
     if t.ctx == 0 {
         return 0;
     }
+    // Zero via raw pointer before creating `&mut [i64]` so uninitialized C++ stack buffers are sound.
+    unsafe { ptr::write_bytes(ids, 0, t.ctx) };
     let out = unsafe { slice::from_raw_parts_mut(ids, t.ctx) };
-    out.fill(0);
     for (o, &i) in out.iter_mut().zip(enc.get_ids()) {
         *o = i as i64;
     }

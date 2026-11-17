@@ -13,6 +13,7 @@
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -166,11 +167,11 @@ struct FixedBasicString {
     size_t len = 0;
 
     constexpr FixedBasicString() noexcept {
-        if (std::is_constant_evaluated()) buf.fill(Char{});
+        if consteval { buf.fill(Char{}); }
         buf[0] = Char{};
     }
     constexpr FixedBasicString(const FixedBasicString& other) noexcept {
-        if (std::is_constant_evaluated()) buf.fill(Char{});
+        if consteval { buf.fill(Char{}); }
         assign(other.view());
     }
     constexpr FixedBasicString& operator=(const FixedBasicString& other) noexcept {
@@ -178,7 +179,7 @@ struct FixedBasicString {
         return *this;
     }
     constexpr FixedBasicString(FixedBasicString&& other) noexcept {
-        if (std::is_constant_evaluated()) buf.fill(Char{});
+        if consteval { buf.fill(Char{}); }
         assign(other.view());
     }
     constexpr FixedBasicString& operator=(FixedBasicString&& other) noexcept {
@@ -187,14 +188,14 @@ struct FixedBasicString {
     }
     constexpr ~FixedBasicString() noexcept = default;
     constexpr FixedBasicString(std::basic_string_view<Char> sv) noexcept {
-        if (std::is_constant_evaluated()) buf.fill(Char{});
+        if consteval { buf.fill(Char{}); }
         assign(sv);
     }
     constexpr FixedBasicString(const Char* s) noexcept
         : FixedBasicString(s ? std::basic_string_view<Char>{s} : std::basic_string_view<Char>{}) {}
     template <size_t M>
     constexpr FixedBasicString(const FixedBasicString<Char, M>& other) noexcept {
-        if (std::is_constant_evaluated()) buf.fill(Char{});
+        if consteval { buf.fill(Char{}); }
         assign(other.view());
     }
 
@@ -256,20 +257,49 @@ using FixedWString = FixedBasicString<wchar_t, N>;
 /// Appends `parts...` onto `dst` in one capacity check without creating intermediate strings.
 template <typename Char, typename... Ts>
 constexpr void append_to(std::basic_string<Char>& dst, const Ts&... parts) {
-    const size_t add = (std::basic_string_view<Char>{parts}.size() + ... + 0);
-    if (add == 0) return;
-    const size_t old = dst.size();
-    dst.resize_and_overwrite(old + add, [&](Char* p, size_t) noexcept {
-        Char* cur = p + old;
-        const auto copy_part = [&](std::basic_string_view<Char> sv) noexcept {
-            if (!sv.empty()) {
-                std::char_traits<Char>::copy(cur, sv.data(), sv.size());
-                cur += sv.size();
+    if constexpr (sizeof...(Ts) == 0) {
+        return;
+    } else {
+        const std::array<std::basic_string_view<Char>, sizeof...(Ts)> views{std::basic_string_view<Char>{parts}...};
+        size_t add = 0;
+        for (const auto sv : views) add += sv.size();
+        if (add == 0) return;
+
+        const size_t old = dst.size();
+        if consteval {
+            std::basic_string<Char> tmp;
+            tmp.reserve(old + add);
+            tmp.append(dst);
+            for (const auto sv : views) tmp.append(sv);
+            dst = std::move(tmp);
+            return;
+        }
+
+        // Snapshot views that alias `dst` before resize_and_overwrite may reallocate `dst`'s buffer.
+        const Char* const old_begin = dst.data();
+        const Char* const old_end = old_begin + old;
+        std::array<bool, sizeof...(Ts)> self_alias{};
+        std::array<size_t, sizeof...(Ts)> self_off{};
+        for (size_t i = 0; i < views.size(); ++i) {
+            const Char* p = views[i].data();
+            if (!views[i].empty() && !std::less<const Char*>{}(p, old_begin) && std::less<const Char*>{}(p, old_end)) {
+                self_alias[i] = true;
+                self_off[i] = static_cast<size_t>(p - old_begin);
             }
-        };
-        (copy_part(std::basic_string_view<Char>{parts}), ...);
-        return old + add;
-    });
+        }
+
+        dst.resize_and_overwrite(old + add, [&](Char* p, size_t) noexcept {
+            Char* cur = p + old;
+            for (size_t i = 0; i < views.size(); ++i) {
+                if (!views[i].empty()) {
+                    const Char* src = self_alias[i] ? (p + self_off[i]) : views[i].data();
+                    std::char_traits<Char>::copy(cur, src, views[i].size());
+                    cur += views[i].size();
+                }
+            }
+            return old + add;
+        });
+    }
 }
 
 template <size_t N = 32, typename T>

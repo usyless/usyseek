@@ -256,7 +256,7 @@ public:
             }
         }
         if (clip_depth_ > 0) {
-            const D2D1_RECT_F& c = clips_[clip_depth_ - 1];
+            const D2D1_RECT_F& c = current_clip();
             if (ri <= c.left || l >= c.right || b <= c.top || t >= c.bottom) {
                 return false;
             }
@@ -290,7 +290,7 @@ public:
 
     void hit(D2D1_RECT_F r, int id, int index = 0) {
         if (clip_depth_ > 0) {
-            const D2D1_RECT_F& c = clips_[clip_depth_ - 1];
+            const D2D1_RECT_F& c = current_clip();
             r.left = std::max(r.left, c.left);
             r.top = std::max(r.top, c.top);
             r.right = std::min(r.right, c.right);
@@ -399,7 +399,7 @@ public:
     void push_clip(D2D1_RECT_F r) noexcept {
         dc_->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED);
         if (clip_depth_ > 0) {
-            const D2D1_RECT_F& c = clips_[std::min(clip_depth_, clips_.size()) - 1];
+            const D2D1_RECT_F& c = current_clip();
             r.left = std::max(r.left, c.left);
             r.top = std::max(r.top, c.top);
             r.right = std::min(r.right, c.right);
@@ -431,6 +431,10 @@ public:
     }
 
 private:
+    [[nodiscard]] const D2D1_RECT_F& current_clip() const noexcept {
+        return clips_[std::min(clip_depth_, clips_.size()) - 1];
+    }
+
     static DWRITE_TEXT_ALIGNMENT text_alignment(Align a) noexcept {
         return a == Align::Left ? DWRITE_TEXT_ALIGNMENT_LEADING : a == Align::Center ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_TRAILING;
     }
