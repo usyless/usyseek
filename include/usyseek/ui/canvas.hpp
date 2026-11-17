@@ -9,6 +9,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <ranges>
 
 namespace usyseek::ui {
 
@@ -18,7 +19,7 @@ namespace usyseek::ui {
 }
 
 [[nodiscard]] inline D2D1_RECT_F lerp_rect(D2D1_RECT_F a, D2D1_RECT_F b, float t) noexcept {
-    return {lerp(a.left, b.left, t), lerp(a.top, b.top, t), lerp(a.right, b.right, t), lerp(a.bottom, b.bottom, t)};
+    return {.left = lerp(a.left, b.left, t), .top = lerp(a.top, b.top, t), .right = lerp(a.right, b.right, t), .bottom = lerp(a.bottom, b.bottom, t)};
 }
 
 namespace glyph {
@@ -101,23 +102,23 @@ public:
             bool wrap;
         };
         const std::array<Def, 17> defs = {{
-            {Font::Body, &text, 13.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
-            {Font::BodySemi, &text, 13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false},
-            {Font::BodyWrap, &text, 13.0f, DWRITE_FONT_WEIGHT_NORMAL, true},
-            {Font::Large, &disp, 15.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false},
-            {Font::Input, &text, 17.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
-            {Font::Small, &text, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
-            {Font::SmallSemi, &text, 12.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false},
-            {Font::SmallWrap, &text, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, true},
-            {Font::Caption, &text, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
-            {Font::Label, &text, 11.0f, DWRITE_FONT_WEIGHT_BOLD, false},
-            {Font::Mono, &mono, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
-            {Font::MonoSmall, &mono, 11.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
-            {Font::Title, &disp, 17.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false},
-            {Font::Hero, &disp, 32.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, false},
-            {Font::Icon, &icon, 16.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
-            {Font::IconSmall, &icon, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
-            {Font::IconLarge, &icon, 20.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
+            {.f = Font::Body, .family = &text, .size = 13.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
+            {.f = Font::BodySemi, .family = &text, .size = 13.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false},
+            {.f = Font::BodyWrap, .family = &text, .size = 13.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = true},
+            {.f = Font::Large, .family = &disp, .size = 15.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false},
+            {.f = Font::Input, .family = &text, .size = 17.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
+            {.f = Font::Small, .family = &text, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
+            {.f = Font::SmallSemi, .family = &text, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false},
+            {.f = Font::SmallWrap, .family = &text, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = true},
+            {.f = Font::Caption, .family = &text, .size = 11.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
+            {.f = Font::Label, .family = &text, .size = 11.0f, .weight = DWRITE_FONT_WEIGHT_BOLD, .wrap = false},
+            {.f = Font::Mono, .family = &mono, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
+            {.f = Font::MonoSmall, .family = &mono, .size = 11.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
+            {.f = Font::Title, .family = &disp, .size = 17.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false},
+            {.f = Font::Hero, .family = &disp, .size = 32.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .wrap = false},
+            {.f = Font::Icon, .family = &icon, .size = 16.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
+            {.f = Font::IconSmall, .family = &icon, .size = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
+            {.f = Font::IconLarge, .family = &icon, .size = 20.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .wrap = false},
         },};
         for (const auto& d : defs) {
             wil::com_ptr<IDWriteTextFormat> fmt;
@@ -127,7 +128,7 @@ public:
             if (!d.wrap) {
                 wil::com_ptr<IDWriteInlineObject> ellipsis;
                 if (SUCCEEDED(dw->CreateEllipsisTrimmingSign(fmt.get(), &ellipsis))) {
-                    const DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+                    const DWRITE_TRIMMING trim{.granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER, .delimiter = 0, .delimiterCount = 0};
                     fmt->SetTrimming(&trim, ellipsis.get());
                 }
             }
@@ -361,7 +362,7 @@ public:
         if (!bmp || !intersects_clip(tr, 1.0f)) return;
         const D2D1_SIZE_F bs = bmp->GetSize();
         if (bs.width <= 0.0f || bs.height <= 0.0f) return;
-        const FitRect dest = fit_image(bs.width, bs.height, FitRect{tr.left, tr.top, width(tr), height(tr)}, fit);
+        const FitRect dest = fit_image(bs.width, bs.height, FitRect{.left = tr.left, .top = tr.top, .width = width(tr), .height = height(tr)}, fit);
         const float s = dest.width / bs.width;
         const D2D1_RECT_F drawn = fit == ThumbFit::Contain ? rect(dest.left, dest.top, dest.width, dest.height) : tr;
         if (ID2D1BitmapBrush1* bb = target_.bitmap_brush(bmp)) {
@@ -426,7 +427,7 @@ public:
         for (int i = steps; i >= 1; --i) {
             const float t = static_cast<float>(i) / steps;
             const float g = spread * t;
-            fill_round(D2D1::RectF(r.left - g * 0.6f, r.top - g * 0.2f, r.right + g * 0.6f, r.bottom + g), radius + g, hex(0x000000, scaled / steps * (1.2f - t)));
+            fill_round(D2D1::RectF(r.left - (g * 0.6f), r.top - (g * 0.2f), r.right + (g * 0.6f), r.bottom + g), radius + g, hex(0x000000, scaled / steps * (1.2f - t)));
         }
     }
 
@@ -453,8 +454,8 @@ private:
 };
 
 inline const Hit* hit_test(std::span<const Hit> hits, D2D1_POINT_2F p) noexcept {
-    for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
-        if (contains(it->r, p)) return &*it;
+    for (const auto& h : std::views::reverse(hits)) {
+        if (contains(h.r, p)) return &h;
     }
     return nullptr;
 }
@@ -649,8 +650,8 @@ struct TooltipLayout {
     }
     const float content_w = std::max(out.title_sz.width, out.sub_sz.width);
     const float content_h = out.title_sz.height + (!title.empty() && !subtitle.empty() ? gap : 0.0f) + out.sub_sz.height;
-    const float box_w = std::ceil(content_w) + pad_x * 2.0f;
-    const float box_h = std::ceil(content_h) + pad_y * 2.0f;
+    const float box_w = std::ceil(content_w) + (pad_x * 2.0f);
+    const float box_h = std::ceil(content_h) + (pad_y * 2.0f);
     float x = (anchor.left + anchor.right - box_w) * 0.5f;
     x = std::clamp(x, 8.0f, std::max(8.0f, win_sz.width - 8.0f - box_w));
     float y = anchor.bottom + 8.0f;
@@ -678,7 +679,7 @@ inline void draw_glass_box(Canvas& cv, D2D1_RECT_F r, float radius, D2D1_COLOR_F
     if (sa > 0.002f && width(r) > 4.0f && height(r) > 4.0f) {
         cv.stroke_round(inset(r, 1.0f, 1.0f), std::max(0.0f, radius - 1.0f), with_alpha(hex(0xffffff), sa), 1.0f);
         const float cap = std::min(radius, width(r) * 0.45f);
-        if (width(r) > cap * 2.0f + 2.0f) {
+        if (width(r) > (cap * 2.0f) + 2.0f) {
             cv.hline(r.left + cap, r.right - cap, r.top + 1.0f, with_alpha(hex(0xffffff), std::min(1.0f, sa * 1.45f)));
         }
     }

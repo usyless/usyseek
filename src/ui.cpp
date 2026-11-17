@@ -29,7 +29,7 @@ void pump_messages(DWORD ms) {
     }
 }
 
-void wait_search(Pill& pill, DWORD timeout_ms = 15000) {
+void wait_search(const Pill& pill, DWORD timeout_ms = 15000) {
     const ULONGLONG deadline = GetTickCount64() + timeout_ms;
     while (GetTickCount64() < deadline) {
         pump_messages(25);
@@ -134,17 +134,23 @@ int run_automated_test(Shared& sh, Pill& pill, SettingsWindow& settings_win, con
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    ulp::win::COMWrapper<false> com{COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE};
+    const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_APARTMENTTHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
     // OLE proper (not just COM) for dragging media out and putting it on the clipboard.
     // Keep alive across Pill/SettingsWindow/Shared destruction.
     struct OleScope {
         HRESULT hr = OleInitialize(nullptr);
+        OleScope() = default;
+        OleScope(const OleScope&) = delete;
+        OleScope& operator=(const OleScope&) = delete;
+        OleScope(OleScope&&) = delete;
+        OleScope& operator=(OleScope&&) = delete;
         ~OleScope() {
             if (SUCCEEDED(hr)) OleUninitialize();
         }
-    } ole;
+    };
+    const OleScope ole;
     ulp::win::dark::init_dark_mode();
 
     int argc = 0;
@@ -176,7 +182,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
             test_dir = fs::path{argv[++i]};
         }
     }
-    if (argv) LocalFree(argv);
+    if (argv) LocalFree(static_cast<HLOCAL>(argv));
 
     // If an instance is already running, forward the request and exit
     if (!test_dir) {
@@ -210,11 +216,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     Pill pill{sh};
     SettingsWindow settings_win{sh};
-    if (!pill.create(inst)) {
+    if (!pill.create(hInstance)) {
         MessageBoxW(nullptr, L"Failed to create the search window.", APP_NAME, MB_ICONERROR | MB_OK);
         return 1;
     }
-    if (!settings_win.create(inst)) {
+    if (!settings_win.create(hInstance)) {
         MessageBoxW(nullptr, L"Failed to create the settings window.", APP_NAME, MB_ICONERROR | MB_OK);
         return 1;
     }
@@ -241,9 +247,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.engine.on_result = [&](std::unique_ptr<SearchResult> r) {
         const HWND hwnd = sh.call_hwnd.load(std::memory_order_acquire);
         if (!hwnd || !r) return;
-        if (PostMessageW(hwnd, WM_APP_RESULT, 0, reinterpret_cast<LPARAM>(r.get()))) {
-            (void)r.release();
-        }
+        const auto* const raw = r.release();
+        if (!PostMessageW(hwnd, WM_APP_RESULT, 0, reinterpret_cast<LPARAM>(raw))) delete raw;
     };
     sh.engine.on_db_state = [&](bool ready, std::string err) {
         sh.call([&, ready, err = std::move(err)] {
@@ -346,7 +351,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                     pill.tray_hide();
                     break;
                 case ToggleMode::TraySelect:
-                    pill.tray_select({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+                    pill.tray_select({.x = GET_X_LPARAM(lp), .y = GET_Y_LPARAM(lp)});
                     break;
                 case ToggleMode::Toggle:
                 default:
@@ -399,7 +404,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         std::error_code ec;
         if (fs::exists(launcher_exe, ec)) {
             std::wstring cmd = ulp::str::concat_strings(L"\"", launcher_exe.wstring(), L"\"");
-            STARTUPINFOW si{sizeof(si)};
+            STARTUPINFOW si{.cb = sizeof(si)};
             wil::unique_process_information pi;
             if (CreateProcessW(launcher_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, exe_dir().c_str(), &si, &pi)) {
                 for (int i = 0; i < 40 && !find_launcher(); ++i) Sleep(25);
@@ -426,9 +431,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     if (test_dir) {
         code = run_automated_test(sh, pill, settings_win, *test_dir);
     } else {
-        if (show_notifications) settings_win.show(2);
-        else if (show_settings) settings_win.show(settings_tab);
-        else if (show_pill) pill.show();
+        if (show_notifications) {
+            settings_win.show(2);
+        } else if (show_settings) {
+            settings_win.show(settings_tab);
+        } else if (show_pill) {
+            pill.show();
+        }
 
         MSG msg;
         while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

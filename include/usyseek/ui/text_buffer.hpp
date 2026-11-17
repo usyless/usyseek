@@ -24,7 +24,14 @@ struct TextBuffer {
     size_t caret = 0;
     size_t anchor = 0;
 
-    void set(std::wstring s) noexcept {
+    TextBuffer() = default;
+    TextBuffer(const TextBuffer&) = default;
+    TextBuffer& operator=(const TextBuffer&) = default;
+    TextBuffer(TextBuffer&&) noexcept = default;
+    TextBuffer& operator=(TextBuffer&&) noexcept = default;
+    virtual ~TextBuffer() = default;
+
+    virtual void set(std::wstring s) noexcept {
         text = std::move(s);
         caret = anchor = text.size();
         clear_history();
@@ -62,7 +69,7 @@ struct TextBuffer {
     bool on_char(wchar_t c) {
         if (c < 0x20 || c == 0x7f) return false;
         const bool merge = !has_selection() && last_kind_ == EditKind::Insert && caret == last_pos_ &&
-                           !(std::iswspace(last_char_) && !std::iswspace(c));
+                           (!std::iswspace(last_char_) || std::iswspace(c));
         if (!merge) push_undo();
         apply_replace_selection(std::wstring_view{&c, 1});
         last_kind_ = EditKind::Insert;
@@ -110,13 +117,19 @@ struct TextBuffer {
     bool redo() { return step_history(redo_, undo_); }
 
     void move_left(bool word, bool extend) noexcept {
-        if (!extend && has_selection()) move_to(sel().first, false);
-        else move_to(word ? word_left(caret) : (caret ? caret - 1 : 0), extend);
+        if (!extend && has_selection()) {
+            move_to(sel().first, false);
+        } else {
+            move_to(word ? word_left(caret) : (caret ? caret - 1 : 0), extend);
+        }
     }
 
     void move_right(bool word, bool extend) noexcept {
-        if (!extend && has_selection()) move_to(sel().second, false);
-        else move_to(word ? word_right(caret) : std::min(text.size(), caret + 1), extend);
+        if (!extend && has_selection()) {
+            move_to(sel().second, false);
+        } else {
+            move_to(word ? word_right(caret) : std::min(text.size(), caret + 1), extend);
+        }
     }
 
     void move_home(bool extend) noexcept { move_to(0, extend); }
@@ -142,14 +155,14 @@ private:
 
     void push_undo() {
         if (undo_.size() >= MAX_UNDO) undo_.pop_front();
-        undo_.push_back({text, caret, anchor});
+        undo_.push_back({.text = text, .caret = caret, .anchor = anchor});
         redo_.clear();
     }
 
     bool step_history(std::deque<UndoEntry>& from, std::deque<UndoEntry>& to) {
         if (from.empty()) return false;
         if (to.size() >= MAX_UNDO) to.pop_front();
-        to.push_back({std::move(text), caret, anchor});
+        to.push_back({.text = std::move(text), .caret = caret, .anchor = anchor});
         UndoEntry target = std::move(from.back());
         from.pop_back();
         text = std::move(target.text);
@@ -167,7 +180,7 @@ private:
                 const wchar_t deleted = text[forward ? caret : other];
                 const EditKind kind = forward ? EditKind::Delete : EditKind::Backspace;
                 const bool merge = last_kind_ == kind && caret == last_pos_ &&
-                                   !(std::iswspace(last_char_) && !std::iswspace(deleted));
+                                   (!std::iswspace(last_char_) || std::iswspace(deleted));
                 if (!merge) push_undo();
                 anchor = other;
                 apply_replace_selection({});

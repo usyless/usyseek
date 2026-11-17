@@ -31,9 +31,10 @@ public:
         draws_.push_back(std::move(draw));
     }
 
-    void add_group(const Flow& inner, float avail, bool grow = false) {
+    void add_group(Flow inner, float avail, bool grow = false) {
         const float group_w = std::min(inner.natural_width(), avail);
-        add(group_w, inner.height(group_w), [inner](D2D1_RECT_F r) { inner.draw(r.left, r.top, width(r)); }, grow);
+        const float group_h = inner.height(group_w);
+        add(group_w, group_h, [inner = std::move(inner)](D2D1_RECT_F r) { inner.draw(r.left, r.top, width(r)); }, grow);
     }
 
     [[nodiscard]] float natural_width() const noexcept {
@@ -41,7 +42,7 @@ public:
         for (const FlowItem& item : items_) {
             total += item.width;
         }
-        return items_.empty() ? 0.0f : total + gap_x_ * static_cast<float>(items_.size() - 1);
+        return items_.empty() ? 0.0f : (total + (gap_x_ * static_cast<float>(items_.size() - 1)));
     }
 
     [[nodiscard]] float height(float avail) const {
@@ -69,7 +70,7 @@ public:
 
     bool create(HINSTANCE inst) {
         inst_ = inst;
-        WNDCLASSEXW wc{sizeof(wc)};
+        WNDCLASSEXW wc{.cbSize = sizeof(wc)};
         wc.style = CS_DBLCLKS;
         wc.lpfnWndProc = &SettingsWindow::wndproc;
         wc.hInstance = inst;
@@ -81,7 +82,7 @@ public:
 
         const UINT dpi = GetDpiForSystem();
         const float s = (dpi > 0 ? static_cast<float>(dpi) : 96.0f) / 96.0f;
-        RECT rc{0, 0, static_cast<LONG>(920 * s), static_cast<LONG>(720 * s)};
+        RECT rc{.left = 0, .top = 0, .right = static_cast<LONG>(920 * s), .bottom = static_cast<LONG>(720 * s)};
         const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
         AdjustWindowRectExForDpi(&rc, style, FALSE, 0, dpi);
 
@@ -400,7 +401,7 @@ private:
         for (const auto& m : downloaded_models_) {
             if (m.weights) models_.push_back(m.name);
         }
-        if (std::find(models_.begin(), models_.end(), sh_.settings.model_name) == models_.end()) {
+        if (std::ranges::find(models_, sh_.settings.model_name) == models_.end()) {
             models_.insert(models_.begin(), sh_.settings.model_name);
         }
         refresh_model_files();
@@ -414,7 +415,7 @@ private:
         }
         sh_.engine.post([this, seq](Db& db) {
             auto cols = db.list_collections();
-            sh_.call([this, seq, cols = std::move(cols)]() mutable {
+            sh_.call([this, seq, cols = std::move(cols)] mutable {
                 if (seq != db_collections_seq_) return;
                 db_collections_ = cols ? std::move(*cols) : scan_edge_collections_on_disk(edge_data_dir());
                 invalidate();
@@ -453,7 +454,7 @@ private:
             const std::wstring name = e.path().filename().wstring();
             if (!name.ends_with(L".dist-info")) continue;
             const std::wstring stem = name.substr(0, name.size() - 10);
-            for (std::wstring_view want : {L"torch-", L"open_clip_torch-", L"timm-", L"safetensors-", L"onnxruntime-"}) {
+            for (const std::wstring_view want : {L"torch-", L"open_clip_torch-", L"timm-", L"safetensors-", L"onnxruntime-"}) {
                 if (_wcsnicmp(stem.c_str(), want.data(), want.size()) == 0) {
                     std::wstring label = stem;
                     std::ranges::replace(label, L'_', L'-');
@@ -474,11 +475,9 @@ private:
 
     bool ensure_target() {
         if (target_.ready()) return true;
-        if (!sh_.gfx.ready() || sh_.gfx.device_lost()) {
-            if (!sh_.gfx.recover(hwnd_)) {
-                SetTimer(hwnd_, TIMER_DEVICE, 250, nullptr);
-                return false;
-            }
+        if ((!sh_.gfx.ready() || sh_.gfx.device_lost()) && !sh_.gfx.recover(hwnd_)) {
+            SetTimer(hwnd_, TIMER_DEVICE, 250, nullptr);
+            return false;
         }
         if (!target_.rebuild()) {
             SetTimer(hwnd_, TIMER_DEVICE, 250, nullptr);
@@ -512,7 +511,7 @@ private:
         if (icon_g && !label.empty()) {
             const float tw = cv.measure(label, Font::SmallSemi);
             const float total = 18.0f + 6.0f + tw;
-            const float sx = r.left + (width(r) - total) * 0.5f;
+            const float sx = r.left + ((width(r) - total) * 0.5f);
             cv.icon(icon_g, rect(sx, r.top, 18.0f, height(r)), fg, Font::IconSmall);
             cv.text(label, rect(sx + 24.0f, r.top, tw + 4.0f, height(r)), Font::SmallSemi, fg);
         } else if (icon_g) {
@@ -589,7 +588,7 @@ private:
         cv.hit(r, id, idx);
     }
 
-    void draw_disabled_button(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, int id, int idx = 0) {
+    static void draw_disabled_button(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, int id, int idx = 0) {
         const float rad = std::min(10.0f, height(r) * 0.5f);
         cv.fill_round(r, rad, with_alpha(cv.theme().surface_high, 0.45f));
         cv.stroke_round(r, rad, with_alpha(cv.theme().outline_variant, 0.40f));
@@ -625,7 +624,7 @@ private:
             const float kw = lerp(16.0f, 22.0f, stretch);
             const float kh = 16.0f;
             const float krad = kh * 0.5f;
-            const D2D1_RECT_F thumb_r = rect(kx - kw * 0.5f, cy - kh * 0.5f, kw, kh);
+            const D2D1_RECT_F thumb_r = rect(kx - (kw * 0.5f), cy - (kh * 0.5f), kw, kh);
             cv.shadow(thumb_r, krad, 4.0f, 0.28f);
             const D2D1_COLOR_F knob_tint = with_alpha(hex(0xffffff), dark ? lerp(0.46f, 0.62f, t) : lerp(0.76f, 0.88f, t));
             const GlassStyle knob_gs = make_control_glass_style(cv.theme(), krad, knob_tint, 1.0f, 0.0f, 6.5f, 1.14f);
@@ -639,7 +638,7 @@ private:
             const D2D1_COLOR_F off_track = lerp_color(cv.theme().surface_high, cv.theme().surface_highest, ha);
             cv.fill_round(r, 12.0f, lerp_color(off_track, cv.theme().primary, t));
             if (t < 1.0f) cv.stroke_round(r, 12.0f, with_alpha(cv.theme().outline, 1.0f - t));
-            cv.fill_circle({kx, cy}, kr, lerp_color(cv.theme().outline, cv.theme().on_primary, t));
+            cv.fill_circle({.x = kx, .y = cy}, kr, lerp_color(cv.theme().outline, cv.theme().on_primary, t));
         }
         cv.hit(r, id, idx);
     }
@@ -648,7 +647,7 @@ private:
         return std::max(min_h, cv.measure_height(s, f, w));
     }
 
-    float error_row_height(Canvas& cv, std::wstring_view message, float row_w) {
+    static float error_row_height(Canvas& cv, std::wstring_view message, float row_w) {
         return text_height(cv, message, Font::Caption, row_w - 22.0f, 20.0f);
     }
 
@@ -694,9 +693,9 @@ private:
         float h;
     };
 
-    CardHeader make_header(Canvas& cv, float rw, std::wstring title, D2D1_COLOR_F title_color, std::wstring caption,
+    static CardHeader make_header(Canvas& cv, float rw, std::wstring title, D2D1_COLOR_F title_color, std::wstring caption,
                            float side_w = 0.0f, float side_h = 0.0f) {
-        CardHeader hd{std::move(title), std::move(caption), title_color, side_w, side_h};
+        CardHeader hd{.title = std::move(title), .caption = std::move(caption), .title_color = title_color, .side_w = side_w, .side_h = side_h};
         const float beside_w = rw - side_w - (side_w > 0.0f ? 12.0f : 0.0f);
         hd.beside = side_w <= 0.0f || beside_w >= 200.0f;
         hd.text_w = hd.beside ? beside_w : rw;
@@ -706,14 +705,14 @@ private:
         return hd;
     }
 
-    D2D1_RECT_F draw_header(Canvas& cv, float lx, float y, float rw, const CardHeader& hd) {
+    static D2D1_RECT_F draw_header(Canvas& cv, float lx, float y, float rw, const CardHeader& hd) {
         cv.text_wrap(hd.title, rect(lx, y + 16.0f, hd.text_w, hd.title_h), Font::Large, hd.title_color);
         cv.text_wrap(hd.caption, rect(lx, y + 16.0f + hd.title_h, hd.text_w, hd.caption_h), Font::Small, cv.theme().on_surface_variant);
         if (hd.beside) return rect(lx + rw - hd.side_w, y + 18.0f, hd.side_w, hd.side_h);
         return rect(lx, y + 16.0f + hd.title_h + hd.caption_h + 8.0f, hd.side_w, hd.side_h);
     }
 
-    float radio_height(Canvas& cv, float w, std::wstring_view title, std::wstring_view desc) {
+    static float radio_height(Canvas& cv, float w, std::wstring_view title, std::wstring_view desc) {
         return 8.0f + text_height(cv, title, Font::BodySemi, w - 54.0f, 20.0f) + text_height(cv, desc, Font::Caption, w - 54.0f, 18.0f) + 10.0f;
     }
 
@@ -739,7 +738,7 @@ private:
             cv.fill_round(r, 12.0f, on ? with_alpha(cv.theme().primary_container, 0.32f) : lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha));
             cv.stroke_round(r, 12.0f, on ? cv.theme().primary : cv.theme().outline_variant, on ? 1.5f : 1.0f);
         }
-        const D2D1_POINT_2F c{r.left + 22.0f, (r.top + r.bottom) * 0.5f};
+        const D2D1_POINT_2F c{.x = r.left + 22.0f, .y = (r.top + r.bottom) * 0.5f};
         cv.stroke_circle(c, 8.0f, on ? cv.theme().primary : cv.theme().outline, 1.8f);
         if (on) cv.fill_circle(c, 4.5f, cv.theme().primary);
         const float title_h = text_height(cv, title, Font::BodySemi, width(r) - 54.0f, 20.0f);
@@ -829,11 +828,11 @@ private:
 
     static constexpr std::array<TabDef, 4> tab_defs() noexcept {
         return {{
-            {glyph::clock, L"Embeddings & Progress", IdTab0},
-            {glyph::settings, L"Application & Venv Settings", IdTab1},
-            {glyph::warning, L"Notifications", IdTab2},
-            {glyph::info, L"About", IdTab3},
-        }};
+            {.g = glyph::clock, .label = L"Embeddings & Progress", .id = IdTab0},
+            {.g = glyph::settings, .label = L"Application & Venv Settings", .id = IdTab1},
+            {.g = glyph::warning, .label = L"Notifications", .id = IdTab2},
+            {.g = glyph::info, .label = L"About", .id = IdTab3},
+        },};
     }
 
     FixedWString<64> tab_label(int i) const noexcept {
@@ -850,9 +849,9 @@ private:
     FlowResult tab_layout(float total_w) const {
         std::array<FlowItem, 4> items; // NOLINT(cppcoreguidelines-pro-type-member-init)
         for (size_t i = 0; i < items.size(); ++i) {
-            items[i] = {sh_.fonts.measure(tab_label(static_cast<int>(i)), Font::BodySemi) + 46.0f, TABS_H - 16.0f, false};
+            items[i] = {.width = sh_.fonts.measure(tab_label(static_cast<int>(i)), Font::BodySemi) + 46.0f, .height = TABS_H - 16.0f, .grow = false};
         }
-        return flow_layout(items, 8.0f, 8.0f, total_w - PAD * 2.0f);
+        return flow_layout(items, 8.0f, 8.0f, total_w - (PAD * 2.0f));
     }
 
     [[nodiscard]] float tabs_height(float total_w) const {
@@ -881,7 +880,7 @@ private:
         const D2D1_RECT_F view = D2D1::RectF(0, tabs_height(sz.width) + 1.0f, sz.width, sz.height);
         cv.push_clip(view);
 
-        const float cw = std::min(860.0f, sz.width - PAD * 2.0f);
+        const float cw = std::min(860.0f, sz.width - (PAD * 2.0f));
         const float cx = std::round((sz.width - cw) * 0.5f);
         float y = view.top + PAD - scroll_;
 
@@ -902,7 +901,7 @@ private:
         if (ms > 0.0f) {
             const float track_h = height(view) - 8.0f;
             const float thumb_h = std::max(28.0f, track_h * height(view) / content_h_);
-            const float ty = view.top + 4.0f + (track_h - thumb_h) * (scroll_ / ms);
+            const float ty = view.top + 4.0f + ((track_h - thumb_h) * (scroll_ / ms));
             const float ha = dragging_scroll_ ? 1.0f : hover_alpha(IdScrollbar);
             const D2D1_RECT_F tr = D2D1::RectF(view.right - lerp(7.0f, 9.0f, ha), ty, view.right - 3.0f, ty + thumb_h);
             cv.fill_round(tr, 3.0f, with_alpha(cv.theme().on_surface_variant, lerp(0.28f, 0.55f, ha)));
@@ -1000,7 +999,8 @@ private:
     }
 
     float draw_tab_notifications(Canvas& cv, float x, float y, float w) {
-        const float lx = x + 22.0f, rw = w - 44.0f;
+        const float lx = x + 22.0f;
+        const float rw = w - 44.0f;
         const size_t total_n = sh_.notifications.size();
         const size_t err_n = sh_.error_notification_count();
         const size_t warn_n = total_n >= err_n ? total_n - err_n : 0;
@@ -1101,10 +1101,10 @@ private:
         app_icon_epoch_ = epoch;
         IWICImagingFactory* wic = sh_.gfx.wic();
         if (!wic || !inst_) return nullptr;
-        HICON hi = static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(101), IMAGE_ICON, 128, 128, LR_DEFAULTCOLOR));
+        auto* hi = static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(101), IMAGE_ICON, 128, 128, LR_DEFAULTCOLOR));
         if (!hi) hi = static_cast<HICON>(LoadImageW(inst_, MAKEINTRESOURCEW(101), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE));
         if (!hi) return nullptr;
-        wil::unique_hicon own_icon{hi};
+        const wil::unique_hicon own_icon{hi};
         wil::com_ptr<IWICBitmap> wic_bmp;
         if (FAILED(wic->CreateBitmapFromHICON(own_icon.get(), &wic_bmp))) return nullptr;
         wil::com_ptr<IWICFormatConverter> conv;
@@ -1117,12 +1117,13 @@ private:
     }
 
     float draw_tab_about(Canvas& cv, float x, float y, float w) {
-        const float lx = x + 22.0f, rw = w - 44.0f;
+        const float lx = x + 22.0f;
+        const float rw = w - 44.0f;
         const std::wstring version_line = ulp::str::concat_strings(L"Version ", APP_VERSION, L"  •  by usy");
         const std::wstring ai_title = L"AI-generated codebase";
         const std::wstring ai_desc = L"All source code in usyseek was written by AI.";
         const float box_pad_x = 18.0f;
-        const float box_inner_w = std::max(120.0f, rw - box_pad_x * 2.0f);
+        const float box_inner_w = std::max(120.0f, rw - (box_pad_x * 2.0f));
         const float ai_title_h = text_height(cv, ai_title, Font::BodySemi, box_inner_w, 22.0f);
         const float ai_desc_h = text_height(cv, ai_desc, Font::Small, box_inner_w, 18.0f);
         const float box_h = 14.0f + ai_title_h + 4.0f + ai_desc_h + 14.0f;
@@ -1137,7 +1138,7 @@ private:
 
         const float next_y = card_begin(cv, x, y, w, h);
 
-        const D2D1_RECT_F icon_r = rect(std::round(x + (w - icon_sz) * 0.5f), icon_y, icon_sz, icon_sz);
+        const D2D1_RECT_F icon_r = rect(std::round(x + ((w - icon_sz) * 0.5f)), icon_y, icon_sz, icon_sz);
         if (ID2D1Bitmap1* bmp = ensure_app_icon(cv)) {
             cv.bitmap(bmp, icon_r);
         } else {
@@ -1324,7 +1325,8 @@ private:
     float draw_storage_list_card(Canvas& cv, float x, float y, float w, const wchar_t* title, const wchar_t* caption,
                                  const wchar_t* empty_msg, std::span<const StorageRow> rows, int refresh_id,
                                  int use_id, int delete_id, int delete_disabled_id) {
-        const float lx = x + 22.0f, rw = w - 44.0f;
+        const float lx = x + 22.0f;
+        const float rw = w - 44.0f;
         const float refresh_w = button_width(cv, L"Refresh", true, 96.0f);
         const CardHeader hd = make_header(cv, rw, title, cv.theme().on_surface, caption, refresh_w, 32.0f);
         const float use_w = button_width(cv, L"Use", false, 58.0f);
@@ -1384,7 +1386,7 @@ private:
             cv.text_wrap(r.subtitle, rect(tx, sub_y, lr.text_w, lr.sub_h), Font::Caption, cv.theme().on_surface_variant);
 
             float bx = lr.beside ? (ir.right - 12.0f - lr.actions_w) : tx;
-            const float by = lr.beside ? (ir.top + (lr.h - 30.0f) * 0.5f) : (ir.bottom - 38.0f);
+            const float by = lr.beside ? (ir.top + ((lr.h - 30.0f) * 0.5f)) : (ir.bottom - 38.0f);
             const int idx = static_cast<int>(i);
             if (r.can_use) {
                 draw_button(cv, rect(bx, by, use_w, 30.0f), 0, L"Use", use_id, idx, 0);
@@ -1406,7 +1408,8 @@ private:
     float draw_tab_progress(Canvas& cv, float x, float y, float w) {
         // 1. Hero status card
         {
-            const float lx = x + 22.0f, rw = w - 44.0f;
+            const float lx = x + 22.0f;
+            const float rw = w - 44.0f;
 
             const bool running = sh_.indexer_running;
             const bool stopping = running && sh_.indexer_stopping;
@@ -1442,13 +1445,13 @@ private:
                 if (d.rate > 0.05f) {
                     append_to(sub, to_fixed_wstr(d.rate, 1), L" files/s");
                     if (d.todo > d.processed) {
-                        const uint64_t rem_ms = static_cast<uint64_t>((d.todo - d.processed) / d.rate * 1000.0f);
+                        const auto rem_ms = static_cast<uint64_t>(static_cast<double>(d.todo - d.processed) / d.rate * 1000.0);
                         append_to(sub, L"  •  ETA ", format_duration_ms(rem_ms));
                     }
                 }
                 if (d.device[0]) {
                     if (!sub.empty()) sub += L"  •  ";
-                    sub += d.device;
+                    sub += d.device.data();
                 }
                 if (d.batch) append_to(sub, L" (batch ", to_fixed_wstr(d.batch), L")");
             } else if (!sh_.index_state.last_error.empty()) {
@@ -1462,8 +1465,8 @@ private:
             FixedWString<32> pbuf = to_fixed_wstr<32>(pct * 100.0f, 1);
             pbuf.append(L"% completed");
             const std::wstring cur = stopping ? std::wstring{L"Stopping indexer — finishing current batch…"}
-                                   : (running && d.current[0] ? ulp::str::concat_strings(L"Processing: ", d.current)
-                                   : (running && d.message[0] ? std::wstring{d.message} : std::wstring{L"On-demand scanner idle — zero background GPU/RAM usage"}));
+                                   : (running && d.current[0] ? ulp::str::concat_strings(L"Processing: ", d.current.data())
+                                   : (running && d.message[0] ? std::wstring{d.message.data()} : std::wstring{L"On-demand scanner idle — zero background GPU/RAM usage"}));
             const bool db_paused = sh_.engine.db_paused_for_indexing();
             const bool db_loading = sh_.engine.db_loading() && !sh_.test_mode;
             const bool db_disconnected = !sh_.engine.db_ready() && !sh_.test_mode;
@@ -1497,7 +1500,7 @@ private:
             Flow status{12.0f, 6.0f};
             status.add(bw, 22.0f, [&](D2D1_RECT_F br) {
                 cv.fill_round(br, 11.0f, with_alpha(badge_col, 0.15f));
-                cv.fill_circle({br.left + 11.0f, br.top + 11.0f}, 3.5f, badge_col);
+                cv.fill_circle({.x = br.left + 11.0f, .y = br.top + 11.0f}, 3.5f, badge_col);
                 cv.text(status_txt, rect(br.left + 20.0f, br.top, bw - 22.0f, 22.0f), Font::Caption, badge_col);
             });
             if (fail_cnt > 0) {
@@ -1551,13 +1554,14 @@ private:
 
         // 1b. Failed files card (shown when decode/embed failures exist)
         if (!sh_.failed_files.empty()) {
-            const float lx = x + 22.0f, rw = w - 44.0f;
+            const float lx = x + 22.0f;
+            const float rw = w - 44.0f;
             const size_t show_n = std::min<size_t>(sh_.failed_files.size(), 6);
             const bool stacked = rw < 560.0f;
             const float path_x = 32.0f;
-            const float path_w = stacked ? rw - 40.0f : rw * 0.64f - path_x - 4.0f;
+            const float path_w = stacked ? rw - 40.0f : (rw * 0.64f) - path_x - 4.0f;
             const float reason_x = stacked ? path_x : rw * 0.64f;
-            const float reason_w = stacked ? rw - 40.0f : rw * 0.36f - 10.0f;
+            const float reason_w = stacked ? rw - 40.0f : (rw * 0.36f) - 10.0f;
 
             const std::wstring title = ulp::str::concat_strings(L"Failed Media Files (", format_count(sh_.failed_files.size()), L")");
             const CardHeader hd = make_header(cv, rw, title, cv.theme().error,
@@ -1601,7 +1605,7 @@ private:
                 cv.stroke_round(retry_r, 10.0f, with_alpha(cv.theme().outline_variant, 0.40f));
                 const float tw = cv.measure(L"Retry Failed", Font::SmallSemi);
                 const float total = 24.0f + tw;
-                const float sx = retry_r.left + (width(retry_r) - total) * 0.5f;
+                const float sx = retry_r.left + ((width(retry_r) - total) * 0.5f);
                 const D2D1_COLOR_F dfg = with_alpha(cv.theme().on_surface_variant, 0.45f);
                 cv.icon(glyph::refresh, rect(sx, retry_r.top, 18.0f, height(retry_r)), dfg, Font::IconSmall);
                 cv.text(L"Retry Failed", rect(sx + 24.0f, retry_r.top, tw + 4.0f, height(retry_r)), Font::SmallSemi, dfg);
@@ -1617,10 +1621,10 @@ private:
                 const float ha = ff.path.empty() ? 0.0f : hover_alpha(IdFailedRow, static_cast<int>(i));
                 draw_well(cv, ir, 8.0f, false, false, false, ha);
                 cv.icon(glyph::warning, rect(ir.left + 8.0f, ir.top, 20.0f, row.h), cv.theme().error, Font::IconSmall);
-                const float content_top = ir.top + (row.h - row.content_h) * 0.5f;
-                const float path_y = stacked ? content_top : ir.top + (row.h - row.path_h) * 0.5f;
+                const float content_top = ir.top + ((row.h - row.content_h) * 0.5f);
+                const float path_y = stacked ? content_top : ir.top + ((row.h - row.path_h) * 0.5f);
                 cv.text_wrap(row.label, rect(ir.left + path_x, path_y, path_w, row.path_h), Font::MonoSmall, cv.theme().on_surface);
-                const float reason_y = stacked ? content_top + row.path_h + 2.0f : ir.top + (row.h - row.reason_h) * 0.5f;
+                const float reason_y = stacked ? content_top + row.path_h + 2.0f : ir.top + ((row.h - row.reason_h) * 0.5f);
                 const float reason_h = stacked ? row.content_h - row.path_h - 2.0f : row.reason_h;
                 cv.text_wrap(ff.reason, rect(ir.left + reason_x, reason_y, reason_w, reason_h), Font::Caption, cv.theme().outline, stacked ? Align::Left : Align::Right);
                 if (!ff.path.empty()) cv.hit(ir, IdFailedRow, static_cast<int>(i));
@@ -1637,8 +1641,8 @@ private:
             rows.reserve(db_collections_.size());
             for (const DbCollectionInfo& col : db_collections_) {
                 const bool is_active = col.name == sh_.settings.model_name;
-                const auto mit = std::find_if(downloaded_models_.begin(), downloaded_models_.end(),
-                                              [&](const ModelStorageInfo& m) { return m.name == col.name && m.weights; });
+                const auto mit = std::ranges::find_if(downloaded_models_,
+                                                      [&](const ModelStorageInfo& m) { return m.name == col.name && m.weights; });
                 std::wstring sub = col.count
                     ? ulp::str::concat_strings(format_count(*col.count), *col.count == 1 ? L" file" : L" files")
                     : (sh_.indexer_running ? L"Counts paused while indexing" : L"Count unavailable");
@@ -1661,7 +1665,8 @@ private:
 
         // 1d. Tag Backup & Sync (SQLite) card
         {
-            const float lx = x + 22.0f, rw = w - 44.0f;
+            const float lx = x + 22.0f;
+            const float rw = w - 44.0f;
             const bool prune_disabled = sh_.indexer_running || prune_checking_;
             const std::wstring prune_lbl = prune_checking_ ? L"Checking…" : L"Prune Missing Tags";
             const float prune_w = button_width(cv, prune_lbl, true, 162.0f);
@@ -1694,7 +1699,8 @@ private:
         {
             const bool custom = !sh_.settings.whole_pc;
             const size_t inc_n = sh_.settings.include_dirs.size();
-            const float lx = x + 22.0f, rw = w - 44.0f;
+            const float lx = x + 22.0f;
+            const float rw = w - 44.0f;
 
             const CardHeader hd = make_header(cv, rw, L"Indexing Scope", cv.theme().on_surface,
                                               L"Scan the whole PC with Voidtools Everything, or restrict indexing to specific folders");
@@ -1706,9 +1712,9 @@ private:
                 int id;
             };
             const std::array<Radio, 2> radios = {{
-                {sh_.settings.whole_pc, L"Include the whole PC", L"All local fixed drives (minus exclusions)", IdScopeAll},
-                {!sh_.settings.whole_pc, L"Specify directories to include", L"Only scan the folders listed below", IdScopeCustom},
-            }};
+                {.on = sh_.settings.whole_pc, .title = L"Include the whole PC", .desc = L"All local fixed drives (minus exclusions)", .id = IdScopeAll},
+                {.on = !sh_.settings.whole_pc, .title = L"Specify directories to include", .desc = L"Only scan the folders listed below", .id = IdScopeCustom},
+            },};
             constexpr float radio_min_w = 300.0f;
             const float radio_h = std::max(radio_height(cv, radio_min_w, radios[0].title, radios[0].desc),
                                            radio_height(cv, radio_min_w, radios[1].title, radios[1].desc));
@@ -1728,7 +1734,8 @@ private:
             const wchar_t* empty_msg = L"No folders added yet — click Add Directory to choose folders to scan";
             const float empty_h = std::max(34.0f, 14.0f + cv.measure_height(empty_msg, Font::Small, rw - 24.0f));
             std::vector<std::wstring> include_paths;
-            std::vector<float> include_y, include_h;
+            std::vector<float> include_y;
+            std::vector<float> include_h;
 
             float cy = y + 16.0f + hd.h + 10.0f;
             const float radios_y = cy;
@@ -1803,7 +1810,7 @@ private:
                     draw_well(cv, ir, 8.0f);
                     cv.icon(glyph::folder, rect(ir.left + 8.0f, ir.top, 22.0f, include_h[i]), cv.theme().primary, Font::IconSmall);
                     text_middle(cv, include_paths[i], rect(ir.left + 34.0f, ir.top, rw - 72.0f, include_h[i]), Font::MonoSmall, cv.theme().on_surface);
-                    draw_button(cv, rect(ir.right - 32.0f, ir.top + (include_h[i] - 28.0f) * 0.5f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveInclude, static_cast<int>(i), 3);
+                    draw_button(cv, rect(ir.right - 32.0f, ir.top + ((include_h[i] - 28.0f) * 0.5f), 28.0f, 28.0f), glyph::remove, L"", IdRemoveInclude, static_cast<int>(i), 3);
                 }
             }
 
@@ -1817,7 +1824,8 @@ private:
         {
             const auto& locked = locked_excludes();
             const bool show_exclude_error = !exclude_error_.empty() && exclude_field_.text == exclude_error_for_text_;
-            const float lx = x + 22.0f, rw = w - 44.0f;
+            const float lx = x + 22.0f;
+            const float rw = w - 44.0f;
 
             const CardHeader hd = make_header(cv, rw, L"Excluded Directories & Patterns", cv.theme().on_surface,
                                               L"Skipped in both Whole PC and Custom Folder modes", 142.0f, 32.0f);
@@ -1847,7 +1855,7 @@ private:
             }
             for (size_t i = 0; i < sh_.settings.exclude_dirs.size(); ++i) {
                 std::wstring wex = to_wide(sh_.settings.exclude_dirs[i]);
-                const bool is_pat = wex.contains(L'*') || !(wex.size() >= 2 && wex[1] == L':');
+                const bool is_pat = wex.contains(L'*') || wex.size() < 2 || wex[1] != L':';
                 rows.emplace_back(std::move(wex), is_pat ? L"Pattern" : L"Folder", false, static_cast<int>(i), 0.0f, 0.0f);
             }
 
@@ -1883,7 +1891,7 @@ private:
                     cv.icon(glyph::lock, lr, cv.theme().outline, Font::IconSmall);
                     cv.hit(lr, IdLockedExclude, row.index);
                 } else {
-                    draw_button(cv, rect(ir.right - 32.0f, ir.top + (row.h - 28.0f) * 0.5f, 28.0f, 28.0f), glyph::remove, L"", IdRemoveExclude, row.index, 3);
+                    draw_button(cv, rect(ir.right - 32.0f, ir.top + ((row.h - 28.0f) * 0.5f), 28.0f, 28.0f), glyph::remove, L"", IdRemoveExclude, row.index, 3);
                 }
             }
             y = next_y;
@@ -1948,7 +1956,8 @@ private:
 
         // 1. Keybind & Pill behaviour card
         {
-            const float lx = x + 22.0f, rw = w - 44.0f;
+            const float lx = x + 22.0f;
+            const float rw = w - 44.0f;
 
             const CardHeader hd = make_header(cv, rw, L"Spotlight Invocation Keybind", cv.theme().on_surface,
                                               L"Global desktop shortcut registered by the lightweight tray launcher", 44.0f, 24.0f);
@@ -2056,7 +2065,8 @@ private:
 
         // 2. Embeddings AI Model & GPU Batching card
         {
-            const float lx = x + 22.0f, rw = w - 44.0f;
+            const float lx = x + 22.0f;
+            const float rw = w - 44.0f;
 
             const CardHeader hd = make_header(cv, rw, L"Embeddings AI Model & Compute", cv.theme().on_surface,
                                               L"Vision weights (.safetensors) and text ONNX / tokenizer directory");
@@ -2079,9 +2089,10 @@ private:
             Flow chips{8.0f, 8.0f};
             flow_text(cv, chips, L"Model:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 32.0f);
             for (size_t i = 0; i < models_.size() && i < 3; ++i) {
-                const std::wstring wm = to_wide(models_[i]);
+                std::wstring wm = to_wide(models_[i]);
                 const bool on = models_[i] == sh_.settings.model_name;
-                chips.add(button_width(cv, wm, false, 0.0f), 32.0f, [&, wm, i, on](D2D1_RECT_F r) {
+                const float bw = button_width(cv, wm, false, 0.0f);
+                chips.add(bw, 32.0f, [&, wm = std::move(wm), i, on](D2D1_RECT_F r) {
                     draw_button(cv, r, 0, wm, IdModelChip, static_cast<int>(i), on ? 1 : 0);
                 });
             }
@@ -2098,7 +2109,7 @@ private:
                 const float bw = cv.measure(text, Font::Caption) + 28.0f;
                 flow.add(bw, 22.0f, [&cv, txt = FixedWString<48>{text}, col, bw](D2D1_RECT_F br) {
                     cv.fill_round(br, 11.0f, with_alpha(col, 0.15f));
-                    cv.fill_circle({br.left + 11.0f, br.top + 11.0f}, 3.5f, col);
+                    cv.fill_circle({.x = br.left + 11.0f, .y = br.top + 11.0f}, 3.5f, col);
                     cv.text(txt, rect(br.left + 20.0f, br.top, bw - 22.0f, 22.0f), Font::Caption, col);
                 });
             };
@@ -2112,9 +2123,13 @@ private:
             badge(files, mf.tokenizer ? L"Tokenizer" : L"Tokenizer missing", mf.tokenizer ? cv.theme().mint : cv.theme().error);
             badge(files, mf.onnx ? L"Text ONNX" : L"Text ONNX not exported yet", mf.onnx ? cv.theme().mint : cv.theme().amber);
             const auto enc_state = sh_.engine.encoder().state();
-            if (enc_state == TextEncoder::State::Ready) badge(files, L"Search model loaded", cv.theme().mint);
-            else if (enc_state == TextEncoder::State::Exporting) badge(files, L"Exporting text ONNX…", cv.theme().primary);
-            else if (enc_state == TextEncoder::State::Loading) badge(files, L"Loading search model…", cv.theme().primary);
+            if (enc_state == TextEncoder::State::Ready) {
+                badge(files, L"Search model loaded", cv.theme().mint);
+            } else if (enc_state == TextEncoder::State::Exporting) {
+                badge(files, L"Exporting text ONNX…", cv.theme().primary);
+            } else if (enc_state == TextEncoder::State::Loading) {
+                badge(files, L"Loading search model…", cv.theme().primary);
+            }
             const std::wstring enc_error = enc_state == TextEncoder::State::Failed ? sh_.engine.encoder().error() : std::wstring{};
             const float enc_error_h = enc_error.empty() ? 0.0f : error_row_height(cv, enc_error, rw);
 
@@ -2261,7 +2276,7 @@ private:
             for (const ModelStorageInfo& m : downloaded_models_) {
                 const bool is_active = m.name == sh_.settings.model_name;
                 std::wstring sub;
-                auto add_part = [&](std::wstring_view part) {
+                const auto add_part = [&](std::wstring_view part) {
                     if (!sub.empty()) sub += L"  •  ";
                     sub += part;
                 };
@@ -2292,7 +2307,8 @@ private:
             const std::wstring& venv_log = venv_view.log;
             const bool venv_busy = venv_job_.busy;
             const bool has_log = !venv_log.empty();
-            const float lx = x + 22.0f, rw = w - 44.0f;
+            const float lx = x + 22.0f;
+            const float rw = w - 44.0f;
 
             std::error_code ec;
             const bool ver_ok = venv_.exists && fs::exists(venv_.python_exe, ec);
@@ -2370,9 +2386,10 @@ private:
                 Flow cuda{4.0f, 0.0f};
                 flow_text(cv, cuda, L"CUDA:", Font::Small, cv.theme().outline, rw, 30.0f);
                 for (size_t i = 0; i < cuda_versions.size(); ++i) {
-                    const std::wstring vl = to_wide(cuda_versions[i]);
+                    std::wstring vl = to_wide(cuda_versions[i]);
                     const bool on = sh_.settings.cuda_version == cuda_versions[i];
-                    cuda.add(button_width(cv, vl, false, 56.0f), 30.0f, [&, i, vl, on](D2D1_RECT_F r) {
+                    const float bw = button_width(cv, vl, false, 56.0f);
+                    cuda.add(bw, 30.0f, [&, i, vl = std::move(vl), on](D2D1_RECT_F r) {
                         draw_button(cv, r, 0, vl, IdCudaPreset, static_cast<int>(i), on ? 1 : 0);
                     });
                 }
@@ -2402,7 +2419,7 @@ private:
             // Action buttons
             const float action_w = std::max({button_width(cv, L"Install / Update Packages", true, 0.0f),
                                              button_width(cv, L"Create / Recreate Venv", true, 0.0f),
-                                             button_width(cv, L"Delete Venv", true, 0.0f)});
+                                             button_width(cv, L"Delete Venv", true, 0.0f),});
             Flow actions{8.0f, 8.0f};
             actions.add(action_w, 36.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::download, L"Install / Update Packages", IdUpdateVenv);
@@ -2427,7 +2444,7 @@ private:
 
             const D2D1_RECT_F sbr = draw_header(cv, lx, y, rw, hd);
             cv.fill_round(sbr, 12.0f, with_alpha(st_col, 0.16f));
-            cv.fill_circle({sbr.left + 11.0f, sbr.top + 12.0f}, 3.5f, st_col);
+            cv.fill_circle({.x = sbr.left + 11.0f, .y = sbr.top + 12.0f}, 3.5f, st_col);
             cv.text(st_txt, rect(sbr.left + 20.0f, sbr.top, sw - 22.0f, 24.0f), Font::Caption, st_col);
 
             const D2D1_RECT_F box = rect(lx, box_y, rw, box_h);
@@ -2477,10 +2494,10 @@ private:
         if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return std::nullopt;
         DWORD opts = 0;
         dlg->GetOptions(&opts);
-        opts |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST);
+        opts |= static_cast<DWORD>(FOS_FORCEFILESYSTEM) | static_cast<DWORD>(FOS_PATHMUSTEXIST) | static_cast<DWORD>(folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST);
         dlg->SetOptions(opts);
         if (!folder && filter_name && filter_spec) {
-            const COMDLG_FILTERSPEC spec{filter_name, filter_spec};
+            const COMDLG_FILTERSPEC spec{.pszName = filter_name, .pszSpec = filter_spec};
             dlg->SetFileTypes(1, &spec);
         }
         if (FAILED(dlg->Show(hwnd_))) return std::nullopt;
@@ -2501,7 +2518,7 @@ private:
             // Portable Python: put the interpreter and its Scripts folder first on PATH
             args = ulp::str::concat_strings(L"/k \"set \"PATH=", venv_.home, L";", venv_.home, L"\\Scripts;%PATH%\"\"");
         }
-        SHELLEXECUTEINFOW sei{sizeof(sei)};
+        SHELLEXECUTEINFOW sei{.cbSize = sizeof(sei)};
         sei.lpVerb = L"open";
         sei.lpFile = L"cmd.exe";
         sei.lpParameters = args.c_str();
@@ -2535,7 +2552,7 @@ private:
 
     static JobView view(Job& job) {
         const std::scoped_lock lk{job.m};
-        return {job.log, job.failed, job.done, job.total};
+        return {.log = job.log, .failed = job.failed, .done = job.done, .total = job.total};
     }
 
     /// Any thread.
@@ -2640,10 +2657,10 @@ private:
         sh_.update_state.last_check_unix = st.last_check_unix;
         invalidate();
 
-        update_check_thread_ = std::jthread([this, st = std::move(st), manual]() mutable {
+        update_check_thread_ = std::jthread([this, st = std::move(st), manual] mutable {
             bool is_newer = false;
             const bool ok = check_latest_release(st, is_newer);
-            sh_.call([this, st = std::move(st), ok, is_newer, manual]() mutable {
+            sh_.call([this, st = std::move(st), ok, is_newer, manual] mutable {
                 sh_.update_checking = false;
                 --sh_.background_jobs;
                 if (ok && is_newer) {
@@ -2680,12 +2697,12 @@ private:
         }
         if (sh_.indexer_running || !sh_.has_update_available() || sh_.update_state.asset_url.empty()) return;
 
-        const UpdateState st = sh_.update_state;
-        auto staged_root = std::make_shared<fs::path>();
-        auto stage_ok = std::make_shared<bool>(false);
+        UpdateState st = sh_.update_state;
+        const auto staged_root = std::make_shared<fs::path>();
+        const auto stage_ok = std::make_shared<bool>(false);
 
         run_job(update_job_,
-                [this, st, staged_root, stage_ok](const std::stop_token& stop) {
+                [this, st = std::move(st), staged_root, stage_ok](const std::stop_token& stop) {
                     try {
                         std::wstring err;
                         *stage_ok = download_and_stage_update(
@@ -2738,7 +2755,7 @@ private:
 
     void notify_async(std::string level, std::string source, std::string title, std::string detail, std::string key = {}) {
         sh_.call([this, level = std::move(level), source = std::move(source), title = std::move(title),
-                  detail = std::move(detail), key = std::move(key)]() mutable {
+                  detail = std::move(detail), key = std::move(key)] mutable {
             sh_.notify(std::move(level), std::move(source), std::move(title), std::move(detail), std::move(key));
         });
     }
@@ -2776,10 +2793,10 @@ private:
             bool present;
         };
         const std::array<Item, 2> items = {{
-            {L"tokenizer.json", dir / tok_name,
-             fs::exists(dir / tok_name, ec) || fs::exists(dir / L"tokenizer.json", ec)},
-            {L"open_clip_model.safetensors", dir / weights_name, fs::exists(dir / weights_name, ec)},
-        }};
+            {.remote = L"tokenizer.json", .local = dir / tok_name,
+             .present = fs::exists(dir / tok_name, ec) || fs::exists(dir / L"tokenizer.json", ec),},
+            {.remote = L"open_clip_model.safetensors", .local = dir / weights_name, .present = fs::exists(dir / weights_name, ec)},
+        },};
         for (const Item& item : items) {
             if (item.present) continue;
             report(model_job_, ulp::str::concat_strings(L"Downloading ", item.remote, L" from ", wrepo, L"…"));
@@ -2839,7 +2856,7 @@ private:
             append_to(disp, L" ", a);
         }
         append_venv_log(ulp::str::concat_strings(L"> ", disp));
-        auto on_line = [this](std::string_view out) { append_venv_log(to_wide(out)); };
+        const auto on_line = [this](std::string_view out) { append_venv_log(to_wide(out)); };
         const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false, .capture_stdout = false, .capture_stderr = false}>(
             ulp::win::proc::process_settings{
                 .commandline = full,
@@ -2877,9 +2894,9 @@ private:
         std::vector<int> out;
         int cur = 0;
         bool any = false;
-        for (char c : v) {
+        for (const char c : v) {
             if (c >= '0' && c <= '9') {
-                cur = cur * 10 + (c - '0');
+                cur = (cur * 10) + (c - '0');
                 any = true;
             } else if (c == '.') {
                 out.push_back(cur);
@@ -2909,9 +2926,9 @@ private:
             notify_async("error", "Venv", "NuGet lookup failed", "Unexpected JSON response from api.nuget.org.", "venv-setup");
             return std::nullopt;
         }
-        const bool exact = std::count(want.begin(), want.end(), '.') >= 2 || want.find('-') != std::string::npos;
+        const bool exact = std::ranges::count(want, '.') >= 2 || want.contains('-');
         if (exact) {
-            if (std::find(idx.versions.begin(), idx.versions.end(), want) != idx.versions.end()) return want;
+            if (std::ranges::find(idx.versions, want) != idx.versions.end()) return want;
             const std::wstring msg = ulp::str::concat_strings(L"Python ", wwant, L" is not published on NuGet");
             report(venv_job_, msg, true);
             notify_async("error", "Venv", "Requested Python version unavailable", to_utf8(msg), "venv-setup");
@@ -2993,8 +3010,9 @@ private:
             notify_async("error", "Venv", "ensurepip failed", "Could not bootstrap pip inside portable Python.", "venv-setup");
             return;
         }
-        sh_.call([this, root] {
-            sh_.settings.venv_dir = to_utf8(root.wstring());
+        std::string venv_dir = to_utf8(root.wstring());
+        sh_.call([this, venv_dir = std::move(venv_dir)] mutable {
+            sh_.settings.venv_dir = std::move(venv_dir);
             sh_.save();
             probe_venv();
             invalidate();
@@ -3029,7 +3047,7 @@ private:
             args.insert(args.end(), base_args.begin(), base_args.end());
             for (int i = 0; argv && i < argc; ++i) args.emplace_back(argv[i]);
             torch_ok = exec_logged(py, args);
-            if (argv) LocalFree(argv);
+            if (argv) LocalFree(static_cast<HLOCAL>(argv));
         } else if (in.torch_backend == "manual") {
             append_venv_log(L"Manual PyTorch mode: skipping Torch install, installing requirements.txt…");
         } else if (in.torch_backend == "rocm") {
@@ -3145,8 +3163,11 @@ private:
             scroll_ = target_scroll_;
         } else {
             scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
-            if (std::abs(target_scroll_ - scroll_) < 0.5f) scroll_ = target_scroll_;
-            else moving = true;
+            if (std::abs(target_scroll_ - scroll_) < 0.5f) {
+                scroll_ = target_scroll_;
+            } else {
+                moving = true;
+            }
         }
         if (tab_anim_.step(dt)) moving = true;
         if (sw_hotkey_.step(dt)) moving = true;
@@ -3364,7 +3385,7 @@ private:
         }
         if (recording_hotkey_ && id != IdRecordHotkey) stop_recording();
 
-        auto focus_field = [&](TextField& tf) {
+        const auto focus_field = [&](TextField& tf) {
             if (active_field_ && active_field_ != &tf) active_field_->focused = false;
             active_field_ = &tf;
             tf.focused = true;
@@ -3395,7 +3416,7 @@ private:
                 sh_.clear_notifications();
                 break;
             case IdDismissNotif:
-                if (idx >= 0 && idx < static_cast<int>(sh_.notifications.size())) {
+                if (idx >= 0 && std::cmp_less(idx, sh_.notifications.size())) {
                     sh_.dismiss_notification(sh_.notifications[static_cast<size_t>(idx)].id);
                 }
                 break;
@@ -3421,7 +3442,7 @@ private:
                     in_modal_ = false;
                     if (confirmed) {
                         if (sh_.indexer_running) send_launcher_or_notify(Cmd::StopIndex, "stop indexing");
-                        const std::string coll = sh_.settings.model_name;
+                        std::string coll = sh_.settings.model_name;
                         std::error_code ec;
                         fs::remove(failed_path(coll), ec);
                         fs::remove(state_path(), ec);
@@ -3429,14 +3450,14 @@ private:
                         sh_.failed_files.clear();
                         sh_.db_count = 0;
                         sh_.tags.clear();
-                        sh_.engine.post_when_ready([this, coll](Db& db) {
+                        sh_.engine.post_when_ready([this, coll = std::move(coll)](Db& db) mutable {
                             std::string drop_err;
                             const bool ok = db.drop_collection(coll, &drop_err);
                             if (ok) {
                                 TagStore store;
                                 if (store.open(tags_db_path())) (void)store.clear_collection_backfilled(coll);
                             }
-                            sh_.call([this, ok, drop_err, coll] {
+                            sh_.call([this, ok, drop_err = std::move(drop_err), coll = std::move(coll)] {
                                 if (!ok) {
                                     sh_.notify("error", "Database", ulp::str::concat_strings("Failed to drop Qdrant Edge collection '", coll, "'"), drop_err, "db-drop");
                                 }
@@ -3454,12 +3475,12 @@ private:
                 refresh_db_collections();
                 break;
             case IdUseDbModel:
-                if (idx >= 0 && idx < static_cast<int>(db_collections_.size())) {
+                if (idx >= 0 && std::cmp_less(idx, db_collections_.size())) {
                     confirm_and_set_model(db_collections_[idx].name);
                 }
                 break;
             case IdDeleteDb: {
-                if (sh_.indexer_running || idx < 0 || idx >= static_cast<int>(db_collections_.size())) break;
+                if (sh_.indexer_running || idx < 0 || std::cmp_greater_equal(idx, db_collections_.size())) break;
                 const DbCollectionInfo col = db_collections_[idx];
                 const std::wstring count_line = col.count
                     ? ulp::str::concat_strings(format_count(*col.count), *col.count == 1 ? L" indexed file" : L" indexed files")
@@ -3530,7 +3551,7 @@ private:
                             }
                         }
                     }
-                    sh_.call([this, ok, err, total_count, missing_ids = std::move(missing_ids)]() mutable {
+                    sh_.call([this, ok, err, total_count, missing_ids = std::move(missing_ids)] mutable {
                         prune_checking_ = false;
                         if (!ok) {
                             sh_.notify("error", "Tags", "Failed to read tags.db", err, "tags-prune");
@@ -3625,7 +3646,7 @@ private:
                 }
                 break;
             case IdFailedRow:
-                if (idx >= 0 && idx < static_cast<int>(sh_.failed_files.size()) && !sh_.failed_files[idx].path.empty()) {
+                if (idx >= 0 && std::cmp_less(idx, sh_.failed_files.size()) && !sh_.failed_files[idx].path.empty()) {
                     if (std::string rev_err; !reveal_in_explorer(sh_.failed_files[idx].path, &rev_err)) {
                         sh_.notify("error", "Explorer", "Failed to reveal file in Explorer", rev_err, "reveal-failed");
                     }
@@ -3654,7 +3675,7 @@ private:
                 }
                 break;
             case IdRemoveInclude:
-                if (idx >= 0 && idx < static_cast<int>(sh_.settings.include_dirs.size())) {
+                if (idx >= 0 && std::cmp_less(idx, sh_.settings.include_dirs.size())) {
                     sh_.settings.include_dirs.erase(sh_.settings.include_dirs.begin() + idx);
                     include_error_.clear();
                     sh_.save();
@@ -3689,7 +3710,7 @@ private:
             case IdAddExcludePattern: add_exclude_from_field(); break;
             case IdExcludeField: focus_field(exclude_field_); break;
             case IdRemoveExclude:
-                if (idx >= 0 && idx < static_cast<int>(sh_.settings.exclude_dirs.size())) {
+                if (idx >= 0 && std::cmp_less(idx, sh_.settings.exclude_dirs.size())) {
                     sh_.settings.exclude_dirs.erase(sh_.settings.exclude_dirs.begin() + idx);
                     sh_.save();
                 }
@@ -3806,7 +3827,7 @@ private:
                 }
                 break;
             case IdModelChip:
-                if (idx >= 0 && idx < static_cast<int>(models_.size())) {
+                if (idx >= 0 && std::cmp_less(idx, models_.size())) {
                     confirm_and_set_model(models_[idx]);
                 }
                 break;
@@ -3814,12 +3835,12 @@ private:
                 scan_models();
                 break;
             case IdUseDownloadedModel:
-                if (idx >= 0 && idx < static_cast<int>(downloaded_models_.size())) {
+                if (idx >= 0 && std::cmp_less(idx, downloaded_models_.size())) {
                     confirm_and_set_model(downloaded_models_[idx].name);
                 }
                 break;
             case IdDeleteModel: {
-                if (idx < 0 || idx >= static_cast<int>(downloaded_models_.size())) break;
+                if (idx < 0 || std::cmp_greater_equal(idx, downloaded_models_.size())) break;
                 const ModelStorageInfo m = downloaded_models_[idx];
                 const bool is_active = m.name == sh_.settings.model_name;
                 if (is_active && sh_.indexer_running) break;
@@ -3867,7 +3888,7 @@ private:
             case IdBatchField: focus_field(batch_field_); break;
             case IdResetAutoBatch: {
                 // Re-read first: the indexer owns the rest of this file and may have written to it since
-                IndexState st = load_json_file<IndexState>(state_path());
+                auto st = load_json_file<IndexState>(state_path());
                 st.auto_batch = 0;
                 st.auto_batch_key.clear();
                 if (!save_json_file(state_path(), st)) {
@@ -4037,8 +4058,11 @@ private:
         }
         if (active_field_) {
             if (vk == VK_RETURN) {
-                if (active_field_ == &exclude_field_) add_exclude_from_field();
-                else commit_fields();
+                if (active_field_ == &exclude_field_) {
+                    add_exclude_from_field();
+                } else {
+                    commit_fields();
+                }
                 active_field_->focused = false;
                 active_field_ = nullptr;
                 invalidate();
@@ -4088,7 +4112,7 @@ private:
     LRESULT handle(UINT msg, WPARAM wp, LPARAM lp) {
         const auto to_dip = [this](LPARAM l) -> D2D1_POINT_2F {
             const float s = target_.scale();
-            return {GET_X_LPARAM(l) / s, GET_Y_LPARAM(l) / s};
+            return {.x = GET_X_LPARAM(l) / s, .y = GET_Y_LPARAM(l) / s};
         };
         switch (msg) {
             case WM_ERASEBKGND: return 1;
@@ -4112,7 +4136,7 @@ private:
                     const auto* wpos = reinterpret_cast<const WINDOWPOS*>(lp);
                     if (wpos && !(wpos->flags & SWP_NOMOVE)) {
                         RECT win_rc{};
-                        POINT cur_origin{0, 0};
+                        POINT cur_origin{.x = 0, .y = 0};
                         GetWindowRect(hwnd_, &win_rc);
                         ClientToScreen(hwnd_, &cur_origin);
                         const bool size_same = (wpos->flags & SWP_NOSIZE) ||
@@ -4142,13 +4166,16 @@ private:
                 return 0;
             case WM_MOVE:
                 if (glass_active() && visible()) {
-                    POINT cur_origin{0, 0};
+                    POINT cur_origin{.x = 0, .y = 0};
                     ClientToScreen(hwnd_, &cur_origin);
                     if (cur_origin.x != glass_.last_rendered_origin().x ||
                         cur_origin.y != glass_.last_rendered_origin().y) {
                         full_dirty_ = true;
-                        if (in_sizemove_) render();
-                        else invalidate();
+                        if (in_sizemove_) {
+                            render();
+                        } else {
+                            invalidate();
+                        }
                     }
                 }
                 return 0;
@@ -4180,7 +4207,7 @@ private:
             case WM_GETMINMAXINFO: {
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
                 const float s = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
-                mmi->ptMinTrackSize = {static_cast<LONG>(420 * s), static_cast<LONG>(520 * s)};
+                mmi->ptMinTrackSize = {.x = static_cast<LONG>(420 * s), .y = static_cast<LONG>(520 * s)};
                 return 0;
             }
             case WM_SETCURSOR:
@@ -4188,7 +4215,7 @@ private:
                     POINT pt;
                     GetCursorPos(&pt);
                     ScreenToClient(hwnd_, &pt);
-                    const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
+                    const Hit* h = hit_test(hits_, {.x = static_cast<float>(pt.x) / target_.scale(), .y = static_cast<float>(pt.y) / target_.scale()});
                     const int id = h ? h->id : 0;
                     const bool ibeam = id == IdExcludeField || id == IdModelField || id == IdRepoField || id == IdBatchField || id == IdArchField || id == IdCudaField || id == IdTorchField || id == IdPyVerField;
                     SetCursor(ibeam ? cursor_ibeam_ : (id && id != IdLockedExclude ? cursor_hand_ : cursor_arrow_));
@@ -4197,20 +4224,20 @@ private:
                 break;
             case WM_MOUSEMOVE: {
                 if (!tracking_) {
-                    TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
+                    TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd_, .dwHoverTime = 0};
                     TrackMouseEvent(&tme);
                     tracking_ = true;
                 }
                 flush();
                 const D2D1_POINT_2F p = to_dip(lp);
                 if (dragging_scroll_) {
-                    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+                    if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                         dragging_scroll_ = false;
                         ReleaseCapture();
                     } else {
                         const float track = view_height() - 8.0f - height(scroll_thumb_);
                         if (track > 0.0f) {
-                            scroll_ = target_scroll_ = std::clamp(drag_scroll_start_ + (p.y - drag_y_) / track * max_scroll(), 0.0f, max_scroll());
+                            scroll_ = target_scroll_ = std::clamp(drag_scroll_start_ + ((p.y - drag_y_) / track * max_scroll()), 0.0f, max_scroll());
                         }
                         invalidate();
                         return 0;
@@ -4232,8 +4259,11 @@ private:
                     const bool vis_changed = hover_.set(vid, vidx, animate);
                     tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, tooltip_text(id) != nullptr, animate);
                     const bool tip_fading = animate && tooltip_.alpha.active();
-                    if ((vis_changed && animate) || tip_fading) start_anim();
-                    else if (vis_changed) invalidate();
+                    if ((vis_changed && animate) || tip_fading) {
+                        start_anim();
+                    } else if (vis_changed) {
+                        invalidate();
+                    }
                 }
                 return 0;
             }
@@ -4247,8 +4277,11 @@ private:
                     raw_hover_id_ = IdNone;
                     raw_hover_index_ = 0;
                     hover_.set(IdNone, 0, animate);
-                    if (animate) start_anim();
-                    else invalidate();
+                    if (animate) {
+                        start_anim();
+                    } else {
+                        invalidate();
+                    }
                 } else if (animate && tooltip_.alpha.active()) {
                     start_anim();
                 }
@@ -4328,8 +4361,11 @@ private:
                         const wchar_t* tip = tooltip_text(raw_hover_id_);
                         const bool animate = visible() && !sh_.test_mode;
                         if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, raw_hover_id_ != IdNone && tip != nullptr, tip ? tip : L"", {}, animate)) {
-                            if (animate) start_anim();
-                            else invalidate();
+                            if (animate) {
+                                start_anim();
+                            } else {
+                                invalidate();
+                            }
                         }
                         return 0;
                     }
@@ -4339,6 +4375,8 @@ private:
                             invalidate();
                         }
                         return 0;
+                    default:
+                        break;
                 }
                 return 0;
             case WM_APP_REDRAW:
@@ -4348,6 +4386,8 @@ private:
             case WM_CLOSE:
                 hide();
                 return 0;
+            default:
+                break;
         }
         return DefWindowProcW(hwnd_, msg, wp, lp);
     }

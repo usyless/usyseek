@@ -62,8 +62,8 @@ inline std::pair<int64_t, uint64_t> notifications_file_stamp() {
     if (!GetFileAttributesExW(notifications_path().c_str(), GetFileExInfoStandard, &fad)) {
         return {0, 0};
     }
-    const int64_t t = (static_cast<int64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) | fad.ftLastWriteTime.dwLowDateTime;
-    const uint64_t sz = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+    const auto t = static_cast<int64_t>((static_cast<uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32u) | fad.ftLastWriteTime.dwLowDateTime);
+    const uint64_t sz = (static_cast<uint64_t>(fad.nFileSizeHigh) << 32u) | fad.nFileSizeLow;
     return {t, sz};
 }
 

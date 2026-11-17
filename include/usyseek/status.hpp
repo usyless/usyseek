@@ -4,6 +4,8 @@
 
 #include <wil/resource.h>
 
+#include <array>
+
 namespace usyseek {
 
 enum class Phase : uint8_t {
@@ -47,9 +49,9 @@ struct StatusData {
     float rate = 0.0f;       // files / second
     uint32_t batch = 0;
     int64_t started_unix = 0;
-    wchar_t current[520]{};
-    wchar_t device[96]{};
-    wchar_t message[260]{};
+    std::array<wchar_t, 520> current{};
+    std::array<wchar_t, 96> device{};
+    std::array<wchar_t, 260> message{};
 };
 
 /// Seqlock over a named file mapping. One writer (the indexer), any number of readers.
@@ -90,7 +92,7 @@ public:
         const auto* s = shared();
         for (int i = 0; i < 64; ++i) {
             const uint32_t a = s->seq.load(std::memory_order_acquire);
-            if (a & 1) {
+            if ((a & 1u) != 0) {
                 YieldProcessor();
                 continue;
             }

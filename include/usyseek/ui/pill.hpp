@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cwctype>
 #include <map>
 #include <ranges>
 #include <set>
@@ -23,7 +24,7 @@ public:
     explicit Pill(Shared& s) : sh_{s} {}
 
     bool create(HINSTANCE inst) {
-        WNDCLASSEXW wc{sizeof(wc)};
+        WNDCLASSEXW wc{.cbSize = sizeof(wc)};
         wc.style = CS_DBLCLKS;
         wc.lpfnWndProc = &Pill::wndproc;
         wc.hInstance = inst;
@@ -188,8 +189,11 @@ public:
     }
 
     void toggle() {
-        if (visible() && !fading_out_ && GetForegroundWindow() == hwnd_) hide();
-        else show();
+        if (visible() && !fading_out_ && GetForegroundWindow() == hwnd_) {
+            hide();
+        } else {
+            show();
+        }
     }
 
     void tray_hide() {
@@ -316,8 +320,11 @@ public:
     }
     /// Test hook: opens the viewer on a result (-1 closes it).
     void test_preview(int index) {
-        if (index < 0) close_preview();
-        else open_preview(index);
+        if (index < 0) {
+            close_preview();
+        } else {
+            open_preview(index);
+        }
     }
     [[nodiscard]] bool preview_loading() const {
         if (!preview_valid()) return false;
@@ -441,13 +448,13 @@ private:
             const POINT saved{.x=sh_.settings.pill_x, .y=sh_.settings.pill_y};
             if (HMONITOR m = MonitorFromPoint(saved, MONITOR_DEFAULTTONULL)) mon = m;
         }
-        MONITORINFO mi{sizeof(mi)};
+        MONITORINFO mi{.cbSize = sizeof(mi)};
         GetMonitorInfoW(mon, &mi);
         UINT dpi_x = 96;
         UINT dpi_y = 96;
         GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y);
         const float s = static_cast<float>(dpi_x) / 96.0f;
-        const int w = static_cast<int>((sh_.settings.pill_w > 0 ? sh_.settings.pill_w : DEFAULT_W) * s);
+        const int w = static_cast<int>((sh_.settings.pill_w > 0 ? static_cast<float>(sh_.settings.pill_w) : DEFAULT_W) * s);
         const int h = static_cast<int>(current_height_dip() * s);
         int x = 0;
         int y = 0;
@@ -456,8 +463,8 @@ private:
             y = sh_.settings.pill_y;
         } else {
             const RECT& wa = mi.rcWork;
-            x = wa.left + (wa.right - wa.left - w) / 2;
-            y = wa.top + (wa.bottom - wa.top) / 5;
+            x = wa.left + ((wa.right - wa.left - w) / 2);
+            y = wa.top + ((wa.bottom - wa.top) / 5);
         }
         SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
     }
@@ -591,7 +598,7 @@ private:
     [[nodiscard]] float dropdown_height_dip() const noexcept {
         if (!drop_open_) return 0.0f;
         const float row = 32.0f;
-        const float h = drop_items_.empty() ? 44.0f : 8.0f + row * static_cast<float>(drop_items_.size());
+        const float h = drop_items_.empty() ? 44.0f : (8.0f + (row * static_cast<float>(drop_items_.size())));
         return (HEADER_H - 4.0f) + h + 12.0f;
     }
 
@@ -614,15 +621,15 @@ private:
         GetWindowRect(hwnd_, &wr);
         sh_.settings.pill_x = wr.left;
         sh_.settings.pill_y = wr.top;
-        sh_.settings.pill_w = static_cast<int32_t>((wr.right - wr.left) / target_.scale());
-        if (expanded()) sh_.settings.pill_h = static_cast<int32_t>((wr.bottom - wr.top) / target_.scale());
+        sh_.settings.pill_w = static_cast<int32_t>(static_cast<float>(wr.right - wr.left) / target_.scale());
+        if (expanded()) sh_.settings.pill_h = static_cast<int32_t>(static_cast<float>(wr.bottom - wr.top) / target_.scale());
         sh_.save();
     }
 
     void toggle_fullscreen() {
         if (!fullscreen_) {
             GetWindowRect(hwnd_, &restore_rect_);
-            MONITORINFO mi{sizeof(mi)};
+            MONITORINFO mi{.cbSize = sizeof(mi)};
             GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi);
             fullscreen_ = true;
             apply_window_theme(hwnd_, sh_.theme, true, false);
@@ -811,13 +818,13 @@ private:
         Grid g;
         const D2D1_SIZE_F sz = target_.size();
         g.view = D2D1::RectF(0, HEADER_H + STATUS_H + 1.0f, sz.width, sz.height);
-        const float avail = sz.width - PAD * 2;
+        const float avail = sz.width - (PAD * 2);
         g.cols = cols_for_zoom(avail, effective_grid_zoom());
-        g.card_w = std::floor((avail - GAP * (g.cols - 1)) / g.cols);
+        g.card_w = std::floor((avail - (GAP * static_cast<float>(g.cols - 1))) / static_cast<float>(g.cols));
         g.thumb_h = std::round((g.card_w - 12.0f) * 10.0f / 16.0f);
         g.card_h = g.thumb_h + CARD_BODY_H;
         const int rows = (static_cast<int>(items_.size()) + g.cols - 1) / g.cols;
-        g.content_h = PAD + rows * (g.card_h + GAP) - (rows ? GAP : 0) + PAD + (has_more_ ? 40.0f : 0.0f);
+        g.content_h = PAD + (static_cast<float>(rows) * (g.card_h + GAP)) - (rows != 0 ? GAP : 0.0f) + PAD + (has_more_ ? 40.0f : 0.0f);
         return g;
     }
 
@@ -828,7 +835,7 @@ private:
 
         const Grid old_g = grid();
         const int top_row = std::max(0, static_cast<int>(std::floor((scroll_ - PAD) / (old_g.card_h + GAP))));
-        const float row_y_old = top_row * (old_g.card_h + GAP);
+        const float row_y_old = static_cast<float>(top_row) * (old_g.card_h + GAP);
         const float in_row_frac = (scroll_ > 0.0f && old_g.card_h + GAP > 0.0f)
             ? std::clamp((scroll_ - PAD - row_y_old) / (old_g.card_h + GAP), 0.0f, 1.0f)
             : 0.0f;
@@ -840,7 +847,7 @@ private:
         if (!items_.empty() && scroll_ > 0.0f) {
             const Grid new_g = grid();
             const int new_row = anchor_idx / new_g.cols;
-            scroll_ = target_scroll_ = std::clamp(PAD + (new_row + in_row_frac) * (new_g.card_h + GAP), 0.0f, max_scroll());
+            scroll_ = target_scroll_ = std::clamp(PAD + ((static_cast<float>(new_row) + in_row_frac) * (new_g.card_h + GAP)), 0.0f, max_scroll());
         } else {
             scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
         }
@@ -850,7 +857,7 @@ private:
     }
 
     void step_grid_zoom(int dir) {
-        const float avail = std::max(1.0f, target_.size().width - PAD * 2.0f);
+        const float avail = std::max(1.0f, target_.size().width - (PAD * 2.0f));
         const Grid g = grid();
         if (dir > 0) {
             if (g.cols <= 1) return;
@@ -879,9 +886,10 @@ private:
     }
 
     [[nodiscard]] D2D1_RECT_F card_rect(const Grid& g, int i) const noexcept {
-        const int row = i / g.cols, col = i % g.cols;
-        const float x = PAD + col * (g.card_w + GAP);
-        const float y = g.view.top + PAD + row * (g.card_h + GAP) - scroll_;
+        const int row = i / g.cols;
+        const int col = i % g.cols;
+        const float x = PAD + (static_cast<float>(col) * (g.card_w + GAP));
+        const float y = g.view.top + PAD + (static_cast<float>(row) * (g.card_h + GAP)) - scroll_;
         return rect(x, y, g.card_w, g.card_h);
     }
 
@@ -889,11 +897,17 @@ private:
         if (i < 0) return;
         const Grid g = grid();
         const D2D1_RECT_F r = card_rect(g, i);
-        if (r.top < g.view.top + 4) target_scroll_ = scroll_ + (r.top - g.view.top - PAD);
-        else if (r.bottom > g.view.bottom - 4) target_scroll_ = scroll_ + (r.bottom - g.view.bottom + PAD);
+        if (r.top < g.view.top + 4) {
+            target_scroll_ = scroll_ + (r.top - g.view.top - PAD);
+        } else if (r.bottom > g.view.bottom - 4) {
+            target_scroll_ = scroll_ + (r.bottom - g.view.bottom + PAD);
+        }
         target_scroll_ = std::clamp(target_scroll_, 0.0f, max_scroll());
-        if (animate) start_anim();
-        else scroll_ = target_scroll_;
+        if (animate) {
+            start_anim();
+        } else {
+            scroll_ = target_scroll_;
+        }
     }
 
     void apply_fade() noexcept {
@@ -911,8 +925,11 @@ private:
         const float dt = std::min(raw_dt, 0.05f);
         last_fade_ = now;
         const float step = dt / 0.11f;
-        if (target_fade_ > fade_) fade_ = std::min(target_fade_, fade_ + step);
-        else fade_ = std::max(target_fade_, fade_ - step);
+        if (target_fade_ > fade_) {
+            fade_ = std::min(target_fade_, fade_ + step);
+        } else {
+            fade_ = std::max(target_fade_, fade_ - step);
+        }
         apply_fade();
         if (std::abs(target_fade_ - fade_) < 0.005f) {
             fade_ = target_fade_;
@@ -939,8 +956,11 @@ private:
             scroll_ = target_scroll_;
         } else {
             scroll_ += d * (1.0f - std::exp(-dt * 22.0f));
-            if (std::abs(target_scroll_ - scroll_) < 0.5f) scroll_ = target_scroll_;
-            else moving = true;
+            if (std::abs(target_scroll_ - scroll_) < 0.5f) {
+                scroll_ = target_scroll_;
+            } else {
+                moving = true;
+            }
         }
         if (chip_anim_.step(dt)) moving = true;
         if (hover_.step(dt)) moving = true;
@@ -984,14 +1004,14 @@ private:
             case IdSimilar: title = L"Find similar (Ctrl+S)"; return true;
             case IdCardName:
             case IdCardDir:
-                if (idx >= 0 && idx < static_cast<int>(items_.size())) {
+                if (idx >= 0 && std::cmp_less(idx, items_.size())) {
                     title = items_[idx].name;
                     subtitle = items_[idx].dir;
                     return !title.empty() || !subtitle.empty();
                 }
                 return false;
             case IdCardMoreTags:
-                if (idx >= 0 && idx < static_cast<int>(items_.size())) {
+                if (idx >= 0 && std::cmp_less(idx, items_.size())) {
                     for (size_t k = 0; k < items_[idx].tags_w.size(); ++k) {
                         if (k) title += L", ";
                         title += items_[idx].tags_w[k];
@@ -1112,8 +1132,11 @@ private:
                 }
             }
         } else {
-            if (active) cv.fill_round(r, rad, with_alpha(cv.theme().primary, 0.16f));
-            else if (ha > 0.002f) cv.fill_round(r, rad, with_alpha(cv.theme().on_surface, 0.08f * ha));
+            if (active) {
+                cv.fill_round(r, rad, with_alpha(cv.theme().primary, 0.16f));
+            } else if (ha > 0.002f) {
+                cv.fill_round(r, rad, with_alpha(cv.theme().on_surface, 0.08f * ha));
+            }
         }
         cv.icon(g, r, active ? cv.theme().primary : lerp_color(cv.theme().on_surface_variant, cv.theme().on_surface, ha));
         cv.hit(r, id);
@@ -1125,12 +1148,12 @@ private:
         const D2D1_RECT_F ic = rect(16, cy - 12, 24, 24);
         cv.icon(glyph::search, ic, cv.theme().on_surface_variant, Font::IconLarge);
         const D2D1_COLOR_F dot = status_dot_color();
-        cv.fill_circle({ic.left + 20, ic.top + 20}, 4.5f, cv.theme().bg);
-        cv.fill_circle({ic.left + 20, ic.top + 20}, 3.0f, dot);
+        cv.fill_circle({.x = ic.left + 20, .y = ic.top + 20}, 4.5f, cv.theme().bg);
+        cv.fill_circle({.x = ic.left + 20, .y = ic.top + 20}, 3.0f, dot);
 
         // Right cluster: close, fullscreen, settings | tag, chips
         float x = sz.width - 12;
-        auto btn = [&](wchar_t g, int id, bool active = false) {
+        const auto btn = [&](wchar_t g, int id, bool active = false) {
             x -= 36;
             icon_button(cv, rect(x, cy - 18, 36, 36), g, id, active);
         };
@@ -1268,7 +1291,7 @@ private:
             cv.text(s, rect(x, y, w + 2, STATUS_H), f, c);
             x += w;
         };
-        auto sep = [&] { piece(L"   •   ", cv.theme().outline_variant); };
+        const auto sep = [&] { piece(L"   •   ", cv.theme().outline_variant); };
 
         cv.icon(glyph::clock, rect(x - 2, y + 8, 14, 14), cv.theme().outline, Font::IconSmall);
         x += 16;
@@ -1391,7 +1414,7 @@ private:
         if (items_.empty()) {
             const wchar_t* msg = (searching_ || debounce_pending_) ? L"" : (error_.empty() ? L"No matches" : L"");
             cv.text(msg, D2D1::RectF(g.view.left, g.view.top, g.view.right, g.view.top + 120), Font::Body, cv.theme().outline, Align::Center);
-            if (searching_) draw_spinner(cv, {(g.view.left + g.view.right) / 2, g.view.top + 60});
+            if (searching_) draw_spinner(cv, {.x = (g.view.left + g.view.right) / 2, .y = g.view.top + 60});
         }
 
         const int first_row = std::max(0, static_cast<int>((scroll_ - PAD) / (g.card_h + GAP)));
@@ -1418,7 +1441,7 @@ private:
 
         if (has_more_ && !items_.empty()) {
             const float bottom = g.view.top + g.content_h - scroll_ - PAD - 20;
-            if (loading_more_) draw_spinner(cv, {(g.view.left + g.view.right) / 2, bottom});
+            if (loading_more_) draw_spinner(cv, {.x = (g.view.left + g.view.right) / 2, .y = bottom});
             // Infinite scroll: fetch the next page when nearing the end
             if (!loading_more_ && !searching_ && bottom < g.view.bottom + height(g.view)) {
                 loading_more_ = true;
@@ -1432,7 +1455,7 @@ private:
         if (ms > 0) {
             const float track_h = height(g.view) - 8;
             const float thumb_h = std::max(28.0f, track_h * height(g.view) / g.content_h);
-            const float ty = g.view.top + 4 + (track_h - thumb_h) * (scroll_ / ms);
+            const float ty = g.view.top + 4 + ((track_h - thumb_h) * (scroll_ / ms));
             const float ha = dragging_scroll_ ? 1.0f : hover_.alpha(IdScrollbar);
             const D2D1_RECT_F tr = D2D1::RectF(g.view.right - lerp(7.0f, 9.0f, ha), ty, g.view.right - 3, ty + thumb_h);
             cv.fill_round(tr, 3, with_alpha(cv.theme().on_surface_variant, lerp(0.28f, 0.55f, ha)));
@@ -1444,9 +1467,9 @@ private:
     void draw_spinner(Canvas& cv, D2D1_POINT_2F c) {
         const float t = static_cast<float>(GetTickCount64() % 1200) / 1200.0f;
         for (int i = 0; i < 8; ++i) {
-            const float a = (i / 8.0f + t) * 6.2831853f;
-            const float alpha = 0.15f + 0.85f * (i / 8.0f);
-            cv.fill_circle({c.x + std::cos(a) * 9, c.y + std::sin(a) * 9}, 2.0f, with_alpha(cv.theme().primary, alpha));
+            const float a = ((static_cast<float>(i) / 8.0f) + t) * 6.2831853f;
+            const float alpha = 0.15f + (0.85f * (static_cast<float>(i) / 8.0f));
+            cv.fill_circle({.x = c.x + (std::cos(a) * 9), .y = c.y + (std::sin(a) * 9)}, 2.0f, with_alpha(cv.theme().primary, alpha));
         }
         start_anim();
     }
@@ -1474,9 +1497,13 @@ private:
             draw_glass_box(cv, r, 14, card_fill, card_border, sel ? 2.0f : 1.0f);
         } else {
             cv.fill_round(r, 14, with_alpha(lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha), 0.92f));
-            if (sel) cv.stroke_round(r, 14, cv.theme().primary, 2.0f);
-            else if (focus) cv.stroke_round(r, 14, with_alpha(cv.theme().primary, 0.6f), 1.0f);
-            else cv.stroke_round(r, 14, with_alpha(cv.theme().outline_variant, lerp(0.45f, 0.9f, ha)));
+            if (sel) {
+                cv.stroke_round(r, 14, cv.theme().primary, 2.0f);
+            } else if (focus) {
+                cv.stroke_round(r, 14, with_alpha(cv.theme().primary, 0.6f), 1.0f);
+            } else {
+                cv.stroke_round(r, 14, with_alpha(cv.theme().outline_variant, lerp(0.45f, 0.9f, ha)));
+            }
         }
         cv.hit(r, IdCard, i);
 
@@ -1503,7 +1530,7 @@ private:
         }
         if (ha > 0.002f) {
             const Canvas::ScopedOpacity op{cv, ha};
-            auto overlay_btn = [&](float x, wchar_t g, int id) {
+            const auto overlay_btn = [&](float x, wchar_t g, int id) {
                 const D2D1_RECT_F sb = rect(x, tr.top + 8, 28, 28);
                 const float ba = hover_.alpha(id, i);
                 if (glass_ui) {
@@ -1514,7 +1541,7 @@ private:
                     draw_glass_box(cv, sb, 14.0f, obg, obd, 1.0f, dark ? 0.24f : 0.44f);
                     cv.icon(g, sb, lerp_color(hex(0xffffff), cv.theme().primary, ba), Font::IconSmall);
                 } else {
-                    cv.fill_circle({sb.left + 14, sb.top + 14}, 14, lerp_color(hex(0x000000, 0.55f), with_alpha(cv.theme().surface_high, 0.95f), ba));
+                    cv.fill_circle({.x = sb.left + 14, .y = sb.top + 14}, 14, lerp_color(hex(0x000000, 0.55f), with_alpha(cv.theme().surface_high, 0.95f), ba));
                     cv.icon(g, sb, lerp_color(hex(0xffffff), cv.theme().primary, ba), Font::IconSmall);
                 }
                 cv.hit(sb, id, i);
@@ -1526,7 +1553,8 @@ private:
         }
 
         float y = tr.bottom + 10.0f;
-        const float lx = r.left + 12.0f, rw = g.card_w - 24.0f;
+        const float lx = r.left + 12.0f;
+        const float rw = g.card_w - 24.0f;
         const D2D1_RECT_F name_r = rect(lx, y, rw, 18.0f);
         cv.text(it.name, name_r, Font::BodySemi, cv.theme().on_surface);
         if (cv.measure(it.name, Font::BodySemi) > rw) cv.hit(name_r, IdCardName, i);
@@ -1565,7 +1593,7 @@ private:
         cv.hline(lx, lx + rw, y, with_alpha(cv.theme().outline_variant, 0.6f));
         y += 8.0f;
         cv.text(it.meta, rect(lx, y, rw * 0.62f, 18.0f), Font::MonoSmall, cv.theme().on_surface_variant);
-        cv.text(it.date, rect(lx + rw * 0.5f, y, rw * 0.5f, 18.0f), Font::Caption, cv.theme().outline, Align::Right);
+        cv.text(it.date, rect(lx + (rw * 0.5f), y, rw * 0.5f, 18.0f), Font::Caption, cv.theme().outline, Align::Right);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1578,8 +1606,10 @@ private:
         size_t start = field_.caret;
         while (start > 0 && !iswspace(t[start - 1])) --start;
         const std::wstring_view tok = std::wstring_view{t}.substr(start, field_.caret - start);
-        for (std::wstring_view p : {L"-tag:", L"!tag:", L"tag:"}) {
-            if (tok.size() >= p.size() && _wcsnicmp(tok.data(), p.data(), p.size()) == 0) {
+        for (const std::wstring_view p : {L"-tag:", L"!tag:", L"tag:"}) {
+            if (tok.size() >= p.size() && std::ranges::equal(tok.substr(0, p.size()), p, [](wchar_t a, wchar_t b) noexcept {
+                    return std::towlower(a) == std::towlower(b);
+                })) {
                 return std::pair{lower(tok.substr(p.size())), start + p.size()};
             }
         }
@@ -1608,8 +1638,11 @@ private:
         });
         if (drop_items_.size() > 8) drop_items_.resize(8);
         drop_open_ = !drop_items_.empty() || drop_from_button_;
-        if (drop_items_.empty()) drop_sel_ = -1;
-        else if (drop_sel_ < 0 || drop_sel_ >= static_cast<int>(drop_items_.size())) drop_sel_ = 0;
+        if (drop_items_.empty()) {
+            drop_sel_ = -1;
+        } else if (drop_sel_ < 0 || std::cmp_greater_equal(drop_sel_, drop_items_.size())) {
+            drop_sel_ = 0;
+        }
         apply_height();
     }
 
@@ -1638,7 +1671,7 @@ private:
         const float y = HEADER_H - 4.0f;
         const float w = 300.0f;
         const float row = 32.0f;
-        const float h = drop_items_.empty() ? 44.0f : 8.0f + row * static_cast<float>(drop_items_.size());
+        const float h = drop_items_.empty() ? 44.0f : (8.0f + (row * static_cast<float>(drop_items_.size())));
         const D2D1_RECT_F r = rect(x, y, w, h);
         cv.shadow(r, 12);
         if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 12.0f, 1.8f))) {
@@ -1652,7 +1685,7 @@ private:
         }
         for (size_t i = 0; i < drop_items_.size(); ++i) {
             const auto& t = drop_items_[i];
-            const D2D1_RECT_F rr = rect(x + 4, y + 4 + row * i, w - 8, row);
+            const D2D1_RECT_F rr = rect(x + 4, y + 4 + (row * static_cast<float>(i)), w - 8, row);
             if (std::cmp_equal(i, drop_sel_)) cv.fill_round(rr, 8, with_alpha(cv.theme().primary, 0.14f));
             const D2D1_COLOR_F c = cv.tag_color(t.v);
             cv.fill_circle({.x=rr.left + 14, .y=(rr.top + rr.bottom) / 2}, 4, c);
@@ -1690,7 +1723,7 @@ private:
 
         cv.text(L"SEARCH SYNTAX  ·  CLICK TO INSERT", rect(x + 14.0f, y + 8.0f, HELP_W - 28.0f, 22.0f), Font::Label, cv.theme().primary);
         float ry = y + 34.0f;
-        for (int i = 0; i < static_cast<int>(std::size(HELP_ROWS)); ++i) {
+        for (int i = 0; std::cmp_less(i, std::size(HELP_ROWS)); ++i) {
             const D2D1_RECT_F rr = rect(x + 6.0f, ry, HELP_W - 12.0f, 28.0f);
             if (const float ha = hover_.alpha(IdHelpItem, i); ha > 0.002f && HELP_ROWS[i].insert[0] != 0) {
                 cv.fill_round(rr, 8.0f, with_alpha(cv.theme().primary, 0.12f * ha));
@@ -1705,7 +1738,7 @@ private:
     }
 
     void insert_help_syntax(int index) {
-        if (index < 0 || index >= static_cast<int>(std::size(HELP_ROWS))) return;
+        if (index < 0 || std::cmp_greater_equal(index, std::size(HELP_ROWS))) return;
         const std::wstring_view ins = HELP_ROWS[index].insert;
         if (ins.empty()) return;
         std::wstring t = trim(field_.text);
@@ -1717,8 +1750,11 @@ private:
         clear_hover();
         caret_reset();
         update_dropdown();
-        if (ins.ends_with(L' ')) run_search(0);
-        else apply_height();
+        if (ins.ends_with(L' ')) {
+            run_search(0);
+        } else {
+            apply_height();
+        }
         invalidate();
     }
 
@@ -1766,11 +1802,12 @@ private:
 
     /// 0 = none of the selection has it, 1 = some, 2 = all
     [[nodiscard]] int tag_state(const std::string& tag) const {
-        size_t with = 0, total = 0;
+        size_t with = 0;
+        size_t total = 0;
         for (const auto& it : items_) {
             if (!selected_.contains(it.pt.id)) continue;
             ++total;
-            if (std::find(it.pt.p.t.begin(), it.pt.p.t.end(), tag) != it.pt.p.t.end()) ++with;
+            if (std::ranges::find(it.pt.p.t, tag) != it.pt.p.t.end()) ++with;
         }
         return with == 0 ? 0 : with == total ? 2 : 1;
     }
@@ -1786,17 +1823,21 @@ private:
         for (auto& it : items_) {
             if (!selected_.contains(it.pt.id)) continue;
             auto& t = it.pt.p.t;
-            const auto pos = std::find(t.begin(), t.end(), tag);
-            if (on && pos == t.end()) t.push_back(tag);
-            else if (!on && pos != t.end()) t.erase(pos);
-            else continue;
+            const auto pos = std::ranges::find(t, tag);
+            if (on && pos == t.end()) {
+                t.push_back(tag);
+            } else if (!on && pos != t.end()) {
+                t.erase(pos);
+            } else {
+                continue;
+            }
             it.tags_w.clear();
             it.tags_w.reserve(t.size());
             for (const auto& s : t) it.tags_w.push_back(to_wide(s));
             changes.emplace_back(it.pt.id, it.pt.p.p, t);
         }
         if (changes.empty()) return;
-        if (on && std::find(menu_tags_.begin(), menu_tags_.end(), tag) == menu_tags_.end()) menu_tags_.insert(menu_tags_.begin(), tag);
+        if (on && std::ranges::find(menu_tags_, tag) == menu_tags_.end()) menu_tags_.insert(menu_tags_.begin(), tag);
         sh_.engine.post([this, changes = std::move(changes)](Db& db) {
             const std::string coll = sh_.engine.collection();
             std::string first_err;
@@ -1866,8 +1907,8 @@ private:
 
     [[nodiscard]] D2D1_RECT_F menu_rect() const noexcept {
         const D2D1_SIZE_F sz = target_.size();
-        const float h = static_cast<float>(ActCount) * 36.0f + 16 + 30 + std::min<size_t>(menu_tags_.size(), 10) * 32.0f + 48;
-        float x = std::min(menu_at_.x, sz.width - MENU_W - 8);
+        const float h = (static_cast<float>(ActCount) * 36.0f) + 16.0f + 30.0f + (static_cast<float>(std::min<size_t>(menu_tags_.size(), 10)) * 32.0f) + 48.0f;
+        const float x = std::min(menu_at_.x, sz.width - MENU_W - 8);
         float y = menu_at_.y;
         if (y + h > sz.height - 8) y = std::max(8.0f, sz.height - 8 - h);
         return rect(std::max(8.0f, x), y, MENU_W, h);
@@ -1888,13 +1929,13 @@ private:
             const wchar_t* key;
         };
         static constexpr std::array<Act, ActCount> acts = {{
-            {glyph::open, L"Open", L"Enter"},
-            {glyph::zoom, L"Preview", L"Space"},
-            {glyph::folder, L"Show in Explorer", L"Ctrl+E"},
-            {glyph::similar, L"Find similar", L"Ctrl+S"},
-            {glyph::copy, L"Copy media", L"Ctrl+C"},
-            {glyph::link, L"Copy path", L"Ctrl+Shift+C"},
-        }};
+            {.g = glyph::open, .label = L"Open", .key = L"Enter"},
+            {.g = glyph::zoom, .label = L"Preview", .key = L"Space"},
+            {.g = glyph::folder, .label = L"Show in Explorer", .key = L"Ctrl+E"},
+            {.g = glyph::similar, .label = L"Find similar", .key = L"Ctrl+S"},
+            {.g = glyph::copy, .label = L"Copy media", .key = L"Ctrl+C"},
+            {.g = glyph::link, .label = L"Copy path", .key = L"Ctrl+Shift+C"},
+        },};
         float y = r.top + 6;
         for (int i = 0; i < ActCount; ++i) {
             const D2D1_RECT_F rr = rect(r.left + 6, y, MENU_W - 12, 36);
@@ -1930,7 +1971,7 @@ private:
                 if (st == 1) cv.fill(rect(box.left + 4, box.top + 7, 8, 2), cv.theme().primary);
             }
             const D2D1_COLOR_F c = cv.tag_color(t);
-            cv.fill_circle({rr.left + 40, (rr.top + rr.bottom) / 2}, 3.5f, c);
+            cv.fill_circle({.x = rr.left + 40, .y = (rr.top + rr.bottom) / 2}, 3.5f, c);
             cv.text(to_wide(t), D2D1::RectF(rr.left + 50, rr.top, rr.right - 10, rr.bottom), Font::Body, cv.theme().on_surface);
             cv.hit(rr, IdMenuTag, static_cast<int>(i));
             y += 32;
@@ -1948,7 +1989,7 @@ private:
         for (const auto& it : items_) {
             if (selected_.contains(it.pt.id)) sel.push_back(&it);
         }
-        const bool have_index = menu_index_ >= 0 && menu_index_ < static_cast<int>(items_.size());
+        const bool have_index = menu_index_ >= 0 && std::cmp_less(menu_index_, items_.size());
         if (sel.empty() && have_index) sel.push_back(&items_[menu_index_]);
         if (sel.empty()) return;
         // Single-item actions follow the item the menu was opened on (or the keyboard focus)
@@ -1976,6 +2017,8 @@ private:
                 copy_item_text(all);
                 break;
             }
+            default:
+                break;
         }
         invalidate();
     }
@@ -2006,17 +2049,18 @@ private:
         copy_decoding_ = decode;
         ++sh_.background_jobs;
         copy_workers_[id] = std::jthread([this, id, decode, paths = std::move(paths)](const std::stop_token& stop) mutable {
-            ulp::win::COMWrapper<false> com{COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE};
-            auto payload = std::make_shared<ClipboardPayload>();
+            const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_APARTMENTTHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
+            const auto payload = std::make_shared<ClipboardPayload>();
             if (!stop.stop_requested()) {
                 std::optional<Raster> image;
                 std::optional<std::wstring> png;
                 if (decode) {
                     image = decode_image(paths[0], 0, false);
-                    if (image && static_cast<uint64_t>(image->w) * image->h > COPY_MAX_PIXELS) image.reset();
-                    else if (!image) {
-                        const std::string p_utf8 = to_utf8(paths[0]);
-                        sh_.call([this, p_utf8] {
+                    if (image && static_cast<uint64_t>(image->w) * image->h > COPY_MAX_PIXELS) {
+                        image.reset();
+                    } else if (!image) {
+                        std::string p_utf8 = to_utf8(paths[0]);
+                        sh_.call([this, p_utf8 = std::move(p_utf8)] {
                             sh_.notify("warning", "Clipboard", "Copied file link only (image decode failed)",
                                 ulp::str::concat_strings(p_utf8, " exceeded pixel limits or could not be decoded for bitmap paste."), "clipboard-decode");
                         });
@@ -2071,7 +2115,7 @@ private:
     static constexpr float PV_BOTTOM = 44.0f;
     static constexpr float PV_CONTROLS_H = 42.0f;
 
-    [[nodiscard]] bool preview_valid() const noexcept { return preview_ >= 0 && preview_ < static_cast<int>(items_.size()); }
+    [[nodiscard]] bool preview_valid() const noexcept { return preview_ >= 0 && std::cmp_less(preview_, items_.size()); }
 
     [[nodiscard]] bool preview_has_controls() const noexcept {
         if (!preview_valid()) return false;
@@ -2299,7 +2343,7 @@ private:
     }
 
     void open_preview(int index) {
-        if (index < 0 || index >= static_cast<int>(items_.size())) return;
+        if (index < 0 || std::cmp_greater_equal(index, items_.size())) return;
         close_popups();
         clear_hover();
         preview_wheel_ = 0;
@@ -2330,7 +2374,7 @@ private:
         video_.close();
         sh_.previews.clear();
         clear_hover();
-        if (restore_focus && last < static_cast<int>(items_.size())) {
+        if (restore_focus && std::cmp_less(last, items_.size())) {
             focus_ = last;
             field_.focused = false;
             if (last != preview_initial_index_) {
@@ -2376,7 +2420,7 @@ private:
         if (!preview_valid()) return;
         const UINT px = preview_px();
         const auto want = [&](int k) {
-            if (k >= 0 && k < static_cast<int>(items_.size())) {
+            if (k >= 0 && std::cmp_less(k, items_.size())) {
                 sh_.previews.request(items_[static_cast<size_t>(k)].pt.id, item_path(items_[static_cast<size_t>(k)]), px);
             }
         };
@@ -2424,7 +2468,7 @@ private:
             const float kw = expanded_knob ? 20.0f : 15.0f;
             const float kh = expanded_knob ? 13.0f : 11.0f;
             const float krad = kh * 0.5f;
-            const D2D1_RECT_F knob = rect(thumb_x - kw * 0.5f, cy - kh * 0.5f, kw, kh);
+            const D2D1_RECT_F knob = rect(thumb_x - (kw * 0.5f), cy - (kh * 0.5f), kw, kh);
             cv.shadow(knob, krad, 5.0f, 0.34f);
             const D2D1_COLOR_F knob_tint = active_drag
                 ? with_alpha(cv.theme().primary, dark ? 0.36f : 0.30f)
@@ -2631,7 +2675,7 @@ private:
                 cv.hit(rect(c.x - 30, c.y - 30, 60, 60), IdPvPlay);
                 const wchar_t* msg = L"Video playback failed — click Play to open externally";
                 const float mw = cv.measure(msg, Font::Caption) + 20.0f;
-                const D2D1_RECT_F badge = rect(c.x - mw * 0.5f, c.y + 38.0f, mw, 24.0f);
+                const D2D1_RECT_F badge = rect(c.x - (mw * 0.5f), c.y + 38.0f, mw, 24.0f);
                 cv.fill_round(badge, 12.0f, hex(0x000000, 0.72f));
                 cv.text(msg, badge, Font::Caption, cv.theme().amber, Align::Center);
             }
@@ -2680,7 +2724,7 @@ private:
         // Title bar: name and folder, position, actions
         float x = sz.width - 12;
         const float cy = PV_TOP / 2;
-        auto btn = [&](wchar_t g, int id) {
+        const auto btn = [&](wchar_t g, int id) {
             x -= 36;
             icon_button(cv, rect(x, cy - 18, 36, 36), g, id);
         };
@@ -3028,7 +3072,7 @@ private:
         drag_pending_ = false;
         deferred_select_.reset();
         ReleaseCapture();
-        if (drag_index_ < 0 || drag_index_ >= static_cast<int>(items_.size())) return;
+        if (drag_index_ < 0 || std::cmp_greater_equal(drag_index_, items_.size())) return;
         const uint64_t id = items_[drag_index_].pt.id;
         if (!selected_.contains(id)) selected_ = {id};
         std::vector<std::wstring> paths;
@@ -3064,7 +3108,7 @@ private:
 
     [[nodiscard]] D2D1_POINT_2F to_dip(LPARAM lp) const noexcept {
         const float s = target_.scale();
-        return {GET_X_LPARAM(lp) / s, GET_Y_LPARAM(lp) / s};
+        return {.x = GET_X_LPARAM(lp) / s, .y = GET_Y_LPARAM(lp) / s};
     }
 
     void caret_reset() noexcept {
@@ -3076,12 +3120,12 @@ private:
     void on_mouse_move(D2D1_POINT_2F p) {
         if (fading_out_) return;
         if (!tracking_) {
-            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd_, 0};
+            TRACKMOUSEEVENT tme{.cbSize = sizeof(tme), .dwFlags = TME_LEAVE, .hwndTrack = hwnd_, .dwHoverTime = 0};
             TrackMouseEvent(&tme);
             tracking_ = true;
         }
         if (drag_pending_) {
-            if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+            if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                 end_drag_detect();
                 ReleaseCapture();
             } else {
@@ -3116,21 +3160,21 @@ private:
             }
         }
         if (dragging_scroll_) {
-            if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+            if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                 dragging_scroll_ = false;
                 ReleaseCapture();
             } else {
                 const Grid g = grid();
                 const float track = height(g.view) - 8 - height(scroll_thumb_);
                 if (track > 0) {
-                    scroll_ = target_scroll_ = std::clamp(drag_scroll_start_ + (p.y - drag_y_) / track * max_scroll(), 0.0f, max_scroll());
+                    scroll_ = target_scroll_ = std::clamp(drag_scroll_start_ + ((p.y - drag_y_) / track * max_scroll()), 0.0f, max_scroll());
                 }
                 invalidate();
                 return;
             }
         }
         if (selecting_text_) {
-            if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+            if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                 selecting_text_ = false;
                 ReleaseCapture();
             } else {
@@ -3163,7 +3207,8 @@ private:
             const bool item_changed = hover_.set(vid, vidx, animate);
             const bool card_changed = card_hover_.set(cid, cidx, animate);
             const bool vis_changed = item_changed || card_changed;
-            std::wstring tt, ts;
+            std::wstring tt;
+            std::wstring ts;
             const bool can_tip = !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_ && tooltip_for(id, idx, tt, ts);
             tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, can_tip, animate);
             const bool tip_fading = animate && tooltip_.alpha.active();
@@ -3171,8 +3216,11 @@ private:
                 full_dirty_ = true;
                 apply_height();
             }
-            if ((vis_changed && animate) || tip_fading) start_anim();
-            else if (vis_changed) invalidate();
+            if ((vis_changed && animate) || tip_fading) {
+                start_anim();
+            } else if (vis_changed) {
+                invalidate();
+            }
         }
     }
 
@@ -3192,7 +3240,8 @@ private:
         const Hit* h = hit_test(hits_, p);
         const int id = h ? h->id : IdNone;
         const int idx = h ? h->index : 0;
-        const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+        const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+        const bool shift = GetKeyState(VK_SHIFT) < 0;
         if (dbl && swallow_dbl_) {
             swallow_dbl_ = false;
             return;
@@ -3258,13 +3307,19 @@ private:
                 break;
             case IdNotifyBtn:
             case IdStatusNotify:
-                if (sh_.open_notifications) sh_.open_notifications();
-                else if (sh_.open_settings) sh_.open_settings();
+                if (sh_.open_notifications) {
+                    sh_.open_notifications();
+                } else if (sh_.open_settings) {
+                    sh_.open_settings();
+                }
                 return;
             case IdZoomReset: set_grid_zoom(GRID_ZOOM_MIN); return;
             case IdSettings:
-                if (sh_.open_settings) sh_.open_settings();
-                else hide();
+                if (sh_.open_settings) {
+                    sh_.open_settings();
+                } else {
+                    hide();
+                }
                 return;
             case IdFullscreen: toggle_fullscreen(); return;
             case IdClose: hide(); return;
@@ -3312,7 +3367,7 @@ private:
                     drag_scroll_start_ = scroll_;
                 } else {
                     const Grid g = grid();
-                    target_scroll_ = std::clamp((p.y - g.view.top) / height(g.view) * grid().content_h - height(g.view) / 2, 0.0f, max_scroll());
+                    target_scroll_ = std::clamp(((p.y - g.view.top) / height(g.view) * grid().content_h) - (height(g.view) / 2), 0.0f, max_scroll());
                     start_anim();
                 }
                 SetCapture(hwnd_);
@@ -3405,18 +3460,21 @@ private:
             }
             return;
         }
-        target_scroll_ = std::clamp(target_scroll_ - delta * 0.9f, 0.0f, max_scroll());
+        target_scroll_ = std::clamp(target_scroll_ - (static_cast<float>(delta) * 0.9f), 0.0f, max_scroll());
         start_anim();
     }
 
     void move_focus(int dx, int dy) {
         if (items_.empty()) return;
         const Grid g = grid();
-        int f = focus_ < 0 ? 0 : focus_ + dx + dy * g.cols;
+        int f = focus_ < 0 ? 0 : focus_ + dx + (dy * g.cols);
         f = std::clamp(f, 0, static_cast<int>(items_.size()) - 1);
         focus_ = f;
-        if (GetKeyState(VK_SHIFT) < 0) selected_.insert(items_[f].pt.id);
-        else selected_ = {items_[f].pt.id};
+        if (GetKeyState(VK_SHIFT) < 0) {
+            selected_.insert(items_[f].pt.id);
+        } else {
+            selected_ = {items_[f].pt.id};
+        }
         field_.focused = false;
         scroll_to(f);
         invalidate();
@@ -3429,14 +3487,19 @@ private:
         // A bare modifier press must not pull focus back to the search field before the chord's key arrives
         if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN || vk == VK_CAPITAL) return;
         if (vk == VK_ESCAPE) {
-            if (menu_open_ || drop_open_ || help_pinned_) close_popups();
-            else if (preview_ >= 0) close_preview();
-            else if (fullscreen_) toggle_fullscreen();
-            else if (!selected_.empty() && !field_.focused) {
+            if (menu_open_ || drop_open_ || help_pinned_) {
+                close_popups();
+            } else if (preview_ >= 0) {
+                close_preview();
+            } else if (fullscreen_) {
+                toggle_fullscreen();
+            } else if (!selected_.empty() && !field_.focused) {
                 selected_.clear();
                 focus_ = -1;
                 field_.focused = true;
-            } else hide();
+            } else {
+                hide();
+            }
             invalidate();
             return;
         }
@@ -3498,14 +3561,17 @@ private:
             if (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) { step_grid_zoom(-1); return; }
             if (vk == '0' || vk == VK_NUMPAD0) { set_grid_zoom(GRID_ZOOM_MIN); return; }
         }
-        if (vk == VK_SPACE && !field_.focused && focus_ >= 0 && focus_ < static_cast<int>(items_.size())) {
+        if (vk == VK_SPACE && !field_.focused && focus_ >= 0 && std::cmp_less(focus_, items_.size())) {
             swallow_space_ = true;
             open_preview(focus_);
             return;
         }
         if (vk == VK_RETURN) {
-            if (!field_.focused && focus_ >= 0) menu_action_selected(ActOpen);
-            else run_search(0);
+            if (!field_.focused && focus_ >= 0) {
+                menu_action_selected(ActOpen);
+            } else {
+                run_search(0);
+            }
             return;
         }
         if (vk == VK_DOWN || (vk == VK_UP && !field_.focused) || (!field_.focused && (vk == VK_LEFT || vk == VK_RIGHT))) {
@@ -3524,8 +3590,11 @@ private:
             focus_ = -1;
         }
         bool handled = false;
-        if (field_.on_key(hwnd_, vk, handled)) schedule_search();
-        else update_dropdown();
+        if (field_.on_key(hwnd_, vk, handled)) {
+            schedule_search();
+        } else {
+            update_dropdown();
+        }
         caret_reset();
         invalidate();
     }
@@ -3559,13 +3628,16 @@ private:
 
     LRESULT hit_test_nc(LPARAM lp) {
         flush();
-        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        POINT pt{.x = GET_X_LPARAM(lp), .y = GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd_, &pt);
         RECT rc;
         GetClientRect(hwnd_, &rc);
         if (fullscreen_) return HTCLIENT;
         const int b = static_cast<int>(6 * target_.scale());
-        const bool l = pt.x < b, r = pt.x >= rc.right - b, t = pt.y < b, btm = pt.y >= rc.bottom - b;
+        const bool l = pt.x < b;
+        const bool r = pt.x >= rc.right - b;
+        const bool t = pt.y < b;
+        const bool btm = pt.y >= rc.bottom - b;
         const bool vert = expanded();
         if (t && l && vert) return HTTOPLEFT;
         if (t && r && vert) return HTTOPRIGHT;
@@ -3575,7 +3647,7 @@ private:
         if (r) return HTRIGHT;
         if (t && vert) return HTTOP;
         if (btm && vert) return HTBOTTOM;
-        const D2D1_POINT_2F p{pt.x / target_.scale(), pt.y / target_.scale()};
+        const D2D1_POINT_2F p{.x = static_cast<float>(pt.x) / target_.scale(), .y = static_cast<float>(pt.y) / target_.scale()};
         if (p.y < HEADER_H + STATUS_H && !menu_open_ && !drop_open_ && !show_help()) {
             const Hit* h = hit_test(hits_, p);
             if (!h) return HTCAPTION;
@@ -3642,7 +3714,7 @@ private:
                     const auto* wpos = reinterpret_cast<const WINDOWPOS*>(lp);
                     if (wpos && !(wpos->flags & SWP_NOMOVE)) {
                         RECT win_rc{};
-                        POINT cur_origin{0, 0};
+                        POINT cur_origin{.x = 0, .y = 0};
                         GetWindowRect(hwnd_, &win_rc);
                         ClientToScreen(hwnd_, &cur_origin);
                         const bool size_same = (wpos->flags & SWP_NOSIZE) ||
@@ -3672,13 +3744,16 @@ private:
                 return 0;
             case WM_MOVE:
                 if (glass_active() && visible()) {
-                    POINT cur_origin{0, 0};
+                    POINT cur_origin{.x = 0, .y = 0};
                     ClientToScreen(hwnd_, &cur_origin);
                     if (cur_origin.x != glass_.last_rendered_origin().x ||
                         cur_origin.y != glass_.last_rendered_origin().y) {
                         full_dirty_ = true;
-                        if (in_sizemove_) render();
-                        else invalidate();
+                        if (in_sizemove_) {
+                            render();
+                        } else {
+                            invalidate();
+                        }
                     }
                 }
                 return 0;
@@ -3711,7 +3786,7 @@ private:
             case WM_GETMINMAXINFO: {
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
                 const float s = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
-                mmi->ptMinTrackSize = {static_cast<LONG>(520 * s), static_cast<LONG>((HEADER_H + STATUS_H) * s)};
+                mmi->ptMinTrackSize = {.x = static_cast<LONG>(520 * s), .y = static_cast<LONG>((HEADER_H + STATUS_H) * s)};
                 return 0;
             }
             case WM_ACTIVATE:
@@ -3741,7 +3816,7 @@ private:
                     POINT pt;
                     GetCursorPos(&pt);
                     ScreenToClient(hwnd_, &pt);
-                    const Hit* h = hit_test(hits_, {pt.x / target_.scale(), pt.y / target_.scale()});
+                    const Hit* h = hit_test(hits_, {.x = static_cast<float>(pt.x) / target_.scale(), .y = static_cast<float>(pt.y) / target_.scale()});
                     const int id = h ? h->id : 0;
                     SetCursor(id == IdField || id == IdMenuField ? cursor_ibeam_ : (id == IdNone || id == IdGrid || id == IdMenu || id == IdDrop || id == IdHelp || id == IdCard || id == IdCardName || id == IdCardDir || id == IdPreview || id == IdPvImage || id == IdPvPath || id == IdPvBar) ? cursor_arrow_ : cursor_hand_);
                     return TRUE;
@@ -3759,8 +3834,11 @@ private:
                         full_dirty_ = true;
                         apply_height();
                     }
-                    if (animate) start_anim();
-                    else invalidate();
+                    if (animate) {
+                        start_anim();
+                    } else {
+                        invalidate();
+                    }
                 } else if (animate && tooltip_.alpha.active()) {
                     start_anim();
                 }
@@ -3823,12 +3901,16 @@ private:
                     }
                     case TIMER_COPY: set_clipboard(); return 0;
                     case TIMER_TOOLTIP: {
-                        std::wstring tt, ts;
+                        std::wstring tt;
+                        std::wstring ts;
                         const bool allow = raw_hover_id_ != IdNone && !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_ && tooltip_for(raw_hover_id_, raw_hover_index_, tt, ts);
                         const bool animate = visible() && !sh_.test_mode;
                         if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, allow, std::move(tt), std::move(ts), animate)) {
-                            if (animate) start_anim();
-                            else invalidate();
+                            if (animate) {
+                                start_anim();
+                            } else {
+                                invalidate();
+                            }
                         }
                         return 0;
                     }
@@ -3840,6 +3922,8 @@ private:
                             invalidate();
                         }
                         return 0;
+                    default:
+                        break;
                 }
                 return 0;
             case WM_APP_THUMBS: on_thumbs(); return 0;
@@ -3851,11 +3935,12 @@ private:
                 } else if (wp == 2) {
                     invalidate();
                 } else if (lp) {
-                    std::unique_ptr<std::function<void()>> fn{reinterpret_cast<std::function<void()>*>(lp)};
+                    const std::unique_ptr<std::function<void()>> fn{reinterpret_cast<std::function<void()>*>(lp)};
                     (*fn)();
                 }
                 return 0;
             case WM_CLOSE: hide(); return 0;
+            default: break;
         }
         return DefWindowProcW(hwnd_, msg, wp, lp);
     }

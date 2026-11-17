@@ -49,7 +49,7 @@ public:
         db_want_event_.reset(CreateEventW(nullptr, TRUE, FALSE, INDEXER_DB_WANT_EVENT));
         taskbar_created_ = RegisterWindowMessageW(L"TaskbarCreated");
 
-        WNDCLASSEXW wc{sizeof(wc)};
+        WNDCLASSEXW wc{.cbSize = sizeof(wc)};
         wc.lpfnWndProc = &Launcher::wndproc;
         wc.hInstance = inst;
         wc.lpszClassName = LAUNCHER_CLASS;
@@ -142,9 +142,15 @@ private:
                         show_menu();
                         break;
                     case NIN_BALLOONUSERCLICK:
-                        if (balloon_target_ == BalloonTarget::Notifications) open_notifications();
-                        else if (balloon_target_ == BalloonTarget::About) open_settings(3);
-                        else open_settings();
+                        if (balloon_target_ == BalloonTarget::Notifications) {
+                            open_notifications();
+                        } else if (balloon_target_ == BalloonTarget::About) {
+                            open_settings(3);
+                        } else {
+                            open_settings();
+                        }
+                        break;
+                    default:
                         break;
                 }
                 return 0;
@@ -161,13 +167,18 @@ private:
                             "indexer-force-stop", true);
                     }
                 } else if (wp == TIMER_TRAY_PROGRESS) {
-                    if (indexer_.hProcess) update_tip();
-                    else KillTimer(hwnd, TIMER_TRAY_PROGRESS);
+                    if (indexer_.hProcess) {
+                        update_tip();
+                    } else {
+                        KillTimer(hwnd, TIMER_TRAY_PROGRESS);
+                    }
                 }
                 return 0;
             case WM_DESTROY:
                 PostQuitMessage(0);
                 return 0;
+            default:
+                break;
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -197,8 +208,11 @@ private:
                 return TRUE;
             case Cmd::SuspendHotkey:
                 // The UI is recording a new shortcut: release the key but keep reporting the real state
-                if (payload(uint32_t{0})) UnregisterHotKey(hwnd_, HOTKEY_ID);
-                else register_hotkey();
+                if (payload(uint32_t{0})) {
+                    UnregisterHotKey(hwnd_, HOTKEY_ID);
+                } else {
+                    register_hotkey();
+                }
                 return TRUE;
             case Cmd::HotkeyStatus:
                 return static_cast<LRESULT>(hotkey_state_);
@@ -338,7 +352,7 @@ private:
             }
             ui_.reset();
         } else if (ext_pid != 0 && ext_pid != GetCurrentProcessId()) {
-            wil::unique_handle proc{OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, ext_pid)};
+            const wil::unique_handle proc{OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, ext_pid)};
             if (proc) {
                 if (WaitForSingleObject(proc.get(), 400) != WAIT_OBJECT_0) {
                     TerminateProcess(proc.get(), 0);
@@ -357,8 +371,8 @@ private:
 
         std::error_code ec;
         fs::create_directories(data_dir(), ec);
-        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
-        wil::unique_hfile log_file{CreateFileW((data_dir() / L"indexer.log").c_str(), GENERIC_WRITE,
+        SECURITY_ATTRIBUTES sa{.nLength = sizeof(sa), .lpSecurityDescriptor = nullptr, .bInheritHandle = TRUE};
+        const wil::unique_hfile log_file{CreateFileW((data_dir() / L"indexer.log").c_str(), GENERIC_WRITE,
                                                FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS,
                                                FILE_ATTRIBUTE_NORMAL, nullptr)};
         indexer_ = spawn(exe_dir() / L"usyseek-indexer.exe", L"", true, log_file.get());
@@ -420,7 +434,7 @@ private:
             std::wstring status_msg;
             if (auto b = indexer_status_ ? std::move(indexer_status_) : StatusBlock::open()) {
                 const StatusData d = b->read();
-                if (d.message[0]) status_msg = d.message;
+                if (d.message[0]) status_msg = d.message.data();
             }
             indexer_status_.reset();
             close_everything_instance();
@@ -494,7 +508,7 @@ private:
     }
 
     NOTIFYICONDATAW tray_data() const noexcept {
-        NOTIFYICONDATAW nid{sizeof(nid)};
+        NOTIFYICONDATAW nid{.cbSize = sizeof(nid)};
         nid.hWnd = hwnd_;
         nid.uID = TRAY_ID;
         return nid;
@@ -521,7 +535,7 @@ private:
     }
 
     static std::string read_indexer_log_error() {
-        wil::unique_hfile f{CreateFileW((data_dir() / L"indexer.log").c_str(), GENERIC_READ,
+        const wil::unique_hfile f{CreateFileW((data_dir() / L"indexer.log").c_str(), GENERIC_READ,
                                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                                         FILE_ATTRIBUTE_NORMAL, nullptr)};
         if (!f) return {};
@@ -593,14 +607,14 @@ private:
                 if (d.rate > 0.05f) {
                     append_to(line, L" • ", to_fixed_wstr(d.rate, 1), L"/s");
                     if (d.todo > d.processed) {
-                        const uint64_t rem_ms = static_cast<uint64_t>((d.todo - d.processed) / d.rate * 1000.0f);
+                        const auto rem_ms = static_cast<uint64_t>(static_cast<double>(d.todo - d.processed) / d.rate * 1000.0);
                         append_to(line, L" • ETA ", format_duration_ms(rem_ms));
                     }
                 }
                 return line;
             }
             std::wstring line = phase_label(d.phase);
-            if (d.message[0]) append_to(line, L" — ", d.message);
+            if (d.message[0]) append_to(line, L" — ", d.message.data());
             return line;
         }
         return stopping_index_ ? L"Stopping indexer…" : L"Indexing…";
@@ -634,7 +648,7 @@ private:
         if (s.hotkey_mods & MOD_SHIFT) t.append(L"Shift+");
         if (s.hotkey_mods & MOD_WIN) t.append(L"Win+");
         std::array<wchar_t, 64> name; // NOLINT(cppcoreguidelines-pro-type-member-init)
-        const UINT sc = MapVirtualKeyW(s.hotkey_vk, MAPVK_VK_TO_VSC) << 16;
+        const UINT sc = MapVirtualKeyW(s.hotkey_vk, MAPVK_VK_TO_VSC) << 16u;
         if (s.hotkey_vk == VK_SPACE) {
             wcscpy_s(name.data(), name.size(), L"Space");
         } else if (GetKeyNameTextW(static_cast<LONG>(sc), name.data(), static_cast<int>(name.size())) == 0) {
@@ -646,7 +660,7 @@ private:
 
     void show_menu() {
         update_tip();
-        wil::unique_hmenu menu{CreatePopupMenu()};
+        const wil::unique_hmenu menu{CreatePopupMenu()};
         const std::wstring header = status_line();
         AppendMenuW(menu.get(), MF_STRING | MF_DISABLED, 0, header.c_str());
         AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
@@ -791,13 +805,13 @@ void cleanup_update_artifacts(const fs::path& update_dir, const fs::path& target
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc >= 5 && std::wstring_view{argv[1]} == L"--apply-update") {
-        const DWORD wait_pid = static_cast<DWORD>(_wtol(argv[2]));
+        const auto wait_pid = static_cast<DWORD>(_wtol(argv[2]));
         const fs::path staging_root{argv[3]};
         const fs::path target_dir{argv[4]};
         bool open_about = false;
@@ -810,11 +824,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
 
     fs::path cleanup_dir;
     bool open_about = false;
+    bool start_index = false;
     if (argv) {
         for (int i = 1; i < argc; ++i) {
             const std::wstring_view a{argv[i]};
-            if (a == L"--cleanup-update" && i + 1 < argc) cleanup_dir = fs::path{argv[++i]};
-            else if (a == L"--open-about") open_about = true;
+            if (a == L"--cleanup-update" && i + 1 < argc) {
+                cleanup_dir = fs::path{argv[++i]};
+            } else if (a == L"--open-about") {
+                open_about = true;
+            } else if (a == L"--index") {
+                start_index = true;
+            }
         }
         LocalFree(static_cast<HLOCAL>(argv));
     }
@@ -822,12 +842,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
         cleanup_update_artifacts(cleanup_dir, exe_dir());
     }
 
-    wil::unique_mutex_nothrow single{CreateMutexW(nullptr, TRUE, LAUNCHER_MUTEX)};
+    const wil::unique_mutex_nothrow single{CreateMutexW(nullptr, TRUE, LAUNCHER_MUTEX)};
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (HWND existing = FindWindowW(LAUNCHER_CLASS, nullptr)) {
-            const std::wstring_view args{cmdline ? cmdline : L""};
-            if (args.contains(L"--index")) send_cmd(existing, Cmd::StartIndex);
-            else PostMessageW(existing, msg_toggle_search(), 0, 0);
+            if (start_index) {
+                send_cmd(existing, Cmd::StartIndex);
+            } else {
+                PostMessageW(existing, msg_toggle_search(), 0, 0);
+            }
         }
         return 0;
     }
@@ -835,7 +857,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
     ulp::win::dark::init_dark_mode();
 
     Launcher launcher;
-    if (!launcher.init(inst)) {
+    if (!launcher.init(hInstance)) {
         MessageBoxW(nullptr, L"Could not initialize the background usyseek launcher window.", APP_NAME, MB_ICONERROR | MB_OK);
         return 1;
     }

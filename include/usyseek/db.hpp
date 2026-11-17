@@ -110,7 +110,7 @@ public:
     Db(Db&&) = delete;
     Db& operator=(Db&&) = delete;
     ~Db() {
-        std::unique_lock lk{mx_};
+        const std::unique_lock lk{mx_};
         if (q_) {
             usy_qd_free(q_);
             q_ = nullptr;
@@ -118,7 +118,7 @@ public:
     }
 
     bool open(const fs::path& dir, std::string* error = nullptr) {
-        std::unique_lock lk{mx_};
+        const std::unique_lock lk{mx_};
         if (q_) {
             usy_qd_free(q_);
             q_ = nullptr;
@@ -132,7 +132,7 @@ public:
 
     /// Flushes and closes all open edge shards, releasing file locks.
     bool close(std::string* error = nullptr) {
-        std::unique_lock lk{mx_};
+        const std::unique_lock lk{mx_};
         if (!q_) return true;
         RustBuf out;
         const bool ok = usy_qd_close_all(q_, &out.b) == 0;
@@ -143,12 +143,12 @@ public:
     }
 
     [[nodiscard]] bool opened() const noexcept {
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         return q_ != nullptr;
     }
 
     bool flush(std::string_view coll = {}, std::string* error = nullptr) {
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) return true;
         RustBuf out;
         const bool ok = usy_qd_flush(q_, ustr(coll), &out.b) == 0;
@@ -157,7 +157,7 @@ public:
     }
 
     bool optimize(std::string_view coll, std::string* error = nullptr) {
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) return false;
         RustBuf out;
         const bool ok = usy_qd_optimize(q_, ustr(coll), &out.b) == 0;
@@ -173,7 +173,7 @@ public:
 
     /// Checks or creates `name`. Pass `dim == 0` to check existence without requiring dimensions.
     CollectionStatus ensure_collection_status(std::string_view name, uint64_t dim = 0, std::string* error = nullptr) {
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return CollectionStatus::Error;
@@ -193,7 +193,7 @@ public:
                 std::span<const MediaPayload> payloads, std::string* error = nullptr) {
         const std::string_view json = write_json_tls<JSON_SKIP_NULL>(payloads);
         if (json.empty()) return false;
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return false;
@@ -210,7 +210,7 @@ public:
             if (error) *error = "Failed to serialize query request";
             return std::nullopt;
         }
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return std::nullopt;
@@ -229,7 +229,7 @@ public:
             if (error) *error = "Failed to serialize scroll request";
             return std::nullopt;
         }
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return std::nullopt;
@@ -248,7 +248,7 @@ public:
             if (error) *error = "Failed to serialize retrieve request";
             return std::nullopt;
         }
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return std::nullopt;
@@ -270,7 +270,7 @@ public:
             if (error) *error = "Failed to serialize tags payload";
             return false;
         }
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return false;
@@ -283,7 +283,7 @@ public:
 
     bool remove(std::string_view coll, std::span<const uint64_t> ids, std::string* error = nullptr) {
         if (ids.empty()) return true;
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return false;
@@ -295,7 +295,7 @@ public:
     }
 
     bool drop_collection(std::string_view coll, std::string* error = nullptr) {
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return false;
@@ -308,7 +308,7 @@ public:
 
     /// True when `coll` is absent on disk or loads cleanly. False with `error` when loading an on-disk shard fails.
     bool check_collection(std::string_view coll, std::string* error = nullptr) {
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return false;
@@ -320,7 +320,7 @@ public:
     }
 
     std::optional<uint64_t> count(std::string_view coll) {
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) return std::nullopt;
         RustBuf out;
         if (usy_qd_count(q_, ustr(coll), &out.b) != 0) return std::nullopt;
@@ -331,7 +331,7 @@ public:
     }
 
     std::optional<std::vector<DbCollectionInfo>> list_collections(std::string* error = nullptr) {
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return std::nullopt;
@@ -350,7 +350,7 @@ public:
     }
 
     std::vector<TagCount> tags(std::string_view coll, uint64_t limit = 2000) {
-        std::shared_lock lk{mx_};
+        const std::shared_lock lk{mx_};
         std::vector<TagCount> v;
         if (!q_) return v;
         RustBuf out;

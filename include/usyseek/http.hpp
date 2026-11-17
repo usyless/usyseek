@@ -102,6 +102,8 @@ struct Response {
     ~Response() { close(); }
     Response(const Response&) = delete;
     Response& operator=(const Response&) = delete;
+    Response(Response&&) = delete;
+    Response& operator=(Response&&) = delete;
 
     void close() noexcept {
         if (request) {
@@ -187,7 +189,7 @@ inline bool open(const std::wstring& url, uint64_t range_from, Response& r, std:
         error = win_error(L"Could not create request");
         return false;
     }
-    DWORD_PTR ctx = reinterpret_cast<DWORD_PTR>(&r.state);
+    auto ctx = reinterpret_cast<DWORD_PTR>(&r.state);
     if (!WinHttpSetOption(r.request.get(), WINHTTP_OPTION_CONTEXT_VALUE, &ctx, sizeof(ctx)) ||
         WinHttpSetStatusCallback(r.request.get(), &winhttp_callback,
                                  WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS | WINHTTP_CALLBACK_FLAG_HANDLES, 0) == WINHTTP_INVALID_STATUS_CALLBACK) {
@@ -281,7 +283,7 @@ inline std::wstring status_text(DWORD status) {
 } // namespace detail
 
 /// Small GET into memory (API responses). Fails on anything but HTTP 200 or when the body exceeds `max_bytes`.
-inline std::optional<std::string> get(const std::wstring& url, size_t max_bytes = 16u << 20) {
+inline std::optional<std::string> get(const std::wstring& url, size_t max_bytes = 16ull << 20u) {
     detail::Response r;
     std::wstring error;
     if (!detail::open(url, 0, r, error) || r.status != 200) return std::nullopt;
@@ -289,8 +291,8 @@ inline std::optional<std::string> get(const std::wstring& url, size_t max_bytes 
     if (r.content_length > 0 && r.content_length <= max_bytes) {
         out.reserve(static_cast<size_t>(r.content_length));
     }
-    constexpr DWORD CHUNK_CAP = 64u << 10;
-    auto buf = std::make_unique_for_overwrite<char[]>(CHUNK_CAP); // NOLINT(modernize-avoid-c-arrays)
+    constexpr DWORD CHUNK_CAP = 64u << 10u;
+    const auto buf = std::make_unique_for_overwrite<char[]>(CHUNK_CAP); // NOLINT(modernize-avoid-c-arrays)
     for (;;) {
         DWORD got = 0;
         if (!detail::read_chunk(r, buf.get(), CHUNK_CAP, got, error)) return std::nullopt;
@@ -347,8 +349,8 @@ inline Result download(const std::wstring& url, const fs::path& dest, const Prog
     }
 
     uint64_t done = have;
-    constexpr DWORD CHUNK_CAP = 256u << 10;
-    auto buf = std::make_unique_for_overwrite<char[]>(CHUNK_CAP); // NOLINT(modernize-avoid-c-arrays)
+    constexpr DWORD CHUNK_CAP = 256u << 10u;
+    const auto buf = std::make_unique_for_overwrite<char[]>(CHUNK_CAP); // NOLINT(modernize-avoid-c-arrays)
     auto last_report = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     for (;;) {
         DWORD got = 0;

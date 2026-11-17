@@ -2,6 +2,7 @@
 
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
@@ -44,7 +45,7 @@ public:
     ~TagStore() { close(); }
 
     bool open(const std::filesystem::path& db_path, std::string* error = nullptr) {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         close_locked();
 
         std::error_code ec;
@@ -92,12 +93,12 @@ public:
     }
 
     void close() noexcept {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         close_locked();
     }
 
     [[nodiscard]] bool opened() const noexcept {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         return db_ != nullptr;
     }
 
@@ -105,7 +106,7 @@ public:
     template <std::ranges::input_range R>
         requires std::convertible_to<std::ranges::range_reference_t<R>, std::string_view>
     bool set_file_tags(uint64_t id, std::string_view path_utf8, const R& tags, std::string* error = nullptr) {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return false;
 
         std::vector<std::string_view> clean;
@@ -126,20 +127,19 @@ public:
 
             Stmt ins;
             if (!prepare_locked("INSERT OR IGNORE INTO file_tags(file_id, tag) VALUES(?1, ?2);", ins, error)) return false;
-            for (std::string_view t : clean) {
+            return std::ranges::all_of(clean, [&](std::string_view t) {
                 sqlite3_reset(ins.s);
                 sqlite3_clear_bindings(ins.s);
                 sqlite3_bind_int64(ins.s, 1, static_cast<int64_t>(id));
                 sqlite3_bind_text(ins.s, 2, t.data(), static_cast<int>(t.size()), SQLITE_TRANSIENT);
-                if (!step_done_locked(ins.s, error)) return false;
-            }
-            return true;
+                return step_done_locked(ins.s, error);
+            });
         }, error);
     }
 
     /// Unions `entries` into the store inside a single transaction (ignores entries with no tags).
     bool merge_batch(std::span<const TaggedFileEntry> entries, std::string* error = nullptr) {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return false;
         if (entries.empty()) return true;
 
@@ -186,25 +186,24 @@ public:
     }
 
     bool remove_ids(std::span<const uint64_t> ids, std::string* error = nullptr) {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return false;
         if (ids.empty()) return true;
 
         return with_tx_locked([&] {
             Stmt del;
             if (!prepare_locked("DELETE FROM tagged_files WHERE id = ?1;", del, error)) return false;
-            for (uint64_t id : ids) {
+            return std::ranges::all_of(ids, [&](uint64_t id) {
                 sqlite3_reset(del.s);
                 sqlite3_clear_bindings(del.s);
                 sqlite3_bind_int64(del.s, 1, static_cast<int64_t>(id));
-                if (!step_done_locked(del.s, error)) return false;
-            }
-            return true;
+                return step_done_locked(del.s, error);
+            });
         }, error);
     }
 
     [[nodiscard]] std::optional<bool> is_collection_backfilled(std::string_view coll, std::string* error = nullptr) {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return std::nullopt;
         const std::string key = backfill_key(coll);
         Stmt st;
@@ -218,7 +217,7 @@ public:
     }
 
     bool mark_collection_backfilled(std::string_view coll, std::string* error = nullptr) {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return false;
         const std::string key = backfill_key(coll);
         Stmt st;
@@ -230,7 +229,7 @@ public:
     }
 
     bool clear_collection_backfilled(std::string_view coll, std::string* error = nullptr) {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return false;
         const std::string key = backfill_key(coll);
         Stmt st;
@@ -240,7 +239,7 @@ public:
     }
 
     [[nodiscard]] std::optional<std::vector<TaggedFileEntry>> list_all(std::string* error = nullptr) {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return std::nullopt;
 
         Stmt st;
@@ -292,11 +291,11 @@ public:
     }
 
     [[nodiscard]] std::optional<TagStoreStats> stats(std::string* error = nullptr) {
-        std::scoped_lock lk{mx_};
+        const std::scoped_lock lk{mx_};
         if (!require_open_locked(error)) return std::nullopt;
 
         TagStoreStats out;
-        auto count_query = [&](const char* sql, uint64_t& dst) -> bool {
+        const auto count_query = [&](const char* sql, uint64_t& dst) -> bool {
             Stmt st;
             if (!prepare_locked(sql, st, error)) return false;
             const int rc = sqlite3_step(st.s);
@@ -311,7 +310,7 @@ public:
         if (!count_query("SELECT COUNT(*) FROM file_tags;", out.tag_count)) return std::nullopt;
 
         std::error_code ec;
-        auto add_size = [&](const std::filesystem::path& p) {
+        const auto add_size = [&](const std::filesystem::path& p) {
             if (std::filesystem::is_regular_file(p, ec)) {
                 const uint64_t sz = std::filesystem::file_size(p, ec);
                 if (!ec) out.bytes += sz;
@@ -330,6 +329,8 @@ private:
         Stmt() = default;
         Stmt(const Stmt&) = delete;
         Stmt& operator=(const Stmt&) = delete;
+        Stmt(Stmt&&) = delete;
+        Stmt& operator=(Stmt&&) = delete;
         ~Stmt() {
             if (s) sqlite3_finalize(s);
         }

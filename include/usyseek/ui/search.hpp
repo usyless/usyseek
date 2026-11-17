@@ -51,7 +51,7 @@ inline ParsedQuery parse_query(std::wstring_view q) {
     ParsedQuery out;
     std::vector<std::wstring> words;
     size_t i = 0;
-    auto read_value = [&](size_t from) {
+    const auto read_value = [&](size_t from) {
         std::wstring v;
         if (from < q.size() && q[from] == L'"') {
             const size_t end = q.find(L'"', from + 1);
@@ -69,7 +69,12 @@ inline ParsedQuery parse_query(std::wstring_view q) {
         while (i < q.size() && iswspace(q[i])) ++i;
         if (i >= q.size()) break;
         const std::wstring_view rest = q.substr(i);
-        auto starts = [&](std::wstring_view p) { return rest.size() >= p.size() && _wcsnicmp(rest.data(), p.data(), p.size()) == 0; };
+        const auto starts = [&](std::wstring_view p) {
+            return rest.size() >= p.size() &&
+                   std::ranges::equal(rest.substr(0, p.size()), p, [](wchar_t a, wchar_t b) noexcept {
+                       return std::towlower(a) == std::towlower(b);
+                   });
+        };
 
         if (starts(L"similar:")) {
             std::wstring v = trim(q.substr(i + 8));
@@ -78,22 +83,26 @@ inline ParsedQuery parse_query(std::wstring_view q) {
             break;
         }
         if (starts(L"-tag:") || starts(L"!tag:")) {
-            if (auto v = read_value(i + 5); !v.empty()) out.not_tags.push_back(tag_key(v));
+            if (const auto v = read_value(i + 5); !v.empty()) out.not_tags.push_back(tag_key(v));
             continue;
         }
         if (starts(L"tag:")) {
-            if (auto v = read_value(i + 4); !v.empty()) out.tags.push_back(tag_key(v));
+            if (const auto v = read_value(i + 4); !v.empty()) out.tags.push_back(tag_key(v));
             continue;
         }
         if (starts(L"name:")) {
-            if (auto v = read_value(i + 5); !v.empty()) out.names.push_back(to_utf8(v));
+            if (const auto v = read_value(i + 5); !v.empty()) out.names.push_back(to_utf8(v));
             continue;
         }
         if (starts(L"type:")) {
             const std::wstring v = lower(read_value(i + 5));
-            if (v.starts_with(L"im") || v.starts_with(L"ph") || v.starts_with(L"pic")) out.kind = 0;
-            else if (v.starts_with(L"vid")) out.kind = 1;
-            else if (!v.empty()) out.unknown_type = v;
+            if (v.starts_with(L"im") || v.starts_with(L"ph") || v.starts_with(L"pic")) {
+                out.kind = 0;
+            } else if (v.starts_with(L"vid")) {
+                out.kind = 1;
+            } else if (!v.empty()) {
+                out.unknown_type = v;
+            }
             continue;
         }
         if (starts(L"dir:") || starts(L"in:")) {
@@ -109,7 +118,7 @@ inline ParsedQuery parse_query(std::wstring_view q) {
                 v = std::wstring{q.substr(i + off, end == std::wstring_view::npos ? std::wstring_view::npos : end - i - off)};
                 i = end == std::wstring_view::npos ? q.size() : end;
             }
-            if (auto d = normalise_dir(v); !d.empty()) out.dirs.push_back(to_utf8(d));
+            if (const auto d = normalise_dir(v); !d.empty()) out.dirs.push_back(to_utf8(d));
             continue;
         }
         if (looks_like_path(rest)) {
@@ -134,6 +143,11 @@ public:
     enum class State : uint8_t { Idle, Exporting, Loading, Ready, Failed };
     std::function<void()> on_state_changed;
 
+    TextEncoder() = default;
+    TextEncoder(const TextEncoder&) = delete;
+    TextEncoder& operator=(const TextEncoder&) = delete;
+    TextEncoder(TextEncoder&&) = delete;
+    TextEncoder& operator=(TextEncoder&&) = delete;
     ~TextEncoder() { stop(); }
 
     void stop() noexcept {
@@ -242,7 +256,7 @@ public:
             const std::array<const char*, 1> in_names = {model->in_name.c_str()};
             const std::array<const char*, 1> out_names = {model->out_name.c_str()};
             auto out = model->session->Run(Ort::RunOptions{nullptr}, in_names.data(), &input, 1, out_names.data(), 1);
-            const float* p = out[0].GetTensorData<float>();
+            const auto* p = out[0].GetTensorData<float>();
             const size_t n = out[0].GetTensorTypeAndShapeInfo().GetElementCount();
             std::vector<float> v(p, p + n);
 
@@ -281,10 +295,10 @@ private:
     static ModelPaths model_paths(const fs::path& dir, const std::string& name) {
         const std::wstring w = to_wide(name);
         return {
-            dir / ulp::str::concat_strings(w, L".safetensors"),
-            dir / ulp::str::concat_strings(w, L"-text.onnx"),
-            dir / ulp::str::concat_strings(w, L"-tokenizer.json"),
-            dir / L"tokenizer.json",
+            .weights = dir / ulp::str::concat_strings(w, L".safetensors"),
+            .onnx = dir / ulp::str::concat_strings(w, L"-text.onnx"),
+            .tokenizer = dir / ulp::str::concat_strings(w, L"-tokenizer.json"),
+            .shared_tokenizer = dir / L"tokenizer.json",
         };
     }
 
@@ -297,8 +311,8 @@ private:
         for (const fs::path* f : {&p.weights, &p.onnx, &p.tokenizer, &p.shared_tokenizer}) {
             WIN32_FILE_ATTRIBUTE_DATA d{};
             if (GetFileAttributesExW(f->c_str(), GetFileExInfoStandard, &d)) {
-                sig[i] = (static_cast<uint64_t>(d.nFileSizeHigh) << 32) | d.nFileSizeLow;
-                sig[i + 1] = (static_cast<uint64_t>(d.ftLastWriteTime.dwHighDateTime) << 32) | d.ftLastWriteTime.dwLowDateTime;
+                sig[i] = (static_cast<uint64_t>(d.nFileSizeHigh) << 32u) | d.nFileSizeLow;
+                sig[i + 1] = (static_cast<uint64_t>(d.ftLastWriteTime.dwHighDateTime) << 32u) | d.ftLastWriteTime.dwLowDateTime;
             }
             i += 2;
         }
@@ -368,10 +382,10 @@ private:
 
             const fs::path idx_exe = exe_dir() / L"usyseek-indexer.exe";
             std::wstring cmd = ulp::str::concat_strings(L"\"", idx_exe.wstring(), L"\" --export-text");
-            STARTUPINFOW si{sizeof(si)};
+            STARTUPINFOW si{.cb = sizeof(si)};
             si.dwFlags = STARTF_USESHOWWINDOW;
             si.wShowWindow = SW_HIDE;
-            wil::unique_handle job = make_kill_on_close_job();
+            const wil::unique_handle job = make_kill_on_close_job();
             wil::unique_process_information pi;
             if (CreateProcessW(idx_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, exe_dir().c_str(), &si, &pi)) {
                 if (job) AssignProcessToJobObject(job.get(), pi.hProcess);
@@ -405,7 +419,7 @@ private:
         model->session = std::make_unique<Ort::Session>(*env_, paths.onnx.c_str(), so);
         const auto in_shape = model->session->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
         model->ctx = in_shape.size() >= 2 && in_shape[1] > 0 ? static_cast<size_t>(in_shape[1]) : 77;
-        Ort::AllocatorWithDefaultOptions alloc;
+        const Ort::AllocatorWithDefaultOptions alloc;
         model->in_name = model->session->GetInputNameAllocated(0, alloc).get();
         model->out_name = model->session->GetOutputNameAllocated(0, alloc).get();
 
@@ -477,7 +491,7 @@ public:
     void stop() noexcept {
         disarm_db_want_wait();
         {
-            std::scoped_lock lk{m_};
+            const std::scoped_lock lk{m_};
             stopping_ = true;
         }
         cv_.notify_all();
@@ -487,7 +501,7 @@ public:
 
     void set_indexing_active(bool active) noexcept {
         {
-            std::scoped_lock lk{m_};
+            const std::scoped_lock lk{m_};
             indexing_active_hint_ = active;
         }
         cv_.notify_one();
@@ -495,7 +509,7 @@ public:
 
     void search(SearchRequest r) noexcept {
         {
-            std::scoped_lock lk{m_};
+            const std::scoped_lock lk{m_};
             pending_search_ = std::move(r);
         }
         cv_.notify_one();
@@ -503,8 +517,8 @@ public:
 
     void post(std::function<void(Db&)> job, bool notify_if_dropped = true) {
         {
-            std::scoped_lock lk{m_};
-            jobs_.push_back({std::move(job), notify_if_dropped});
+            const std::scoped_lock lk{m_};
+            jobs_.push_back({.fn = std::move(job), .notify_if_dropped = notify_if_dropped});
         }
         cv_.notify_one();
     }
@@ -512,14 +526,14 @@ public:
     /// Runs `job` as soon as the database is open (waiting through an indexing pause if needed).
     void post_when_ready(std::function<void(Db&)> job) {
         {
-            std::scoped_lock lk{m_};
+            const std::scoped_lock lk{m_};
             deferred_jobs_.push_back(std::move(job));
         }
         cv_.notify_one();
     }
 
     void set_settings(const Settings& s) {
-        std::scoped_lock lk{m_};
+        const std::scoped_lock lk{m_};
         settings_ = s;
     }
 
@@ -532,7 +546,7 @@ public:
     [[nodiscard]] bool db_paused_for_indexing() const noexcept { return db_state() == DbState::PausedForIndexing; }
 
     [[nodiscard]] std::string collection() const {
-        std::scoped_lock lk{m_};
+        const std::scoped_lock lk{m_};
         return settings_.model_name;
     }
 
@@ -543,7 +557,7 @@ private:
 
     void arm_db_want_wait() noexcept {
         if (!db_want_event_) return;
-        std::scoped_lock lk{wait_mx_};
+        const std::scoped_lock lk{wait_mx_};
         if (wait_handle_) {
             UnregisterWaitEx(wait_handle_, nullptr);
             wait_handle_ = nullptr;
@@ -552,7 +566,7 @@ private:
     }
 
     void disarm_db_want_wait() noexcept {
-        std::scoped_lock lk{wait_mx_};
+        const std::scoped_lock lk{wait_mx_};
         if (wait_handle_) {
             UnregisterWaitEx(wait_handle_, INVALID_HANDLE_VALUE);
             wait_handle_ = nullptr;
@@ -560,10 +574,10 @@ private:
     }
 
     void run() {
-        ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
+        const ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
         Settings s;
         {
-            std::scoped_lock lk{m_};
+            const std::scoped_lock lk{m_};
             s = settings_;
         }
 
@@ -575,7 +589,7 @@ private:
             }
         };
 
-        auto open_db = [&] {
+        const auto open_db = [&] {
             db_state_.store(DbState::Loading, std::memory_order_release);
             if (on_db_state) on_db_state(false, {});
             std::string err;
@@ -589,7 +603,7 @@ private:
                 if (on_db_state) on_db_state(false, err);
             }
         };
-        auto pause_db = [&] {
+        const auto pause_db = [&] {
             const bool already_paused = db_paused_for_indexing() && !db_.opened();
             std::string err;
             (void)db_.close(&err);
@@ -639,7 +653,7 @@ private:
                         job = std::move(jobs_.front());
                         jobs_.pop_front();
                     } else if (db_ready() && !deferred_jobs_.empty()) {
-                        job = {std::move(deferred_jobs_.front()), true};
+                        job = {.fn = std::move(deferred_jobs_.front()), .notify_if_dropped = true};
                         deferred_jobs_.pop_front();
                     } else if (pending_search_) {
                         req = std::move(pending_search_);
@@ -698,8 +712,11 @@ private:
         if (q.empty()) return res;
 
         DbFilter f;
-        if (q.kind) f.kind = *q.kind;
-        else if (r.kind >= 0) f.kind = r.kind;
+        if (q.kind) {
+            f.kind = *q.kind;
+        } else if (r.kind >= 0) {
+            f.kind = r.kind;
+        }
         f.tags_all = q.tags;
         f.tags_none = q.not_tags;
         f.dirs = q.dirs;

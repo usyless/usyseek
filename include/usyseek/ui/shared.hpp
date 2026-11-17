@@ -34,9 +34,10 @@ inline FixedWString<96> format_hotkey(uint32_t mods, uint32_t vk) noexcept {
     if (mods & MOD_SHIFT) t.append(L"Shift + ");
     if (mods & MOD_WIN) t.append(L"Win + ");
     std::array<wchar_t, 64> name; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    const UINT key_lp = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16u;
     if (vk == VK_SPACE) {
         wcscpy_s(name.data(), name.size(), L"Space");
-    } else if (GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16, name.data(), static_cast<int>(name.size())) == 0) {
+    } else if (GetKeyNameTextW(static_cast<LONG>(key_lp), name.data(), static_cast<int>(name.size())) == 0) {
         name[0] = L'\0';
     }
     t.append(name[0] ? name.data() : L"Key");
@@ -89,8 +90,8 @@ struct Shared {
         const HWND hwnd = call_hwnd.load(std::memory_order_acquire);
         if (!hwnd) return;
         auto p = std::make_unique<std::function<void()>>(std::move(fn));
-        if (!PostMessageW(hwnd, WM_APP_CALL, 0, reinterpret_cast<LPARAM>(p.get()))) return;
-        (void)p.release();
+        const auto* const raw = p.release();
+        if (!PostMessageW(hwnd, WM_APP_CALL, 0, reinterpret_cast<LPARAM>(raw))) delete raw;
     }
 
     void refresh_tags(bool backfill = false) {
@@ -105,8 +106,8 @@ struct Shared {
                 }
             }
             auto t = db.tags(engine.collection());
-            auto c = db.count(engine.collection());
-            call([this, t = std::move(t), c, ts]() mutable {
+            const auto c = db.count(engine.collection());
+            call([this, t = std::move(t), c, ts] mutable {
                 tags = std::move(t);
                 db_count = c;
                 if (ts) tag_store_stats = *ts;
@@ -182,9 +183,9 @@ struct Shared {
     }
 
     void notify(std::string severity, std::string source, std::string title, std::string detail, std::string key = {}) {
-        auto apply = [this, sev = std::move(severity), src = std::move(source), t = std::move(title), d = std::move(detail), k = std::move(key)]() mutable {
+        auto apply = [this, sev = std::move(severity), src = std::move(source), t = std::move(title), d = std::move(detail), k = std::move(key)] mutable {
             if (test_mode) {
-                NotificationStoreData store{test_next_notif_id_++, std::move(notifications)};
+                NotificationStoreData store{.next_id = test_next_notif_id_++, .items = std::move(notifications)};
                 apply_notification(store, sev, src, t, d, k, unix_now());
                 notifications = std::move(store.items);
             } else {
@@ -206,7 +207,7 @@ struct Shared {
 
     void dismiss_notification(uint64_t id) {
         if (test_mode) {
-            NotificationStoreData store{test_next_notif_id_, std::move(notifications)};
+            NotificationStoreData store{.next_id = test_next_notif_id_, .items = std::move(notifications)};
             ::usyseek::dismiss_notification(store, id);
             notifications = std::move(store.items);
         } else {
@@ -228,7 +229,7 @@ struct Shared {
 
     void clear_notification_key(std::string_view source, std::string_view key) {
         if (test_mode) {
-            NotificationStoreData store{test_next_notif_id_, std::move(notifications)};
+            NotificationStoreData store{.next_id = test_next_notif_id_, .items = std::move(notifications)};
             ::usyseek::clear_notification_key(store, source, key);
             notifications = std::move(store.items);
         } else {
@@ -327,7 +328,7 @@ inline void style_window(HWND hwnd, int backdrop, bool round = true) {
 }
 
 inline bool open_file(const std::wstring& path, std::string* error = nullptr) {
-    SHELLEXECUTEINFOW sei{sizeof(sei)};
+    SHELLEXECUTEINFOW sei{.cbSize = sizeof(sei)};
     sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
     sei.lpVerb = L"open";
     sei.lpFile = path.c_str();
@@ -358,7 +359,7 @@ inline bool set_data_bytes(IDataObject* obj, CLIPFORMAT cf, const void* data, si
         std::memcpy(p, data, n);
         GlobalUnlock(h);
     }
-    FORMATETC fe{cf, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    FORMATETC fe{.cfFormat = cf, .ptd = nullptr, .dwAspect = DVASPECT_CONTENT, .lindex = -1, .tymed = TYMED_HGLOBAL};
     STGMEDIUM sm{};
     sm.tymed = TYMED_HGLOBAL;
     sm.hGlobal = h;
@@ -389,12 +390,12 @@ inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring>
     PIDLIST_ABSOLUTE parent = ILCloneFull(pidls.front());
     if (!parent) return nullptr;
     const auto free_parent = wil::scope_exit([&] { ILFree(parent); });
-    ILRemoveLastID(reinterpret_cast<PUIDLIST_RELATIVE>(parent));
+    ILRemoveLastID(parent);
     bool same_parent = true;
-    for (auto* id : pidls) {
+    for (const auto* id : pidls) {
         PIDLIST_ABSOLUTE pp = ILCloneFull(id);
         if (!pp) return nullptr;
-        ILRemoveLastID(reinterpret_cast<PUIDLIST_RELATIVE>(pp));
+        ILRemoveLastID(pp);
         const bool eq = ILIsEqual(pp, parent) != FALSE;
         ILFree(pp);
         if (!eq) {
@@ -404,7 +405,7 @@ inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring>
     }
     std::vector<PCUITEMID_CHILD> children;
     children.reserve(pidls.size());
-    for (auto* id : pidls) children.push_back(same_parent ? ILFindLastID(id) : reinterpret_cast<PCUITEMID_CHILD>(id));
+    for (const auto* id : pidls) children.push_back(same_parent ? ILFindLastID(id) : reinterpret_cast<PCUITEMID_CHILD>(id));
     wil::com_ptr<IDataObject> obj;
     if (FAILED(SHCreateDataObject(same_parent ? parent : nullptr, static_cast<UINT>(children.size()), children.data(), nullptr, IID_PPV_ARGS(&obj)))) return nullptr;
 
@@ -412,7 +413,7 @@ inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring>
     std::vector<uint8_t> buf(sizeof(DROPFILES));
     for (const auto& p : found) {
         const auto* b = reinterpret_cast<const uint8_t*>(p.c_str());
-        buf.insert(buf.end(), b, b + (p.size() + 1) * sizeof(wchar_t));
+        buf.insert(buf.end(), b, b + ((p.size() + 1) * sizeof(wchar_t)));
     }
     buf.insert(buf.end(), sizeof(wchar_t), 0);
     auto* df = reinterpret_cast<DROPFILES*>(buf.data());
@@ -577,10 +578,10 @@ struct ClipboardPayload {
 
 /// Any thread: copies `image` (unpremultiplied BGRA) into a DIB and reads `png_file`.
 inline ClipboardPayload build_clipboard_payload(std::vector<std::wstring> paths, const Raster* image, const std::wstring* png_file) {
-    ClipboardPayload payload{std::move(paths)};
+    ClipboardPayload payload{.paths = std::move(paths)};
     if (image && image->w && image->h) {
         const size_t stride = static_cast<size_t>(image->w) * 4;
-        payload.dib.resize(sizeof(BITMAPINFOHEADER) + stride * image->h);
+        payload.dib.resize(sizeof(BITMAPINFOHEADER) + (stride * image->h));
         auto* bih = reinterpret_cast<BITMAPINFOHEADER*>(payload.dib.data());
         bih->biSize = sizeof(BITMAPINFOHEADER);
         bih->biWidth = static_cast<LONG>(image->w);
@@ -590,13 +591,13 @@ inline ClipboardPayload build_clipboard_payload(std::vector<std::wstring> paths,
         bih->biCompression = BI_RGB;
         bih->biSizeImage = static_cast<DWORD>(stride * image->h);
         for (UINT y = 0; y < image->h; ++y) {
-            std::memcpy(payload.dib.data() + sizeof(BITMAPINFOHEADER) + stride * (image->h - 1 - y), image->pixels.data() + stride * y, stride);
+            std::memcpy(payload.dib.data() + sizeof(BITMAPINFOHEADER) + (stride * (image->h - 1 - y)), image->pixels.data() + (stride * y), stride);
         }
     }
     if (png_file) {
-        wil::unique_hfile f{CreateFileW(png_file->c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr)};
+        const wil::unique_hfile f{CreateFileW(png_file->c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr)};
         LARGE_INTEGER size{};
-        if (f && GetFileSizeEx(f.get(), &size) && size.QuadPart > 0 && size.QuadPart < (256ll << 20)) {
+        if (f && GetFileSizeEx(f.get(), &size) && size.QuadPart > 0 && std::cmp_less(size.QuadPart, 256ull << 20u)) {
             payload.png.resize(static_cast<size_t>(size.QuadPart));
             DWORD read = 0;
             if (!ReadFile(f.get(), payload.png.data(), static_cast<DWORD>(payload.png.size()), &read, nullptr) || read != payload.png.size()) payload.png.clear();
@@ -618,7 +619,7 @@ inline FixedWString<64> format_date(int64_t unix) noexcept {
     FixedWString<64> out;
     if (unix <= 0) return out;
     const uint64_t ft = (static_cast<uint64_t>(unix) + 11'644'473'600ull) * 10'000'000ull;
-    FILETIME f{static_cast<DWORD>(ft), static_cast<DWORD>(ft >> 32)};
+    const FILETIME f{.dwLowDateTime = static_cast<DWORD>(ft), .dwHighDateTime = static_cast<DWORD>(ft >> 32u)};
     FILETIME local;
     SYSTEMTIME st;
     FileTimeToLocalFileTime(&f, &local);
@@ -636,7 +637,7 @@ inline float draw_tag_chip(Canvas& cv, float x, float y, std::wstring_view label
     const D2D1_RECT_F r = rect(x, y, w, 20.0f);
     cv.fill_round(r, 10.0f, with_alpha(col, 0.13f));
     cv.stroke_round(r, 10.0f, with_alpha(col, 0.38f));
-    cv.fill_circle({x + 10.0f, y + 10.0f}, 2.5f, col);
+    cv.fill_circle({.x = x + 10.0f, .y = y + 10.0f}, 2.5f, col);
     cv.text(label, rect(x + 16.0f, y, tw + 2.0f, 20.0f), Font::Caption, col);
     return w;
 }

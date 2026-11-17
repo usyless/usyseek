@@ -34,8 +34,8 @@ inline int kind_of(std::wstring_view path) {
     const auto dot = path.find_last_of(L'.');
     if (dot == std::wstring_view::npos) return -1;
     const std::wstring ext = lower(path.substr(dot + 1));
-    for (auto e : IMAGE_EXTS) if (ext == e) return 0;
-    for (auto e : VIDEO_EXTS) if (ext == e) return 1;
+    for (const auto e : IMAGE_EXTS) if (ext == e) return 0;
+    for (const auto e : VIDEO_EXTS) if (ext == e) return 1;
     return -1;
 }
 
@@ -59,7 +59,7 @@ public:
     }
 
     std::optional<Decoded> image(const std::wstring& path, uint32_t frame_count = 1, std::wstring* reason = nullptr) {
-        auto fail = [&](std::wstring_view msg) -> std::optional<Decoded> {
+        const auto fail = [&](std::wstring_view msg) -> std::optional<Decoded> {
             if (reason) *reason = std::wstring{msg};
             return std::nullopt;
         };
@@ -84,12 +84,13 @@ public:
         wil::com_ptr<IWICBitmapFrameDecode> frame;
         if (FAILED(dec->GetFrame(0, &frame))) return fail(L"Failed to read image frame");
 
-        UINT w = 0, h = 0;
+        UINT w = 0;
+        UINT h = 0;
         if (FAILED(frame->GetSize(&w, &h))) return fail(L"Failed to read image dimensions");
         if (w < 32 || h < 32) return fail(L"Image smaller than 32x32 minimum");
 
         const WICBitmapTransformOptions orient = orientation(frame.get());
-        const bool swapped = (orient & WICBitmapTransformRotate90) != 0;
+        const bool swapped = (static_cast<unsigned>(orient) & static_cast<unsigned>(WICBitmapTransformRotate90)) != 0;
 
         Decoded out;
         out.width = swapped ? h : w;
@@ -101,7 +102,7 @@ public:
     }
 
     std::optional<Decoded> video(const std::wstring& path, uint32_t frame_count, std::wstring* reason = nullptr) {
-        auto fail = [&](std::wstring_view msg) -> std::optional<Decoded> {
+        const auto fail = [&](std::wstring_view msg) -> std::optional<Decoded> {
             if (reason) *reason = std::wstring{msg};
             return std::nullopt;
         };
@@ -114,7 +115,7 @@ public:
             return fail(L"Unsupported video container or unreadable file");
         }
 
-        const DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
+        const auto stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
         reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
         if (FAILED(reader->SetStreamSelection(stream, TRUE))) return fail(L"No video stream found");
 
@@ -134,7 +135,8 @@ public:
 
         wil::com_ptr<IMFMediaType> current;
         if (FAILED(reader->GetCurrentMediaType(stream, &current))) return fail(L"Could not query video stream format");
-        UINT32 w = 0, h = 0;
+        UINT32 w = 0;
+        UINT32 h = 0;
         if (FAILED(MFGetAttributeSize(current.get(), MF_MT_FRAME_SIZE, &w, &h)) || w == 0 || h == 0) {
             return fail(L"Invalid video frame dimensions");
         }
@@ -148,9 +150,13 @@ public:
         PropVariantClear(&dur);
 
         WICBitmapTransformOptions orient = WICBitmapTransformRotate0;
-        if (rotation == 90) orient = WICBitmapTransformRotate90;
-        else if (rotation == 180) orient = WICBitmapTransformRotate180;
-        else if (rotation == 270) orient = WICBitmapTransformRotate270;
+        if (rotation == 90) {
+            orient = WICBitmapTransformRotate90;
+        } else if (rotation == 180) {
+            orient = WICBitmapTransformRotate180;
+        } else if (rotation == 270) {
+            orient = WICBitmapTransformRotate270;
+        }
         const bool swapped = rotation == 90 || rotation == 270;
 
         Decoded out;
@@ -165,7 +171,7 @@ public:
         for (uint32_t k = 0; k < n; ++k) {
             if (duration > 0) {
                 PROPVARIANT pos;
-                InitPropVariantFromInt64(static_cast<LONGLONG>(duration * (2ull * k + 1) / (2ull * n)), &pos);
+                InitPropVariantFromInt64(static_cast<LONGLONG>(duration * ((2ull * k) + 1) / (2ull * n)), &pos);
                 const HRESULT hr = reader->SetCurrentPosition(GUID_NULL, pos);
                 PropVariantClear(&pos);
                 if (FAILED(hr)) {
@@ -178,7 +184,7 @@ public:
                 DWORD flags = 0;
                 LONGLONG ts = 0;
                 if (FAILED(reader->ReadSample(stream, 0, nullptr, &flags, &ts, &sample))) break;
-                if (flags & MF_SOURCE_READERF_ENDOFSTREAM) break;
+                if ((flags & static_cast<DWORD>(MF_SOURCE_READERF_ENDOFSTREAM)) != 0) break;
             }
             if (!sample || !copy_sample(sample.get(), w, h, bgrx_buf_)) continue;
 
@@ -210,7 +216,8 @@ private:
     }
 
     std::optional<Decoded> animated_gif(IWICBitmapDecoder* dec, UINT total, uint32_t frame_count) {
-        UINT cw = 0, ch = 0;
+        UINT cw = 0;
+        UINT ch = 0;
         {
             wil::com_ptr<IWICMetadataQueryReader> gmeta;
             if (SUCCEEDED(dec->GetMetadataQueryReader(&gmeta))) {
@@ -222,7 +229,7 @@ private:
             wil::com_ptr<IWICBitmapFrameDecode> f0;
             if (FAILED(dec->GetFrame(0, &f0)) || FAILED(f0->GetSize(&cw, &ch))) return std::nullopt;
         }
-        if (cw < 32 || ch < 32 || static_cast<uint64_t>(cw) * ch * 4 > (512ull << 20)) return std::nullopt;
+        if (cw < 32 || ch < 32 || static_cast<uint64_t>(cw) * ch * 4 > (512ull << 20u)) return std::nullopt;
 
         const UINT n = std::min<UINT>(total, std::max(1u, frame_count));
         std::vector<UINT> targets;
@@ -231,7 +238,7 @@ private:
             for (UINT i = 0; i < total; ++i) targets.push_back(i);
         } else {
             for (uint32_t k = 0; k < n; ++k) {
-                const UINT idx = static_cast<UINT>((static_cast<uint64_t>(total) * (2ull * k + 1)) / (2ull * n));
+                const UINT idx = static_cast<UINT>((static_cast<uint64_t>(total) * ((2ull * k) + 1)) / (2ull * n));
                 if (targets.empty() || idx > targets.back()) targets.push_back(std::min(idx, total - 1));
             }
         }
@@ -248,10 +255,13 @@ private:
             while (next_target < targets.size() && targets[next_target] < i) ++next_target;
             wil::com_ptr<IWICBitmapFrameDecode> frame;
             if (FAILED(dec->GetFrame(i, &frame))) continue;
-            UINT fw = 0, fh = 0;
+            UINT fw = 0;
+            UINT fh = 0;
             if (FAILED(frame->GetSize(&fw, &fh)) || fw == 0 || fh == 0) continue;
 
-            UINT left = 0, top = 0, disposal = 0;
+            UINT left = 0;
+            UINT top = 0;
+            UINT disposal = 0;
             {
                 wil::com_ptr<IWICMetadataQueryReader> fmeta;
                 if (SUCCEEDED(frame->GetMetadataQueryReader(&fmeta))) {
@@ -267,25 +277,25 @@ private:
             if (FAILED(wic_->CreateFormatConverter(&conv))) continue;
             if (FAILED(conv->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) continue;
             const size_t fstride = static_cast<size_t>(fw) * 4;
-            if (static_cast<uint64_t>(fstride) * fh > (512ull << 20)) continue;
+            if (static_cast<uint64_t>(fstride) * fh > (512ull << 20u)) continue;
             frame_buf_.resize(fstride * fh);
             if (FAILED(conv->CopyPixels(nullptr, static_cast<UINT>(fstride), static_cast<UINT>(frame_buf_.size()), frame_buf_.data()))) continue;
 
             const UINT copy_w = left < cw ? std::min(fw, cw - left) : 0;
             const UINT copy_h = top < ch ? std::min(fh, ch - top) : 0;
             for (UINT y = 0; y < copy_h; ++y) {
-                const uint8_t* src = frame_buf_.data() + static_cast<size_t>(y) * fstride;
-                uint8_t* dst = gif_canvas_.data() + (static_cast<size_t>(top + y) * cw + left) * 4;
+                const uint8_t* src = frame_buf_.data() + (static_cast<size_t>(y) * fstride);
+                uint8_t* dst = gif_canvas_.data() + (((static_cast<size_t>(top + y) * cw) + left) * 4);
                 for (UINT x = 0; x < copy_w; ++x, src += 4, dst += 4) {
                     const uint8_t a = src[3];
                     if (a == 255) {
                         std::memcpy(dst, src, 4);
                     } else if (a > 0) {
                         const uint32_t inv = 255u - a;
-                        dst[0] = static_cast<uint8_t>(std::min<uint32_t>(255, src[0] + (dst[0] * inv + 127) / 255));
-                        dst[1] = static_cast<uint8_t>(std::min<uint32_t>(255, src[1] + (dst[1] * inv + 127) / 255));
-                        dst[2] = static_cast<uint8_t>(std::min<uint32_t>(255, src[2] + (dst[2] * inv + 127) / 255));
-                        dst[3] = static_cast<uint8_t>(std::min<uint32_t>(255, a + (dst[3] * inv + 127) / 255));
+                        dst[0] = static_cast<uint8_t>(std::min<uint32_t>(255, src[0] + (((dst[0] * inv) + 127) / 255)));
+                        dst[1] = static_cast<uint8_t>(std::min<uint32_t>(255, src[1] + (((dst[1] * inv) + 127) / 255)));
+                        dst[2] = static_cast<uint8_t>(std::min<uint32_t>(255, src[2] + (((dst[2] * inv) + 127) / 255)));
+                        dst[3] = static_cast<uint8_t>(std::min<uint32_t>(255, a + (((dst[3] * inv) + 127) / 255)));
                     }
                 }
             }
@@ -304,7 +314,7 @@ private:
 
             if (disposal == 2) {
                 for (UINT y = 0; y < copy_h; ++y) {
-                    std::memset(gif_canvas_.data() + (static_cast<size_t>(top + y) * cw + left) * 4, 0, static_cast<size_t>(copy_w) * 4);
+                    std::memset(gif_canvas_.data() + (((static_cast<size_t>(top + y) * cw) + left) * 4), 0, static_cast<size_t>(copy_w) * 4);
                 }
             } else if (disposal == 3) {
                 gif_canvas_.swap(gif_prev_canvas_);
@@ -342,11 +352,12 @@ private:
         Frame f;
         f.rgb.assign(static_cast<size_t>(size_) * size_ * 3, 0);
         // Contain leaves the bitmap smaller than the input: centre it, like raster images in Longest mode
-        const size_t x0 = (size_ - raster->width) / 2, y0 = (size_ - raster->height) / 2;
+        const size_t x0 = (size_ - raster->width) / 2;
+        const size_t y0 = (size_ - raster->height) / 2;
         const std::span<const uint8_t> src = raster->rgba();
         for (size_t y = 0; y < raster->height; ++y) {
-            const uint8_t* s = src.data() + y * raster->width * 4;
-            uint8_t* d = f.rgb.data() + ((y0 + y) * size_ + x0) * 3;
+            const uint8_t* s = src.data() + (y * raster->width * 4);
+            uint8_t* d = f.rgb.data() + ((((y0 + y) * size_) + x0) * 3);
             for (size_t x = 0; x < raster->width; ++x, s += 4, d += 3) {
                 d[0] = s[0];
                 d[1] = s[1];
@@ -361,11 +372,11 @@ private:
         wil::com_ptr<IMFMediaBuffer> buf;
         if (FAILED(sample->ConvertToContiguousBuffer(&buf))) return false;
         const size_t row = static_cast<size_t>(w) * 4;
-        if (auto b2d = buf.try_query<IMF2DBuffer>()) {
+        if (const auto b2d = buf.try_query<IMF2DBuffer>()) {
             BYTE* scan0 = nullptr;
             LONG pitch = 0;
             if (SUCCEEDED(b2d->Lock2D(&scan0, &pitch))) {
-                for (UINT32 y = 0; y < h; ++y) std::memcpy(dst.data() + y * row, scan0 + static_cast<ptrdiff_t>(y) * pitch, row);
+                for (UINT32 y = 0; y < h; ++y) std::memcpy(dst.data() + (y * row), scan0 + (static_cast<ptrdiff_t>(y) * pitch), row);
                 b2d->Unlock2D();
                 return true;
             }
@@ -375,7 +386,7 @@ private:
         if (FAILED(buf->Lock(&data, nullptr, &len))) return false;
         const bool ok = len >= row * h;
         if (ok) {
-            for (UINT32 y = 0; y < h; ++y) std::memcpy(dst.data() + y * row, data + y * row, row);
+            for (UINT32 y = 0; y < h; ++y) std::memcpy(dst.data() + (y * row), data + (y * row), row);
         }
         buf->Unlock();
         return ok;
@@ -384,7 +395,7 @@ private:
     static double mean_luma(std::span<const uint8_t> rgb) noexcept {
         constexpr size_t step = 21; // every 7th RGB pixel is plenty
         uint64_t sum = 0;
-        for (size_t i = 0; i + 2 < rgb.size(); i += step) sum += (rgb[i] * 77u + rgb[i + 1] * 150u + rgb[i + 2] * 29u) >> 8;
+        for (size_t i = 0; i + 2 < rgb.size(); i += step) sum += ((rgb[i] * 77u) + (rgb[i + 1] * 150u) + (rgb[i + 2] * 29u)) >> 8u;
         const size_t n = rgb.size() / step;
         return n ? static_cast<double>(sum) / static_cast<double>(n) : 0.0;
     }
@@ -401,9 +412,9 @@ private:
             case 2: return WICBitmapTransformFlipHorizontal;
             case 3: return WICBitmapTransformRotate180;
             case 4: return WICBitmapTransformFlipVertical;
-            case 5: return static_cast<WICBitmapTransformOptions>(WICBitmapTransformRotate90 | WICBitmapTransformFlipHorizontal);
+            case 5: return static_cast<WICBitmapTransformOptions>(static_cast<unsigned>(WICBitmapTransformRotate90) | static_cast<unsigned>(WICBitmapTransformFlipHorizontal));
             case 6: return WICBitmapTransformRotate90;
-            case 7: return static_cast<WICBitmapTransformOptions>(WICBitmapTransformRotate270 | WICBitmapTransformFlipHorizontal);
+            case 7: return static_cast<WICBitmapTransformOptions>(static_cast<unsigned>(WICBitmapTransformRotate270) | static_cast<unsigned>(WICBitmapTransformFlipHorizontal));
             case 8: return WICBitmapTransformRotate270;
             default: return WICBitmapTransformRotate0;
         }
@@ -411,12 +422,13 @@ private:
 
     /// Scales (with the JPEG DCT fast path when the source supports it), orients, converts to RGB and crops/pads.
     bool resize(IWICBitmapSource* src, UINT w, UINT h, WICBitmapTransformOptions orient, Frame& out) {
-        const bool swapped = (orient & WICBitmapTransformRotate90) != 0;
+        const bool swapped = (static_cast<unsigned>(orient) & static_cast<unsigned>(WICBitmapTransformRotate90)) != 0;
         const double ow = swapped ? h : w;
         const double oh = swapped ? w : h;
         const UINT S = size_;
 
-        UINT sw = S, sh = S; // oriented scaled size
+        UINT sw = S;
+        UINT sh = S; // oriented scaled size
         if (mode_ == ResizeMode::Shortest || mode_ == ResizeMode::Longest) {
             const double scale = (mode_ == ResizeMode::Shortest) ? S / std::min(ow, oh) : S / std::max(ow, oh);
             sw = std::max(1u, static_cast<UINT>(std::lround(ow * scale)));
@@ -432,7 +444,7 @@ private:
 
         wil::com_ptr<IWICBitmapScaler> scaler;
         if (FAILED(wic_->CreateBitmapScaler(&scaler))) return false;
-        HRESULT hr = scaler->Initialize(src, swapped ? sh : sw, swapped ? sw : sh, WICBitmapInterpolationModeHighQualityCubic);
+        const HRESULT hr = scaler->Initialize(src, swapped ? sh : sw, swapped ? sw : sh, WICBitmapInterpolationModeHighQualityCubic);
         wil::com_ptr<IWICFormatConverter> pre;
         if (FAILED(hr)) {
             // Some pixel formats cannot be scaled directly
@@ -455,15 +467,16 @@ private:
         const UINT stride = S * 3;
         if (mode_ == ResizeMode::Longest) {
             out.rgb.assign(static_cast<size_t>(S) * S * 3, 0);
-            const size_t x0 = (S - sw) / 2, y0 = (S - sh) / 2;
+            const size_t x0 = (S - sw) / 2;
+            const size_t y0 = (S - sh) / 2;
             const size_t row = static_cast<size_t>(sw) * 3;
             resize_tmp_.resize(row * sh);
             if (FAILED(final_src->CopyPixels(nullptr, sw * 3, static_cast<UINT>(resize_tmp_.size()), resize_tmp_.data()))) return false;
-            for (size_t y = 0; y < sh; ++y) std::memcpy(out.rgb.data() + (y0 + y) * stride + x0 * 3, resize_tmp_.data() + y * row, row);
+            for (size_t y = 0; y < sh; ++y) std::memcpy(out.rgb.data() + ((y0 + y) * stride) + (x0 * 3), resize_tmp_.data() + (y * row), row);
             return true;
         }
         out.rgb.resize(static_cast<size_t>(S) * S * 3);
-        const WICRect rc{static_cast<INT>((sw - S) / 2), static_cast<INT>((sh - S) / 2), static_cast<INT>(S), static_cast<INT>(S)};
+        const WICRect rc{.X = static_cast<INT>((sw - S) / 2), .Y = static_cast<INT>((sh - S) / 2), .Width = static_cast<INT>(S), .Height = static_cast<INT>(S)};
         return SUCCEEDED(final_src->CopyPixels(&rc, stride, static_cast<UINT>(out.rgb.size()), out.rgb.data()));
     }
 

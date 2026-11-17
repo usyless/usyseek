@@ -104,7 +104,7 @@ public:
     void reload(std::vector<std::string>* errors = nullptr) {
         entries_.clear();
         static constexpr std::array<std::string_view, 8> builtin_ids = {
-            "system", "accent", "dark", "light", "nord", "mocha", "oled", "liquid-glass"};
+            "system", "accent", "dark", "light", "nord", "mocha", "oled", "liquid-glass",};
         for (const std::string_view id : builtin_ids) {
             Theme t = resolve_builtin_theme(id);
             entries_.emplace_back(std::move(t.id), std::move(t.name), false, fs::path{}, std::nullopt, t.primary);

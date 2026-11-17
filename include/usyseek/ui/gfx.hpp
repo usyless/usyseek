@@ -26,7 +26,7 @@ namespace usyseek::ui {
 class Gfx {
 public:
     bool init() {
-        D2D1_FACTORY_OPTIONS opts{};
+        const D2D1_FACTORY_OPTIONS opts{};
         if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory7), &opts, reinterpret_cast<void**>(&d2d_factory_)))) return false;
         if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory3), reinterpret_cast<IUnknown**>(&dwrite_)))) return false;
         if (FAILED(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_)))) return false;
@@ -59,7 +59,7 @@ public:
     [[nodiscard]] bool adapter_stale(HWND hwnd) const noexcept {
         if (!dxgi_factory_ || !dxgi_factory_->IsCurrent()) return true;
         if (warp_) return false;
-        if (auto a = window_adapter(dxgi_factory_.get(), hwnd)) {
+        if (const auto a = window_adapter(dxgi_factory_.get(), hwnd)) {
             DXGI_ADAPTER_DESC1 d{};
             if (SUCCEEDED(a->GetDesc1(&d))) return d.AdapterLuid.LowPart != luid_.LowPart || d.AdapterLuid.HighPart != luid_.HighPart;
         }
@@ -116,7 +116,7 @@ private:
         if (FAILED(hr)) return false;
 
         if (FAILED(d3d_->QueryInterface(IID_PPV_ARGS(&dxgi_device_)))) return false;
-        if (auto d1 = dxgi_device_.try_query<IDXGIDevice1>()) d1->SetMaximumFrameLatency(1);
+        if (const auto d1 = dxgi_device_.try_query<IDXGIDevice1>()) d1->SetMaximumFrameLatency(1);
 
         wil::com_ptr<IDXGIAdapter> used;
         if (SUCCEEDED(dxgi_device_->GetAdapter(&used))) {
@@ -127,7 +127,7 @@ private:
 
         if (FAILED(d2d_factory_->CreateDevice(dxgi_device_.get(), &d2d_device_))) return false;
         // Keep the D2D glyph/bitmap caches small - this process should stay light
-        d2d_device_->SetMaximumTextureMemory(32ull << 20);
+        d2d_device_->SetMaximumTextureMemory(32ull << 20u);
         ++epoch_;
         if (on_device_changed) on_device_changed();
         return true;
@@ -233,7 +233,7 @@ public:
     [[nodiscard]] bool ready() const noexcept { return dc_ && target_ && gfx_ && epoch_ == gfx_->epoch(); }
     [[nodiscard]] ID2D1DeviceContext6* dc() const noexcept { return dc_.get(); }
     [[nodiscard]] float scale() const noexcept { return dpi_ / 96.0f; }
-    [[nodiscard]] D2D1_SIZE_F size() const noexcept { return {static_cast<float>(w_) / scale(), static_cast<float>(h_) / scale()}; }
+    [[nodiscard]] D2D1_SIZE_F size() const noexcept { return {.width = static_cast<float>(w_) / scale(), .height = static_cast<float>(h_) / scale()}; }
     [[nodiscard]] ID2D1Bitmap1* target_bitmap() const noexcept { return target_.get(); }
     [[nodiscard]] UINT pixel_width() const noexcept { return w_; }
     [[nodiscard]] UINT pixel_height() const noexcept { return h_; }
@@ -261,7 +261,7 @@ public:
 
     bool resize(UINT w, UINT h) noexcept {
         if (w == 0 || h == 0) return ready();
-        const float dpi = static_cast<float>(GetDpiForWindow(hwnd_));
+        const auto dpi = static_cast<float>(GetDpiForWindow(hwnd_));
         if (!ready()) return rebuild();
         if (w == w_ && h == h_ && dpi == dpi_) return true;
         dpi_ = dpi > 0 ? dpi : 96.0f;
@@ -384,13 +384,14 @@ private:
         // Composite over a dark backdrop so translucent areas read correctly in the PNG
         std::vector<uint8_t> px(static_cast<size_t>(desc.Width) * desc.Height * 4);
         for (UINT y = 0; y < desc.Height; ++y) {
-            const uint8_t* src = static_cast<const uint8_t*>(m.pData) + static_cast<size_t>(y) * m.RowPitch;
-            uint8_t* dst = px.data() + static_cast<size_t>(y) * desc.Width * 4;
+            const uint8_t* src = static_cast<const uint8_t*>(m.pData) + (static_cast<size_t>(y) * m.RowPitch);
+            uint8_t* dst = px.data() + (static_cast<size_t>(y) * desc.Width * 4);
             for (UINT x = 0; x < desc.Width; ++x) {
-                const uint8_t a = src[x * 4 + 3];
+                const size_t px_off = static_cast<size_t>(x) * 4u;
+                const uint8_t a = src[px_off + 3];
                 static constexpr std::array<uint8_t, 3> bg = {0x1a, 0x18, 0x1c};
-                for (size_t c = 0; c < 3; ++c) dst[x * 4 + c] = static_cast<uint8_t>(src[x * 4 + c] + bg[c] * (255 - a) / 255);
-                dst[x * 4 + 3] = 255;
+                for (size_t c = 0; c < 3; ++c) dst[px_off + c] = static_cast<uint8_t>(src[px_off + c] + (bg[c] * (255 - a) / 255));
+                dst[px_off + 3] = 255;
             }
         }
         gfx_->d3d_context()->Unmap(staging.get(), 0);

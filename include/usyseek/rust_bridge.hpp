@@ -22,19 +22,19 @@ void usy_buf_free(UsyBuf b);
 
 namespace usyseek {
 
-inline UsyStr ustr(std::string_view s) noexcept { return UsyStr{s.data(), s.size()}; }
+inline UsyStr ustr(std::string_view s) noexcept { return UsyStr{.ptr = s.data(), .len = s.size()}; }
 
 /// RAII owner of a Rust-allocated buffer.
 struct RustBuf {
-    UsyBuf b{nullptr, 0, 0};
+    UsyBuf b{.ptr = nullptr, .len = 0, .cap = 0};
     RustBuf() = default;
     RustBuf(const RustBuf&) = delete;
     RustBuf& operator=(const RustBuf&) = delete;
-    RustBuf(RustBuf&& o) noexcept : b{std::exchange(o.b, UsyBuf{nullptr, 0, 0})} {}
+    RustBuf(RustBuf&& o) noexcept : b{std::exchange(o.b, UsyBuf{.ptr = nullptr, .len = 0, .cap = 0})} {}
     RustBuf& operator=(RustBuf&& o) noexcept {
         if (this != &o) {
             if (b.ptr) usy_buf_free(b);
-            b = std::exchange(o.b, UsyBuf{nullptr, 0, 0});
+            b = std::exchange(o.b, UsyBuf{.ptr = nullptr, .len = 0, .cap = 0});
         }
         return *this;
     }

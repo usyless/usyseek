@@ -132,7 +132,7 @@ inline std::vector<std::string> default_excludes() {
         &FOLDERID_LocalAppData,
     };
     for (const KNOWNFOLDERID* id : folders) {
-        auto p = known_folder(*id);
+        const auto p = known_folder(*id);
         if (!p.empty()) v.push_back(to_utf8(p));
     }
     v.emplace_back("*\\node_modules");
@@ -178,7 +178,7 @@ inline Settings load_settings(bool* corrupt_recovered = nullptr) {
     std::error_code ec;
     const bool existed = fs::exists(settings_path(), ec);
     bool ok = true;
-    Settings s = load_json_file<Settings>(settings_path(), &ok);
+    auto s = load_json_file<Settings>(settings_path(), &ok);
     const bool corrupted = existed && !ok;
     if (corrupt_recovered) *corrupt_recovered = corrupted;
     s.launch_on_startup = is_startup_enabled();
@@ -277,7 +277,7 @@ inline std::wstring read_pe_version(const fs::path& exe) {
     DWORD dummy = 0;
     const DWORD sz = GetFileVersionInfoSizeW(exe.c_str(), &dummy);
     if (sz == 0) return {};
-    auto buf = std::make_unique_for_overwrite<uint8_t[]>(sz); // NOLINT(modernize-avoid-c-arrays)
+    const auto buf = std::make_unique_for_overwrite<uint8_t[]>(sz); // NOLINT(modernize-avoid-c-arrays)
     if (!GetFileVersionInfoW(exe.c_str(), 0, sz, buf.get())) return {};
     VS_FIXEDFILEINFO* ffi = nullptr;
     UINT len = 0;
@@ -304,7 +304,7 @@ inline VenvInfo read_venv(const fs::path& venv) {
         std::string_view rest{*cfg};
         while (!rest.empty()) {
             const auto nl = rest.find('\n');
-            std::string_view line = rest.substr(0, nl);
+            const std::string_view line = rest.substr(0, nl);
             rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
             const auto eq = line.find('=');
             if (eq == std::string_view::npos) continue;
@@ -312,8 +312,8 @@ inline VenvInfo read_venv(const fs::path& venv) {
             const std::string_view val = trim_sv(line.substr(eq + 1));
             if (key == "home") { 
                 info.home = to_wide(val);
-            } else if (key == "version" || key == "version_info") {
-                if (info.version.empty() || key == "version") info.version = to_wide(val);
+            } else if ((key == "version" || key == "version_info") && (info.version.empty() || key == "version")) {
+                info.version = to_wide(val);
             }
         }
         return info;

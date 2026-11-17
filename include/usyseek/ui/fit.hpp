@@ -25,7 +25,7 @@ inline FitRect fit_image(float image_w, float image_h, const FitRect& tile, Thum
     const float s = fit == ThumbFit::Crop ? std::max(sx, sy) : std::min(sx, sy);
     const float w = image_w * s;
     const float h = image_h * s;
-    return {.left=tile.left + (tile.width - w) * 0.5f, .top=tile.top + (tile.height - h) * 0.5f, .width=w, .height=h};
+    return {.left = tile.left + ((tile.width - w) * 0.5f), .top = tile.top + ((tile.height - h) * 0.5f), .width = w, .height = h};
 }
 
 } // namespace usyseek::ui

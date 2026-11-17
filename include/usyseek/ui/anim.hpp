@@ -5,7 +5,7 @@
 namespace usyseek::ui {
 
 [[nodiscard]] constexpr float lerp(float a, float b, float t) noexcept {
-    return a + (b - a) * t;
+    return a + ((b - a) * t);
 }
 
 /// Exponential smoothing toward `target`; snaps cleanly at `eps` so idle UIs stop repainting.

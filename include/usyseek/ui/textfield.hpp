@@ -50,7 +50,7 @@ public:
     bool focused = false;
     bool caret_on = true;
 
-    void set(std::wstring s) noexcept {
+    void set(std::wstring s) noexcept override {
         TextBuffer::set(std::move(s));
         scroll_ = 0.0f;
     }
@@ -68,6 +68,7 @@ public:
             case VK_END: move_end(shift); return false;
             case VK_BACK: return backspace(ctrl);
             case VK_DELETE: return del(ctrl);
+            default: break;
         }
         if (ctrl && !alt) {
             switch (vk) {
@@ -89,6 +90,7 @@ public:
                 case 'Y':
                     if (!shift) return redo();
                     break;
+                default: break;
             }
         }
         handled = false;
@@ -104,7 +106,8 @@ public:
         IDWriteTextLayout* layout = ensure_layout(cv);
         if (!layout) return;
 
-        float caret_x = 0.0f, caret_y = 0.0f;
+        float caret_x = 0.0f;
+        float caret_y = 0.0f;
         DWRITE_HIT_TEST_METRICS hm{};
         layout->HitTestTextPosition(static_cast<UINT32>(caret), FALSE, &caret_x, &caret_y, &hm);
         // Keep the caret visible
@@ -145,7 +148,8 @@ public:
     void click(Canvas& cv, float x, bool extend) {
         IDWriteTextLayout* layout = ensure_layout(cv);
         if (!layout) return;
-        BOOL trailing = FALSE, inside = FALSE;
+        BOOL trailing = FALSE;
+        BOOL inside = FALSE;
         DWRITE_HIT_TEST_METRICS m{};
         layout->HitTestPoint(x - rect_.left + scroll_, 1.0f, &trailing, &inside, &m);
         move_to(static_cast<size_t>(m.textPosition) + (trailing ? static_cast<size_t>(m.length) : 0), extend);
@@ -156,7 +160,7 @@ public:
         if (HIMC imc = ImmGetContext(hwnd)) {
             COMPOSITIONFORM cf{};
             cf.dwStyle = CFS_POINT;
-            cf.ptCurrentPos = {static_cast<LONG>(caret_screen_x_ * scale), static_cast<LONG>(rect_.top * scale)};
+            cf.ptCurrentPos = {.x = static_cast<LONG>(caret_screen_x_ * scale), .y = static_cast<LONG>(rect_.top * scale)};
             ImmSetCompositionWindow(imc, &cf);
             ImmReleaseContext(hwnd, imc);
         }
@@ -176,7 +180,7 @@ private:
         fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         dw->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), fmt, 100000.0f, h, &layout);
         if (layout) {
-            const DWRITE_TRIMMING none{DWRITE_TRIMMING_GRANULARITY_NONE, 0, 0};
+            const DWRITE_TRIMMING none{.granularity = DWRITE_TRIMMING_GRANULARITY_NONE, .delimiter = 0, .delimiterCount = 0};
             layout->SetTrimming(&none, nullptr);
         }
         cached_layout_ = std::move(layout);

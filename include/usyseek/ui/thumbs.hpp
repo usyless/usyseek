@@ -17,7 +17,8 @@ namespace usyseek::ui {
 
 /// A decoded 32bpp BGRA raster.
 struct Raster {
-    UINT w = 0, h = 0;
+    UINT w = 0;
+    UINT h = 0;
     std::vector<uint8_t> pixels;
 };
 
@@ -30,7 +31,8 @@ inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px,
     if (FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) return std::nullopt;
     wil::com_ptr<IWICBitmapFrameDecode> frame;
     if (FAILED(dec->GetFrame(0, &frame))) return std::nullopt;
-    UINT w = 0, h = 0;
+    UINT w = 0;
+    UINT h = 0;
     if (FAILED(frame->GetSize(&w, &h)) || !w || !h) return std::nullopt;
 
     USHORT orientation = 1;
@@ -45,7 +47,8 @@ inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px,
     const UINT longest = std::max(w, h);
     if (max_px && longest > max_px) {
         const double s = static_cast<double>(max_px) / longest;
-        const UINT sw = std::max(1u, static_cast<UINT>(std::lround(w * s))), shh = std::max(1u, static_cast<UINT>(std::lround(h * s)));
+        const UINT sw = std::max(1u, static_cast<UINT>(std::lround(w * s)));
+        const UINT shh = std::max(1u, static_cast<UINT>(std::lround(h * s)));
         wil::com_ptr<IWICBitmapScaler> scaler;
         if (FAILED(wic->CreateBitmapScaler(&scaler)) || FAILED(scaler->Initialize(src.get(), sw, shh, WICBitmapInterpolationModeHighQualityCubic))) return std::nullopt;
         src = scaler;
@@ -76,7 +79,7 @@ inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px,
     Raster r;
     if (FAILED(conv->GetSize(&r.w, &r.h)) || !r.w || !r.h) return std::nullopt;
     const size_t stride = static_cast<size_t>(r.w) * 4;
-    if (stride * r.h > (1ull << 31)) return std::nullopt;
+    if (stride * r.h > (1ull << 31u)) return std::nullopt;
     r.pixels.resize(stride * r.h);
     if (FAILED(conv->CopyPixels(nullptr, static_cast<UINT>(stride), static_cast<UINT>(r.pixels.size()), r.pixels.data()))) return std::nullopt;
     return r;
@@ -102,7 +105,7 @@ public:
 
     void stop() noexcept {
         {
-            std::scoped_lock lk{m_};
+            const std::scoped_lock lk{m_};
             stopping_ = true;
         }
         cv_.notify_all();
@@ -114,9 +117,9 @@ public:
         if (failed_.contains(id)) return;
         if (const auto it = bitmaps_.find(id); it != bitmaps_.end() && it->second.px >= px) return;
         {
-            std::scoped_lock lk{m_};
+            const std::scoped_lock lk{m_};
             if (!pending_.insert(id).second) return;
-            queue_.push_front({id, path, px});
+            queue_.push_front({.id = id, .path = path, .px = px});
             while (queue_.size() > (full_ ? 6u : 64u)) {
                 pending_.erase(queue_.back().id);
                 queue_.pop_back();
@@ -139,7 +142,7 @@ public:
     bool process(ID2D1DeviceContext* dc) {
         done_scratch_.clear();
         {
-            std::scoped_lock lk{m_};
+            const std::scoped_lock lk{m_};
             done_scratch_.swap(done_);
         }
         for (auto& d : done_scratch_) {
@@ -158,7 +161,7 @@ public:
                 lru_.splice(lru_.begin(), lru_, existing->second.lru);
             } else {
                 lru_.push_front(d.id);
-                bitmaps_[d.id] = {std::move(bmp), lru_.begin(), d.px};
+                bitmaps_[d.id] = {.bmp = std::move(bmp), .lru = lru_.begin(), .px = d.px};
                 while (bitmaps_.size() > max_bitmaps_) {
                     bitmaps_.erase(lru_.back());
                     lru_.pop_back();
@@ -177,7 +180,7 @@ public:
     /// Drops every bitmap, queued request and failure (frees preview memory once the viewer closes).
     void clear() {
         {
-            std::scoped_lock lk{m_};
+            const std::scoped_lock lk{m_};
             for (const auto& q : queue_) pending_.erase(q.id);
             queue_.clear();
         }
@@ -198,7 +201,8 @@ private:
     };
     struct Done {
         uint64_t id = 0;
-        UINT w = 0, h = 0;
+        UINT w = 0;
+    UINT h = 0;
         UINT px = 0;
         std::vector<uint8_t> pixels;
     };
@@ -209,7 +213,7 @@ private:
     };
 
     void worker(const std::stop_token& st) {
-        ulp::win::COMWrapper<false> com{COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE};
+        const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_APARTMENTTHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         while (!st.stop_requested()) {
             Req r;
@@ -220,11 +224,11 @@ private:
                 r = std::move(queue_.front());
                 queue_.pop_front();
             }
-            Done d{r.id};
+            Done d{.id = r.id};
             d.px = r.px;
             if (!full_ || !load_full(r, d)) load(r, d);
             {
-                std::scoped_lock lk{m_};
+                const std::scoped_lock lk{m_};
                 pending_.erase(r.id);
                 done_.push_back(std::move(d));
             }
@@ -267,8 +271,9 @@ private:
         wil::com_ptr<IShellItemImageFactory> factory;
         if (FAILED(SHCreateItemFromParsingName(r.path.c_str(), nullptr, IID_PPV_ARGS(&factory)))) return;
         HBITMAP raw = nullptr;
-        if (FAILED(factory->GetImage(SIZE{static_cast<LONG>(r.px), static_cast<LONG>(r.px)}, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK, &raw)) || !raw) return;
-        wil::unique_hbitmap bmp{raw};
+        if (FAILED(factory->GetImage(SIZE{static_cast<LONG>(r.px), static_cast<LONG>(r.px)},
+                                     static_cast<SIIGBF>(static_cast<unsigned>(SIIGBF_RESIZETOFIT) | static_cast<unsigned>(SIIGBF_BIGGERSIZEOK)), &raw)) || !raw) return;
+        const wil::unique_hbitmap bmp{raw};
 
         BITMAP info{};
         if (!GetObjectW(bmp.get(), sizeof(info), &info) || info.bmWidth <= 0 || info.bmHeight == 0) return;
@@ -282,7 +287,7 @@ private:
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
         d.pixels.resize(static_cast<size_t>(w) * h * 4);
-        wil::unique_hdc_window screen{GetDC(nullptr)};
+        const wil::unique_hdc_window screen{GetDC(nullptr)};
         if (GetDIBits(screen.get(), bmp.get(), 0, h, d.pixels.data(), &bi, DIB_RGB_COLORS) != static_cast<int>(h)) {
             d.pixels.clear();
             return;

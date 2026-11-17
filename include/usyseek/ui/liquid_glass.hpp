@@ -375,11 +375,16 @@ inline D2D1_RECT_L expand_rect_safe(const D2D1_RECT_L& r, LONG pad) noexcept {
 /// Native Direct2D custom effect implementation running the Liquid Glass pixel shader.
 class LiquidGlassEffectImpl final : public ID2D1EffectImpl, public ID2D1DrawTransform {
 public:
+    LiquidGlassEffectImpl(const LiquidGlassEffectImpl&) = delete;
+    LiquidGlassEffectImpl& operator=(const LiquidGlassEffectImpl&) = delete;
+    LiquidGlassEffectImpl(LiquidGlassEffectImpl&&) = delete;
+    LiquidGlassEffectImpl& operator=(LiquidGlassEffectImpl&&) = delete;
+
     static bool register_once(ID2D1Factory1* factory) {
         if (!factory) return false;
         static std::mutex mtx;
         static std::vector<ID2D1Factory1*> registered;
-        std::scoped_lock lk{mtx};
+        const std::scoped_lock lk{mtx};
         if (std::ranges::find(registered, factory) != registered.end()) return true;
 
         static constexpr PCWSTR xml = LR"(<?xml version='1.0'?>
@@ -456,7 +461,7 @@ public:
 
     IFACEMETHODIMP_(ULONG) AddRef() noexcept override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
     IFACEMETHODIMP_(ULONG) Release() noexcept override {
-        const ULONG r = static_cast<ULONG>(InterlockedDecrement(&refs_));
+        const auto r = static_cast<ULONG>(InterlockedDecrement(&refs_));
         if (r == 0) delete this;
         return r;
     }
@@ -630,7 +635,7 @@ public:
                 delta.dirty_all = true;
             }
 
-            if (auto tex = res.try_query<ID3D11Texture2D>()) {
+            if (const auto tex = res.try_query<ID3D11Texture2D>()) {
                 if (ensure_desktop_surface(gfx, *st, tex.get(), next_tex_id_)) {
                     gfx.d3d_context()->CopyResource(st->desktop_tex.get(), tex.get());
                     st->has_frame = true;
@@ -679,7 +684,7 @@ private:
             if (adapter->EnumOutputs(i, &out) == DXGI_ERROR_NOT_FOUND) break;
             DXGI_OUTPUT_DESC desc{};
             if (SUCCEEDED(out->GetDesc(&desc)) && desc.Monitor == st.mon) {
-                if (auto out1 = out.try_query<IDXGIOutput1>()) {
+                if (const auto out1 = out.try_query<IDXGIOutput1>()) {
                     if (SUCCEEDED(out1->DuplicateOutput(gfx.d3d(), &st.dupl))) {
                         st.mon_rect = desc.DesktopCoordinates;
                         st.has_frame = false;
@@ -774,7 +779,7 @@ public:
         if (!GetClientRect(hwnd, &crc)) return false;
         const UINT pw = static_cast<UINT>(std::max(1L, crc.right - crc.left));
         const UINT ph = static_cast<UINT>(std::max(1L, crc.bottom - crc.top));
-        POINT origin{0, 0};
+        POINT origin{.x = 0, .y = 0};
         ClientToScreen(hwnd, &origin);
         const auto [st, changed] = sync_dupl_state(dupl, gfx, hwnd, pw, ph, origin, true);
         return st != nullptr && changed;
@@ -790,7 +795,7 @@ public:
         const UINT ph = target.pixel_height();
         if (pw == 0 || ph == 0) return false;
 
-        POINT origin{0, 0};
+        POINT origin{.x = 0, .y = 0};
         if (origin_override_) {
             origin = *origin_override_;
         } else {
@@ -1270,7 +1275,7 @@ private:
                                screen_dc, origin.x, origin.y, SRCCOPY);
         SelectObject(mem_dc, prev);
         if (!ok) return false;
-        const D2D1_RECT_U dst_rc{0, 0, pw, ph};
+        const D2D1_RECT_U dst_rc{.left = 0, .top = 0, .right = pw, .bottom = ph};
         return SUCCEEDED(dst_bmp->CopyFromMemory(&dst_rc, bits, pw * 4));
     }
 

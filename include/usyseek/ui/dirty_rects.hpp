@@ -25,14 +25,14 @@ struct PixelRect {
 [[nodiscard]] inline PixelRect dip_to_pixel_rect(float left, float top, float right, float bottom, float scale,
                                                  uint32_t win_w, uint32_t win_h, float pad_dips = 2.0f) noexcept {
     if (right <= left || bottom <= top || win_w == 0 || win_h == 0 || scale <= 0.0f) return {};
-    const int32_t w = static_cast<int32_t>(win_w);
-    const int32_t h = static_cast<int32_t>(win_h);
+    const auto w = static_cast<int32_t>(win_w);
+    const auto h = static_cast<int32_t>(win_h);
     const int32_t l = std::clamp(static_cast<int32_t>(std::floor((left - pad_dips) * scale)), 0, w);
     const int32_t t = std::clamp(static_cast<int32_t>(std::floor((top - pad_dips) * scale)), 0, h);
     const int32_t r = std::clamp(static_cast<int32_t>(std::ceil((right + pad_dips) * scale)), 0, w);
     const int32_t b = std::clamp(static_cast<int32_t>(std::ceil((bottom + pad_dips) * scale)), 0, h);
     if (r <= l || b <= t) return {};
-    return PixelRect{l, t, r, b};
+    return PixelRect{.left = l, .top = t, .right = r, .bottom = b};
 }
 
 /// Returns pairwise strictly disjoint non-empty rectangles covering all non-empty inputs.

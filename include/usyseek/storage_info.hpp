@@ -87,13 +87,13 @@ namespace detail {
         Kind kind;
     };
     static constexpr std::array<SuffixRule, 7> rules = {{
-        {".safetensors.part", Kind::Partial},
-        {".safetensors", Kind::Weights},
-        {"-tokenizer.json.part", Kind::Partial},
-        {"-tokenizer.json", Kind::Tokenizer},
-        {"-text.onnx.data", Kind::Onnx},
-        {"-text.onnx.tmp", Kind::Partial},
-        {"-text.onnx", Kind::Onnx},
+        {.suffix = ".safetensors.part", .kind = Kind::Partial},
+        {.suffix = ".safetensors", .kind = Kind::Weights},
+        {.suffix = "-tokenizer.json.part", .kind = Kind::Partial},
+        {.suffix = "-tokenizer.json", .kind = Kind::Tokenizer},
+        {.suffix = "-text.onnx.data", .kind = Kind::Onnx},
+        {.suffix = "-text.onnx.tmp", .kind = Kind::Partial},
+        {.suffix = "-text.onnx", .kind = Kind::Onnx},
     },};
 
     std::map<std::string, ModelStorageInfo> by_name;
@@ -143,7 +143,7 @@ namespace detail {
     paths.reserve(suffixes.size());
     std::string fname;
     fname.reserve(name.size() + 24);
-    for (std::string_view s : suffixes) {
+    for (const std::string_view s : suffixes) {
         fname.assign(name);
         fname.append(s);
         paths.emplace_back(model_dir / detail::utf8_to_path(fname));

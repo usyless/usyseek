@@ -9,11 +9,13 @@
 #include <usyseek/indexer/everything_config.hpp>
 #include <usyseek/indexer/media.hpp>
 
+#include <algorithm>
 #include <condition_variable>
 #include <deque>
+#include <format>
 #include <future>
 #include <mutex>
-#include <algorithm>
+#include <print>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -26,15 +28,16 @@ using namespace usyseek;
 
 namespace {
 
-void wlog(const wchar_t* fmt, ...) {
-    std::array<wchar_t, 2048> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-    va_list args{}; // NOLINT(cppcoreguidelines-init-variables)
-    va_start(args, fmt);
-    _vsnwprintf_s(buf.data(), buf.size(), _TRUNCATE, fmt, args);
-    va_end(args);
-    const std::string s = to_utf8(buf.data());
-    std::fwrite(s.data(), 1, s.size(), stdout);
+template <typename... Args>
+void wlog(std::wformat_string<Args...> fmt, Args&&... args) {
+    std::print("{}", to_utf8(std::format(fmt, std::forward<Args>(args)...)));
     std::fflush(stdout);
+}
+
+template <size_t N>
+void copy_wstr(std::array<wchar_t, N>& dst, std::wstring_view src) noexcept {
+    const size_t n = src.copy(dst.data(), N - 1);
+    dst[n] = L'\0';
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -50,21 +53,13 @@ struct Progress {
         d.phase = p;
         set_message(msg);
         publish(true);
-        wlog(L"[%s] %.*s\n", phase_label(p), static_cast<int>(msg.size()), msg.data());
+        wlog(L"[{}] {}\n", phase_label(p), msg);
     }
     void set_message(std::wstring_view msg) noexcept {
-        if (msg.empty()) {
-            d.message[0] = L'\0';
-            return;
-        }
-        wcsncpy_s(d.message, msg.data(), std::min(msg.size(), std::size(d.message) - 1));
+        copy_wstr(d.message, msg);
     }
     void set_current(std::wstring_view path) noexcept {
-        if (path.empty()) {
-            d.current[0] = L'\0';
-            return;
-        }
-        wcsncpy_s(d.current, path.data(), std::min(path.size(), std::size(d.current) - 1));
+        copy_wstr(d.current, path);
     }
     void publish(bool force = false) noexcept {
         const auto now = std::chrono::steady_clock::now();
@@ -74,12 +69,20 @@ struct Progress {
     }
 };
 
-Progress g_progress;
-HANDLE g_stop = nullptr;
-bool g_no_everything = false; // --no-everything: walk included folders directly
+struct IndexerRuntime {
+    Progress progress;
+    HANDLE stop = nullptr;
+    bool no_everything = false; // --no-everything: walk included folders directly
+};
+
+IndexerRuntime& runtime() noexcept {
+    static IndexerRuntime r;
+    return r;
+}
 
 bool stopping() noexcept {
-    return g_stop && WaitForSingleObject(g_stop, 0) == WAIT_OBJECT_0;
+    const HANDLE stop = runtime().stop;
+    return stop && WaitForSingleObject(stop, 0) == WAIT_OBJECT_0;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -100,7 +103,7 @@ struct Scope {
             auto n = normalise_dir(to_wide(d));
             if (!n.empty()) includes.push_back(std::move(n));
         }
-        auto add_exclude = [this](std::wstring raw) {
+        const auto add_exclude = [this](std::wstring raw) {
             raw = trim(raw);
             if (raw.empty()) return;
             const bool absolute = raw.size() >= 2 && raw[1] == L':';
@@ -122,22 +125,22 @@ struct Scope {
     }
 
     [[nodiscard]] bool excluded_lower(std::wstring_view l) const noexcept {
-        for (const auto& e : abs_excludes) {
-            if (l.size() > e.size() && l.starts_with(e) && l[e.size()] == L'\\') return true;
+        if (std::ranges::any_of(abs_excludes, [l](const std::wstring& e) noexcept {
+                return l.size() > e.size() && l.starts_with(e) && l[e.size()] == L'\\';
+            })) {
+            return true;
         }
-        for (const auto& n : name_excludes) {
-            if (l.contains(n)) return true;
-        }
-        return false;
+        return std::ranges::any_of(name_excludes, [l](const std::wstring& n) noexcept {
+            return l.contains(n);
+        });
     }
 
     [[nodiscard]] bool in_scope_lower(std::wstring_view l) const noexcept {
         if (excluded_lower(l)) return false;
         if (whole_pc) return true;
-        for (const auto& i : includes) {
-            if (l.size() > i.size() && l.starts_with(i) && l[i.size()] == L'\\') return true;
-        }
-        return false;
+        return std::ranges::any_of(includes, [l](const std::wstring& i) noexcept {
+            return l.size() > i.size() && l.starts_with(i) && l[i.size()] == L'\\';
+        });
     }
 
     [[nodiscard]] bool excluded(std::wstring_view path) const {
@@ -153,7 +156,7 @@ struct Scope {
         if (whole_pc) {
             const DWORD mask = GetLogicalDrives();
             for (int i = 0; i < 26; ++i) {
-                if (!(mask & (1u << i))) continue;
+                if ((mask & (1u << static_cast<unsigned>(i))) == 0) continue;
                 const auto drive = static_cast<wchar_t>(L'A' + i);
                 const std::array<wchar_t, 4> root = {drive, L':', L'\\', 0};
                 if (GetDriveTypeW(root.data()) != DRIVE_FIXED) continue;
@@ -181,8 +184,8 @@ struct Scope {
     [[nodiscard]] std::wstring query() const {
         std::wstring q = L"file: ext:";
         bool first = true;
-        auto add = [&](auto&& list) {
-            for (auto e : list) {
+        const auto add = [&](auto&& list) {
+            for (const auto e : list) {
                 if (!first) q += L';';
                 q += e;
                 first = false;
@@ -206,7 +209,7 @@ struct Scope {
 
     [[nodiscard]] std::wstring everything_exclude_folders() const {
         std::wstring out;
-        auto append = [&](std::wstring_view item) {
+        const auto append = [&](std::wstring_view item) {
             if (!out.empty()) out += L';';
             out += item;
         };
@@ -408,6 +411,8 @@ public:
             StopWaitGuard() = default;
             StopWaitGuard(const StopWaitGuard&) = delete;
             StopWaitGuard& operator=(const StopWaitGuard&) = delete;
+            StopWaitGuard(StopWaitGuard&&) = delete;
+            StopWaitGuard& operator=(StopWaitGuard&&) = delete;
             ~StopWaitGuard() { release(); }
             void release() noexcept {
                 if (handle) {
@@ -417,10 +422,10 @@ public:
             }
         } stop_guard;
 
-        if (g_stop) {
+        if (const HANDLE stop = runtime().stop) {
             RegisterWaitForSingleObject(
                 &stop_guard.handle,
-                g_stop,
+                stop,
                 [](PVOID param, BOOLEAN) {
                     Everything3_ShutdownClient(static_cast<EVERYTHING3_CLIENT*>(param));
                 },
@@ -553,7 +558,7 @@ std::vector<FileEntry> walk_dirs(const Scope& scope) {
         const std::wstring dir = std::move(stack.back());
         stack.pop_back();
         WIN32_FIND_DATAW fd;
-        wil::unique_hfind h{FindFirstFileExW(ulp::str::concat_strings(dir, L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH)};
+        const wil::unique_hfind h{FindFirstFileExW(ulp::str::concat_strings(dir, L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH)};
         if (!h) {
             const DWORD err = GetLastError();
             if (err != ERROR_FILE_NOT_FOUND && err != ERROR_NO_MORE_FILES) {
@@ -579,9 +584,9 @@ std::vector<FileEntry> walk_dirs(const Scope& scope) {
             FileEntry e;
             e.kind = media::kind_of(path);
             if (e.kind < 0 || (e.kind == 0 && !scope.images) || (e.kind == 1 && !scope.videos)) continue;
-            e.size = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow;
+            e.size = (static_cast<uint64_t>(fd.nFileSizeHigh) << 32u) | fd.nFileSizeLow;
             if (e.size < min_bytes || !scope.in_scope(path)) continue;
-            e.mtime = filetime_to_unix((static_cast<uint64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime);
+            e.mtime = filetime_to_unix((static_cast<uint64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32u) | fd.ftLastWriteTime.dwLowDateTime);
             e.id = path_id(path);
             e.path = std::move(path);
             out.push_back(std::move(e));
@@ -620,7 +625,7 @@ struct FailureCache {
         for (wchar_t& c : clean) {
             if (c == L'\t' || c == L'\r' || c == L'\n') c = L' ';
         }
-        entries[e.id] = FailedFile{e.id, e.mtime, e.size, e.path, std::move(clean)};
+        entries[e.id] = FailedFile{.id = e.id, .mtime = e.mtime, .size = e.size, .path = e.path, .reason = std::move(clean)};
     }
     void remove(uint64_t id) { entries.erase(id); }
     void prune(const Scope& scope) {
@@ -677,13 +682,13 @@ public:
         return true;
     }
     void close() noexcept {
-        std::scoped_lock lk{m_};
+        const std::scoped_lock lk{m_};
         closed_ = true;
         not_full_.notify_all();
         not_empty_.notify_all();
     }
     [[nodiscard]] bool done() noexcept {
-        std::scoped_lock lk{m_};
+        const std::scoped_lock lk{m_};
         return closed_ && q_.empty();
     }
 
@@ -820,14 +825,17 @@ struct PyVision {
 
     void cancel() noexcept {
         if (cancel_event) SetEvent(cancel_event.get());
-        std::scoped_lock lk{proc_mu};
+        const std::scoped_lock lk{proc_mu};
         cancelled = true;
-        if (job) TerminateJobObject(job.get(), 0);
-        else if (proc.hProcess) TerminateProcess(proc.hProcess, 0);
+        if (job) {
+            TerminateJobObject(job.get(), 0);
+        } else if (proc.hProcess) {
+            TerminateProcess(proc.hProcess, 0);
+        }
     }
 
     [[nodiscard]] bool is_cancelled() const noexcept {
-        std::scoped_lock lk{proc_mu};
+        const std::scoped_lock lk{proc_mu};
         return cancelled;
     }
 
@@ -870,7 +878,7 @@ struct PyVision {
             append_to(cmd, L" \"", to_wide(settings.vision_script), L"\"");
         }
 
-        STARTUPINFOW si{sizeof(si)};
+        STARTUPINFOW si{.cb = sizeof(si)};
         si.dwFlags |= STARTF_USESHOWWINDOW;
         si.wShowWindow = SW_HIDE;
         wil::unique_process_information pi;
@@ -887,10 +895,13 @@ struct PyVision {
         SetProcessInformation(pi.hProcess, ProcessPowerThrottling, &throttling, sizeof(throttling));
         SetPriorityClass(pi.hProcess, ABOVE_NORMAL_PRIORITY_CLASS);
         {
-            std::scoped_lock lk{proc_mu};
+            const std::scoped_lock lk{proc_mu};
             if (cancelled) {
-                if (new_job) TerminateJobObject(new_job.get(), 0);
-                else TerminateProcess(pi.hProcess, 0);
+                if (new_job) {
+                    TerminateJobObject(new_job.get(), 0);
+                } else {
+                    TerminateProcess(pi.hProcess, 0);
+                }
                 throw std::runtime_error("Vision load cancelled");
             }
             job = std::move(new_job);
@@ -910,7 +921,7 @@ struct PyVision {
             }
         }
 
-        PyResp r = call(PyLoadReq{.cfg = {settings.model_dir, settings.model_name, settings.device}});
+        const PyResp r = call(PyLoadReq{.cfg = {.model_dir = settings.model_dir, .model_name = settings.model_name, .device = settings.device}});
         size = r.info.size;
         dim = r.info.dim;
         mode = media::parse_resize_mode(r.info.resize_mode);
@@ -938,15 +949,15 @@ struct PyVision {
     uint8_t* prepare_shm(size_t frames) {
         const size_t in_bytes = frames * size * size * 3;
         const size_t out_bytes = frames * dim * sizeof(float);
-        const size_t needed = std::max<size_t>(65536, std::max(in_bytes, out_bytes));
+        const auto needed = std::max<size_t>({65536, in_bytes, out_bytes});
         if (needed > shm_bytes || !shm_view) {
             unmap_shm();
             const size_t min_alloc = static_cast<size_t>(std::max<size_t>(frames, 128)) * size * size * 3;
-            const size_t alloc = std::max(needed, std::max(min_alloc, shm_bytes * 2));
+            const size_t alloc = std::max({needed, min_alloc, shm_bytes * 2});
             shm_name = ulp::str::concat_strings("Local\\usyseek.vision.shm.", to_fixed_str(GetCurrentProcessId()), ".", to_fixed_str(++shm_gen));
             shm.reset(CreateFileMappingA(
                 INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                static_cast<DWORD>(alloc >> 32), static_cast<DWORD>(alloc & 0xFFFFFFFFu),
+                static_cast<DWORD>(alloc >> 32u), static_cast<DWORD>(alloc & 0xFFFFFFFFu),
                 shm_name.c_str()));
             if (!shm) throw std::runtime_error("Shared memory allocation failed");
             shm_view = MapViewOfFile(shm.get(), FILE_MAP_ALL_ACCESS, 0, 0, alloc);
@@ -960,7 +971,7 @@ struct PyVision {
     }
 
     const float* embed(size_t frames) {
-        PyResp r = call(PyEmbedReq{
+        const PyResp r = call(PyEmbedReq{
             .shm = shm_name,
             .shm_bytes = shm_bytes,
             .frames = static_cast<uint32_t>(frames),
@@ -976,13 +987,13 @@ private:
         handles[count++] = ov_event.get();
         handles[count++] = proc.hProcess;
         if (cancel_event) handles[count++] = cancel_event.get();
-        if (g_stop) handles[count++] = g_stop;
+        if (const HANDLE stop = runtime().stop) handles[count++] = stop;
         const DWORD w = WaitForMultipleObjects(count, handles.data(), FALSE, INFINITE);
         if (w != WAIT_OBJECT_0) {
             CancelIoEx(pipe.get(), &ov);
             DWORD dummy = 0;
             GetOverlappedResult(pipe.get(), &ov, &dummy, TRUE);
-            if (g_stop && WaitForSingleObject(g_stop, 0) == WAIT_OBJECT_0) throw std::runtime_error("Indexing stopped");
+            if (stopping()) throw std::runtime_error("Indexing stopped");
             if (cancel_event && WaitForSingleObject(cancel_event.get(), 0) == WAIT_OBJECT_0) throw std::runtime_error("Vision load cancelled");
             throw std::runtime_error(crash_msg);
         }
@@ -1058,8 +1069,8 @@ int export_text_only(const Settings& settings) {
     std::wstring cmd = ulp::str::concat_strings(
         L"\"", venv.python_exe, L"\" -u \"", script.wstring(),
         L"\" --export-text \"", to_wide(settings.model_dir), L"\" \"", to_wide(settings.model_name), L"\"");
-    wil::unique_handle job = make_kill_on_close_job();
-    STARTUPINFOW si{sizeof(si)};
+    const wil::unique_handle job = make_kill_on_close_job();
+    STARTUPINFOW si{.cb = sizeof(si)};
     si.dwFlags |= STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     wil::unique_process_information pi;
@@ -1075,7 +1086,7 @@ int export_text_only(const Settings& settings) {
 }
 
 int run_indexer(Settings& settings) {
-    auto& pr = g_progress;
+    auto& pr = runtime().progress;
     const std::string coll = settings.model_name;
     const Scope scope{settings};
 
@@ -1087,12 +1098,12 @@ int run_indexer(Settings& settings) {
 
     Db db;
     bool db_modified = false;
-    auto finish_db = [&] {
+    const auto finish_db = [&] {
         if (db_modified) {
             pr.phase(Phase::Cleaning, L"Optimizing database");
             std::string opt_err;
             if (!db.optimize(coll, &opt_err)) {
-                std::printf("optimize failed: %s\n", opt_err.c_str());
+                std::println("optimize failed: {}", opt_err);
                 push_notification_to_disk("warning", "Database", "Failed to optimize database",
                     opt_err, "indexer-optimize");
             }
@@ -1100,7 +1111,7 @@ int run_indexer(Settings& settings) {
         }
         std::string close_err;
         if (!db.close(&close_err) && !close_err.empty()) {
-            std::printf("database close failed: %s\n", close_err.c_str());
+            std::println("database close failed: {}", close_err);
             push_notification_to_disk("warning", "Database", "Failed to flush database",
                 close_err, "indexer-flush");
         }
@@ -1108,7 +1119,7 @@ int run_indexer(Settings& settings) {
     const auto db_cleanup = wil::scope_exit([&] {
         std::string close_err;
         if (!db.close(&close_err) && !close_err.empty()) {
-            std::printf("database close warning: %s\n", close_err.c_str());
+            std::println("database close warning: {}", close_err);
         }
         if (db_want) ResetEvent(db_want.get());
         if (HWND ui = FindWindowW(PILL_CLASS, nullptr)) PostMessageW(ui, msg_indexer_changed(), 0, 0);
@@ -1130,10 +1141,10 @@ int run_indexer(Settings& settings) {
     std::vector<FileEntry> files;
     std::wstring scan_error;
     std::jthread scanner([&] {
-        ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
+        const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED)};
         EverythingSession ev;
         const bool unc_only = !scope.whole_pc && !scope.includes.empty() && scope.drives().empty();
-        if (g_no_everything) {
+        if (runtime().no_everything) {
             scan_error = L"disabled";
         } else if (unc_only) {
             scan_error = L"Non-drive / network path";
@@ -1143,8 +1154,8 @@ int run_indexer(Settings& settings) {
         }
         if (scope.whole_pc) return;
         // Specific folders can still be walked directly when Everything is unavailable
-        wlog(L"Everything unavailable (%s), walking included folders\n", scan_error.c_str());
-        if (!g_no_everything) {
+        wlog(L"Everything unavailable ({}), walking included folders\n", scan_error);
+        if (!runtime().no_everything) {
             push_notification_to_disk("warning", "Scanner", "Using slower directory walk",
                 ulp::str::concat_strings("Everything index was not used (", to_utf8(scan_error), "). Walking included folders directly."),
                 "indexer-scan-fallback");
@@ -1382,7 +1393,7 @@ int run_indexer(Settings& settings) {
             cursor = page->next;
         } while (cursor && !stopping());
         if (!stale.empty()) {
-            wlog(L"Removing %zu stale entries\n", stale.size());
+            wlog(L"Removing {} stale entries\n", stale.size());
             std::string rm_err;
             if (!db.remove(coll, stale, &rm_err)) {
                 push_notification_to_disk("warning", "Database", "Failed to remove stale database entries",
@@ -1398,7 +1409,7 @@ int run_indexer(Settings& settings) {
             if (scope.excluded(to_wide(entry.path))) excluded_tags.push_back(id);
         }
         if (!excluded_tags.empty()) {
-            wlog(L"Pruning %zu excluded tag entries from tags.db\n", excluded_tags.size());
+            wlog(L"Pruning {} excluded tag entries from tags.db\n", excluded_tags.size());
             std::string prune_err;
             if (!tag_store.remove_ids(excluded_tags, &prune_err)) {
                 push_notification_to_disk("warning", "Tags", "Failed to prune excluded tags from tags.db",
@@ -1408,7 +1419,7 @@ int run_indexer(Settings& settings) {
     }
 
     // Images first (fast), then videos; path order keeps directory reads sequential
-    std::stable_sort(todo.begin(), todo.end(), [&](size_t a, size_t b) {
+    std::ranges::stable_sort(todo, [&](size_t a, size_t b) {
         if (files[a].kind != files[b].kind) return files[a].kind < files[b].kind;
         return a < b;
     });
@@ -1427,7 +1438,7 @@ int run_indexer(Settings& settings) {
                 } catch (const std::exception& e) {
                     if (!stopping()) {
                         export_err = e.what();
-                        std::printf("export_text failed: %s\n", e.what());
+                        std::println("export_text failed: {}", e.what());
                     }
                 }
             } else {
@@ -1442,7 +1453,7 @@ int run_indexer(Settings& settings) {
         }
         failures.save();
         finish_db();
-        IndexState st = load_json_file<IndexState>(state_path());
+        auto st = load_json_file<IndexState>(state_path());
         st.last_index_unix = unix_now();
         st.last_index_found = files.size();
         st.last_index_embedded = pr.d.embedded;
@@ -1470,10 +1481,10 @@ int run_indexer(Settings& settings) {
     }
     if (!loader.error.empty()) {
         pr.phase(Phase::Error, loader.error_msg);
-        std::printf("%s\n", loader.error.c_str());
+        std::println("{}", loader.error);
         return 1;
     }
-    wcsncpy_s(pr.d.device, vision.device.c_str(), std::size(pr.d.device) - 1);
+    copy_wstr(pr.d.device, vision.device);
 
     if (!fs::exists(onnx, onnx_ec)) {
         try {
@@ -1482,7 +1493,7 @@ int run_indexer(Settings& settings) {
         } catch (const std::exception& e) {
             if (stopping()) return 2;
             pr.phase(Phase::Error, py_error_text(e));
-            std::printf("%s\n", e.what());
+            std::println("{}", e.what());
             return 1;
         }
     }
@@ -1500,14 +1511,14 @@ int run_indexer(Settings& settings) {
     const bool auto_batch = batch == 0;
     const std::string auto_batch_key = ulp::str::concat_strings(settings.model_name, "|", to_utf8(vision.device), "|", to_fixed_str(vision.size));
     if (auto_batch) {
-        IndexState cached = load_json_file<IndexState>(state_path());
+        auto cached = load_json_file<IndexState>(state_path());
         if (cached.auto_batch > 0 && cached.auto_batch_key == auto_batch_key) {
             batch = cached.auto_batch;
         } else {
             try {
                 batch = vision.benchmark_batch(128);
             } catch (const std::exception& e) {
-                std::printf("benchmark_batch failed: %s\n", e.what());
+                std::println("benchmark_batch failed: {}", e.what());
                 push_notification_to_disk("warning", "Indexer", "Auto-batch benchmark failed",
                     ulp::str::concat_strings("Using fallback batch size 16: ", e.what()), "indexer-autobatch");
                 batch = 16;
@@ -1522,27 +1533,27 @@ int run_indexer(Settings& settings) {
     }
     batch = std::max(1u, batch);
     pr.d.batch = batch;
-    wlog(L"Batch size %u, %zu files to embed\n", batch, todo.size());
+    wlog(L"Batch size {}, {} files to embed\n", batch, todo.size());
 
     // --- Decode workers
     pr.phase(Phase::Embedding);
     const uint32_t hw = std::max(2u, std::thread::hardware_concurrency());
     const uint32_t workers = settings.decode_threads ? settings.decode_threads : std::clamp(hw - 2, 2u, 16u);
-    BoundedQueue<DecodedItem> queue{static_cast<size_t>(batch) * 2 + workers};
+    BoundedQueue<DecodedItem> queue{(static_cast<size_t>(batch) * 2) + workers};
     std::atomic<size_t> next{0};
     std::atomic<uint32_t> alive{workers};
     std::vector<std::jthread> pool;
     pool.reserve(workers);
     for (uint32_t w = 0; w < workers; ++w) {
         pool.emplace_back([&] {
-            ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
+            const ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             media::Decoder dec{vision.size, vision.mode};
             for (;;) {
                 const size_t i = next.fetch_add(1);
                 if (i >= todo.size() || stopping()) break;
                 const FileEntry& f = files[todo[i]];
-                DecodedItem item{todo[i], {}, {}};
+                DecodedItem item{.index = todo[i]};
                 try {
                     item.data = f.kind == 0 ? dec.image(f.path, settings.video_frames, &item.reason)
                                             : dec.video(f.path, settings.video_frames, &item.reason);
@@ -1579,7 +1590,7 @@ int run_indexer(Settings& settings) {
     std::future<UploadBatch> upload;
     UploadBatch cur_batch;
     UploadBatch spare_batch;
-    auto flush = [&](bool wait) {
+    const auto flush = [&](bool wait) {
         if (upload.valid()) {
             spare_batch = upload.get();
             spare_batch.clear();
@@ -1592,8 +1603,8 @@ int run_indexer(Settings& settings) {
                 if (db.upsert(coll, batch.ids, batch.vecs, dim, batch.payloads, &e)) {
                     upsert_any.store(true, std::memory_order_relaxed);
                 } else {
-                    std::printf("upsert failed: %s\n", e.c_str());
-                    std::scoped_lock lk{upsert_mx};
+                    std::println("upsert failed: {}", e);
+                    const std::scoped_lock lk{upsert_mx};
                     ++upsert_failures;
                     if (upsert_err.empty()) upsert_err = std::move(e);
                 }
@@ -1658,14 +1669,14 @@ int run_indexer(Settings& settings) {
             if (const uint32_t hint = vision.last_hint; hint > 0 && hint < batch) {
                 batch = hint;
                 pr.d.batch = batch;
-                std::printf("Reduced batch size to %u after running out of VRAM\n", batch);
+                std::println("Reduced batch size to {} after running out of VRAM", batch);
                 push_notification_to_disk("warning", "Compute", "Reduced batch size after out-of-VRAM",
                     ulp::str::concat_strings("GPU memory limit reached; batch size automatically lowered to ", to_fixed_str(batch), "."),
                     "indexer-vram");
             }
         } catch (const std::exception& e) {
             if (stopping()) break;
-            std::printf("embed failed: %s\n", e.what());
+            std::println("embed failed: {}", e.what());
             const std::wstring reason = py_error_text(e);
             pr.set_message(reason);
             push_notification_to_disk("warning", "Compute", "Embedding batch failed",
@@ -1684,11 +1695,11 @@ int run_indexer(Settings& settings) {
             const size_t n = it.data->frames.size();
             v.assign(dim, 0.0f);
             for (size_t k = 0; k < n; ++k, ++row) {
-                for (size_t c = 0; c < dim; ++c) v[c] += rows[row * dim + c];
+                for (size_t c = 0; c < dim; ++c) v[c] += rows[(row * dim) + c];
             }
             if (n > 1) {
                 double norm = 0;
-                for (float x : v) norm += static_cast<double>(x) * x;
+                for (const float x : v) norm += static_cast<double>(x) * x;
                 const float inv = norm > 0 ? static_cast<float>(1.0 / std::sqrt(norm)) : 1.0f;
                 for (float& x : v) x *= inv;
             }
@@ -1703,7 +1714,7 @@ int run_indexer(Settings& settings) {
         if (cur_batch.ids.size() >= 256) flush(false);
 
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        pr.d.rate = secs > 0.5 ? static_cast<float>(done_this_run / secs) : 0.0f;
+        pr.d.rate = secs > 0.5 ? static_cast<float>(static_cast<double>(done_this_run) / secs) : 0.0f;
         pr.publish();
     }
 
@@ -1736,7 +1747,7 @@ int run_indexer(Settings& settings) {
         }
     }
 
-    IndexState st = load_json_file<IndexState>(state_path());
+    auto st = load_json_file<IndexState>(state_path());
     st.last_index_unix = unix_now();
     st.last_index_found = files.size();
     st.last_index_embedded = pr.d.embedded;
@@ -1752,12 +1763,16 @@ int run_indexer(Settings& settings) {
 
 } // namespace
 
-int wmain(int argc, wchar_t** argv) {
+int wmain(int argc, wchar_t* const* argv) {
+    auto& rt = runtime();
     bool export_only = false;
     for (int i = 1; i < argc; ++i) {
         const std::wstring_view a{argv[i]};
-        if (a == L"--no-everything") g_no_everything = true;
-        else if (a == L"--export-text") export_only = true;
+        if (a == L"--no-everything") {
+            rt.no_everything = true;
+        } else if (a == L"--export-text") {
+            export_only = true;
+        }
     }
     SetConsoleOutputCP(CP_UTF8);
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1771,36 +1786,36 @@ int wmain(int argc, wchar_t** argv) {
     throttling.StateMask = 0;
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
-    ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
+    const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED)};
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
 
     // Only one indexer at a time
-    wil::unique_mutex_nothrow single{CreateMutexW(nullptr, TRUE, INDEXER_MUTEX)};
+    const wil::unique_mutex_nothrow single{CreateMutexW(nullptr, TRUE, INDEXER_MUTEX)};
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 3;
 
-    g_progress.block = StatusBlock::create();
-    if (!g_progress.block) {
+    rt.progress.block = StatusBlock::create();
+    if (!rt.progress.block) {
         push_notification_to_disk("warning", "Indexer", "Progress shared memory unavailable",
             ulp::str::concat_strings("Live indexing progress cannot be shown in Settings (", win32_error_utf8(), ")."), "indexer-shm");
     }
-    g_progress.d.pid = GetCurrentProcessId();
-    g_progress.d.started_unix = unix_now();
+    rt.progress.d.pid = GetCurrentProcessId();
+    rt.progress.d.started_unix = unix_now();
     wil::unique_event_nothrow stop{OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, INDEXER_STOP_EVENT)};
     if (!stop) stop.reset(CreateEventW(nullptr, TRUE, FALSE, INDEXER_STOP_EVENT));
-    g_stop = stop.get();
+    rt.stop = stop.get();
 
     Settings settings = load_settings();
     int code = 1;
     try {
         code = run_indexer(settings);
     } catch (const std::exception& e) {
-        g_progress.phase(Phase::Error, to_wide(e.what()));
+        rt.progress.phase(Phase::Error, to_wide(e.what()));
     }
-    if (g_progress.d.phase == Phase::Error) {
-        const std::string err_utf8 = to_utf8(g_progress.d.message);
+    if (rt.progress.d.phase == Phase::Error) {
+        const std::string err_utf8 = to_utf8(rt.progress.d.message.data());
         push_notification_to_disk("error", "Indexer", "Indexing failed",
             err_utf8.empty() ? std::string{"Indexer stopped with an error."} : err_utf8, "indexer-error");
-        IndexState st = load_json_file<IndexState>(state_path());
+        auto st = load_json_file<IndexState>(state_path());
         st.last_error = err_utf8;
         if (!save_json_file(state_path(), st)) {
             push_notification_to_disk("warning", "Indexer", "Failed to save state.json",

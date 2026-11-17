@@ -123,7 +123,7 @@ inline std::string sha256_file_hex(const fs::path& path, std::wstring& err) {
         return {};
     }
 
-    auto hash_obj = std::make_unique_for_overwrite<uint8_t[]>(hash_obj_len); // NOLINT(modernize-avoid-c-arrays)
+    const auto hash_obj = std::make_unique_for_overwrite<uint8_t[]>(hash_obj_len); // NOLINT(modernize-avoid-c-arrays)
     BCRYPT_HASH_HANDLE hash = nullptr;
     if (!BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, hash_obj.get(), hash_obj_len, nullptr, 0, 0))) {
         err = L"Could not create SHA-256 hash.";
@@ -132,7 +132,7 @@ inline std::string sha256_file_hex(const fs::path& path, std::wstring& err) {
     const auto close_hash = wil::scope_exit([&] { BCryptDestroyHash(hash); });
 
     constexpr DWORD BUF_CAP = 65536;
-    auto buf = std::make_unique_for_overwrite<uint8_t[]>(BUF_CAP); // NOLINT(modernize-avoid-c-arrays)
+    const auto buf = std::make_unique_for_overwrite<uint8_t[]>(BUF_CAP); // NOLINT(modernize-avoid-c-arrays)
     for (;;) {
         DWORD got = 0;
         if (!ReadFile(file.get(), buf.get(), BUF_CAP, &got, nullptr)) {

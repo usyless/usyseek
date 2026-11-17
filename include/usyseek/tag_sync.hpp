@@ -15,7 +15,8 @@ namespace usyseek {
 [[nodiscard]] inline std::vector<std::string> normalize_tag_list(std::vector<std::string> tags) {
     std::erase_if(tags, [](const std::string& t) { return t.empty(); });
     std::ranges::sort(tags);
-    tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+    const auto dup = std::ranges::unique(tags);
+    tags.erase(dup.begin(), dup.end());
     return tags;
 }
 
