@@ -15,10 +15,10 @@ inline DisplayedProgress displayed_progress(bool indexer_running, uint64_t live_
                                             std::optional<uint64_t> state_embedded, uint64_t state_found,
                                             std::optional<uint64_t> db_count) noexcept {
     const bool live_counts_ready = indexer_running && live_found > 0;
-    if (live_counts_ready) return {live_embedded, live_found};
-    if (state_embedded) return {*state_embedded, state_found};
+    if (live_counts_ready) return {.embedded=live_embedded, .total=live_found};
+    if (state_embedded) return {.embedded=*state_embedded, .total=state_found};
     const uint64_t embedded = db_count.value_or(state_found);
-    return {embedded, std::max(embedded, state_found)};
+    return {.embedded=embedded, .total=std::max(embedded, state_found)};
 }
 
 } // namespace usyseek

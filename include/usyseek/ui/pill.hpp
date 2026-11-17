@@ -302,10 +302,10 @@ public:
         run_search(0);
     }
     void test_open_menu(int index) {
-        if (index >= static_cast<int>(items_.size())) return;
+        if (std::cmp_greater_equal(index ,items_.size())) return;
         selected_ = {items_[index].pt.id};
         focus_ = index;
-        open_menu(index, {420.0f, 260.0f});
+        open_menu(index, {.x=420.0f, .y=260.0f});
     }
     void test_dropdown(std::wstring q) {
         field_.set(std::move(q));
@@ -424,7 +424,7 @@ private:
         return it;
     }
 
-    [[nodiscard]] std::wstring item_path(const Item& it) const { return to_wide(it.pt.p.p); }
+    [[nodiscard]] static std::wstring item_path(const Item& it)  { return to_wide(it.pt.p.p); }
 
     // ------------------------------------------------------------------------------------------
     // Window placement
@@ -438,12 +438,13 @@ private:
         GetCursorPos(&cur);
         HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
         if (sh_.settings.pill_x != INT32_MIN) {
-            const POINT saved{sh_.settings.pill_x, sh_.settings.pill_y};
+            const POINT saved{.x=sh_.settings.pill_x, .y=sh_.settings.pill_y};
             if (HMONITOR m = MonitorFromPoint(saved, MONITOR_DEFAULTTONULL)) mon = m;
         }
         MONITORINFO mi{sizeof(mi)};
         GetMonitorInfoW(mon, &mi);
-        UINT dpi_x = 96, dpi_y = 96;
+        UINT dpi_x = 96;
+        UINT dpi_y = 96;
         GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpi_x, &dpi_y);
         const float s = static_cast<float>(dpi_x) / 96.0f;
         const int w = static_cast<int>((sh_.settings.pill_w > 0 ? sh_.settings.pill_w : DEFAULT_W) * s);
@@ -1600,8 +1601,9 @@ private:
             const std::wstring w = to_wide(tc.v);
             if (prefix.empty() || w.contains(prefix)) drop_items_.push_back(tc);
         }
-        std::stable_sort(drop_items_.begin(), drop_items_.end(), [&](const TagCount& a, const TagCount& b) {
-            const bool pa = to_wide(a.v).starts_with(prefix), pb = to_wide(b.v).starts_with(prefix);
+        std::ranges::stable_sort(drop_items_, [&](const TagCount& a, const TagCount& b) {
+            const bool pa = to_wide(a.v).starts_with(prefix);
+            const bool pb = to_wide(b.v).starts_with(prefix);
             return pa > pb;
         });
         if (drop_items_.size() > 8) drop_items_.resize(8);
@@ -1612,7 +1614,7 @@ private:
     }
 
     void accept_dropdown(int index) {
-        if (index < 0 || index >= static_cast<int>(drop_items_.size())) return;
+        if (index < 0 || std::cmp_greater_equal(index ,drop_items_.size())) return;
         const std::wstring tag = to_wide(drop_items_[index].v);
         const std::wstring value = tag.contains(L' ') ? ulp::str::concat_strings(L"\"", tag, L"\"") : tag;
         if (auto tok = tag_token()) {
@@ -1632,7 +1634,9 @@ private:
     }
 
     void draw_dropdown(Canvas& cv) {
-        const float x = 44.0f, y = HEADER_H - 4.0f, w = 300.0f;
+        const float x = 44.0f;
+        const float y = HEADER_H - 4.0f;
+        const float w = 300.0f;
         const float row = 32.0f;
         const float h = drop_items_.empty() ? 44.0f : 8.0f + row * static_cast<float>(drop_items_.size());
         const D2D1_RECT_F r = rect(x, y, w, h);
@@ -1649,9 +1653,9 @@ private:
         for (size_t i = 0; i < drop_items_.size(); ++i) {
             const auto& t = drop_items_[i];
             const D2D1_RECT_F rr = rect(x + 4, y + 4 + row * i, w - 8, row);
-            if (static_cast<int>(i) == drop_sel_) cv.fill_round(rr, 8, with_alpha(cv.theme().primary, 0.14f));
+            if (std::cmp_equal(i, drop_sel_)) cv.fill_round(rr, 8, with_alpha(cv.theme().primary, 0.14f));
             const D2D1_COLOR_F c = cv.tag_color(t.v);
-            cv.fill_circle({rr.left + 14, (rr.top + rr.bottom) / 2}, 4, c);
+            cv.fill_circle({.x=rr.left + 14, .y=(rr.top + rr.bottom) / 2}, 4, c);
             cv.text(to_wide(t.v), D2D1::RectF(rr.left + 28, rr.top, rr.right - 60, rr.bottom), Font::Body, cv.theme().on_surface);
             cv.text(format_count(t.c), D2D1::RectF(rr.right - 70, rr.top, rr.right - 12, rr.bottom), Font::Caption, cv.theme().outline, Align::Right);
             cv.hit(rr, IdDropItem, static_cast<int>(i));
@@ -1664,14 +1668,14 @@ private:
         const wchar_t* insert;
     };
     static constexpr std::array<HelpRow, 7> HELP_ROWS = {{
-        {L"free text", L"Semantic search by meaning (CLIP)", L""},
-        {L"name:cat", L"File name contains prefix tokens", L"name:"},
-        {L"tag:fav", L"Require tag (\"quotes\" for spaces)", L"tag:"},
-        {L"-tag:wip", L"Exclude tag (or !tag:wip)", L"-tag:"},
-        {L"dir:C:\\Photos", L"Search inside folder (or in:, bare path)", L"dir:"},
-        {L"similar:path", L"Visually similar to an indexed file", L"similar:"},
-        {L"type:image", L"Filter media type (image or video)", L"type:image "},
-    }};
+        {.syntax=L"free text", .desc=L"Semantic search by meaning (CLIP)", .insert=L""},
+        {.syntax=L"name:cat", .desc=L"File name contains prefix tokens", .insert=L"name:"},
+        {.syntax=L"tag:fav", .desc=L"Require tag (\"quotes\" for spaces)", .insert=L"tag:"},
+        {.syntax=L"-tag:wip", .desc=L"Exclude tag (or !tag:wip)", .insert=L"-tag:"},
+        {.syntax=L"dir:C:\\Photos", .desc=L"Search inside folder (or in:, bare path)", .insert=L"dir:"},
+        {.syntax=L"similar:path", .desc=L"Visually similar to an indexed file", .insert=L"similar:"},
+        {.syntax=L"type:image", .desc=L"Filter media type (image or video)", .insert=L"type:image "},
+    },};
 
     void draw_help(Canvas& cv, D2D1_SIZE_F sz) {
         const float x = std::clamp(help_btn_x_ + 36.0f - HELP_W, 14.0f, std::max(14.0f, sz.width - HELP_W - 14.0f));

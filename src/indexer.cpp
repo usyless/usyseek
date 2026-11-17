@@ -154,7 +154,7 @@ struct Scope {
             const DWORD mask = GetLogicalDrives();
             for (int i = 0; i < 26; ++i) {
                 if (!(mask & (1u << i))) continue;
-                const wchar_t drive = static_cast<wchar_t>(L'A' + i);
+                const auto drive = static_cast<wchar_t>(L'A' + i);
                 const std::array<wchar_t, 4> root = {drive, L':', L'\\', 0};
                 if (GetDriveTypeW(root.data()) != DRIVE_FIXED) continue;
                 
@@ -167,7 +167,7 @@ struct Scope {
         } else {
             for (const auto& i : includes) {
                 if (i.size() >= 2 && i[1] == L':') {
-                    const wchar_t drive = static_cast<wchar_t>(towupper(i[0]));
+                    const auto drive = static_cast<wchar_t>(towupper(i[0]));
                     const std::array<wchar_t, 5> probe = {drive, L':', L'\\', L'*', 0};
                     if (!excluded(std::wstring_view{probe.data(), 4})) {
                         out.insert(drive);

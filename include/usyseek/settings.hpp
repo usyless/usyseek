@@ -310,8 +310,9 @@ inline VenvInfo read_venv(const fs::path& venv) {
             if (eq == std::string_view::npos) continue;
             const std::string_view key = trim_sv(line.substr(0, eq));
             const std::string_view val = trim_sv(line.substr(eq + 1));
-            if (key == "home") info.home = to_wide(val);
-            else if (key == "version" || key == "version_info") {
+            if (key == "home") { 
+                info.home = to_wide(val);
+            } else if (key == "version" || key == "version_info") {
                 if (info.version.empty() || key == "version") info.version = to_wide(val);
             }
         }

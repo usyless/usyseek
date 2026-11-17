@@ -14,10 +14,8 @@
 #include <wil/com.h>
 
 #include <algorithm>
-#include <cmath>
 #include <functional>
 #include <span>
-#include <unordered_map>
 #include <vector>
 
 namespace usyseek::ui {
@@ -105,7 +103,7 @@ private:
         if (!adapter) factory->EnumAdapters1(0, &adapter);
 
         static constexpr std::array<D3D_FEATURE_LEVEL, 4> levels = {
-            D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
+            D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0,};
         const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         HRESULT hr = E_FAIL;
         warp_ = false;

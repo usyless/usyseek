@@ -4,7 +4,6 @@
 #include <concepts>
 #include <cwctype>
 #include <ranges>
-#include <span>
 #include <string>
 #include <string_view>
 
@@ -12,7 +11,8 @@ namespace usyseek {
 
 inline std::wstring normalize_path_rule(std::wstring_view raw) {
     const auto is_space = [](wchar_t c) { return std::iswspace(static_cast<wint_t>(c)) != 0; };
-    size_t b = 0, e = raw.size();
+    size_t b = 0;
+    size_t e = raw.size();
     while (b < e && is_space(raw[b])) ++b;
     while (e > b && is_space(raw[e - 1])) --e;
 

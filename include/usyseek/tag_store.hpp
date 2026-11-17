@@ -2,7 +2,6 @@
 
 #include <sqlite3.h>
 
-#include <algorithm>
 #include <concepts>
 #include <cstdint>
 #include <filesystem>

@@ -94,7 +94,7 @@ namespace detail {
         {"-text.onnx.data", Kind::Onnx},
         {"-text.onnx.tmp", Kind::Partial},
         {"-text.onnx", Kind::Onnx},
-    }};
+    },};
 
     std::map<std::string, ModelStorageInfo> by_name;
     for (const auto& entry : fs::directory_iterator(model_dir, fs::directory_options::skip_permission_denied, ec)) {

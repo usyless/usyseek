@@ -330,8 +330,11 @@ inline Result download(const std::wstring& url, const fs::path& dest, const Prog
         if (!detail::open(url, 0, r, res.error, cancel_ev.get())) return fail(res.error);
     }
     res.status = r.status;
-    if (r.status == 200) have = 0; // the server ignored the range
-    else if (r.status != 206) return fail(detail::status_text(r.status));
+    if (r.status == 200) {
+        have = 0; // the server ignored the range
+    } else if (r.status != 206) {
+        return fail(detail::status_text(r.status));
+    }
     const uint64_t total = r.content_length > 0 ? have + r.content_length : 0;
 
     wil::unique_hfile file{CreateFileW(part.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, have > 0 ? OPEN_EXISTING : CREATE_ALWAYS,

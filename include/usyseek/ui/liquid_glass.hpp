@@ -9,8 +9,6 @@
 #include <dxgi1_2.h>
 
 #include <algorithm>
-#include <atomic>
-#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -24,11 +22,19 @@ namespace usyseek::ui {
 
 // {6A1E8D20-4C45-4F9A-9D82-2F1E37C0A811}
 inline constexpr GUID CLSID_UsyseekLiquidGlass = {
-    0x6a1e8d20, 0x4c45, 0x4f9a, {0x9d, 0x82, 0x2f, 0x1e, 0x37, 0xc0, 0xa8, 0x11}};
+    .Data1=0x6a1e8d20, 
+    .Data2=0x4c45, 
+    .Data3=0x4f9a, 
+    .Data4={0x9d, 0x82, 0x2f, 0x1e, 0x37, 0xc0, 0xa8, 0x11},
+};
 
 // {A3F42B91-8D13-4E2F-8A10-914D2C77E502}
 inline constexpr GUID GUID_UsyseekLiquidGlassPS = {
-    0xa3f42b91, 0x8d13, 0x4e2f, {0x8a, 0x10, 0x91, 0x4d, 0x2c, 0x77, 0xe5, 0x02}};
+    .Data1=0xa3f42b91, 
+    .Data2=0x8d13, 
+    .Data3=0x4e2f, 
+    .Data4={0x8a, 0x10, 0x91, 0x4d, 0x2c, 0x77, 0xe5, 0x02},
+};
 
 /// Constant buffer matching `cbuffer LiquidGlassParams : register(b0)` in the D2D shader.
 struct alignas(16) LiquidGlassShaderParams {
@@ -392,7 +398,7 @@ public:
 
         const std::array<D2D1_PROPERTY_BINDING, 1> bindings = {{
             D2D1_BLOB_TYPE_BINDING(L"Params", &LiquidGlassEffectImpl::set_params, &LiquidGlassEffectImpl::get_params),
-        }};
+        },};
         const HRESULT hr = factory->RegisterEffectFromString(
             CLSID_UsyseekLiquidGlass,
             xml,
@@ -1236,7 +1242,7 @@ private:
         return seeded_gdi_ ? win_bmp_[win_bmp_idx_].get() : nullptr;
     }
 
-    bool seed_from_screen_dc(ID2D1Bitmap1* dst_bmp, POINT origin, UINT pw, UINT ph) noexcept {
+    static bool seed_from_screen_dc(ID2D1Bitmap1* dst_bmp, POINT origin, UINT pw, UINT ph) noexcept {
         if (!dst_bmp || pw == 0 || ph == 0) return false;
         HDC screen_dc = GetDC(nullptr);
         if (!screen_dc) return false;

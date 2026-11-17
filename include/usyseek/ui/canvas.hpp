@@ -79,7 +79,7 @@ enum class Font : uint8_t {
     Icon,       // 16
     IconSmall,  // 12
     IconLarge,  // 20
-    Count
+    Count,
 };
 
 enum class Align : uint8_t { Left, Center, Right };
@@ -118,7 +118,7 @@ public:
             {Font::Icon, &icon, 16.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
             {Font::IconSmall, &icon, 12.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
             {Font::IconLarge, &icon, 20.0f, DWRITE_FONT_WEIGHT_NORMAL, false},
-        }};
+        },};
         for (const auto& d : defs) {
             wil::com_ptr<IDWriteTextFormat> fmt;
             if (FAILED(dw->CreateTextFormat(d.family->c_str(), nullptr, d.weight, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, d.size, L"en-us", &fmt))) return false;
@@ -499,7 +499,8 @@ inline void middle_truncate_dir_into(Canvas& cv, std::wstring_view path, Font f,
     }
     if (!out.empty()) return;
 
-    size_t lo = 0, hi = path.size();
+    size_t lo = 0;
+    size_t hi = path.size();
     while (lo < hi) {
         const size_t mid = (lo + hi + 1) / 2;
         const size_t left_n = std::max<size_t>(root_end, mid / 3);
@@ -511,8 +512,11 @@ inline void middle_truncate_dir_into(Canvas& cv, std::wstring_view path, Font f,
         cand.assign(path.substr(0, left_n));
         cand.push_back(L'…');
         cand.append(path.substr(path.size() - right_n));
-        if (cv.measure(cand, f) <= max_w) lo = mid;
-        else hi = mid - 1;
+        if (cv.measure(cand, f) <= max_w) { 
+            lo = mid;
+        } else { 
+            hi = mid - 1;
+        }
     }
     const size_t left_n = std::min(path.size(), std::max<size_t>(root_end, lo / 3));
     const size_t right_n = lo > left_n ? std::min(path.size() - left_n, lo - left_n) : 0;
