@@ -1,6 +1,7 @@
 #pragma once
 
 #include "canvas.hpp"
+#include "desktop_rotation.hpp"
 
 #include <d2d1effectauthor.h>
 #include <d2d1effecthelpers.h>
@@ -11,7 +12,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
@@ -534,7 +537,7 @@ private:
     LiquidGlassShaderParams params_{};
 };
 
-/// Captures the live monitor desktop on the GPU via DXGI Output Duplication.
+/// Captures the live monitor desktops on the GPU via DXGI Output Duplication.
 /// Shared across all windows on the same D3D11 device so `DuplicateOutput` is only
 /// acquired once per monitor (DXGI rejects a second duplication on the same device & output).
 class DesktopDuplicator {
@@ -542,39 +545,86 @@ public:
     struct FrameDelta {
         uint64_t seq = 0;
         bool dirty_all = false;
-        std::vector<RECT> dirty_rects;
+        std::vector<RECT> dirty_rects; // virtual-desktop coordinates
     };
 
     struct OutputState {
         static constexpr size_t MAX_HISTORY = 16;
         HMONITOR mon = nullptr;
-        RECT mon_rect{};
+        RECT mon_rect{}; // virtual-desktop coordinates (already rotated)
+        DesktopRotation rotation = DesktopRotation::Identity;
         wil::com_ptr<IDXGIOutputDuplication> dupl;
-        wil::com_ptr<ID3D11Texture2D> desktop_tex;
+        wil::com_ptr<ID3D11Texture2D> desktop_tex; // always desktop-oriented, `tex_w` x `tex_h` == monitor size
         uint64_t tex_id = 0;
         UINT tex_w = 0;
         UINT tex_h = 0;
+        // Rotated outputs only: duplication frames arrive in the panel's native orientation, so they are copied
+        // here and drawn rotated into `desktop_tex`.
+        wil::com_ptr<ID3D11Texture2D> native_tex;
+        wil::com_ptr<ID2D1Bitmap1> native_bmp;
+        wil::com_ptr<ID2D1Bitmap1> desktop_target_bmp;
         bool has_frame = false;
         uint64_t frame_seq = 0;
         std::vector<FrameDelta> history;
         ULONGLONG retry_after_tick = 0;
+
+        [[nodiscard]] long desk_w() const noexcept { return mon_rect.right - mon_rect.left; }
+        [[nodiscard]] long desk_h() const noexcept { return mon_rect.bottom - mon_rect.top; }
+
+        /// Part of `screen_rc` (virtual-desktop coordinates) on this output, in `desktop_tex` coordinates.
+        [[nodiscard]] IntRect tex_rect_for(const RECT& screen_rc) const noexcept {
+            return int_rect_intersect(
+                IntRect{.left = screen_rc.left - mon_rect.left, .top = screen_rc.top - mon_rect.top,
+                        .right = screen_rc.right - mon_rect.left, .bottom = screen_rc.bottom - mon_rect.top,},
+                IntRect{.left = 0, .top = 0, .right = static_cast<long>(tex_w), .bottom = static_cast<long>(tex_h)});
+        }
     };
 
     void reset() noexcept {
         outputs_.clear();
+        rot_dc_.reset();
         epoch_ = 0;
     }
 
-    /// Polls DXGI Output Duplication without blocking (or with a brief wait on initial acquire).
-    /// Returns the monitor state when valid (or nullptr if duplication is currently unavailable).
-    const OutputState* poll_monitor(Gfx& gfx, HWND hwnd, ULONGLONG now_tick) {
-        if (!gfx.ready() || !hwnd) return nullptr;
+    /// Polls every output that `screen_rc` overlaps (without blocking, or with a brief wait on initial acquire).
+    /// Fills `out` with their states and returns true only when every overlapped output has a valid frame.
+    bool poll_rect(Gfx& gfx, const RECT& screen_rc, ULONGLONG now_tick, std::vector<const OutputState*>& out) {
+        out.clear();
+        if (!gfx.ready()) return false;
         if (epoch_ != gfx.epoch()) {
             outputs_.clear();
+            rot_dc_.reset();
             epoch_ = gfx.epoch();
         }
 
-        const HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        mons_scratch_.clear();
+        EnumDisplayMonitors(nullptr, &screen_rc, &collect_monitor, reinterpret_cast<LPARAM>(&mons_scratch_));
+        if (mons_scratch_.empty()) {
+            mons_scratch_.push_back(MonitorFromRect(&screen_rc, MONITOR_DEFAULTTONEAREST));
+        }
+
+        bool all_ok = true;
+        for (const HMONITOR mon : mons_scratch_) {
+            if (const OutputState* st = poll_output(gfx, mon, now_tick)) {
+                out.push_back(st);
+            } else {
+                all_ok = false;
+            }
+        }
+        return all_ok && !out.empty();
+    }
+
+private:
+    static BOOL CALLBACK collect_monitor(HMONITOR m, HDC /*dc*/, LPRECT /*rc*/, LPARAM lp) noexcept {
+        try {
+            reinterpret_cast<std::vector<HMONITOR>*>(lp)->push_back(m);
+        } catch (...) {
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    const OutputState* poll_output(Gfx& gfx, HMONITOR mon, ULONGLONG now_tick) {
         OutputState* st = find_or_create(mon);
         if (!ensure_duplication(gfx, *st, now_tick)) return st->has_frame ? st : nullptr;
 
@@ -596,6 +646,9 @@ public:
             // The initial DXGI handshake frame (and pointer-only updates) have LastPresentTime == 0: skip them.
             if (info.LastPresentTime.QuadPart == 0) continue;
 
+            const auto tex = res.try_query<ID3D11Texture2D>();
+            if (!tex || !ensure_desktop_surface(gfx, *st, tex.get(), next_tex_id_)) break;
+
             FrameDelta delta;
             delta.dirty_all = !st->has_frame;
             const UINT meta_bytes = info.TotalMetadataBufferSize;
@@ -609,11 +662,7 @@ public:
                     const UINT n = move_bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT);
                     const auto* moves = reinterpret_cast<const DXGI_OUTDUPL_MOVE_RECT*>(metadata_buf_.data());
                     delta.dirty_rects.reserve(delta.dirty_rects.size() + n);
-                    for (UINT i = 0; i < n; ++i) {
-                        RECT r = moves[i].DestinationRect;
-                        OffsetRect(&r, st->mon_rect.left, st->mon_rect.top);
-                        delta.dirty_rects.push_back(r);
-                    }
+                    for (UINT i = 0; i < n; ++i) delta.dirty_rects.push_back(tex_to_screen(*st, moves[i].DestinationRect));
                     any_meta = true;
                 }
                 UINT dirty_bytes = 0;
@@ -623,11 +672,7 @@ public:
                     const UINT n = dirty_bytes / sizeof(RECT);
                     const auto* rects = reinterpret_cast<const RECT*>(metadata_buf_.data());
                     delta.dirty_rects.reserve(delta.dirty_rects.size() + n);
-                    for (UINT i = 0; i < n; ++i) {
-                        RECT r = rects[i];
-                        OffsetRect(&r, st->mon_rect.left, st->mon_rect.top);
-                        delta.dirty_rects.push_back(r);
-                    }
+                    for (UINT i = 0; i < n; ++i) delta.dirty_rects.push_back(tex_to_screen(*st, rects[i]));
                     any_meta = true;
                 }
                 if (!any_meta) delta.dirty_all = true;
@@ -635,35 +680,74 @@ public:
                 delta.dirty_all = true;
             }
 
-            if (const auto tex = res.try_query<ID3D11Texture2D>()) {
-                if (ensure_desktop_surface(gfx, *st, tex.get(), next_tex_id_)) {
-                    gfx.d3d_context()->CopyResource(st->desktop_tex.get(), tex.get());
-                    st->has_frame = true;
-                    ++st->frame_seq;
-                    delta.seq = st->frame_seq;
-                    st->history.push_back(std::move(delta));
-                    if (st->history.size() > OutputState::MAX_HISTORY) st->history.erase(st->history.begin());
-                }
+            if (st->rotation == DesktopRotation::Identity) {
+                gfx.d3d_context()->CopyResource(st->desktop_tex.get(), tex.get());
+            } else {
+                gfx.d3d_context()->CopyResource(st->native_tex.get(), tex.get());
+                if (!rotate_into_desktop(*st)) break;
             }
+            st->has_frame = true;
+            ++st->frame_seq;
+            delta.seq = st->frame_seq;
+            st->history.push_back(std::move(delta));
+            if (st->history.size() > OutputState::MAX_HISTORY) st->history.erase(st->history.begin());
             break;
         }
         return st->has_frame ? st : nullptr;
     }
 
-private:
-    OutputState* find_or_create(HMONITOR mon) {
-        for (auto& o : outputs_) {
-            if (o.mon == mon) return &o;
+    /// Duplication metadata rects are in texture space; map them to virtual-desktop coordinates.
+    [[nodiscard]] static RECT tex_to_screen(const OutputState& st, const RECT& r) noexcept {
+        const IntRect d = tex_to_desktop(IntRect{.left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom},
+                                         st.rotation, st.desk_w(), st.desk_h());
+        return RECT{.left = d.left + st.mon_rect.left, .top = d.top + st.mon_rect.top,
+                    .right = d.right + st.mon_rect.left, .bottom = d.bottom + st.mon_rect.top,};
+    }
+
+    [[nodiscard]] static DesktopRotation to_rotation(DXGI_MODE_ROTATION r) noexcept {
+        switch (r) {
+            case DXGI_MODE_ROTATION_ROTATE90: return DesktopRotation::Rot90;
+            case DXGI_MODE_ROTATION_ROTATE180: return DesktopRotation::Rot180;
+            case DXGI_MODE_ROTATION_ROTATE270: return DesktopRotation::Rot270;
+            default: return DesktopRotation::Identity;
         }
-        outputs_.push_back(OutputState{.mon = mon});
-        return &outputs_.back();
+    }
+
+    OutputState* find_or_create(HMONITOR mon) {
+        for (const auto& o : outputs_) {
+            if (o->mon == mon) return o.get();
+        }
+        auto st = std::make_unique<OutputState>();
+        st->mon = mon;
+        outputs_.push_back(std::move(st));
+        return outputs_.back().get();
+    }
+
+    /// Draws the native-orientation frame into the desktop-oriented texture.
+    bool rotate_into_desktop(OutputState& st) noexcept {
+        if (!rot_dc_ || !st.native_bmp || !st.desktop_target_bmp) return false;
+        const Affine2D m = tex_to_desktop_xform(st.rotation, st.desk_w(), st.desk_h(), 0.0f, 0.0f);
+        const D2D1_SIZE_U native = st.native_bmp->GetPixelSize();
+        const D2D1_RECT_F src = D2D1::RectF(0.0f, 0.0f, static_cast<float>(native.width), static_cast<float>(native.height));
+        rot_dc_->SetTarget(st.desktop_target_bmp.get());
+        rot_dc_->BeginDraw();
+        rot_dc_->SetTransform(D2D1::Matrix3x2F(m.m11, m.m12, m.m21, m.m22, m.dx, m.dy));
+        rot_dc_->DrawBitmap(st.native_bmp.get(), &src, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src, nullptr);
+        rot_dc_->SetTransform(D2D1::Matrix3x2F::Identity());
+        const HRESULT hr = rot_dc_->EndDraw();
+        rot_dc_->SetTarget(nullptr);
+        return SUCCEEDED(hr);
     }
 
     static void reset_output(OutputState& st) noexcept {
+        st.native_bmp.reset();
+        st.desktop_target_bmp.reset();
+        st.native_tex.reset();
         st.dupl.reset();
         st.desktop_tex.reset();
         st.tex_id = 0;
         st.mon_rect = {};
+        st.rotation = DesktopRotation::Identity;
         st.tex_w = st.tex_h = 0;
         st.has_frame = false;
         st.history.clear();
@@ -686,7 +770,10 @@ private:
             if (SUCCEEDED(out->GetDesc(&desc)) && desc.Monitor == st.mon) {
                 if (const auto out1 = out.try_query<IDXGIOutput1>()) {
                     if (SUCCEEDED(out1->DuplicateOutput(gfx.d3d(), &st.dupl))) {
+                        DXGI_OUTDUPL_DESC dd{};
+                        st.dupl->GetDesc(&dd);
                         st.mon_rect = desc.DesktopCoordinates;
+                        st.rotation = to_rotation(dd.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED ? dd.Rotation : desc.Rotation);
                         st.has_frame = false;
                         return true;
                     }
@@ -698,30 +785,70 @@ private:
         return false;
     }
 
-    static bool ensure_desktop_surface(Gfx& gfx, OutputState& st, ID3D11Texture2D* src, uint64_t& next_tex_id) noexcept {
+    bool ensure_desktop_surface(Gfx& gfx, OutputState& st, ID3D11Texture2D* src, uint64_t& next_tex_id) noexcept {
         D3D11_TEXTURE2D_DESC sd{};
         src->GetDesc(&sd);
-        if (st.desktop_tex && st.tex_w == sd.Width && st.tex_h == sd.Height) return true;
+        const bool rotated = st.rotation != DesktopRotation::Identity;
+        const bool swap = st.rotation == DesktopRotation::Rot90 || st.rotation == DesktopRotation::Rot270;
+        const UINT want_w = swap ? sd.Height : sd.Width;
+        const UINT want_h = swap ? sd.Width : sd.Height;
+        if (st.desktop_tex && st.tex_w == want_w && st.tex_h == want_h && (!rotated || st.native_tex)) return true;
 
+        st.native_bmp.reset();
+        st.desktop_target_bmp.reset();
+        st.native_tex.reset();
         st.desktop_tex.reset();
         st.tex_id = 0;
+        st.tex_w = st.tex_h = 0;
+        st.has_frame = false; // a fresh texture is empty until this frame lands in it
         D3D11_TEXTURE2D_DESC td{};
-        td.Width = sd.Width;
-        td.Height = sd.Height;
+        td.Width = want_w;
+        td.Height = want_h;
         td.MipLevels = 1;
         td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.BindFlags = static_cast<UINT>(D3D11_BIND_SHADER_RESOURCE) | (rotated ? static_cast<UINT>(D3D11_BIND_RENDER_TARGET) : 0u);
         if (FAILED(gfx.d3d()->CreateTexture2D(&td, nullptr, &st.desktop_tex))) return false;
+
+        if (rotated && !create_rotation_surfaces(gfx, st, td, sd)) {
+            st.native_bmp.reset();
+            st.desktop_target_bmp.reset();
+            st.native_tex.reset();
+            st.desktop_tex.reset();
+            return false;
+        }
         st.tex_id = ++next_tex_id;
-        st.tex_w = sd.Width;
-        st.tex_h = sd.Height;
+        st.tex_w = want_w;
+        st.tex_h = want_h;
         return true;
     }
 
-    std::vector<OutputState> outputs_;
+    bool create_rotation_surfaces(Gfx& gfx, OutputState& st, const D3D11_TEXTURE2D_DESC& desk_desc,
+                                  const D3D11_TEXTURE2D_DESC& native_desc) noexcept {
+        if (!rot_dc_ && FAILED(gfx.d2d_device()->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &rot_dc_))) {
+            return false;
+        }
+        D3D11_TEXTURE2D_DESC nd = desk_desc;
+        nd.Width = native_desc.Width;
+        nd.Height = native_desc.Height;
+        nd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(gfx.d3d()->CreateTexture2D(&nd, nullptr, &st.native_tex))) return false;
+        const auto native_surf = st.native_tex.try_query<IDXGISurface>();
+        const auto desk_surf = st.desktop_tex.try_query<IDXGISurface>();
+        if (!native_surf || !desk_surf) return false;
+        const auto native_props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+        const auto target_props = D2D1::BitmapProperties1(
+            D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+        return SUCCEEDED(rot_dc_->CreateBitmapFromDxgiSurface(native_surf.get(), &native_props, &st.native_bmp)) &&
+               SUCCEEDED(rot_dc_->CreateBitmapFromDxgiSurface(desk_surf.get(), &target_props, &st.desktop_target_bmp));
+    }
+
+    std::vector<std::unique_ptr<OutputState>> outputs_; // stable addresses: windows hold pointers across a frame
+    std::vector<HMONITOR> mons_scratch_;
+    wil::com_ptr<ID2D1DeviceContext> rot_dc_; // only created once a rotated output is duplicated
     uint64_t epoch_ = 0;
     uint64_t next_tex_id_ = 0;
     std::vector<uint8_t> metadata_buf_;
@@ -731,8 +858,8 @@ private:
 class LiquidGlassWindow {
 public:
     void release() noexcept {
-        desktop_bmp_.reset();
-        desktop_bmp_tex_id_ = 0;
+        views_.clear();
+        outs_.clear();
         win_bmp_[0].reset();
         win_bmp_[1].reset();
         win_bmp_idx_ = 0;
@@ -742,19 +869,9 @@ public:
         desktop_fx_ = {};
         lens_pool_.clear();
         lens_cursor_ = 0;
-        probe_tex_.reset();
-        last_probe_px_.clear();
         last_probe_valid_ = false;
-        last_probe_seq_ = 0;
-        last_probe_mon_ = nullptr;
         last_probe_origin_ = {.x = LONG_MIN, .y = LONG_MIN};
         last_probe_pw_ = last_probe_ph_ = 0;
-        last_probe_clip_l_ = last_probe_clip_t_ = 0;
-        last_probe_cw_ = last_probe_ch_ = 0;
-        probe_epoch_ = 0;
-        last_mon_ = nullptr;
-        last_tex_id_ = 0;
-        last_seq_ = 0;
         backdrop_ver_ = 0;
         gdi_origin_ = {.x = LONG_MIN, .y = LONG_MIN};
         gdi_pw_ = gdi_ph_ = 0;
@@ -768,7 +885,6 @@ public:
         scene_w_ = scene_h_ = 0;
         epoch_ = 0;
         scene_epoch_ = 0;
-        desktop_bmp_epoch_ = 0;
         win_bmp_epoch_ = 0;
         cached_glass_epoch_ = 0;
     }
@@ -786,8 +902,8 @@ public:
         const UINT ph = static_cast<UINT>(std::max(1L, crc.bottom - crc.top));
         POINT origin{.x = 0, .y = 0};
         ClientToScreen(hwnd, &origin);
-        const auto [st, changed] = sync_dupl_state(dupl, gfx, hwnd, pw, ph, origin, !sizemove_);
-        return st != nullptr && changed;
+        const auto [ok, changed] = sync_dupl_state(dupl, gfx, hwnd, pw, ph, origin, !sizemove_);
+        return ok && changed;
     }
 
     /// Draws the live monitor desktop behind `hwnd` through the Liquid Glass shader across `panel_rect`.
@@ -811,12 +927,11 @@ public:
         const bool allow_probe = !sizemove_ && !origin_override_ && last_probe_valid_ &&
                                  last_probe_origin_.x == origin.x && last_probe_origin_.y == origin.y &&
                                  last_probe_pw_ == pw && last_probe_ph_ == ph;
-        const auto [st, _] = sync_dupl_state(dupl, gfx, hwnd, pw, ph, origin, allow_probe);
+        const auto [use_dupl, _] = sync_dupl_state(dupl, gfx, hwnd, pw, ph, origin, allow_probe);
 
         GlassStyle s = style;
         s.force_opaque = true;
 
-        const bool use_dupl = (st && st->has_frame && st->desktop_tex);
         ID2D1Bitmap1* gdi_bmp = nullptr;
         if (!use_dupl) {
             gdi_bmp = capture_gdi_backdrop(target, origin, pw, ph);
@@ -833,50 +948,8 @@ public:
 
         ID2D1Bitmap1* src_bmp = nullptr;
         if (use_dupl) {
-            if (!desktop_bmp_ || desktop_bmp_tex_id_ != st->tex_id || desktop_bmp_dpi_ != target.dpi() || desktop_bmp_epoch_ != target.target_epoch()) {
-                desktop_bmp_.reset();
-                desktop_bmp_tex_id_ = 0;
-                const auto surf = st->desktop_tex.try_query<IDXGISurface>();
-                if (!surf) return false;
-                const auto props = D2D1::BitmapProperties1(
-                    D2D1_BITMAP_OPTIONS_NONE,
-                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
-                    target.dpi(), target.dpi());
-                if (FAILED(target.dc()->CreateBitmapFromDxgiSurface(surf.get(), &props, &desktop_bmp_))) {
-                    return false;
-                }
-                desktop_bmp_tex_id_ = st->tex_id;
-                desktop_bmp_dpi_ = target.dpi();
-                desktop_bmp_epoch_ = target.target_epoch();
-            }
-
-            const LONG sx = origin.x - st->mon_rect.left;
-            const LONG sy = origin.y - st->mon_rect.top;
-            const LONG clip_l = std::clamp<LONG>(sx, 0, static_cast<LONG>(st->tex_w));
-            const LONG clip_t = std::clamp<LONG>(sy, 0, static_cast<LONG>(st->tex_h));
-            const LONG clip_r = std::clamp<LONG>(sx + static_cast<LONG>(pw), 0, static_cast<LONG>(st->tex_w));
-            const LONG clip_b = std::clamp<LONG>(sy + static_cast<LONG>(ph), 0, static_cast<LONG>(st->tex_h));
-            if (clip_r <= clip_l || clip_b <= clip_t) return false;
-
-            if (!ensure_win_bmp(target, pw, ph)) return false;
-            win_bmp_idx_ ^= 1u;
-            ID2D1Bitmap1* dst_bmp = win_bmp_[win_bmp_idx_].get();
-
-            const D2D1_POINT_2U dst_pt{
-                .x = static_cast<UINT32>(clip_l - sx),
-                .y = static_cast<UINT32>(clip_t - sy),
-            };
-            const D2D1_RECT_U src_rc{
-                .left = static_cast<UINT32>(clip_l),
-                .top = static_cast<UINT32>(clip_t),
-                .right = static_cast<UINT32>(clip_r),
-                .bottom = static_cast<UINT32>(clip_b),
-            };
-            if (FAILED(dst_bmp->CopyFromBitmap(&dst_pt, desktop_bmp_.get(), &src_rc))) return false;
-            if (!sizemove_ && !origin_override_ && last_probe_seq_ != st->frame_seq) {
-                (void)probe_desktop_changed(gfx, *st, origin, pw, ph);
-            }
-            src_bmp = dst_bmp;
+            src_bmp = composite_outputs(gfx, target, origin, pw, ph);
+            if (!src_bmp) return false;
         } else {
             src_bmp = gdi_bmp;
         }
@@ -1066,67 +1139,198 @@ private:
         };
     }
 
-    std::pair<const DesktopDuplicator::OutputState*, bool> sync_dupl_state(
-        DesktopDuplicator& dupl, Gfx& gfx, HWND hwnd, UINT pw, UINT ph, POINT origin, bool allow_probe) {
-        const auto* st = dupl.poll_monitor(gfx, hwnd, GetTickCount64());
-        if (!st || !st->has_frame) return {nullptr, false};
+    /// What this window last saw of one duplicated output, plus its self-repaint probe baseline.
+    struct OutputView {
+        HMONITOR mon = nullptr;
+        uint64_t seen_tex_id = 0;
+        uint64_t seen_seq = 0;
+        wil::com_ptr<ID2D1Bitmap1> bmp; // D2D view of the output's desktop texture
+        uint64_t bmp_tex_id = 0;
+        uint64_t bmp_epoch = 0;
+        wil::com_ptr<ID3D11Texture2D> probe_tex;
+        UINT probe_tex_w = 0, probe_tex_h = 0;
+        uint64_t probe_epoch = 0;
+        std::vector<uint8_t> probe_px;
+        IntRect probe_rc{};
+        uint64_t probe_src_tex = 0;
+        uint64_t probe_seq = 0;
+        bool probe_valid = false;
+    };
 
-        const bool mon_changed = (last_mon_ != st->mon || last_tex_id_ != st->tex_id);
-        if (!mon_changed && last_seq_ == st->frame_seq) return {st, false};
+    [[nodiscard]] static RECT screen_rect(POINT origin, UINT pw, UINT ph) noexcept {
+        return RECT{.left = origin.x, .top = origin.y, .right = origin.x + static_cast<LONG>(pw), .bottom = origin.y + static_cast<LONG>(ph)};
+    }
 
-        bool need_check = mon_changed || last_seq_ == 0 || st->history.empty() ||
-                          st->history.front().seq > last_seq_ + 1;
+    /// Polls every output under the window into `outs_` (with `views_` kept parallel to it).
+    /// Returns {all outputs available, backdrop changed}.
+    std::pair<bool, bool> sync_dupl_state(DesktopDuplicator& dupl, Gfx& gfx, HWND hwnd, UINT pw, UINT ph, POINT origin, bool allow_probe) {
+        const RECT rc = screen_rect(origin, pw, ph);
+        if (!dupl.poll_rect(gfx, rc, GetTickCount64(), outs_)) {
+            outs_.clear();
+            return {false, false};
+        }
+
+        // Re-align views with outputs, keeping existing state for monitors that are still covered.
+        bool set_changed = views_.size() != outs_.size();
+        views_scratch_.clear();
+        for (size_t i = 0; i < outs_.size(); ++i) {
+            const auto* st = outs_[i];
+            const auto it = std::ranges::find(views_, st->mon, &OutputView::mon);
+            if (it == views_.end()) {
+                OutputView v;
+                v.mon = st->mon;
+                views_scratch_.push_back(std::move(v));
+                set_changed = true;
+            } else {
+                if (std::cmp_not_equal(it - views_.begin(), i) || it->seen_tex_id != st->tex_id) set_changed = true;
+                views_scratch_.push_back(std::move(*it));
+            }
+        }
+        views_.swap(views_scratch_);
+        views_scratch_.clear();
+
+        bool any_new_frame = set_changed;
+        for (size_t i = 0; i < outs_.size() && !any_new_frame; ++i) {
+            if (views_[i].seen_seq != outs_[i]->frame_seq) any_new_frame = true;
+        }
+        if (!any_new_frame) return {true, false};
+
+        bool need_check = set_changed;
         if (!need_check) {
-            RECT win_rc{.left = origin.x, .top = origin.y, .right = origin.x + static_cast<LONG>(pw), .bottom = origin.y + static_cast<LONG>(ph)};
+            RECT win_rc = rc;
             RECT full_win_rc{};
             if (GetWindowRect(hwnd, &full_win_rc)) UnionRect(&win_rc, &win_rc, &full_win_rc);
-            for (const auto& delta : st->history) {
-                if (delta.seq <= last_seq_) continue;
-                if (delta.dirty_all) {
-                    need_check = true;
-                    break;
-                }
-                for (const RECT& r : delta.dirty_rects) {
-                    RECT inter{};
-                    if (IntersectRect(&inter, &r, &win_rc)) {
-                        need_check = true;
-                        break;
-                    }
-                }
-                if (need_check) break;
+            for (size_t i = 0; i < outs_.size() && !need_check; ++i) {
+                need_check = output_touched(*outs_[i], views_[i].seen_seq, win_rc);
             }
         }
 
-        last_mon_ = st->mon;
-        last_tex_id_ = st->tex_id;
-        last_seq_ = st->frame_seq;
-        if (!need_check) return {st, false};
+        for (size_t i = 0; i < outs_.size(); ++i) {
+            views_[i].seen_tex_id = outs_[i]->tex_id;
+            views_[i].seen_seq = outs_[i]->frame_seq;
+        }
+        if (!need_check) return {true, false};
 
-        if (allow_probe && !probe_desktop_changed(gfx, *st, origin, pw, ph)) {
-            return {st, false};
+        if (allow_probe && !probe_outputs(gfx, origin, pw, ph)) {
+            return {true, false};
         }
         ++backdrop_ver_;
-        return {st, true};
+        return {true, true};
     }
 
-    bool probe_desktop_changed(Gfx& gfx, const DesktopDuplicator::OutputState& st, POINT origin, UINT pw, UINT ph) {
-        if (!st.desktop_tex || !gfx.d3d() || !gfx.d3d_context() || pw == 0 || ph == 0) return true;
+    /// True when frames newer than `seen_seq` may have changed pixels inside `win_rc`.
+    [[nodiscard]] static bool output_touched(const DesktopDuplicator::OutputState& st, uint64_t seen_seq, const RECT& win_rc) noexcept {
+        if (st.frame_seq == seen_seq) return false;
+        if (seen_seq == 0 || st.history.empty() || st.history.front().seq > seen_seq + 1) return true;
+        for (const auto& delta : st.history) {
+            if (delta.seq <= seen_seq) continue;
+            if (delta.dirty_all) return true;
+            for (const RECT& r : delta.dirty_rects) {
+                RECT inter{};
+                if (IntersectRect(&inter, &r, &win_rc)) return true;
+            }
+        }
+        return false;
+    }
 
-        const LONG sx = origin.x - st.mon_rect.left;
-        const LONG sy = origin.y - st.mon_rect.top;
-        const LONG clip_l = std::clamp<LONG>(sx, 0, static_cast<LONG>(st.tex_w));
-        const LONG clip_t = std::clamp<LONG>(sy, 0, static_cast<LONG>(st.tex_h));
-        const LONG clip_r = std::clamp<LONG>(sx + static_cast<LONG>(pw), 0, static_cast<LONG>(st.tex_w));
-        const LONG clip_b = std::clamp<LONG>(sy + static_cast<LONG>(ph), 0, static_cast<LONG>(st.tex_h));
-        if (clip_r <= clip_l || clip_b <= clip_t) {
-            last_probe_seq_ = st.frame_seq;
+    /// Composites every output under the window into the next `win_bmp_` (black where no monitor is).
+    ID2D1Bitmap1* composite_outputs(Gfx& gfx, WindowTarget& target, POINT origin, UINT pw, UINT ph) {
+        if (outs_.empty() || outs_.size() != views_.size()) return nullptr;
+        const RECT rc = screen_rect(origin, pw, ph);
+
+        uint64_t covered = 0;
+        for (size_t i = 0; i < outs_.size(); ++i) {
+            const auto& st = *outs_[i];
+            OutputView& v = views_[i];
+            if (!st.desktop_tex) return nullptr;
+            if (!v.bmp || v.bmp_tex_id != st.tex_id || v.bmp_epoch != target.target_epoch()) {
+                v.bmp.reset();
+                v.bmp_tex_id = 0;
+                const auto surf = st.desktop_tex.try_query<IDXGISurface>();
+                if (!surf) return nullptr;
+                const auto props = D2D1::BitmapProperties1(
+                    D2D1_BITMAP_OPTIONS_NONE,
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+                    target.dpi(), target.dpi());
+                if (FAILED(target.dc()->CreateBitmapFromDxgiSurface(surf.get(), &props, &v.bmp))) return nullptr;
+                v.bmp_tex_id = st.tex_id;
+                v.bmp_epoch = target.target_epoch();
+            }
+            const IntRect tr = st.tex_rect_for(rc);
+            if (!int_rect_empty(tr)) {
+                covered += static_cast<uint64_t>(tr.right - tr.left) * static_cast<uint64_t>(tr.bottom - tr.top);
+            }
+        }
+        if (covered == 0) return nullptr;
+
+        if (!ensure_win_bmp(target, pw, ph)) return nullptr;
+        win_bmp_idx_ ^= 1u;
+        ID2D1Bitmap1* dst_bmp = win_bmp_[win_bmp_idx_].get();
+
+        // Parts of the window off every monitor would otherwise keep whatever this buffer held two frames ago.
+        if (covered < static_cast<uint64_t>(pw) * ph) {
+            black_px_.resize(static_cast<size_t>(pw) * ph * 4u);
+            const D2D1_RECT_U all{.left = 0, .top = 0, .right = pw, .bottom = ph};
+            if (FAILED(dst_bmp->CopyFromMemory(&all, black_px_.data(), pw * 4u))) return nullptr;
+        }
+
+        for (size_t i = 0; i < outs_.size(); ++i) {
+            const auto& st = *outs_[i];
+            const IntRect tr = st.tex_rect_for(rc);
+            if (int_rect_empty(tr)) continue;
+            const D2D1_POINT_2U dst_pt{
+                .x = static_cast<UINT32>(st.mon_rect.left + tr.left - origin.x),
+                .y = static_cast<UINT32>(st.mon_rect.top + tr.top - origin.y),
+            };
+            const D2D1_RECT_U src_rc{
+                .left = static_cast<UINT32>(tr.left),
+                .top = static_cast<UINT32>(tr.top),
+                .right = static_cast<UINT32>(tr.right),
+                .bottom = static_cast<UINT32>(tr.bottom),
+            };
+            if (FAILED(dst_bmp->CopyFromBitmap(&dst_pt, views_[i].bmp.get(), &src_rc))) return nullptr;
+        }
+
+        if (!sizemove_ && !origin_override_) {
+            for (size_t i = 0; i < outs_.size(); ++i) {
+                if (views_[i].probe_seq != outs_[i]->frame_seq) {
+                    (void)probe_outputs(gfx, origin, pw, ph);
+                    break;
+                }
+            }
+        }
+        return dst_bmp;
+    }
+
+    /// Reads back the window's footprint on every output and compares it with the last readback, so repaints of
+    /// this (capture-excluded) window that still show up as dirty rects don't trigger endless re-renders.
+    bool probe_outputs(Gfx& gfx, POINT origin, UINT pw, UINT ph) {
+        const RECT rc = screen_rect(origin, pw, ph);
+        bool changed = false;
+        for (size_t i = 0; i < outs_.size() && i < views_.size(); ++i) {
+            if (probe_output(gfx, views_[i], *outs_[i], rc)) changed = true;
+        }
+        last_probe_valid_ = true;
+        last_probe_origin_ = origin;
+        last_probe_pw_ = pw;
+        last_probe_ph_ = ph;
+        return changed;
+    }
+
+    static bool probe_output(Gfx& gfx, OutputView& v, const DesktopDuplicator::OutputState& st, const RECT& rc) {
+        if (!st.desktop_tex || !gfx.d3d() || !gfx.d3d_context()) return true;
+
+        const IntRect tr = st.tex_rect_for(rc);
+        if (int_rect_empty(tr)) {
+            v.probe_seq = st.frame_seq;
             return false;
         }
 
-        const UINT cw = static_cast<UINT>(clip_r - clip_l);
-        const UINT ch = static_cast<UINT>(clip_b - clip_t);
-        if (!probe_tex_ || last_probe_cw_ != cw || last_probe_ch_ != ch || probe_epoch_ != gfx.epoch()) {
-            probe_tex_.reset();
+        const UINT cw = static_cast<UINT>(tr.right - tr.left);
+        const UINT ch = static_cast<UINT>(tr.bottom - tr.top);
+        if (!v.probe_tex || v.probe_tex_w != cw || v.probe_tex_h != ch || v.probe_epoch != gfx.epoch()) {
+            v.probe_tex.reset();
+            v.probe_valid = false;
             D3D11_TEXTURE2D_DESC td{};
             td.Width = cw;
             td.Height = ch;
@@ -1136,62 +1340,52 @@ private:
             td.SampleDesc.Count = 1;
             td.Usage = D3D11_USAGE_STAGING;
             td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            if (FAILED(gfx.d3d()->CreateTexture2D(&td, nullptr, &probe_tex_))) return true;
-            probe_epoch_ = gfx.epoch();
+            if (FAILED(gfx.d3d()->CreateTexture2D(&td, nullptr, &v.probe_tex))) return true;
+            v.probe_tex_w = cw;
+            v.probe_tex_h = ch;
+            v.probe_epoch = gfx.epoch();
         }
 
         const D3D11_BOX src_box{
-            .left = static_cast<UINT>(clip_l),
-            .top = static_cast<UINT>(clip_t),
+            .left = static_cast<UINT>(tr.left),
+            .top = static_cast<UINT>(tr.top),
             .front = 0,
-            .right = static_cast<UINT>(clip_r),
-            .bottom = static_cast<UINT>(clip_b),
+            .right = static_cast<UINT>(tr.right),
+            .bottom = static_cast<UINT>(tr.bottom),
             .back = 1,
         };
-        gfx.d3d_context()->CopySubresourceRegion(probe_tex_.get(), 0, 0, 0, 0, st.desktop_tex.get(), 0, &src_box);
+        gfx.d3d_context()->CopySubresourceRegion(v.probe_tex.get(), 0, 0, 0, 0, st.desktop_tex.get(), 0, &src_box);
 
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (FAILED(gfx.d3d_context()->Map(probe_tex_.get(), 0, D3D11_MAP_READ, 0, &mapped))) return true;
-        const auto unmap = wil::scope_exit([&] { gfx.d3d_context()->Unmap(probe_tex_.get(), 0); });
+        if (FAILED(gfx.d3d_context()->Map(v.probe_tex.get(), 0, D3D11_MAP_READ, 0, &mapped))) return true;
+        const auto unmap = wil::scope_exit([&] { gfx.d3d_context()->Unmap(v.probe_tex.get(), 0); });
 
-        const LONG rel_l = clip_l - sx;
-        const LONG rel_t = clip_t - sy;
         const size_t row_bytes = static_cast<size_t>(cw) * 4;
-        const bool same_meta = last_probe_valid_ && last_probe_mon_ == st.mon &&
-                               last_probe_origin_.x == origin.x && last_probe_origin_.y == origin.y &&
-                               last_probe_pw_ == pw && last_probe_ph_ == ph &&
-                               last_probe_clip_l_ == rel_l && last_probe_clip_t_ == rel_t &&
-                               last_probe_cw_ == cw && last_probe_ch_ == ch &&
-                               last_probe_px_.size() == row_bytes * ch;
+        const bool same_meta = v.probe_valid && v.probe_rc == tr && v.probe_src_tex == st.tex_id &&
+                               v.probe_px.size() == row_bytes * ch;
 
         const auto* src_ptr = static_cast<const uint8_t*>(mapped.pData);
         bool changed = !same_meta;
         if (!changed) {
             for (UINT y = 0; y < ch; ++y) {
                 if (std::memcmp(src_ptr + (static_cast<size_t>(y) * mapped.RowPitch),
-                                last_probe_px_.data() + (static_cast<size_t>(y) * row_bytes), row_bytes) != 0) {
+                                v.probe_px.data() + (static_cast<size_t>(y) * row_bytes), row_bytes) != 0) {
                     changed = true;
                     break;
                 }
             }
         }
         if (changed) {
-            last_probe_px_.resize(row_bytes * ch);
+            v.probe_px.resize(row_bytes * ch);
             for (UINT y = 0; y < ch; ++y) {
-                std::memcpy(last_probe_px_.data() + (static_cast<size_t>(y) * row_bytes),
+                std::memcpy(v.probe_px.data() + (static_cast<size_t>(y) * row_bytes),
                             src_ptr + (static_cast<size_t>(y) * mapped.RowPitch), row_bytes);
             }
-            last_probe_valid_ = true;
-            last_probe_mon_ = st.mon;
-            last_probe_origin_ = origin;
-            last_probe_pw_ = pw;
-            last_probe_ph_ = ph;
-            last_probe_clip_l_ = rel_l;
-            last_probe_clip_t_ = rel_t;
-            last_probe_cw_ = cw;
-            last_probe_ch_ = ch;
+            v.probe_valid = true;
+            v.probe_rc = tr;
+            v.probe_src_tex = st.tex_id;
         }
-        last_probe_seq_ = st.frame_seq;
+        v.probe_seq = st.frame_seq;
         return changed;
     }
 
@@ -1423,9 +1617,10 @@ private:
         return true;
     }
 
-    wil::com_ptr<ID2D1Bitmap1> desktop_bmp_;
-    uint64_t desktop_bmp_tex_id_ = 0;
-    float desktop_bmp_dpi_ = 0.0f;
+    std::vector<const DesktopDuplicator::OutputState*> outs_; // outputs under the window, valid for this frame
+    std::vector<OutputView> views_;                         // parallel to `outs_`
+    std::vector<OutputView> views_scratch_;
+    std::vector<uint8_t> black_px_;
     std::array<wil::com_ptr<ID2D1Bitmap1>, 2> win_bmp_;
     uint32_t win_bmp_idx_ = 0;
     wil::com_ptr<ID2D1Bitmap1> cached_glass_bmp_;
@@ -1438,19 +1633,9 @@ private:
     LensFx desktop_fx_;
     std::vector<LensFx> lens_pool_;
     size_t lens_cursor_ = 0;
-    wil::com_ptr<ID3D11Texture2D> probe_tex_;
-    std::vector<uint8_t> last_probe_px_;
     bool last_probe_valid_ = false;
-    uint64_t last_probe_seq_ = 0;
-    HMONITOR last_probe_mon_ = nullptr;
     POINT last_probe_origin_{.x = LONG_MIN, .y = LONG_MIN};
     UINT last_probe_pw_ = 0, last_probe_ph_ = 0;
-    LONG last_probe_clip_l_ = 0, last_probe_clip_t_ = 0;
-    UINT last_probe_cw_ = 0, last_probe_ch_ = 0;
-    uint64_t probe_epoch_ = 0;
-    HMONITOR last_mon_ = nullptr;
-    uint64_t last_tex_id_ = 0;
-    uint64_t last_seq_ = 0;
     uint64_t backdrop_ver_ = 0;
     UINT win_bmp_w_ = 0, win_bmp_h_ = 0;
     float win_bmp_dpi_ = 0.0f;
@@ -1458,7 +1643,6 @@ private:
     float scene_dpi_ = 0.0f;
     uint64_t epoch_ = 0;
     uint64_t scene_epoch_ = 0;
-    uint64_t desktop_bmp_epoch_ = 0;
     uint64_t win_bmp_epoch_ = 0;
     POINT gdi_origin_{.x = LONG_MIN, .y = LONG_MIN};
     UINT gdi_pw_ = 0, gdi_ph_ = 0;
