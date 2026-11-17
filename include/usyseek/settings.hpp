@@ -82,7 +82,8 @@ inline T load_json_file(const fs::path& p, bool* parse_ok = nullptr) {
     T value{};
     if (parse_ok) *parse_ok = true;
     if (auto bytes = ulp::fs::read_as_bytes(p)) {
-        const auto err = glz::read<JSON_READ>(value, *bytes);
+        thread_local glz::context ctx{};
+        const auto err = glz::read<JSON_READ>(value, *bytes, ctx);
         if (err && parse_ok) *parse_ok = false;
     }
     return value;
@@ -90,10 +91,12 @@ inline T load_json_file(const fs::path& p, bool* parse_ok = nullptr) {
 
 template <typename T>
 inline bool save_json_file(const fs::path& p, const T& value) {
-    auto out = glz::write<JSON_WRITE>(value);
-    if (!out) return false;
-    const fs::path tmp = p.wstring() + L".tmp." + std::to_wstring(GetCurrentProcessId()) + L"." + std::to_wstring(GetCurrentThreadId());
-    if (!ulp::fs::write(tmp, std::string_view{*out})) return false;
+    thread_local std::string out;
+    thread_local glz::context ctx{};
+    out.clear();
+    if (glz::write<JSON_WRITE>(value, out, ctx)) return false;
+    const fs::path tmp = ulp::str::concat_strings(p.wstring(), L".tmp.", to_fixed_wstr(GetCurrentProcessId()), L".", to_fixed_wstr(GetCurrentThreadId()));
+    if (!ulp::fs::write(tmp, std::string_view{out})) return false;
     if (MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) return true;
     const DWORD err = GetLastError();
     std::error_code ec;
@@ -279,9 +282,10 @@ inline std::wstring read_pe_version(const fs::path& exe) {
     VS_FIXEDFILEINFO* ffi = nullptr;
     UINT len = 0;
     if (!VerQueryValueW(buf.get(), L"\\", reinterpret_cast<void**>(&ffi), &len) || !ffi) return {};
-    return std::to_wstring(HIWORD(ffi->dwFileVersionMS)) + L"." +
-           std::to_wstring(LOWORD(ffi->dwFileVersionMS)) + L"." +
-           std::to_wstring(HIWORD(ffi->dwFileVersionLS));
+    return ulp::str::concat_strings(
+        to_fixed_wstr(HIWORD(ffi->dwFileVersionMS)), L".",
+        to_fixed_wstr(LOWORD(ffi->dwFileVersionMS)), L".",
+        to_fixed_wstr(HIWORD(ffi->dwFileVersionLS)));
 }
 
 inline VenvInfo read_venv(const fs::path& venv) {

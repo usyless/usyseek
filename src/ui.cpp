@@ -260,8 +260,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sh.engine.on_db_cleared = [&](std::string coll, std::string err) {
         sh.call([&, coll = std::move(coll), err = std::move(err)] {
             sh.notify("warning", "Database", "Database cleared — re-indexing required",
-                      "Could not load the Qdrant Edge index for '" + coll + "' (" + err +
-                      "), so it was cleared. Please run indexing again to rebuild embeddings. Your manual tags are preserved.",
+                      ulp::str::concat_strings("Could not load the Qdrant Edge index for '", coll, "' (", err,
+                      "), so it was cleared. Please run indexing again to rebuild embeddings. Your manual tags are preserved."),
                       "db-cleared");
             sh.refresh_tags();
             if (sh.redraw_all) sh.redraw_all();
@@ -405,7 +405,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
                 for (int i = 0; i < 40 && !find_launcher(); ++i) Sleep(25);
             } else {
                 sh.notify("warning", "Launcher", "Could not start background launcher",
-                          "Failed to launch usyseek.exe (" + win32_error_utf8(GetLastError()) + "). Indexing and tray controls require the launcher.", "launcher-missing");
+                          ulp::str::concat_strings("Failed to launch usyseek.exe (", win32_error_utf8(GetLastError()), "). Indexing and tray controls require the launcher."), "launcher-missing");
             }
         } else {
             sh.notify("warning", "Launcher", "Background launcher not found",

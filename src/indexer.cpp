@@ -189,7 +189,7 @@ struct Scope {
         };
         if (images) add(media::IMAGE_EXTS);
         if (videos) add(media::VIDEO_EXTS);
-        if (min_kb > 0) q += L" size:>=" + std::to_wstring(min_kb) + L"kb";
+        if (min_kb > 0) append_to(q, L" size:>=", to_fixed_wstr(min_kb), L"kb");
         if (!whole_pc && !includes.empty()) {
             q += L" <";
             for (size_t i = 0; i < includes.size(); ++i) {
@@ -587,7 +587,7 @@ std::vector<FileEntry> walk_dirs(const Scope& scope) {
     if (reparse_skipped > 0) {
         push_notification_to_disk(
             "info", "Indexer", "Skipped symlinks / junctions",
-            "Skipped " + std::to_string(reparse_skipped) + " symlink/junction entries during folder traversal.",
+            ulp::str::concat_strings("Skipped ", to_fixed_str(reparse_skipped), " symlink/junction entries during folder traversal."),
             "walk-reparse", true);
     }
     return out;
@@ -629,22 +629,18 @@ struct FailureCache {
     }
     void save() const {
         std::string out;
-        std::array<char, 96> prefix; // NOLINT(cppcoreguidelines-pro-type-member-init)
         for (const auto& [id, f] : entries) {
-            std::snprintf(prefix.data(), prefix.size(), "%llu\t%lld\t%llu\t",
-                          static_cast<unsigned long long>(id),
-                          static_cast<long long>(f.mtime),
-                          static_cast<unsigned long long>(f.size));
-            out += prefix.data();
-            out += to_utf8(f.path);
-            out += '\t';
-            out += to_utf8(f.reason.empty() ? L"Decode failed" : f.reason);
-            out += '\n';
+            append_to(out,
+                      to_fixed_str(id), "\t",
+                      to_fixed_str(f.mtime), "\t",
+                      to_fixed_str(f.size), "\t",
+                      to_utf8(f.path), "\t",
+                      to_utf8(f.reason.empty() ? L"Decode failed" : f.reason), "\n");
         }
         if (!ulp::fs::write(path, std::string_view{out})) {
             push_notification_to_disk(
                 "error", "Indexer", "Failed to save failed-files log",
-                "Could not write " + to_utf8(path.wstring()) + " (" + win32_error_utf8(GetLastError()) + ").",
+                ulp::str::concat_strings("Could not write ", to_utf8(path.wstring()), " (", win32_error_utf8(GetLastError()), ")."),
                 "save-failed-log", true);
         }
     }
@@ -703,12 +699,13 @@ struct DecodedItem {
 };
 
 std::vector<std::string> ancestors_of(std::wstring_view path) {
-    const std::wstring l = lower(path);
-    const auto depth = static_cast<size_t>(std::ranges::count(l, L'\\'));
+    const std::string lu = to_utf8(lower(path));
+    const auto depth = static_cast<size_t>(std::ranges::count(lu, '\\'));
     std::vector<std::string> out;
     out.reserve(depth);
-    for (size_t pos = l.find(L'\\'); pos != std::wstring::npos; pos = l.find(L'\\', pos + 1)) {
-        out.push_back(to_utf8(std::wstring_view{l}.substr(0, pos)));
+    // '\\' (0x5C) is single-byte ASCII and never appears inside multi-byte UTF-8 sequences.
+    for (size_t pos = lu.find('\\'); pos != std::string::npos; pos = lu.find('\\', pos + 1)) {
+        out.emplace_back(lu.data(), pos);
     }
     return out;
 }
@@ -716,8 +713,8 @@ std::vector<std::string> ancestors_of(std::wstring_view path) {
 MediaPayload make_payload(const FileEntry& e, const media::Decoded& d) {
     MediaPayload p;
     p.p = to_utf8(e.path);
-    const auto slash = e.path.find_last_of(L'\\');
-    p.n = to_utf8(slash == std::wstring::npos ? e.path : e.path.substr(slash + 1));
+    const auto slash = p.p.rfind('\\');
+    p.n = (slash == std::string::npos) ? p.p : p.p.substr(slash + 1);
     p.a = ancestors_of(e.path);
     p.k = e.kind;
     p.m = e.mtime;
@@ -803,6 +800,7 @@ struct PyVision {
     std::string shm_name;
     std::string read_buf;
     std::string write_buf;
+    glz::context json_ctx;
 
     PyVision() noexcept {
         cancel_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
@@ -851,7 +849,7 @@ struct PyVision {
         }
 
         const DWORD pid = GetCurrentProcessId();
-        const std::wstring pipe_name = L"\\\\.\\pipe\\usyseek.vision." + std::to_wstring(pid);
+        const std::wstring pipe_name = ulp::str::concat_strings(L"\\\\.\\pipe\\usyseek.vision.", to_fixed_wstr(pid));
         pipe.reset(CreateNamedPipeW(
             pipe_name.c_str(),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
@@ -941,7 +939,7 @@ struct PyVision {
             unmap_shm();
             const size_t min_alloc = static_cast<size_t>(std::max<size_t>(frames, 128)) * size * size * 3;
             const size_t alloc = std::max(needed, std::max(min_alloc, shm_bytes * 2));
-            shm_name = "Local\\usyseek.vision.shm." + std::to_string(GetCurrentProcessId()) + "." + std::to_string(++shm_gen);
+            shm_name = ulp::str::concat_strings("Local\\usyseek.vision.shm.", to_fixed_str(GetCurrentProcessId()), ".", to_fixed_str(++shm_gen));
             shm.reset(CreateFileMappingA(
                 INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
                 static_cast<DWORD>(alloc >> 32), static_cast<DWORD>(alloc & 0xFFFFFFFFu),
@@ -995,7 +993,7 @@ private:
     PyResp call(const Req& req) {
         if (is_cancelled()) throw std::runtime_error("Vision load cancelled");
         write_buf.clear();
-        (void)glz::write_json(req, write_buf);
+        (void)glz::write<glz::opts{}>(req, write_buf, json_ctx);
         write_buf.push_back('\n');
 
         size_t written = 0;
@@ -1014,7 +1012,7 @@ private:
         for (;;) {
             if (const auto nl = read_buf.find('\n'); nl != std::string::npos) {
                 PyResp resp{};
-                const auto parse_err = glz::read<JSON_READ>(resp, std::string_view{read_buf.data(), nl});
+                const auto parse_err = glz::read<JSON_READ>(resp, std::string_view{read_buf.data(), nl}, json_ctx);
                 read_buf.erase(0, nl + 1);
                 if (parse_err) {
                     throw std::runtime_error("Invalid response from Python worker");
@@ -1142,7 +1140,7 @@ int run_indexer(Settings& settings) {
         wlog(L"Everything unavailable (%s), walking included folders\n", scan_error.c_str());
         if (!g_no_everything) {
             push_notification_to_disk("warning", "Scanner", "Using slower directory walk",
-                "Everything index was not used (" + to_utf8(scan_error) + "). Walking included folders directly.",
+                ulp::str::concat_strings("Everything index was not used (", to_utf8(scan_error), "). Walking included folders directly."),
                 "indexer-scan-fallback");
         }
         scan_error.clear();
@@ -1198,8 +1196,8 @@ int run_indexer(Settings& settings) {
         if (db.drop_collection(coll, &drop_err)) {
             push_notification_to_disk(
                 "warning", "Database", "Database cleared — re-indexing required",
-                "Could not load the Qdrant Edge index for '" + coll + "' (" + err +
-                "), so it was cleared and is being rebuilt. Your manual tags are preserved.",
+                ulp::str::concat_strings("Could not load the Qdrant Edge index for '", coll, "' (", err,
+                "), so it was cleared and is being rebuilt. Your manual tags are preserved."),
                 "db-cleared");
             collection_exists = false;
         } else {
@@ -1494,7 +1492,7 @@ int run_indexer(Settings& settings) {
     // --- Batch size
     uint32_t batch = settings.batch_size;
     const bool auto_batch = batch == 0;
-    const std::string auto_batch_key = settings.model_name + "|" + to_utf8(vision.device) + "|" + std::to_string(vision.size);
+    const std::string auto_batch_key = ulp::str::concat_strings(settings.model_name, "|", to_utf8(vision.device), "|", to_fixed_str(vision.size));
     if (auto_batch) {
         IndexState cached = load_json_file<IndexState>(state_path());
         if (cached.auto_batch > 0 && cached.auto_batch_key == auto_batch_key) {
@@ -1558,22 +1556,34 @@ int run_indexer(Settings& settings) {
 
     // --- Upload (single background thread so the GPU never waits on gRPC)
     // Declared before `upload` so `upload`'s destructor joins before destroying these shared targets.
+    struct UploadBatch {
+        std::vector<uint64_t> ids;
+        std::vector<float> vecs;
+        std::vector<MediaPayload> payloads;
+        void clear() noexcept {
+            ids.clear();
+            vecs.clear();
+            payloads.clear();
+        }
+    };
     std::mutex upsert_mx;
     std::string upsert_err;
     uint64_t upsert_failures = 0;
     std::atomic<bool> upsert_any{false};
-    std::future<void> upload;
-    std::vector<uint64_t> up_ids;
-    std::vector<float> up_vecs;
-    std::vector<MediaPayload> up_payloads;
+    std::future<UploadBatch> upload;
+    UploadBatch cur_batch;
+    UploadBatch spare_batch;
     auto flush = [&](bool wait) {
-        if (upload.valid()) upload.get();
-        if (!up_ids.empty()) {
+        if (upload.valid()) {
+            spare_batch = upload.get();
+            spare_batch.clear();
+        }
+        if (!cur_batch.ids.empty()) {
             upload = std::async(std::launch::async, [&db, &coll, &upsert_mx, &upsert_err, &upsert_failures, &upsert_any,
-                                                     ids = std::move(up_ids), vecs = std::move(up_vecs),
-                                                     pls = std::move(up_payloads), dim = vision.dim] {
+                                                     batch = std::exchange(cur_batch, std::move(spare_batch)),
+                                                     dim = vision.dim] mutable -> UploadBatch {
                 std::string e;
-                if (db.upsert(coll, ids, vecs, dim, pls, &e)) {
+                if (db.upsert(coll, batch.ids, batch.vecs, dim, batch.payloads, &e)) {
                     upsert_any.store(true, std::memory_order_relaxed);
                 } else {
                     std::printf("upsert failed: %s\n", e.c_str());
@@ -1581,12 +1591,14 @@ int run_indexer(Settings& settings) {
                     ++upsert_failures;
                     if (upsert_err.empty()) upsert_err = std::move(e);
                 }
+                return batch;
             });
-            up_ids = {};
-            up_vecs = {};
-            up_payloads = {};
+            spare_batch = {};
         }
-        if (wait && upload.valid()) upload.get();
+        if (wait && upload.valid()) {
+            spare_batch = upload.get();
+            spare_batch.clear();
+        }
     };
 
     const size_t frame_bytes = static_cast<size_t>(vision.size) * vision.size * 3;
@@ -1642,7 +1654,7 @@ int run_indexer(Settings& settings) {
                 pr.d.batch = batch;
                 std::printf("Reduced batch size to %u after running out of VRAM\n", batch);
                 push_notification_to_disk("warning", "Compute", "Reduced batch size after out-of-VRAM",
-                    "GPU memory limit reached; batch size automatically lowered to " + std::to_string(batch) + ".",
+                    ulp::str::concat_strings("GPU memory limit reached; batch size automatically lowered to ", to_fixed_str(batch), "."),
                     "indexer-vram");
             }
         } catch (const std::exception& e) {
@@ -1676,13 +1688,13 @@ int run_indexer(Settings& settings) {
             }
             const FileEntry& f = files[it.index];
             failures.remove(f.id);
-            up_ids.push_back(f.id);
-            up_vecs.insert(up_vecs.end(), v.begin(), v.end());
-            up_payloads.push_back(make_payload(f, *it.data));
+            cur_batch.ids.push_back(f.id);
+            cur_batch.vecs.insert(cur_batch.vecs.end(), v.begin(), v.end());
+            cur_batch.payloads.push_back(make_payload(f, *it.data));
             ++pr.d.embedded;
             ++done_this_run;
         }
-        if (up_ids.size() >= 256) flush(false);
+        if (cur_batch.ids.size() >= 256) flush(false);
 
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         pr.d.rate = secs > 0.5 ? static_cast<float>(done_this_run / secs) : 0.0f;
@@ -1703,13 +1715,13 @@ int run_indexer(Settings& settings) {
 
     if (failed_this_run > 0) {
         push_notification_to_disk("warning", "Indexer",
-            std::to_string(failed_this_run) + (failed_this_run == 1 ? " file failed to index" : " files failed to index"),
+            ulp::str::concat_strings(to_fixed_str(failed_this_run), failed_this_run == 1 ? " file failed to index" : " files failed to index"),
             "Skipped files were recorded in the failed list. Check Settings -> Embeddings & Progress or use Retry Failed after fixing.",
             "indexer-file-failures");
     }
 
     if (upsert_failures > 0) {
-        const std::string detail = "Failed " + std::to_string(upsert_failures) + " batch upload(s) to Qdrant: " + upsert_err;
+        const std::string detail = ulp::str::concat_strings("Failed ", to_fixed_str(upsert_failures), " batch upload(s) to Qdrant: ", upsert_err);
         push_notification_to_disk("error", "Database", "Failed to store embeddings in Qdrant",
             detail, "indexer-upsert");
         if (!was_stopped) {

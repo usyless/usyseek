@@ -227,9 +227,9 @@ private:
     // Processes
     // ------------------------------------------------------------------------------------------
 
-    wil::unique_process_information spawn(const fs::path& exe, const std::wstring& args, bool no_window, HANDLE std_out = nullptr) {
+    wil::unique_process_information spawn(const fs::path& exe, std::wstring_view args, bool no_window, HANDLE std_out = nullptr) {
         wil::unique_process_information pi;
-        std::wstring cmd = L"\"" + exe.wstring() + L"\" " + args;
+        std::wstring cmd = ulp::str::concat_strings(L"\"", exe.wstring(), L"\" ", args);
         STARTUPINFOW si{.cb = sizeof(STARTUPINFOW)};
         si.dwFlags |= STARTF_USESHOWWINDOW;
         si.wShowWindow = no_window ? SW_HIDE : SW_SHOWNORMAL;
@@ -259,7 +259,7 @@ private:
         return pi;
     }
 
-    void spawn_ui(const std::wstring& arg) {
+    void spawn_ui(std::wstring_view arg) {
         ui_ = spawn(exe_dir() / L"usyseek-ui.exe", arg, false);
     }
 
@@ -298,7 +298,13 @@ private:
             SetForegroundWindow(ui_hwnd_);
             PostMessageW(ui_hwnd_, msg_open_settings(), tab >= 0 ? static_cast<WPARAM>(tab + 1) : 0, 0);
         } else if (!ui_.hProcess) {
-            spawn_ui(tab >= 0 ? (L"--settings-tab " + std::to_wstring(tab)) : L"--settings");
+            if (tab >= 0) {
+                FixedWString<32> arg{L"--settings-tab "};
+                arg.append(to_fixed_wstr(tab));
+                spawn_ui(arg);
+            } else {
+                spawn_ui(L"--settings");
+            }
         }
     }
 
@@ -376,8 +382,13 @@ private:
         update_tip();
     }
 
-    void close_everything_instance() {
-        const std::wstring cls = std::wstring{L"EVERYTHING_TASKBAR_NOTIFICATION_("} + EVERYTHING_INSTANCE + L")";
+    static void close_everything_instance() {
+        const FixedWString<64> cls = [&] {
+            FixedWString<64> s{L"EVERYTHING_TASKBAR_NOTIFICATION_("};
+            s.append(EVERYTHING_INSTANCE);
+            s.push_back(L')');
+            return s;
+        }();
         if (HWND h = FindWindowW(cls.c_str(), nullptr)) {
             DWORD_PTR r = 0;
             SendMessageTimeoutW(h, WM_USER, 4 /* EVERYTHING_IPC_EXIT */, 0, SMTO_ABORTIFHUNG, 2000, &r);
@@ -394,7 +405,7 @@ private:
             if (code != 0) {
                 push_notification_to_disk(
                     "error", "Launcher", "UI process exited unexpectedly",
-                    "usyseek-ui.exe terminated with exit code " + std::to_string(code) + ".",
+                    ulp::str::concat_strings("usyseek-ui.exe terminated with exit code ", to_fixed_str(code), "."),
                     "ui-exit", false);
             }
         } else if (h == indexer_.hProcess) {
@@ -417,11 +428,11 @@ private:
                 if (status_msg.empty()) status_msg = to_wide(read_indexer_log_error());
                 const std::wstring msg = status_msg.empty()
                     ? L"Indexing failed. See data\\indexer.log for details."
-                    : (L"Indexing failed: " + status_msg);
+                    : ulp::str::concat_strings(L"Indexing failed: ", status_msg);
                 if (!was_stopping) {
                     push_notification_to_disk(
                         "error", "Indexer", "Indexing ended with errors",
-                        to_utf8(msg) + " (exit code " + std::to_string(code) + ", log: data\\indexer.log)",
+                        ulp::str::concat_strings(to_utf8(msg), " (exit code ", to_fixed_str(code), ", log: data\\indexer.log)"),
                         "indexer-exit", true);
                 }
                 if (!is_ui_running()) {
@@ -565,41 +576,38 @@ private:
             const StatusData d = indexer_status_->read();
             if (stopping_index_) {
                 if (d.found > 0) {
-                    std::array<wchar_t, 32> pbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
                     const double pct = std::clamp(100.0 * static_cast<double>(d.embedded) / static_cast<double>(d.found), 0.0, 100.0);
-                    swprintf_s(pbuf.data(), pbuf.size(), L"%.1f%%", pct);
-                    return std::wstring{L"Stopping indexer… ("} + format_count(d.embedded) + L" / " + format_count(d.found) + L" • " + pbuf.data() + L")";
+                    return ulp::str::concat_strings(
+                        L"Stopping indexer… (", format_count(d.embedded), L" / ", format_count(d.found),
+                        L" • ", to_fixed_wstr(pct, 1), L"%)");
                 }
                 return L"Stopping indexer…";
             }
             if (d.phase == Phase::Embedding || d.found > 0) {
-                std::array<wchar_t, 32> pbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
                 const double pct = d.found > 0
                     ? std::clamp(100.0 * static_cast<double>(d.embedded) / static_cast<double>(d.found), 0.0, 100.0)
                     : 0.0;
-                swprintf_s(pbuf.data(), pbuf.size(), L"%.1f%%", pct);
-                std::wstring line = std::wstring{L"Indexing "} + pbuf.data() + (multiline ? L"\n" : L"  •  ") +
-                                    format_count(d.embedded) + L" / " + format_count(d.found);
+                std::wstring line = ulp::str::concat_strings(
+                    L"Indexing ", to_fixed_wstr(pct, 1), L"%", multiline ? L"\n" : L"  •  ",
+                    format_count(d.embedded), L" / ", format_count(d.found));
                 if (d.rate > 0.05f) {
-                    std::array<wchar_t, 32> rbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-                    swprintf_s(rbuf.data(), rbuf.size(), L"%.1f/s", d.rate);
-                    line += std::wstring{L" • "} + rbuf.data();
+                    append_to(line, L" • ", to_fixed_wstr(d.rate, 1), L"/s");
                     if (d.todo > d.processed) {
                         const uint64_t rem_ms = static_cast<uint64_t>((d.todo - d.processed) / d.rate * 1000.0f);
-                        line += L" • ETA " + format_duration_ms(rem_ms);
+                        append_to(line, L" • ETA ", format_duration_ms(rem_ms));
                     }
                 }
                 return line;
             }
             std::wstring line = phase_label(d.phase);
-            if (d.message[0]) line += std::wstring{L" — "} + d.message;
+            if (d.message[0]) append_to(line, L" — ", d.message);
             return line;
         }
         return stopping_index_ ? L"Stopping indexer…" : L"Indexing…";
     }
 
     std::wstring status_line() const {
-        if (!indexer_.hProcess) return std::wstring{APP_NAME} + L"  v" + APP_VERSION;
+        if (!indexer_.hProcess) return ulp::str::concat_strings(APP_NAME, L"  v", APP_VERSION);
         return format_index_progress(false);
     }
 
@@ -607,7 +615,7 @@ private:
         std::wstring tip = APP_NAME;
         if (indexer_.hProcess) {
             const std::wstring prog = format_index_progress(true);
-            if (!prog.empty()) tip += L" — " + prog;
+            if (!prog.empty()) append_to(tip, L" — ", prog);
         }
         if (tip.size() >= 127) tip.resize(127);
         if (tip == last_tip_) return;

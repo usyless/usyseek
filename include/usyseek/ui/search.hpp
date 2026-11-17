@@ -223,16 +223,22 @@ public:
             model = model_;
         }
 
-        std::vector<int64_t> ids(model->ctx, 0);
+        std::array<int64_t, 256> stack_ids{};
+        std::vector<int64_t> heap_ids;
+        int64_t* ids_ptr = stack_ids.data();
+        if (model->ctx > stack_ids.size()) {
+            heap_ids.assign(model->ctx, 0);
+            ids_ptr = heap_ids.data();
+        }
         const std::string u = to_utf8(lower(text));
-        if (usy_tok_encode(model->tok, ustr(u), ids.data()) == 0) {
+        if (usy_tok_encode(model->tok, ustr(u), ids_ptr) == 0) {
             if (err) *err = L"Tokenizer failed";
             return std::nullopt;
         }
         try {
             const auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
             const std::array<int64_t, 2> shape = {1, static_cast<int64_t>(model->ctx)};
-            Ort::Value input = Ort::Value::CreateTensor<int64_t>(mem, ids.data(), ids.size(), shape.data(), shape.size());
+            const Ort::Value input = Ort::Value::CreateTensor<int64_t>(mem, ids_ptr, model->ctx, shape.data(), shape.size());
             const std::array<const char*, 1> in_names = {model->in_name.c_str()};
             const std::array<const char*, 1> out_names = {model->out_name.c_str()};
             auto out = model->session->Run(Ort::RunOptions{nullptr}, in_names.data(), &input, 1, out_names.data(), 1);

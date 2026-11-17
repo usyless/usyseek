@@ -7,13 +7,17 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
+#include <compare>
+#include <concepts>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 #include <rapidhash.h>
@@ -154,42 +158,225 @@ inline uint64_t path_id(std::wstring_view path) {
     return rapidhash(l.data(), l.size() * sizeof(wchar_t));
 }
 
-inline std::wstring format_count(uint64_t n) {
-    std::wstring s = std::to_wstring(n);
-    for (int i = static_cast<int>(s.size()) - 3; i > 0; i -= 3) s.insert(static_cast<size_t>(i), L",");
-    return s;
+/// Fixed-capacity stack string with implicit `std::basic_string_view` conversion and zero heap allocations.
+template <typename Char, size_t N>
+struct FixedBasicString {
+    static_assert(N > 0);
+    std::array<Char, N> buf{};
+    size_t len = 0;
+
+    constexpr FixedBasicString() noexcept = default;
+    constexpr FixedBasicString(std::basic_string_view<Char> sv) noexcept { assign(sv); }
+    constexpr FixedBasicString(const Char* s) noexcept
+        : FixedBasicString(s ? std::basic_string_view<Char>{s} : std::basic_string_view<Char>{}) {}
+    template <size_t M>
+    constexpr FixedBasicString(const FixedBasicString<Char, M>& other) noexcept {
+        assign(other.view());
+    }
+
+    constexpr void clear() noexcept {
+        len = 0;
+        buf[0] = Char{};
+    }
+
+    constexpr void assign(std::basic_string_view<Char> sv) noexcept {
+        const size_t n = std::min(sv.size(), N - 1);
+        for (size_t i = 0; i < n; ++i) buf[i] = sv[i];
+        buf[n] = Char{};
+        len = n;
+    }
+
+    constexpr void push_back(Char c) noexcept {
+        if (len + 1 < N) {
+            buf[len++] = c;
+            buf[len] = Char{};
+        }
+    }
+
+    constexpr void append(std::basic_string_view<Char> sv) noexcept {
+        const size_t room = (N - 1) - len;
+        const size_t n = std::min(sv.size(), room);
+        for (size_t i = 0; i < n; ++i) buf[len + i] = sv[i];
+        len += n;
+        buf[len] = Char{};
+    }
+
+    [[nodiscard]] constexpr const Char* data() const noexcept { return buf.data(); }
+    [[nodiscard]] constexpr Char* data() noexcept { return buf.data(); }
+    [[nodiscard]] constexpr const Char* c_str() const noexcept { return buf.data(); }
+    [[nodiscard]] constexpr size_t size() const noexcept { return len; }
+    [[nodiscard]] constexpr size_t length() const noexcept { return len; }
+    [[nodiscard]] static constexpr size_t capacity() noexcept { return N - 1; }
+    [[nodiscard]] constexpr bool empty() const noexcept { return len == 0; }
+    [[nodiscard]] constexpr const Char* begin() const noexcept { return buf.data(); }
+    [[nodiscard]] constexpr const Char* end() const noexcept { return buf.data() + len; }
+    [[nodiscard]] constexpr Char operator[](size_t i) const noexcept { return buf[i]; }
+    [[nodiscard]] constexpr std::basic_string_view<Char> view() const noexcept { return {buf.data(), len}; }
+    [[nodiscard]] constexpr operator std::basic_string_view<Char>() const noexcept { return view(); }
+    [[nodiscard]] std::basic_string<Char> str() const { return std::basic_string<Char>{buf.data(), len}; }
+
+    friend constexpr bool operator==(const FixedBasicString& a, std::basic_string_view<Char> b) noexcept {
+        return a.view() == b;
+    }
+    friend constexpr auto operator<=>(const FixedBasicString& a, std::basic_string_view<Char> b) noexcept {
+        return a.view() <=> b;
+    }
+};
+
+template <size_t N>
+using FixedString = FixedBasicString<char, N>;
+
+template <size_t N>
+using FixedWString = FixedBasicString<wchar_t, N>;
+
+/// Appends `parts...` onto `dst` in one capacity check without creating intermediate strings.
+template <typename Char, typename... Ts>
+constexpr void append_to(std::basic_string<Char>& dst, const Ts&... parts) {
+    const size_t add = (std::basic_string_view<Char>{parts}.size() + ... + 0);
+    if (add == 0) return;
+    const size_t old = dst.size();
+    dst.resize_and_overwrite(old + add, [&](Char* p, size_t) noexcept {
+        Char* cur = p + old;
+        const auto copy_part = [&](std::basic_string_view<Char> sv) noexcept {
+            if (!sv.empty()) {
+                std::char_traits<Char>::copy(cur, sv.data(), sv.size());
+                cur += sv.size();
+            }
+        };
+        (copy_part(std::basic_string_view<Char>{parts}), ...);
+        return old + add;
+    });
 }
 
-inline std::wstring format_size(uint64_t bytes) {
+template <size_t N = 32, typename T>
+    requires(std::integral<T> && !std::same_as<std::remove_cv_t<T>, bool>)
+[[nodiscard]] inline FixedString<N> to_fixed_str(T val) noexcept {
+    FixedString<N> out;
+    const auto [ptr, ec] = std::to_chars(out.buf.data(), out.buf.data() + out.buf.size() - 1, val);
+    out.len = (ec == std::errc{}) ? static_cast<size_t>(ptr - out.buf.data()) : 0u;
+    out.buf[out.len] = '\0';
+    return out;
+}
+
+template <size_t N = 48, std::floating_point T>
+[[nodiscard]] inline FixedString<N> to_fixed_str(T val, int precision) noexcept {
+    FixedString<N> out;
+    const auto [ptr, ec] = std::to_chars(out.buf.data(), out.buf.data() + out.buf.size() - 1, val, std::chars_format::fixed, precision);
+    out.len = (ec == std::errc{}) ? static_cast<size_t>(ptr - out.buf.data()) : 0u;
+    out.buf[out.len] = '\0';
+    return out;
+}
+
+template <size_t N = 32, typename T>
+    requires(std::integral<T> && !std::same_as<std::remove_cv_t<T>, bool>)
+[[nodiscard]] inline FixedWString<N> to_fixed_wstr(T val) noexcept {
+    std::array<char, N> tmp; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    const auto [ptr, ec] = std::to_chars(tmp.data(), tmp.data() + tmp.size() - 1, val);
+    FixedWString<N> out;
+    if (ec == std::errc{}) {
+        const auto n = static_cast<size_t>(ptr - tmp.data());
+        for (size_t i = 0; i < n; ++i) out.buf[i] = static_cast<wchar_t>(tmp[i]);
+        out.len = n;
+        out.buf[n] = L'\0';
+    }
+    return out;
+}
+
+template <size_t N = 48, std::floating_point T>
+[[nodiscard]] inline FixedWString<N> to_fixed_wstr(T val, int precision) noexcept {
+    std::array<char, N> tmp; // NOLINT(cppcoreguidelines-pro-type-member-init)
+    const auto [ptr, ec] = std::to_chars(tmp.data(), tmp.data() + tmp.size() - 1, val, std::chars_format::fixed, precision);
+    FixedWString<N> out;
+    if (ec == std::errc{}) {
+        const auto n = static_cast<size_t>(ptr - tmp.data());
+        for (size_t i = 0; i < n; ++i) out.buf[i] = static_cast<wchar_t>(tmp[i]);
+        out.len = n;
+        out.buf[n] = L'\0';
+    }
+    return out;
+}
+
+/// Formats `n` with thousands separators into `buf` (32 chars suffices for any `uint64_t`).
+inline std::wstring_view format_count_to(uint64_t n, std::span<wchar_t> buf) noexcept {
+    if (buf.empty()) return {};
+    size_t pos = buf.size();
+    unsigned group = 0;
+    do {
+        if (group == 3) {
+            if (pos == 0) break;
+            buf[--pos] = L',';
+            group = 0;
+        }
+        if (pos == 0) break;
+        buf[--pos] = static_cast<wchar_t>(L'0' + (n % 10));
+        n /= 10;
+        ++group;
+    } while (n > 0);
+    return {buf.data() + pos, buf.size() - pos};
+}
+
+inline FixedWString<32> format_count(uint64_t n) noexcept {
     std::array<wchar_t, 32> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-    if (bytes >= (1ull << 30)) swprintf_s(buf.data(), buf.size(), L"%.1f GB", static_cast<double>(bytes) / (1ull << 30));
-    else if (bytes >= (1ull << 20)) swprintf_s(buf.data(), buf.size(), L"%.1f MB", static_cast<double>(bytes) / (1ull << 20));
-    else if (bytes >= 1024) swprintf_s(buf.data(), buf.size(), L"%.0f KB", static_cast<double>(bytes) / 1024.0);
-    else swprintf_s(buf.data(), buf.size(), L"%llu B", static_cast<unsigned long long>(bytes));
-    return buf.data();
+    return FixedWString<32>{format_count_to(n, buf)};
 }
 
-inline std::wstring format_duration_ms(uint64_t ms) {
+inline FixedWString<32> format_size(uint64_t bytes) noexcept {
+    FixedWString<32> out;
+    if (bytes >= (1ull << 30u)) {
+        out = to_fixed_wstr<32>(static_cast<double>(bytes) / (1ull << 30u), 1);
+        out.append(L" GB");
+    } else if (bytes >= (1ull << 20u)) {
+        out = to_fixed_wstr<32>(static_cast<double>(bytes) / (1ull << 20u), 1);
+        out.append(L" MB");
+    } else if (bytes >= 1024) {
+        out = to_fixed_wstr<32>(static_cast<double>(bytes) / 1024.0, 0);
+        out.append(L" KB");
+    } else {
+        out = to_fixed_wstr<32>(bytes);
+        out.append(L" B");
+    }
+    return out;
+}
+
+inline FixedWString<32> format_duration_ms(uint64_t ms) noexcept {
     const uint64_t s = ms / 1000;
-    std::array<wchar_t, 32> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-    if (s >= 3600) swprintf_s(buf.data(), buf.size(), L"%llu:%02llu:%02llu", s / 3600, (s / 60) % 60, s % 60);
-    else swprintf_s(buf.data(), buf.size(), L"%llu:%02llu", s / 60, s % 60);
-    return buf.data();
+    FixedWString<32> out;
+    const auto push2 = [&](uint64_t v) noexcept {
+        out.push_back(static_cast<wchar_t>(L'0' + ((v / 10) % 10)));
+        out.push_back(static_cast<wchar_t>(L'0' + (v % 10)));
+    };
+    if (s >= 3600) {
+        out.assign(to_fixed_wstr<32>(s / 3600));
+        out.push_back(L':');
+        push2((s / 60) % 60);
+    } else {
+        out.assign(to_fixed_wstr<32>(s / 60));
+    }
+    out.push_back(L':');
+    push2(s % 60);
+    return out;
 }
 
 inline int64_t unix_now() noexcept {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-inline std::wstring format_ago(int64_t unix_time) {
-    if (unix_time <= 0) return L"Never";
+inline FixedWString<48> format_ago(int64_t unix_time) noexcept {
+    if (unix_time <= 0) return FixedWString<48>{L"Never"};
     const int64_t d = std::max<int64_t>(0, unix_now() - unix_time);
-    if (d < 60) return L"Just now";
-    std::array<wchar_t, 48> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-    if (d < 3600) swprintf_s(buf.data(), buf.size(), L"%lld min ago", d / 60);
-    else if (d < 86400) swprintf_s(buf.data(), buf.size(), L"%lld h ago", d / 3600);
-    else swprintf_s(buf.data(), buf.size(), L"%lld d ago", d / 86400);
-    return buf.data();
+    if (d < 60) return FixedWString<48>{L"Just now"};
+    FixedWString<48> out;
+    if (d < 3600) {
+        out = to_fixed_wstr<48>(d / 60);
+        out.append(L" min ago");
+    } else if (d < 86400) {
+        out = to_fixed_wstr<48>(d / 3600);
+        out.append(L" h ago");
+    } else {
+        out = to_fixed_wstr<48>(d / 86400);
+        out.append(L" d ago");
+    }
+    return out;
 }
 
 inline int64_t filetime_to_unix(uint64_t ft) noexcept {

@@ -255,8 +255,8 @@ public:
                 return false;
             }
         }
-        if (!clips_.empty()) {
-            const D2D1_RECT_F& c = clips_.back();
+        if (clip_depth_ > 0) {
+            const D2D1_RECT_F& c = clips_[clip_depth_ - 1];
             if (ri <= c.left || l >= c.right || b <= c.top || t >= c.bottom) {
                 return false;
             }
@@ -289,8 +289,8 @@ public:
     }
 
     void hit(D2D1_RECT_F r, int id, int index = 0) {
-        if (!clips_.empty()) {
-            const D2D1_RECT_F& c = clips_.back();
+        if (clip_depth_ > 0) {
+            const D2D1_RECT_F& c = clips_[clip_depth_ - 1];
             r.left = std::max(r.left, c.left);
             r.top = std::max(r.top, c.top);
             r.right = std::min(r.right, c.right);
@@ -396,20 +396,24 @@ public:
         return e ? e->metrics : D2D1_SIZE_F{};
     }
 
-    void push_clip(D2D1_RECT_F r) {
+    void push_clip(D2D1_RECT_F r) noexcept {
         dc_->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED);
-        if (!clips_.empty()) {
-            const D2D1_RECT_F& c = clips_.back();
+        if (clip_depth_ > 0) {
+            const D2D1_RECT_F& c = clips_[clip_depth_ - 1];
             r.left = std::max(r.left, c.left);
             r.top = std::max(r.top, c.top);
             r.right = std::min(r.right, c.right);
             r.bottom = std::min(r.bottom, c.bottom);
         }
-        clips_.push_back(r);
+        if (clip_depth_ < clips_.size()) {
+            clips_[clip_depth_++] = r;
+        } else {
+            ++clip_depth_;
+        }
     }
     void pop_clip() noexcept {
         dc_->PopAxisAlignedClip();
-        if (!clips_.empty()) clips_.pop_back();
+        if (clip_depth_ > 0) --clip_depth_;
     }
 
     /// Soft drop shadow approximated with stacked translucent rounded rects (cheap, no effects).
@@ -440,7 +444,8 @@ private:
     float opacity_ = 1.0f;
     D2D1_COLOR_F last_color_{};
     bool has_color_ = false;
-    std::vector<D2D1_RECT_F> clips_;
+    std::array<D2D1_RECT_F, 8> clips_{};
+    size_t clip_depth_ = 0;
 };
 
 inline const Hit* hit_test(std::span<const Hit> hits, D2D1_POINT_2F p) noexcept {
@@ -450,9 +455,12 @@ inline const Hit* hit_test(std::span<const Hit> hits, D2D1_POINT_2F p) noexcept 
     return nullptr;
 }
 
-/// Truncates a directory path in the middle while keeping the drive/root and deepest folder names visible.
-inline std::wstring middle_truncate_dir(Canvas& cv, std::wstring_view path, Font f, float max_w) {
-    if (path.empty() || max_w <= 0.0f || cv.measure(path, f) <= max_w) return std::wstring{path};
+/// Truncates a directory path in the middle into `out`, reusing a single scratch buffer.
+inline void middle_truncate_dir_into(Canvas& cv, std::wstring_view path, Font f, float max_w, std::wstring& out) {
+    if (path.empty() || max_w <= 0.0f || cv.measure(path, f) <= max_w) {
+        out.assign(path);
+        return;
+    }
 
     size_t root_end = 0;
     if (path.size() >= 3 && path[1] == L':' && path[2] == L'\\') {
@@ -472,16 +480,20 @@ inline std::wstring middle_truncate_dir(Canvas& cv, std::wstring_view path, Font
     }
 
     const std::wstring_view root = path.substr(0, root_end);
-    std::wstring best;
+    out.clear();
+    std::wstring cand;
     for (size_t i = path.size(); i > root_end; --i) {
         if (path[i - 1] != L'\\') continue;
-        std::wstring cand{root};
-        cand += L'…';
-        cand += path.substr(i - 1);
-        if (cv.measure(cand, f) <= max_w) best = std::move(cand);
-        else break;
+        cand.assign(root);
+        cand.push_back(L'…');
+        cand.append(path.substr(i - 1));
+        if (cv.measure(cand, f) <= max_w) {
+            out.assign(cand);
+        } else {
+            break;
+        }
     }
-    if (!best.empty()) return best;
+    if (!out.empty()) return;
 
     size_t lo = 0, hi = path.size();
     while (lo < hi) {
@@ -492,17 +504,23 @@ inline std::wstring middle_truncate_dir(Canvas& cv, std::wstring_view path, Font
             hi = mid - 1;
             continue;
         }
-        std::wstring cand{path.substr(0, left_n)};
-        cand += L'…';
-        cand += path.substr(path.size() - right_n);
+        cand.assign(path.substr(0, left_n));
+        cand.push_back(L'…');
+        cand.append(path.substr(path.size() - right_n));
         if (cv.measure(cand, f) <= max_w) lo = mid;
         else hi = mid - 1;
     }
     const size_t left_n = std::min(path.size(), std::max<size_t>(root_end, lo / 3));
     const size_t right_n = lo > left_n ? std::min(path.size() - left_n, lo - left_n) : 0;
-    std::wstring out{path.substr(0, left_n)};
-    out += L'…';
-    out += path.substr(path.size() - right_n);
+    out.assign(path.substr(0, left_n));
+    out.push_back(L'…');
+    out.append(path.substr(path.size() - right_n));
+}
+
+/// Truncates a directory path in the middle while keeping the drive/root and deepest folder names visible.
+inline std::wstring middle_truncate_dir(Canvas& cv, std::wstring_view path, Font f, float max_w) {
+    std::wstring out;
+    middle_truncate_dir_into(cv, path, f, max_w, out);
     return out;
 }
 

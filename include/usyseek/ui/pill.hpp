@@ -399,6 +399,9 @@ private:
         std::wstring dir;
         std::wstring meta;
         std::wstring date;
+        std::wstring duration_w;
+        std::wstring dir_disp;
+        float dir_disp_w = -1.0f;
         std::vector<std::wstring> tags_w;
     };
 
@@ -408,11 +411,13 @@ private:
         const auto slash = path.find_last_of(L'\\');
         it.name = slash == std::wstring::npos ? path : path.substr(slash + 1);
         it.dir = slash == std::wstring::npos ? L"" : path.substr(0, slash);
-        std::wstring meta;
-        if (p.p.w && p.p.h) meta = std::to_wstring(p.p.w) + L"×" + std::to_wstring(p.p.h) + L"  •  ";
-        meta += format_size(p.p.s);
-        it.meta = std::move(meta);
-        it.date = format_date(p.p.m);
+        if (p.p.w && p.p.h) {
+            append_to(it.meta, to_fixed_wstr(p.p.w), L"×", to_fixed_wstr(p.p.h), L"  •  ", format_size(p.p.s));
+        } else {
+            it.meta = format_size(p.p.s).str();
+        }
+        it.date = format_date(p.p.m).str();
+        if (p.p.k == 1 && p.p.d) it.duration_w = format_duration_ms(p.p.d).str();
         it.tags_w.reserve(p.p.t.size());
         for (const auto& t : p.p.t) it.tags_w.push_back(to_wide(t));
         it.pt = std::move(p);
@@ -524,36 +529,36 @@ private:
         queue_hover_dirty(pending_dirty_, id, idx, full_dirty_);
     }
 
-    static void sync_card_overlay_hits(std::vector<Hit>& hits, std::span<const Hit> partial_hits) {
-        std::vector<int> touched_cards;
+    void sync_card_overlay_hits(std::vector<Hit>& hits, std::span<const Hit> partial_hits) {
+        touched_cards_scratch_.clear();
         for (const Hit& h : partial_hits) {
-            if (h.id == IdCard && std::ranges::find(touched_cards, h.index) == touched_cards.end()) {
-                touched_cards.push_back(h.index);
+            if (h.id == IdCard && std::ranges::find(touched_cards_scratch_, h.index) == touched_cards_scratch_.end()) {
+                touched_cards_scratch_.push_back(h.index);
             }
         }
-        if (touched_cards.empty()) return;
+        if (touched_cards_scratch_.empty()) return;
 
-        for (const int card_idx : touched_cards) {
+        for (const int card_idx : touched_cards_scratch_) {
             std::erase_if(hits, [card_idx](const Hit& h) {
                 return h.index == card_idx && (h.id == IdSimilar || h.id == IdCardPreview);
             });
 
-            std::vector<Hit> overlays;
+            overlays_scratch_.clear();
             for (const Hit& ph : partial_hits) {
                 if (ph.index == card_idx && (ph.id == IdSimilar || ph.id == IdCardPreview)) {
-                    const bool dup = std::ranges::any_of(overlays, [&](const Hit& ex) {
+                    const bool dup = std::ranges::any_of(overlays_scratch_, [&](const Hit& ex) {
                         return ex.id == ph.id && ex.index == ph.index;
                     });
-                    if (!dup) overlays.push_back(ph);
+                    if (!dup) overlays_scratch_.push_back(ph);
                 }
             }
-            if (overlays.empty()) continue;
+            if (overlays_scratch_.empty()) continue;
 
             const auto card_it = std::ranges::find_if(hits, [card_idx](const Hit& h) {
                 return h.id == IdCard && h.index == card_idx;
             });
             if (card_it != hits.end()) {
-                hits.insert(std::next(card_it), overlays.begin(), overlays.end());
+                hits.insert(std::next(card_it), overlays_scratch_.begin(), overlays_scratch_.end());
             }
         }
     }
@@ -962,8 +967,9 @@ private:
             case IdNotifyBtn:
             case IdStatusNotify:
                 title = L"View notifications";
-                subtitle = format_count(sh_.notifications.size()) +
-                           (sh_.notifications.size() == 1 ? L" active notification" : L" active notifications");
+                subtitle = ulp::str::concat_strings(
+                    format_count(sh_.notifications.size()),
+                    sh_.notifications.size() == 1 ? L" active notification" : L" active notifications");
                 return true;
             case IdHelpBtn: title = L"Search syntax & shortcuts"; return true;
             case IdSettings: title = L"Settings"; return true;
@@ -1009,12 +1015,12 @@ private:
             case IdPvMute: {
                 const int pct = static_cast<int>(std::lround(displayed_video_volume() * 100.0f));
                 title = effective_video_muted() ? L"Unmute (M)" : L"Mute (M)";
-                subtitle = L"Volume: " + std::to_wstring(pct) + L"%  \u2022  Scroll to adjust";
+                subtitle = ulp::str::concat_strings(L"Volume: ", to_fixed_wstr(pct), L"%  \u2022  Scroll to adjust");
                 return true;
             }
             case IdPvVolume: {
                 const int pct = static_cast<int>(std::lround(displayed_video_volume() * 100.0f));
-                title = L"Volume: " + std::to_wstring(pct) + L"%";
+                title = ulp::str::concat_strings(L"Volume: ", to_fixed_wstr(pct), L"%");
                 subtitle = L"Drag, scroll, or +/- keys";
                 return true;
             }
@@ -1133,7 +1139,8 @@ private:
         if (!sh_.notifications.empty()) {
             const bool has_err = sh_.error_notification_count() > 0;
             const D2D1_COLOR_F ncol = has_err ? cv.theme().error : cv.theme().amber;
-            const std::wstring cnt = format_count(sh_.notifications.size());
+            std::array<wchar_t, 32> cnt_buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+            const std::wstring_view cnt = format_count_to(sh_.notifications.size(), cnt_buf);
             const float bw = std::max(44.0f, 26.0f + cv.measure(cnt, Font::Caption) + 12.0f);
             x -= bw + 4;
             const D2D1_RECT_F nr = rect(x, cy - 15, bw, 30);
@@ -1270,8 +1277,15 @@ private:
                 piece(L"Stopping indexer…", cv.theme().amber, Font::SmallSemi);
             } else {
                 piece(L"Indexing ", cv.theme().outline);
-                if (d.phase == Phase::Embedding) piece(format_count(d.embedded) + L" / " + format_count(d.found), cv.theme().amber, Font::SmallSemi);
-                else piece(phase_label(d.phase), cv.theme().amber, Font::SmallSemi);
+                if (d.phase == Phase::Embedding) {
+                    FixedWString<64> counts;
+                    counts.assign(format_count(d.embedded));
+                    counts.append(L" / ");
+                    counts.append(format_count(d.found));
+                    piece(counts, cv.theme().amber, Font::SmallSemi);
+                } else {
+                    piece(phase_label(d.phase), cv.theme().amber, Font::SmallSemi);
+                }
             }
         } else {
             piece(L"Last indexed ", cv.theme().outline);
@@ -1279,7 +1293,10 @@ private:
         }
         if (sh_.db_count) {
             sep();
-            piece(format_count(*sh_.db_count) + L" files", cv.theme().outline);
+            FixedWString<40> files_txt;
+            files_txt.assign(format_count(*sh_.db_count));
+            files_txt.append(L" files");
+            piece(files_txt, cv.theme().outline);
         }
         const auto enc = sh_.engine.encoder().state();
         if (enc == TextEncoder::State::Exporting) {
@@ -1309,22 +1326,29 @@ private:
             piece(error_, cv.theme().error);
         } else if (last_ms_ > 0 && expanded()) {
             sep();
-            std::array<wchar_t, 48> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-            swprintf_s(buf.data(), buf.size(), L"%.0f ms", last_ms_);
-            piece(buf.data(), cv.theme().outline);
+            FixedWString<48> ms_txt = to_fixed_wstr(last_ms_, 0);
+            ms_txt.append(L" ms");
+            piece(ms_txt, cv.theme().outline);
         }
         sep();
-        piece(to_wide(sh_.settings.model_name), cv.theme().outline);
+        if (cached_model_utf8_ != sh_.settings.model_name) {
+            cached_model_utf8_ = sh_.settings.model_name;
+            cached_model_w_ = to_wide(cached_model_utf8_);
+        }
+        piece(cached_model_w_, cv.theme().outline);
         if (sh_.hotkey_unavailable()) {
             sep();
-            piece(format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk) + L" is taken by another app", cv.theme().amber);
+            FixedWString<128> hk_msg = format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk);
+            hk_msg.append(L" is taken by another app");
+            piece(hk_msg, cv.theme().amber);
         }
         if (!sh_.notifications.empty()) {
             sep();
             const bool has_err = sh_.error_notification_count() > 0;
             const D2D1_COLOR_F nc = has_err ? cv.theme().error : cv.theme().amber;
-            const std::wstring ntxt = format_count(sh_.notifications.size()) +
-                                      (sh_.notifications.size() == 1 ? L" alert" : L" alerts");
+            FixedWString<48> ntxt;
+            ntxt.assign(format_count(sh_.notifications.size()));
+            ntxt.append(sh_.notifications.size() == 1 ? L" alert" : L" alerts");
             const float nw = cv.measure(ntxt, Font::SmallSemi);
             const D2D1_RECT_F nr = rect(x - 4, y + 3, nw + 8, STATUS_H - 6);
             if (const float ha = hover_.alpha(IdStatusNotify); ha > 0.002f) {
@@ -1345,8 +1369,14 @@ private:
             right_edge -= 32.0f;
         }
         if (expanded() && !items_.empty()) {
-            std::wstring right = format_count(items_.size()) + (has_more_ ? L"+" : L"") + L" results";
-            if (selected_.size() > 1) right = format_count(selected_.size()) + L" selected  •  " + right;
+            FixedWString<80> right;
+            if (selected_.size() > 1) {
+                right.assign(format_count(selected_.size()));
+                right.append(L" selected  •  ");
+            }
+            right.append(format_count(items_.size()));
+            if (has_more_) right.push_back(L'+');
+            right.append(L" results");
             cv.text(right, D2D1::RectF(x + 12, y, right_edge, y + STATUS_H), Font::Caption, cv.theme().outline, Align::Right);
         }
         if (expanded()) cv.hline(0, sz.width, HEADER_H + STATUS_H, with_alpha(cv.theme().outline_variant, 0.5f));
@@ -1463,7 +1493,7 @@ private:
         }
 
         if (it.pt.p.k == 1) {
-            std::wstring dur = it.pt.p.d ? format_duration_ms(it.pt.p.d) : L"";
+            const std::wstring_view dur = it.duration_w;
             const float dw = cv.measure(dur, Font::Caption);
             const D2D1_RECT_F b = rect(tr.right - dw - 34, tr.bottom - 30, dw + 26, 22);
             cv.fill_round(b, 11, hex(0x000000, 0.62f));
@@ -1501,8 +1531,11 @@ private:
         if (cv.measure(it.name, Font::BodySemi) > rw) cv.hit(name_r, IdCardName, i);
         y += 20.0f;
         const D2D1_RECT_F dir_r = rect(lx, y, rw, 16.0f);
-        const std::wstring dir_disp = middle_truncate_dir(cv, it.dir, Font::MonoSmall, rw);
-        cv.text(dir_disp, dir_r, Font::MonoSmall, cv.theme().outline);
+        if (std::abs(it.dir_disp_w - rw) > 0.25f) {
+            middle_truncate_dir_into(cv, it.dir, Font::MonoSmall, rw, it.dir_disp);
+            it.dir_disp_w = rw;
+        }
+        cv.text(it.dir_disp, dir_r, Font::MonoSmall, cv.theme().outline);
         if (cv.measure(it.dir, Font::MonoSmall) > rw) cv.hit(dir_r, IdCardDir, i);
         y += 22.0f;
 
@@ -1518,7 +1551,9 @@ private:
             ++shown;
         }
         if (shown < it.tags_w.size()) {
-            const std::wstring more = L"+" + std::to_wstring(it.tags_w.size() - shown);
+            std::array<wchar_t, 16> more_buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
+            const int more_len = swprintf_s(more_buf.data(), more_buf.size(), L"+%zu", it.tags_w.size() - shown);
+            const std::wstring_view more{more_buf.data(), more_len > 0 ? static_cast<size_t>(more_len) : 0u};
             const float w = cv.measure(more, Font::Caption) + 12.0f;
             const D2D1_RECT_F mr = rect(tx, y, w, 20.0f);
             cv.fill_round(mr, 10.0f, with_alpha(cv.theme().on_surface, 0.08f));
@@ -1792,7 +1827,7 @@ private:
                 sh_.call([this, fail_cnt, first_err, store_err] {
                     if (fail_cnt > 0) {
                         sh_.notify("error", "Tags",
-                            "Failed to update tags on " + std::to_string(fail_cnt) + (fail_cnt == 1 ? " item" : " items"),
+                            ulp::str::concat_strings("Failed to update tags on ", to_fixed_str(fail_cnt), fail_cnt == 1 ? " item" : " items"),
                             first_err, "tags-save");
                     }
                     if (!store_err.empty()) {
@@ -1869,8 +1904,12 @@ private:
         y += 4;
         cv.hline(r.left + 12, r.right - 12, y, cv.theme().outline_variant);
         y += 6;
-        std::wstring label = L"TAGS";
-        if (selected_.size() > 1) label += L"  ·  " + std::to_wstring(selected_.size()) + L" ITEMS";
+        FixedWString<48> label{L"TAGS"};
+        if (selected_.size() > 1) {
+            label.append(L"  ·  ");
+            label.append(to_fixed_wstr(selected_.size()));
+            label.append(L" ITEMS");
+        }
         cv.text(label, rect(r.left + 16, y, MENU_W - 32, 24), Font::Label, cv.theme().primary);
         y += 26;
         for (size_t i = 0; i < menu_tags_.size() && i < 10; ++i) {
@@ -2455,10 +2494,10 @@ private:
             ratio = dragging_seek_ ? seek_drag_ratio_
                                    : (dur_s > 0.0 ? static_cast<float>(std::clamp(cur_s / dur_s, 0.0, 1.0)) : 0.0f);
 
-            const std::wstring cur_str = format_duration_ms(static_cast<uint64_t>(std::max(0.0, cur_s * 1000.0)));
-            const std::wstring dur_str = dur_s > 0.0
+            const auto cur_str = format_duration_ms(static_cast<uint64_t>(std::max(0.0, cur_s * 1000.0)));
+            const FixedWString<32> dur_str = dur_s > 0.0
                 ? format_duration_ms(static_cast<uint64_t>(dur_s * 1000.0))
-                : L"--:--";
+                : FixedWString<32>{L"--:--"};
             const float cur_w = std::max(34.0f, cv.measure(cur_str, Font::MonoSmall) + 6.0f);
             const float dur_w = std::max(34.0f, cv.measure(dur_str, Font::MonoSmall) + 6.0f);
 
@@ -2498,7 +2537,9 @@ private:
             ratio = dragging_seek_ ? seek_drag_ratio_
                                    : (total > 1 ? static_cast<float>(cur) / static_cast<float>(total - 1) : 0.0f);
 
-            const std::wstring fstr = std::to_wstring(cur + 1) + L"/" + std::to_wstring(total);
+            FixedWString<48> fstr = to_fixed_wstr<48>(cur + 1);
+            fstr.push_back(L'/');
+            fstr.append(to_fixed_wstr<48>(total));
             const float fw = std::max(38.0f, cv.measure(fstr, Font::MonoSmall) + 8.0f);
             cv.text(fstr, rect(rx - fw, ctrl.top, fw, height(ctrl)), Font::MonoSmall, cv.theme().outline, Align::Center);
             rx -= fw + 4.0f;
@@ -2646,7 +2687,11 @@ private:
         btn(glyph::copy, IdPvCopy);
         btn(glyph::folder, IdPvReveal);
         btn(glyph::open, IdPvOpen);
-        const std::wstring pos = format_count(static_cast<uint64_t>(preview_) + 1) + L" / " + format_count(items_.size()) + (has_more_ ? L"+" : L"");
+        FixedWString<64> pos;
+        pos.assign(format_count(static_cast<uint64_t>(preview_) + 1));
+        pos.append(L" / ");
+        pos.append(format_count(items_.size()));
+        if (has_more_) pos.push_back(L'+');
         const float pw = cv.measure(pos, Font::SmallSemi) + 24;
         x -= pw + 6;
         const D2D1_RECT_F pr = rect(x, cy - 13, pw, 26);
@@ -2663,17 +2708,28 @@ private:
         }
         cv.text(pos, pr, Font::SmallSemi, cv.theme().on_surface_variant, Align::Center);
         const float path_w = std::max(40.0f, x - 34.0f);
-        const std::wstring dir_disp = middle_truncate_dir(cv, it.dir, Font::MonoSmall, path_w);
+        if (pv_dir_disp_id_ != it.pt.id || std::abs(pv_dir_disp_w_ - path_w) > 0.25f) {
+            middle_truncate_dir_into(cv, it.dir, Font::MonoSmall, path_w, pv_dir_disp_);
+            pv_dir_disp_w_ = path_w;
+            pv_dir_disp_id_ = it.pt.id;
+        }
         cv.text(it.name, D2D1::RectF(18, 9, x - 16, 29), Font::BodySemi, cv.theme().on_surface);
-        cv.text(dir_disp, D2D1::RectF(18, 29, x - 16, 46), Font::MonoSmall, cv.theme().outline);
+        cv.text(pv_dir_disp_, D2D1::RectF(18, 29, x - 16, 46), Font::MonoSmall, cv.theme().outline);
         if (cv.measure(it.name, Font::BodySemi) > path_w || cv.measure(it.dir, Font::MonoSmall) > path_w) {
             cv.hit(D2D1::RectF(18, 9, x - 16, 46), IdPvPath, preview_);
         }
 
         // Footer: size, date, duration
-        std::wstring meta = it.meta;
-        if (is_video && it.pt.p.d) meta = format_duration_ms(it.pt.p.d) + L"  •  " + meta;
-        if (!it.date.empty()) meta += L"  •  " + it.date;
+        FixedWString<128> meta;
+        if (!it.duration_w.empty()) {
+            meta.assign(it.duration_w);
+            meta.append(L"  •  ");
+        }
+        meta.append(it.meta);
+        if (!it.date.empty()) {
+            meta.append(L"  •  ");
+            meta.append(it.date);
+        }
         cv.text(meta, D2D1::RectF(18, sz.height - PV_BOTTOM, sz.width - 18, sz.height), Font::Caption, cv.theme().outline, Align::Center);
     }
 
@@ -3806,6 +3862,13 @@ private:
     LiquidGlassWindow glass_;
     std::vector<Hit> hits_;
     std::vector<Hit> partial_hits_;
+    std::vector<int> touched_cards_scratch_;
+    std::vector<Hit> overlays_scratch_;
+    std::string cached_model_utf8_;
+    std::wstring cached_model_w_;
+    std::wstring pv_dir_disp_;
+    float pv_dir_disp_w_ = -1.0f;
+    uint64_t pv_dir_disp_id_ = 0;
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
     bool rendering_ = false;
     bool dirty_ = false; // state changed since the last frame

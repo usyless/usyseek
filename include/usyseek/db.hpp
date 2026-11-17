@@ -191,22 +191,22 @@ public:
 
     bool upsert(std::string_view coll, std::span<const uint64_t> ids, std::span<const float> vectors, size_t dim,
                 std::span<const MediaPayload> payloads, std::string* error = nullptr) {
-        auto json = glz::write<JSON_SKIP_NULL>(payloads);
-        if (!json) return false;
+        const std::string_view json = write_json_tls<JSON_SKIP_NULL>(payloads);
+        if (json.empty()) return false;
         std::shared_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return false;
         }
         RustBuf out;
-        const bool ok = usy_qd_upsert(q_, ustr(coll), ids.data(), ids.size(), vectors.data(), dim, ustr(*json), &out.b) == 0;
+        const bool ok = usy_qd_upsert(q_, ustr(coll), ids.data(), ids.size(), vectors.data(), dim, ustr(json), &out.b) == 0;
         if (!ok && error) *error = out.str();
         return ok;
     }
 
     std::optional<DbPoints> query(std::string_view coll, std::span<const float> vector, const QueryRequest& req, std::string* error = nullptr) {
-        auto json = glz::write<JSON_SKIP_NULL>(req);
-        if (!json) {
+        const std::string_view json = write_json_tls<JSON_SKIP_NULL>(req);
+        if (json.empty()) {
             if (error) *error = "Failed to serialize query request";
             return std::nullopt;
         }
@@ -216,7 +216,7 @@ public:
             return std::nullopt;
         }
         RustBuf out;
-        if (usy_qd_query(q_, ustr(coll), vector.empty() ? nullptr : vector.data(), vector.size(), ustr(*json), &out.b) != 0) {
+        if (usy_qd_query(q_, ustr(coll), vector.empty() ? nullptr : vector.data(), vector.size(), ustr(json), &out.b) != 0) {
             if (error) *error = out.str();
             return std::nullopt;
         }
@@ -224,8 +224,8 @@ public:
     }
 
     std::optional<DbPoints> scroll(std::string_view coll, const ScrollRequest& req, std::string* error = nullptr) {
-        auto json = glz::write<JSON_SKIP_NULL>(req);
-        if (!json) {
+        const std::string_view json = write_json_tls<JSON_SKIP_NULL>(req);
+        if (json.empty()) {
             if (error) *error = "Failed to serialize scroll request";
             return std::nullopt;
         }
@@ -235,7 +235,7 @@ public:
             return std::nullopt;
         }
         RustBuf out;
-        if (usy_qd_scroll(q_, ustr(coll), ustr(*json), &out.b) != 0) {
+        if (usy_qd_scroll(q_, ustr(coll), ustr(json), &out.b) != 0) {
             if (error) *error = out.str();
             return std::nullopt;
         }
@@ -243,8 +243,8 @@ public:
     }
 
     std::optional<DbPoints> retrieve(std::string_view coll, std::span<const uint64_t> ids, std::span<const std::string_view> fields, std::string* error = nullptr) {
-        auto json = glz::write<JSON_SKIP_NULL>(FieldsRequest{fields});
-        if (!json) {
+        const std::string_view json = write_json_tls<JSON_SKIP_NULL>(FieldsRequest{fields});
+        if (json.empty()) {
             if (error) *error = "Failed to serialize retrieve request";
             return std::nullopt;
         }
@@ -254,7 +254,7 @@ public:
             return std::nullopt;
         }
         RustBuf out;
-        if (usy_qd_retrieve(q_, ustr(coll), ids.data(), ids.size(), ustr(*json), &out.b) != 0) {
+        if (usy_qd_retrieve(q_, ustr(coll), ids.data(), ids.size(), ustr(json), &out.b) != 0) {
             if (error) *error = out.str();
             return std::nullopt;
         }
@@ -265,8 +265,8 @@ public:
         struct TagsOnly {
             std::span<const std::string> t;
         };
-        auto json = glz::write_json(TagsOnly{tags});
-        if (!json) {
+        const std::string_view json = write_json_tls<glz::opts{}>(TagsOnly{tags});
+        if (json.empty()) {
             if (error) *error = "Failed to serialize tags payload";
             return false;
         }
@@ -276,7 +276,7 @@ public:
             return false;
         }
         RustBuf out;
-        const bool ok = usy_qd_set_payload(q_, ustr(coll), ids.data(), ids.size(), ustr(*json), &out.b) == 0;
+        const bool ok = usy_qd_set_payload(q_, ustr(coll), ids.data(), ids.size(), ustr(json), &out.b) == 0;
         if (!ok && error) *error = out.str();
         return ok;
     }
@@ -342,7 +342,7 @@ public:
             return std::nullopt;
         }
         std::vector<DbCollectionInfo> list;
-        if (const auto err = glz::read<JSON_READ>(list, out.view())) {
+        if (const auto err = glz::read<JSON_READ>(list, out.view(), read_ctx_tls())) {
             if (error) *error = "Failed to parse collections list: " + glz::format_error(err, out.view());
             return std::nullopt;
         }
@@ -355,15 +355,29 @@ public:
         if (!q_) return v;
         RustBuf out;
         if (usy_qd_facet_tags(q_, ustr(coll), limit, &out.b) == 0) {
-            (void)glz::read<JSON_READ>(v, out.view());
+            (void)glz::read<JSON_READ>(v, out.view(), read_ctx_tls());
         }
         return v;
     }
 
 private:
+    static glz::context& read_ctx_tls() noexcept {
+        thread_local glz::context ctx{};
+        return ctx;
+    }
+
+    template <auto Opts, typename T>
+    static std::string_view write_json_tls(const T& value) {
+        thread_local std::string buf;
+        thread_local glz::context ctx{};
+        buf.clear();
+        if (glz::write<Opts>(value, buf, ctx)) return {};
+        return buf;
+    }
+
     static std::optional<DbPoints> parse_points(std::string_view json, std::string* error = nullptr) {
         DbPoints pts;
-        if (const auto err = glz::read<JSON_READ>(pts, json)) {
+        if (const auto err = glz::read<JSON_READ>(pts, json, read_ctx_tls())) {
             if (error) *error = "Failed to parse database response: " + glz::format_error(err, json);
             return std::nullopt;
         }

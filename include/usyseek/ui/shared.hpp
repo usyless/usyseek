@@ -27,16 +27,17 @@ inline constexpr UINT WM_APP_REDRAW = WM_APP + 13; // coalesced "something chang
 inline constexpr UINT WM_APP_GIF = WM_APP + 14;    // decoded animated GIF frame ready
 inline constexpr UINT WM_APP_VIDEO = WM_APP + 15;  // Media Foundation video event ready
 
-inline std::wstring format_hotkey(uint32_t mods, uint32_t vk) {
-    std::wstring t;
-    if (mods & MOD_CONTROL) t += L"Ctrl + ";
-    if (mods & MOD_ALT) t += L"Alt + ";
-    if (mods & MOD_SHIFT) t += L"Shift + ";
-    if (mods & MOD_WIN) t += L"Win + ";
+inline FixedWString<96> format_hotkey(uint32_t mods, uint32_t vk) noexcept {
+    FixedWString<96> t;
+    if (mods & MOD_CONTROL) t.append(L"Ctrl + ");
+    if (mods & MOD_ALT) t.append(L"Alt + ");
+    if (mods & MOD_SHIFT) t.append(L"Shift + ");
+    if (mods & MOD_WIN) t.append(L"Win + ");
     std::array<wchar_t, 64> name{};
     if (vk == VK_SPACE) wcscpy_s(name.data(), name.size(), L"Space");
     else GetKeyNameTextW(static_cast<LONG>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)) << 16, name.data(), static_cast<int>(name.size()));
-    return t + (name[0] ? name.data() : L"Key");
+    t.append(name[0] ? name.data() : L"Key");
+    return t;
 }
 
 /// State and services shared by the pill and the settings window (UI thread only unless noted).
@@ -610,18 +611,19 @@ inline wil::com_ptr<IDataObject> clipboard_data_object(const ClipboardPayload& p
     return obj;
 }
 
-inline std::wstring format_date(int64_t unix) {
-    if (unix <= 0) return {};
+inline FixedWString<64> format_date(int64_t unix) noexcept {
+    FixedWString<64> out;
+    if (unix <= 0) return out;
     const uint64_t ft = (static_cast<uint64_t>(unix) + 11'644'473'600ull) * 10'000'000ull;
     FILETIME f{static_cast<DWORD>(ft), static_cast<DWORD>(ft >> 32)};
     FILETIME local;
     SYSTEMTIME st;
     FileTimeToLocalFileTime(&f, &local);
     FileTimeToSystemTime(&local, &st);
-    std::array<wchar_t, 64> buf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-    buf[0] = L'\0';
-    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, L"d MMM yyyy", buf.data(), static_cast<int>(buf.size()), nullptr);
-    return buf.data();
+    const int n = GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, L"d MMM yyyy", out.buf.data(), static_cast<int>(out.buf.size()), nullptr);
+    out.len = n > 1 ? static_cast<size_t>(n - 1) : 0u;
+    out.buf[out.len] = L'\0';
+    return out;
 }
 
 /// Tag chip; returns its width.

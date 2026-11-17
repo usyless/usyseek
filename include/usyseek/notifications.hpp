@@ -26,8 +26,8 @@ inline std::string win32_error_utf8(DWORD err = GetLastError()) {
         msg = trim(std::wstring_view{buf, n});
     }
     if (buf) LocalFree(buf);
-    if (msg.empty()) return "Windows error " + std::to_string(err);
-    return to_utf8(msg) + " (error " + std::to_string(err) + ")";
+    if (msg.empty()) return ulp::str::concat_strings("Windows error ", to_fixed_str(err));
+    return ulp::str::concat_strings(to_utf8(msg), " (error ", to_fixed_str(err), ")");
 }
 
 namespace detail {

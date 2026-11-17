@@ -116,7 +116,7 @@ struct Response {
 };
 
 inline std::wstring win_error(const wchar_t* what, DWORD err = GetLastError()) {
-    return std::wstring{what} + L" (WinHTTP error " + std::to_wstring(err) + L")";
+    return ulp::str::concat_strings(what, L" (WinHTTP error ", to_fixed_wstr(err), L")");
 }
 
 enum class OpStatus : uint8_t { Ok, Error, Cancelled };
@@ -197,7 +197,9 @@ inline bool open(const std::wstring& url, uint64_t range_from, Response& r, std:
     ResetEvent(r.state.req_closed.get());
 
     if (range_from > 0) {
-        const std::wstring range = L"Range: bytes=" + std::to_wstring(range_from) + L"-";
+        FixedWString<64> range{L"Range: bytes="};
+        range.append(to_fixed_wstr(range_from));
+        range.push_back(L'-');
         WinHttpAddRequestHeaders(r.request.get(), range.c_str(), static_cast<DWORD>(range.size()), WINHTTP_ADDREQ_FLAG_ADD);
     }
 
@@ -270,9 +272,9 @@ inline bool read_chunk(Response& r, void* buf, DWORD cap, DWORD& got, std::wstri
 inline std::wstring status_text(DWORD status) {
     switch (status) {
         case 401:
-        case 403: return L"Access denied (HTTP " + std::to_wstring(status) + L") — the file may be gated or private";
+        case 403: return ulp::str::concat_strings(L"Access denied (HTTP ", to_fixed_wstr(status), L") — the file may be gated or private");
         case 404: return L"Not found on the server (HTTP 404)";
-        default: return L"Server answered HTTP " + std::to_wstring(status);
+        default: return ulp::str::concat_strings(L"Server answered HTTP ", to_fixed_wstr(status));
     }
 }
 

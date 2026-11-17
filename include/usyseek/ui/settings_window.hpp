@@ -384,7 +384,7 @@ private:
     void sync_fields() {
         sh_.settings.launch_on_startup = is_startup_enabled();
         model_field_.set(to_wide(sh_.settings.model_name));
-        batch_field_.set(sh_.settings.batch_size > 0 ? std::to_wstring(sh_.settings.batch_size) : L"");
+        batch_field_.set(sh_.settings.batch_size > 0 ? to_fixed_wstr(sh_.settings.batch_size).str() : std::wstring{});
         py_ver_field_.set(to_wide(sh_.settings.python_version.empty() ? "3.14" : sh_.settings.python_version));
         arch_field_.set(to_wide(sh_.settings.rocm_arch));
         cuda_field_.set(to_wide(sh_.settings.cuda_version));
@@ -833,11 +833,13 @@ private:
         }};
     }
 
-    std::wstring tab_label(int i) const {
+    FixedWString<64> tab_label(int i) const noexcept {
         constexpr auto tabs = tab_defs();
-        std::wstring s = tabs[static_cast<size_t>(i)].label;
+        FixedWString<64> s{tabs[static_cast<size_t>(i)].label};
         if (i == 2 && !sh_.notifications.empty()) {
-            s += L" (" + format_count(sh_.notifications.size()) + L")";
+            s.append(L" (");
+            s.append(format_count(sh_.notifications.size()));
+            s.push_back(L')');
         }
         return s;
     }
@@ -981,7 +983,7 @@ private:
         for (int i = 0; i < 4; ++i) {
             const D2D1_RECT_F r = rects[i];
             const float act = std::clamp(1.0f - std::abs(t - static_cast<float>(i)), 0.0f, 1.0f);
-            const std::wstring lbl = tab_label(i);
+            const FixedWString<64> lbl = tab_label(i);
             const float tw = cv.measure(lbl, Font::BodySemi);
             const D2D1_COLOR_F base_fg = (i == 2 && any_notifs)
                 ? (has_errors ? cv.theme().error : cv.theme().amber)
@@ -1006,9 +1008,9 @@ private:
             if (total_n == 0) {
                 caption = L"No active errors or warnings. Indexing, search, database, and environment alerts appear here.";
             } else {
-                caption = format_count(total_n) + (total_n == 1 ? L" active notification" : L" active notifications");
-                if (err_n > 0) caption += L"  •  " + format_count(err_n) + (err_n == 1 ? L" error" : L" errors");
-                if (warn_n > 0) caption += L"  •  " + format_count(warn_n) + (warn_n == 1 ? L" warning" : L" warnings");
+                append_to(caption, format_count(total_n), total_n == 1 ? L" active notification" : L" active notifications");
+                if (err_n > 0) append_to(caption, L"  •  ", format_count(err_n), err_n == 1 ? L" error" : L" errors");
+                if (warn_n > 0) append_to(caption, L"  •  ", format_count(warn_n), warn_n == 1 ? L" warning" : L" warnings");
             }
             const float test_w = button_width(cv, L"Test Notification", true, 154.0f);
             const float clear_w = total_n > 0 ? button_width(cv, L"Clear All", true, 114.0f) : 0.0f;
@@ -1040,11 +1042,11 @@ private:
             const bool is_err = n.severity == "error";
             const bool is_info = n.severity == "info";
             const D2D1_COLOR_F col = is_err ? cv.theme().error : (is_info ? cv.theme().primary : cv.theme().amber);
-            const std::wstring sev = is_err ? L"Error" : (is_info ? L"Info" : L"Warning");
+            const wchar_t* sev = is_err ? L"Error" : (is_info ? L"Info" : L"Warning");
             std::wstring meta = sev;
-            if (!n.source.empty()) meta += L"  •  " + to_wide(n.source);
-            if (n.unix_ts > 0) meta += L"  •  " + format_ago(n.unix_ts);
-            if (n.count > 1) meta += L"  •  ×" + format_count(n.count);
+            if (!n.source.empty()) append_to(meta, L"  •  ", to_wide(n.source));
+            if (n.unix_ts > 0) append_to(meta, L"  •  ", format_ago(n.unix_ts));
+            if (n.count > 1) append_to(meta, L"  •  ×", format_count(n.count));
 
             const std::wstring title = to_wide(n.title);
             const std::wstring detail = to_wide(n.detail);
@@ -1163,17 +1165,17 @@ private:
                 caption = L"Checking GitHub Releases…";
             } else if (update_avail) {
                 const std::wstring ver = sh_.update_state.latest_tag.empty()
-                    ? (L"v" + to_wide(sh_.update_state.latest_version))
+                    ? ulp::str::concat_strings(L"v", to_wide(sh_.update_state.latest_version))
                     : to_wide(sh_.update_state.latest_tag);
-                caption = L"New version " + ver + L" is available (current: v" + APP_VERSION + L").";
+                caption = ulp::str::concat_strings(L"New version ", ver, L" is available (current: v", APP_VERSION, L").");
                 title_col = cv.theme().primary;
             } else if (!sh_.update_state.last_error.empty()) {
-                caption = L"Last check failed: " + to_wide(sh_.update_state.last_error);
+                caption = ulp::str::concat_strings(L"Last check failed: ", to_wide(sh_.update_state.last_error));
                 if (sh_.update_state.last_check_unix > 0) {
-                    caption += L"  •  Checked " + format_ago(sh_.update_state.last_check_unix);
+                    append_to(caption, L"  •  Checked ", format_ago(sh_.update_state.last_check_unix));
                 }
             } else if (sh_.update_state.last_check_unix > 0) {
-                caption = L"Up to date  •  Last checked " + format_ago(sh_.update_state.last_check_unix);
+                caption = ulp::str::concat_strings(L"Up to date  •  Last checked ", format_ago(sh_.update_state.last_check_unix));
             } else {
                 caption = L"Checks github.com/usyless/usyseek/releases once every 24 hours when opened.";
             }
@@ -1187,17 +1189,17 @@ private:
                 draw_switch(cv, r.right, (r.top + r.bottom) * 0.5f, sh_.settings.auto_check_updates, IdToggleAutoUpdate);
             });
 
-            const std::wstring check_lbl = sh_.update_checking ? L"Checking…" : L"Check Now";
+            const wchar_t* check_lbl = sh_.update_checking ? L"Checking…" : L"Check Now";
             std::wstring install_lbl = L"Download & Install";
             if (update_job_.busy) {
                 install_lbl = upd_view.total > 0
-                    ? (L"Cancel  •  " + std::to_wstring(upd_view.done * 100 / upd_view.total) + L"%")
+                    ? ulp::str::concat_strings(L"Cancel  •  ", to_fixed_wstr(upd_view.done * 100 / upd_view.total), L"%")
                     : L"Cancel";
             } else if (update_avail) {
                 const std::wstring ver = sh_.update_state.latest_tag.empty()
-                    ? (L"v" + to_wide(sh_.update_state.latest_version))
+                    ? ulp::str::concat_strings(L"v", to_wide(sh_.update_state.latest_version))
                     : to_wide(sh_.update_state.latest_tag);
-                install_lbl = L"Download & Install " + ver;
+                install_lbl = ulp::str::concat_strings(L"Download & Install ", ver);
             }
 
             Flow actions{8.0f, 8.0f};
@@ -1224,9 +1226,9 @@ private:
 
             std::wstring pkg_note;
             if (update_avail && !sh_.update_state.asset_name.empty()) {
-                pkg_note = L"Selected package: " + to_wide(sh_.update_state.asset_name);
+                append_to(pkg_note, L"Selected package: ", to_wide(sh_.update_state.asset_name));
                 if (sh_.update_state.asset_size > 0) {
-                    pkg_note += L" (" + format_size(sh_.update_state.asset_size) + L")";
+                    append_to(pkg_note, L" (", format_size(sh_.update_state.asset_size), L")");
                 }
                 pkg_note += tar_supports_7z()
                     ? L"  •  Windows tar supports .7z"
@@ -1235,7 +1237,7 @@ private:
 
             std::wstring job_note = upd_view.log;
             if (update_job_.busy && upd_view.total > 0) {
-                job_note += L"  " + format_size(upd_view.done) + L" / " + format_size(upd_view.total);
+                append_to(job_note, L"  ", format_size(upd_view.done), L" / ", format_size(upd_view.total));
             }
             const bool show_bar = update_job_.busy && upd_view.total > 0;
             std::wstring notes_txt;
@@ -1326,19 +1328,8 @@ private:
         const float del_w = button_width(cv, L"Delete", true, 84.0f);
         const float badge_w = cv.measure(L"Active", Font::Caption) + 18.0f;
 
-        struct LayoutRow {
-            float y;
-            float h;
-            float title_w;
-            float title_h;
-            float sub_h;
-            float text_w;
-            float actions_w;
-            bool beside;
-            bool badge_inline;
-        };
-        std::vector<LayoutRow> lay;
-        lay.reserve(rows.size());
+        storage_lay_scratch_.clear();
+        storage_lay_scratch_.reserve(rows.size());
         float cy = y + 16.0f + hd.h + 10.0f;
         const float empty_h = rows.empty() ? text_height(cv, empty_msg, Font::Small, rw, 24.0f) : 0.0f;
         for (const StorageRow& r : rows) {
@@ -1353,7 +1344,7 @@ private:
             const float badge_extra = (r.active && !badge_inline) ? 24.0f : 0.0f;
             const float text_h = title_h + badge_extra + 2.0f + sub_h;
             const float row_h = beside ? std::max(50.0f, 16.0f + text_h) : (16.0f + text_h + 8.0f + 30.0f);
-            lay.emplace_back(cy, row_h, title_w, title_h, sub_h, text_w, actions_w, beside, badge_inline);
+            storage_lay_scratch_.emplace_back(cy, row_h, title_w, title_h, sub_h, text_w, actions_w, beside, badge_inline);
             cy += row_h + 6.0f;
         }
 
@@ -1371,7 +1362,7 @@ private:
 
         for (size_t i = 0; i < rows.size(); ++i) {
             const StorageRow& r = rows[i];
-            const LayoutRow& lr = lay[i];
+            const StorageLayoutRow& lr = storage_lay_scratch_[i];
             const D2D1_RECT_F ir = rect(lx, lr.y, rw, lr.h);
             draw_well(cv, ir, 10.0f, r.active, r.active);
 
@@ -1422,12 +1413,13 @@ private:
             const uint64_t embedded = shown.embedded;
             const uint64_t total = shown.total;
 
-            const std::wstring num_a = format_count(embedded);
-            const std::wstring num_b = L" / " + format_count(total);
+            const FixedWString<32> num_a = format_count(embedded);
+            FixedWString<40> num_b{L" / "};
+            num_b.append(format_count(total));
             const float wa = cv.measure(num_a, Font::Hero);
             const float wb = cv.measure(num_b, Font::Title);
 
-            std::wstring status_txt = stopping ? L"Stopping…" : (running ? phase_label(d.phase) : (sh_.index_state.last_error.empty() ? L"Up to date" : L"Error"));
+            const wchar_t* status_txt = stopping ? L"Stopping…" : (running ? phase_label(d.phase) : (sh_.index_state.last_error.empty() ? L"Up to date" : L"Error"));
             D2D1_COLOR_F badge_col = running ? cv.theme().amber : (sh_.index_state.last_error.empty() ? cv.theme().mint : cv.theme().error);
             if (!running && d.phase == Phase::Stopped && sh_.index_state.last_error.empty()) {
                 status_txt = L"Stopped";
@@ -1438,35 +1430,34 @@ private:
             }
             const float bw = cv.measure(status_txt, Font::Caption) + 28.0f;
             const uint64_t fail_cnt = running ? d.failed : sh_.failed_files.size();
-            const std::wstring ftxt = format_count(fail_cnt) + L" failed";
+            FixedWString<48> ftxt = format_count(fail_cnt);
+            ftxt.append(L" failed");
             const float fw = cv.measure(ftxt, Font::Caption) + 18.0f;
 
             std::wstring sub;
             if (running) {
                 if (d.rate > 0.05f) {
-                    std::array<wchar_t, 64> rbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-                    swprintf_s(rbuf.data(), rbuf.size(), L"%.1f files/s", d.rate);
-                    sub += rbuf.data();
+                    append_to(sub, to_fixed_wstr(d.rate, 1), L" files/s");
                     if (d.todo > d.processed) {
                         const uint64_t rem_ms = static_cast<uint64_t>((d.todo - d.processed) / d.rate * 1000.0f);
-                        sub += L"  •  ETA " + format_duration_ms(rem_ms);
+                        append_to(sub, L"  •  ETA ", format_duration_ms(rem_ms));
                     }
                 }
                 if (d.device[0]) {
                     if (!sub.empty()) sub += L"  •  ";
                     sub += d.device;
                 }
-                if (d.batch) sub += L" (batch " + std::to_wstring(d.batch) + L")";
+                if (d.batch) append_to(sub, L" (batch ", to_fixed_wstr(d.batch), L")");
             } else if (!sh_.index_state.last_error.empty()) {
                 sub = to_wide(sh_.index_state.last_error);
             } else {
-                sub = L"Last indexed " + format_ago(sh_.index_state.last_index_unix);
+                sub = ulp::str::concat_strings(L"Last indexed ", format_ago(sh_.index_state.last_index_unix));
             }
 
             float pct = total > 0 ? static_cast<float>(embedded) / static_cast<float>(total) : (running ? 0.05f : 0.0f);
             pct = std::clamp(pct, 0.0f, 1.0f);
-            std::array<wchar_t, 32> pbuf; // NOLINT(cppcoreguidelines-pro-type-member-init)
-            swprintf_s(pbuf.data(), pbuf.size(), L"%.1f%% completed", pct * 100.0f);
+            FixedWString<32> pbuf = to_fixed_wstr<32>(pct * 100.0f, 1);
+            pbuf.append(L"% completed");
             const std::wstring cur = stopping ? L"Stopping indexer — finishing current batch…"
                                    : (running && d.current[0] ? (std::wstring{L"Processing: "} + d.current)
                                    : (running && d.message[0] ? std::wstring{d.message} : L"On-demand scanner idle — zero background GPU/RAM usage"));
@@ -1514,7 +1505,7 @@ private:
             flow_text(cv, status, sub, Font::Caption, cv.theme().on_surface_variant, rw, 22.0f);
 
             Flow progress_text{8.0f, 4.0f};
-            flow_text(cv, progress_text, pbuf.data(), Font::Caption, cv.theme().outline, rw, 20.0f);
+            flow_text(cv, progress_text, pbuf, Font::Caption, cv.theme().outline, rw, 20.0f);
             flow_text(cv, progress_text, cur, Font::MonoSmall, stopping ? cv.theme().amber : cv.theme().on_surface_variant, rw, 20.0f, true, Align::Right);
 
             Flow database{8.0f, 8.0f};
@@ -1564,7 +1555,7 @@ private:
             const float reason_x = stacked ? path_x : rw * 0.64f;
             const float reason_w = stacked ? rw - 40.0f : rw * 0.36f - 10.0f;
 
-            const std::wstring title = L"Failed Media Files (" + format_count(sh_.failed_files.size()) + L")";
+            const std::wstring title = ulp::str::concat_strings(L"Failed Media Files (", format_count(sh_.failed_files.size()), L")");
             const CardHeader hd = make_header(cv, rw, title, cv.theme().error,
                                               L"Skipped until modified — click a file to reveal in Explorer, or retry all", 266.0f, 32.0f);
 
@@ -1581,7 +1572,7 @@ private:
             float cy = y + 16.0f + hd.h + 10.0f;
             for (size_t i = 0; i < show_n; ++i) {
                 const auto& ff = sh_.failed_files[i];
-                FailedRow row{ff.path.empty() ? (L"ID " + std::to_wstring(ff.id)) : ff.path, cy, 0.0f, 0.0f, 0.0f, 0.0f};
+                FailedRow row{.label = ff.path.empty() ? ulp::str::concat_strings(L"ID ", to_fixed_wstr(ff.id)) : ff.path, .y = cy};
                 row.path_h = cv.measure_height(row.label, Font::MonoSmall, path_w);
                 row.reason_h = cv.measure_height(ff.reason, Font::Caption, reason_w);
                 row.content_h = stacked ? row.path_h + (row.reason_h > 0.0f ? 2.0f + row.reason_h : 0.0f) : std::max(row.path_h, row.reason_h);
@@ -1591,7 +1582,7 @@ private:
             }
             const bool has_more = sh_.failed_files.size() > show_n;
             const std::wstring more = has_more
-                ? L"+ " + format_count(sh_.failed_files.size() - show_n) + L" more in " + failed_path(sh_.settings.model_name).filename().wstring()
+                ? ulp::str::concat_strings(L"+ ", format_count(sh_.failed_files.size() - show_n), L" more in ", failed_path(sh_.settings.model_name).filename().wstring())
                 : std::wstring{};
             const float more_h = has_more ? text_height(cv, more, Font::Caption, rw, 20.0f) : 0.0f;
             const float list_bottom = has_more ? cy + more_h : cy - 4.0f;
@@ -1645,9 +1636,9 @@ private:
                 const auto mit = std::find_if(downloaded_models_.begin(), downloaded_models_.end(),
                                               [&](const ModelStorageInfo& m) { return m.name == col.name && m.weights; });
                 std::wstring sub = col.count
-                    ? (format_count(*col.count) + (*col.count == 1 ? L" file" : L" files"))
+                    ? ulp::str::concat_strings(format_count(*col.count), *col.count == 1 ? L" file" : L" files")
                     : (sh_.indexer_running ? L"Counts paused while indexing" : L"Count unavailable");
-                sub += L"  •  " + format_size(col.bytes);
+                append_to(sub, L"  •  ", format_size(col.bytes));
                 if (mit == downloaded_models_.end()) sub += L"  •  Weights not downloaded";
                 rows.push_back({
                     .title = to_wide(col.name),
@@ -1675,9 +1666,10 @@ private:
                                               prune_w, 32.0f);
             const TagStoreStats& ts = sh_.tag_store_stats;
             const std::wstring summary = ts.file_count > 0
-                ? (format_count(ts.file_count) + (ts.file_count == 1 ? L" tagged file" : L" tagged files") +
-                   L"  •  " + format_count(ts.tag_count) + (ts.tag_count == 1 ? L" tag" : L" tags") +
-                   L"  •  " + format_size(ts.bytes))
+                ? ulp::str::concat_strings(
+                      format_count(ts.file_count), ts.file_count == 1 ? L" tagged file" : L" tagged files",
+                      L"  •  ", format_count(ts.tag_count), ts.tag_count == 1 ? L" tag" : L" tags",
+                      L"  •  ", format_size(ts.bytes))
                 : L"No tags stored in data\\tags.db yet — tags are saved as you tag media or backfill on startup.";
             const float sum_y = y + 16.0f + hd.h + 10.0f;
             const float sum_h = text_height(cv, summary, Font::Caption, rw, 18.0f);
@@ -1766,7 +1758,9 @@ private:
             const float line_y = cy;
             cy += 12.0f;
 
-            const std::wstring min_lbl = L"Min size: " + std::to_wstring(sh_.settings.min_file_kb) + L" KB";
+            FixedWString<40> min_lbl{L"Min size: "};
+            min_lbl.append(to_fixed_wstr(sh_.settings.min_file_kb));
+            min_lbl.append(L" KB");
             Flow media{8.0f, 8.0f};
             media.add(button_width(cv, L"Images", true, 108.0f), 32.0f, [&](D2D1_RECT_F r) {
                 draw_button(cv, r, glyph::photo, L"Images", IdToggleImages, 0, sh_.settings.index_images ? 1 : 0);
@@ -1955,7 +1949,9 @@ private:
             const CardHeader hd = make_header(cv, rw, L"Spotlight Invocation Keybind", cv.theme().on_surface,
                                               L"Global desktop shortcut registered by the lightweight tray launcher", 44.0f, 24.0f);
 
-            const std::wstring hk = recording_hotkey_ ? L"Press shortcut…" : format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk);
+            const FixedWString<96> hk = recording_hotkey_
+                ? FixedWString<96>{L"Press shortcut…"}
+                : format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk);
             const wchar_t* record_label = recording_hotkey_ ? L"Cancel Recording" : L"Record Keybind";
             Flow keys{8.0f, 8.0f};
             keys.add(240.0f, 40.0f, [&](D2D1_RECT_F kr) {
@@ -1989,11 +1985,16 @@ private:
                 draw_switch(cv, r.right, (r.top + r.bottom) * 0.5f, sh_.settings.hide_on_focus_loss, IdToggleHideFocus);
             });
 
-            const std::wstring idle_lbl = sh_.settings.ui_idle_timeout_s < 0
-                ? L"UI process timeout: Never"
-                : (sh_.settings.ui_idle_timeout_s == 0
-                    ? L"UI process timeout: 0s (Immediate)"
-                    : L"UI process timeout: " + std::to_wstring(sh_.settings.ui_idle_timeout_s) + L"s");
+            FixedWString<48> idle_lbl;
+            if (sh_.settings.ui_idle_timeout_s < 0) {
+                idle_lbl.assign(L"UI process timeout: Never");
+            } else if (sh_.settings.ui_idle_timeout_s == 0) {
+                idle_lbl.assign(L"UI process timeout: 0s (Immediate)");
+            } else {
+                idle_lbl.assign(L"UI process timeout: ");
+                idle_lbl.append(to_fixed_wstr(sh_.settings.ui_idle_timeout_s));
+                idle_lbl.push_back(L's');
+            }
             Flow options{24.0f, 10.0f};
             options.add_group(startup, rw);
             options.add_group(hide_on_blur, rw);
@@ -2024,8 +2025,9 @@ private:
 
             // The launcher could not register the shortcut: say so here instead of leaving a dead key
             const bool hotkey_warn = sh_.hotkey_unavailable() && !recording_hotkey_;
-            const std::wstring hotkey_msg = format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk) +
-                L" is already registered by another app, so it cannot open search. Record a different shortcut or close the app that uses it.";
+            const std::wstring hotkey_msg = ulp::str::concat_strings(
+                format_hotkey(sh_.settings.hotkey_mods, sh_.settings.hotkey_vk),
+                L" is already registered by another app, so it cannot open search. Record a different shortcut or close the app that uses it.");
             const float hotkey_msg_h = hotkey_warn ? error_row_height(cv, hotkey_msg, rw) : 0.0f;
 
             const float keys_y = y + 16.0f + hd.h + 10.0f;
@@ -2088,16 +2090,21 @@ private:
             // What is on disk for the selected model, and a way to fetch what is missing
             const ModelFiles& mf = model_files_;
             const JobView fetch_view = view(model_job_);
-            const auto badge = [&cv](Flow& flow, std::wstring text, D2D1_COLOR_F col) {
+            const auto badge = [&cv](Flow& flow, FixedWString<48> text, D2D1_COLOR_F col) {
                 const float bw = cv.measure(text, Font::Caption) + 28.0f;
-                flow.add(bw, 22.0f, [&cv, text = std::move(text), col, bw](D2D1_RECT_F br) {
+                flow.add(bw, 22.0f, [&cv, text, col, bw](D2D1_RECT_F br) {
                     cv.fill_round(br, 11.0f, with_alpha(col, 0.15f));
                     cv.fill_circle({br.left + 11.0f, br.top + 11.0f}, 3.5f, col);
                     cv.text(text, rect(br.left + 20.0f, br.top, bw - 22.0f, 22.0f), Font::Caption, col);
                 });
             };
             Flow files{8.0f, 6.0f};
-            badge(files, mf.weights ? L"Weights  " + format_size(mf.weights_bytes) : L"Weights missing", mf.weights ? cv.theme().mint : cv.theme().error);
+            FixedWString<48> weights_lbl{L"Weights missing"};
+            if (mf.weights) {
+                weights_lbl.assign(L"Weights  ");
+                weights_lbl.append(format_size(mf.weights_bytes));
+            }
+            badge(files, weights_lbl, mf.weights ? cv.theme().mint : cv.theme().error);
             badge(files, mf.tokenizer ? L"Tokenizer" : L"Tokenizer missing", mf.tokenizer ? cv.theme().mint : cv.theme().error);
             badge(files, mf.onnx ? L"Text ONNX" : L"Text ONNX not exported yet", mf.onnx ? cv.theme().mint : cv.theme().amber);
             const auto enc_state = sh_.engine.encoder().state();
@@ -2109,8 +2116,16 @@ private:
 
             const bool show_fetch = !mf.weights || !mf.tokenizer || model_job_.busy;
             repo_field_.placeholder = to_wide(default_repo());
-            const std::wstring fetch_label = !model_job_.busy ? L"Download Model"
-                : (fetch_view.total > 0 ? L"Cancel  •  " + std::to_wstring(fetch_view.done * 100 / fetch_view.total) + L"%" : L"Cancel");
+            FixedWString<32> fetch_label{L"Download Model"};
+            if (model_job_.busy) {
+                if (fetch_view.total > 0) {
+                    fetch_label.assign(L"Cancel  •  ");
+                    fetch_label.append(to_fixed_wstr(fetch_view.done * 100 / fetch_view.total));
+                    fetch_label.push_back(L'%');
+                } else {
+                    fetch_label.assign(L"Cancel");
+                }
+            }
             Flow fetch{8.0f, 8.0f};
             flow_text(cv, fetch, L"Hugging Face repo:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 32.0f);
             fetch.add(200.0f, 32.0f, [&](D2D1_RECT_F fr) {
@@ -2123,7 +2138,7 @@ private:
             });
             std::wstring fetch_note = fetch_view.log;
             if (model_job_.busy && fetch_view.total > 0) {
-                fetch_note += L"  " + format_size(fetch_view.done) + L" / " + format_size(fetch_view.total);
+                append_to(fetch_note, L"  ", format_size(fetch_view.done), L" / ", format_size(fetch_view.total));
             }
             const float fetch_note_h = fetch_note.empty() ? 0.0f : text_height(cv, fetch_note, Font::Caption, rw, 18.0f);
 
@@ -2142,7 +2157,7 @@ private:
             flow_text(cv, batch, L"Batch size:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 32.0f);
             static constexpr std::array<uint32_t, 5> batches = {0, 32, 64, 128, 256};
             for (const uint32_t b : batches) {
-                const std::wstring bl = b == 0 ? L"Auto (VRAM)" : std::to_wstring(b);
+                const FixedWString<16> bl = b == 0 ? FixedWString<16>{L"Auto (VRAM)"} : to_fixed_wstr<16>(b);
                 batch.add(button_width(cv, bl, false, b == 0 ? 92.0f : 44.0f), 32.0f, [&, b, bl](D2D1_RECT_F r) {
                     draw_button(cv, r, 0, bl, IdBatchPreset, static_cast<int>(b), sh_.settings.batch_size == b ? 1 : 0);
                 });
@@ -2165,10 +2180,9 @@ private:
             if (batch_warn) {
                 batch_note = L"High fixed batch sizes may exceed VRAM and trigger driver resets; OOM automatically halves the batch.";
             } else if (sh_.settings.batch_size == 0) {
-                const std::wstring chosen = sh_.index_state.auto_batch > 0
-                    ? L"Auto chose " + std::to_wstring(sh_.index_state.auto_batch) + L" on the last run."
-                    : L"Auto measures the fastest batch size on first index.";
-                batch_note = chosen + L" Backs off automatically on out-of-memory.";
+                batch_note = sh_.index_state.auto_batch > 0
+                    ? ulp::str::concat_strings(L"Auto chose ", to_fixed_wstr(sh_.index_state.auto_batch), L" on the last run. Backs off automatically on out-of-memory.")
+                    : L"Auto measures the fastest batch size on first index. Backs off automatically on out-of-memory.";
             } else {
                 batch_note = L"Auto probes free VRAM on startup and backs off automatically on out-of-memory.";
             }
@@ -2303,9 +2317,12 @@ private:
 
             // Portable Python (NuGet) row
             static constexpr std::array<const char*, 4> versions = {"3.14", "3.13", "3.12", "3.11"};
-            const std::wstring dl_label = venv_view.total > 0 && venv_busy
-                ? (L"Downloading " + std::to_wstring(venv_view.done * 100 / venv_view.total) + L"%")
-                : L"Download & Use";
+            FixedWString<32> dl_label{L"Download & Use"};
+            if (venv_view.total > 0 && venv_busy) {
+                dl_label.assign(L"Downloading ");
+                dl_label.append(to_fixed_wstr(venv_view.done * 100 / venv_view.total));
+                dl_label.push_back(L'%');
+            }
             Flow portable{8.0f, 8.0f};
             flow_text(cv, portable, L"Portable Python:", Font::SmallSemi, cv.theme().on_surface_variant, rw, 30.0f);
             for (size_t i = 0; i < versions.size(); ++i) {
@@ -3265,7 +3282,7 @@ private:
             sh_.settings.batch_size = new_bs;
             changed = true;
         }
-        batch_field_.set(sh_.settings.batch_size > 0 ? std::to_wstring(sh_.settings.batch_size) : L"");
+        batch_field_.set(sh_.settings.batch_size > 0 ? to_fixed_wstr(sh_.settings.batch_size).str() : std::wstring{});
         if (changed) {
             sh_.save();
             if (sh_.settings_changed) sh_.settings_changed();
@@ -3433,11 +3450,12 @@ private:
                 if (sh_.indexer_running || idx < 0 || idx >= static_cast<int>(db_collections_.size())) break;
                 const DbCollectionInfo col = db_collections_[idx];
                 const std::wstring count_line = col.count
-                    ? (format_count(*col.count) + (*col.count == 1 ? L" indexed file" : L" indexed files"))
+                    ? ulp::str::concat_strings(format_count(*col.count), *col.count == 1 ? L" indexed file" : L" indexed files")
                     : L"unknown file count";
-                const std::wstring msg = L"Delete Qdrant Edge database '" + to_wide(col.name) + L"' (" +
-                                         count_line + L", " + format_size(col.bytes) + L")?\n\n"
-                                         L"This removes all indexed embeddings and tags in that collection. Your media files and downloaded models will not be touched.";
+                const std::wstring msg = ulp::str::concat_strings(
+                    L"Delete Qdrant Edge database '", to_wide(col.name), L"' (",
+                    count_line, L", ", format_size(col.bytes),
+                    L")?\n\nThis removes all indexed embeddings and tags in that collection. Your media files and downloaded models will not be touched.");
                 if (!in_modal_) {
                     in_modal_ = true;
                     const bool confirmed = confirm_box(hwnd_, L"Delete Database Collection", msg);
@@ -3508,8 +3526,9 @@ private:
                             return;
                         }
                         if (missing_ids.empty()) {
-                            const std::wstring msg = L"All " + format_count(total_count) +
-                                                     L" tagged file(s) in data\\tags.db currently exist on disk.";
+                            const std::wstring msg = ulp::str::concat_strings(
+                                L"All ", format_count(total_count),
+                                L" tagged file(s) in data\\tags.db currently exist on disk.");
                             if (!in_modal_) {
                                 in_modal_ = true;
                                 MessageBoxW(hwnd_, msg.c_str(), L"Prune Missing Tags", MB_ICONINFORMATION | MB_OK);
@@ -3523,10 +3542,10 @@ private:
                             return;
                         }
                         in_modal_ = true;
-                        const std::wstring msg = L"Remove tags for " + format_count(missing_ids.size()) +
-                                                 (missing_ids.size() == 1 ? L" file" : L" files") +
-                                                 L" that no longer exist on disk?\n\n"
-                                                 L"This deletes their entries from data\\tags.db and clears their tags from the active collection if still present.";
+                        const std::wstring msg = ulp::str::concat_strings(
+                            L"Remove tags for ", format_count(missing_ids.size()),
+                            missing_ids.size() == 1 ? L" file" : L" files",
+                            L" that no longer exist on disk?\n\nThis deletes their entries from data\\tags.db and clears their tags from the active collection if still present.");
                         const bool confirmed = confirm_box(hwnd_, L"Prune Missing Tags", msg);
                         in_modal_ = false;
                         if (!confirmed) {
@@ -3566,7 +3585,7 @@ private:
                             sh_.call([this, count = missing_ids.size()] {
                                 sh_.refresh_tags();
                                 sh_.notify("info", "Tags", "Pruned missing tags",
-                                    "Removed tags for " + std::to_string(count) + (count == 1 ? " missing file." : " missing files."),
+                                    ulp::str::concat_strings("Removed tags for ", to_fixed_str(count), count == 1 ? " missing file." : " missing files."),
                                     "tags-prune");
                             });
                         });
@@ -3792,9 +3811,10 @@ private:
                 const ModelStorageInfo m = downloaded_models_[idx];
                 const bool is_active = m.name == sh_.settings.model_name;
                 if (is_active && sh_.indexer_running) break;
-                const std::wstring msg = L"Delete downloaded model files for '" + to_wide(m.name) + L"' (" +
-                                         format_size(m.bytes) + L")?\n\n"
-                                         L"Your indexed Qdrant database collections and tags will not be touched.";
+                const std::wstring msg = ulp::str::concat_strings(
+                    L"Delete downloaded model files for '", to_wide(m.name), L"' (",
+                    format_size(m.bytes),
+                    L")?\n\nYour indexed Qdrant database collections and tags will not be touched.");
                 if (!in_modal_) {
                     in_modal_ = true;
                     const bool confirmed = confirm_box(hwnd_, L"Delete Model Files", msg);
@@ -3829,7 +3849,7 @@ private:
                 break;
             case IdBatchPreset:
                 sh_.settings.batch_size = static_cast<uint32_t>(idx);
-                batch_field_.set(idx > 0 ? std::to_wstring(idx) : L"");
+                batch_field_.set(idx > 0 ? to_fixed_wstr(idx).str() : std::wstring{});
                 sh_.save();
                 break;
             case IdBatchField: focus_field(batch_field_); break;
@@ -4327,6 +4347,18 @@ private:
     uint64_t app_icon_epoch_ = 0;
     std::vector<Hit> hits_;
     std::vector<Hit> scratch_hits_;
+    struct StorageLayoutRow {
+        float y;
+        float h;
+        float title_w;
+        float title_h;
+        float sub_h;
+        float text_w;
+        float actions_w;
+        bool beside;
+        bool badge_inline;
+    };
+    std::vector<StorageLayoutRow> storage_lay_scratch_;
     HCURSOR cursor_arrow_ = nullptr, cursor_hand_ = nullptr, cursor_ibeam_ = nullptr;
     bool rendering_ = false;
     bool dirty_ = false; // state changed since the last frame

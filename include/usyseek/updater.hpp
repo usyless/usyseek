@@ -183,7 +183,7 @@ inline std::string sha256_file_hex(const fs::path& path, std::wstring& err) {
 }
 
 inline bool is_dir_writable(const fs::path& dir) {
-    const fs::path probe = dir / (L".usyseek-write-probe-" + std::to_wstring(GetCurrentProcessId()));
+    const fs::path probe = dir / ulp::str::concat_strings(L".usyseek-write-probe-", to_fixed_wstr(GetCurrentProcessId()));
     const wil::unique_hfile f{CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr)};
     if (f) return true;
@@ -257,8 +257,9 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
         while (!tar_err.empty() && (tar_err.back() == '\r' || tar_err.back() == '\n' || tar_err.back() == ' ' || tar_err.back() == '\t')) {
             tar_err.remove_suffix(1);
         }
-        err = L"Extraction failed (tar exited with code " + std::to_wstring(res.status) + L")" +
-              (tar_err.empty() ? L"." : (L": " + to_wide(tar_err)));
+        err = ulp::str::concat_strings(
+            L"Extraction failed (tar exited with code ", to_fixed_wstr(res.status), L")",
+            tar_err.empty() ? L"." : L": ", tar_err.empty() ? std::wstring{} : to_wide(tar_err));
         return false;
     }
 
@@ -276,12 +277,13 @@ inline bool launch_staged_updater(const fs::path& staging_root, const fs::path& 
                                   bool open_about_after, bool& uac_cancelled, std::wstring& err) {
     uac_cancelled = false;
     const fs::path staged_exe = staging_root / L"usyseek.exe";
-    std::wstring args = L"--apply-update " + std::to_wstring(wait_pid) +
-                        L" \"" + staging_root.wstring() + L"\" \"" + target_dir.wstring() + L"\"";
+    std::wstring args = ulp::str::concat_strings(
+        L"--apply-update ", to_fixed_wstr(wait_pid),
+        L" \"", staging_root.wstring(), L"\" \"", target_dir.wstring(), L"\"");
     if (open_about_after) args += L" --open-about";
 
     if (is_dir_writable(target_dir)) {
-        std::wstring cmd = L"\"" + staged_exe.wstring() + L"\" " + args;
+        std::wstring cmd = ulp::str::concat_strings(L"\"", staged_exe.wstring(), L"\" ", args);
         STARTUPINFOW si{.cb = sizeof(STARTUPINFOW)};
         wil::unique_process_information pi;
         if (CreateProcessW(staged_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
