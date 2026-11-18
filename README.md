@@ -56,9 +56,9 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
    - Manages the system tray icon, global hotkey (default: `Alt + Space`), and process lifecycles.
    - Enforces a `KillOnClose` Windows Job object so background helpers never leak when quitting.
 
-2. **`usyseek-ui.exe` (Search Pill & Settings Window)**:
+2. **`usyseek-ui.exe` (Search Pill, Settings & Theme Editor)**:
    - Hardware-accelerated UI rendered with **Direct2D**, **DirectWrite**, **DirectComposition**, and **DXGI**.
-   - Features a floating Spotlight search pill, fullscreen media exploration grid, tag editor, and settings interface following a flat **Material 3 (M3)** design system.
+   - Features a floating Spotlight search pill, fullscreen media exploration grid, tag editor, settings interface, and live custom **Theme Editor** following a flat **Material 3 (M3)** design system (with optional real-time **Liquid Glass** refraction via DXGI Desktop Duplication).
    - Runs **ONNX Runtime (CPU)** to encode text queries on-the-fly into vector embeddings using the exported text tower and fast Hugging Face tokenizers.
    - **Zero-Footprint Idle**: After `ui_idle_timeout_s` of inactivity while hidden (default: 180 seconds), the UI process exits cleanly, releasing all GUI and ONNX resources back to the OS.
 
@@ -90,7 +90,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 - **Find Similar (Visual Cosine Search)**: Click the "Similar" button on any image or video card to search your library for visually and semantically related items.
 - **Interactive Media Previews**: Supports video and animated GIF playback directly in previews with seek controls, volume adjustment, and image/preview zooming.
 - **Search History & Default Open Mode**: Navigate previous queries with text box history, and choose whether the app opens in Pill or Fullscreen mode by default.
-- **Themes & Liquid Glass**: Customize the interface with built-in or custom themes and an optional Liquid Glass visual effect.
+- **Themes & Liquid Glass**: Customize the interface with 8 built-in themes (including **Liquid Glass** with multi-monitor & DPI-aware live desktop refraction) or build your own in the **Theme Editor**.
 - **Directory Path Scoping**: Filter searches to specific folders or parent directories using `dir:...` or path autocompletion.
 - **Media Kind Filters**: Filter seamlessly between All, Images, or Videos.
 
@@ -121,6 +121,19 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 - **Thumbnail Fit**: Show image thumbnails cropped to fill the tile (default) or as the whole image, letterboxed.
 - **Hardware Acceleration**: Configure hardware acceleration (ROCm / CUDA / CPU) with custom PyTorch arguments directly within the UI.
 - **Notifications, About & Auto-Updater**: Built-in notifications tab, About page, and automatic updates.
+
+### 🎨 Themes, Liquid Glass & Theme Editor
+
+<p align="center">
+  <img src="assets/theme-editor.png" alt="Custom Theme Editor" />
+</p>
+
+- **Built-In Presets & Windows Sync**: Switch between **Follow Windows**, **Windows Accent** (dynamically derived from your Windows accent color), **Midnight Dark**, **Daylight**, **Nord**, **Catppuccin Mocha**, **Pure OLED**, and **Liquid Glass**.
+- **Built-In Theme Editor**: Create, duplicate, edit, or delete custom themes directly from **Settings → Appearance & Theme**, with **Apply** for instant live previewing and **Save & Apply** to persist to disk.
+- **JSON Schema & Live Reload**: Custom themes live in `data/themes/*.json` alongside an auto-synced `theme.schema.json` (for editor autocomplete/validation) and `example-sakura (copy but do not edit).json`, with **Open Folder** and **Reload** actions in Settings.
+- **Surfaces, Radii & Shadows**: Customize dark/light/system polarity, DWM backdrops (`Acrylic`, `Mica`, `Tabbed`, `Solid`) independently for the search pill and settings/editor windows, surface opacities, drop shadow scale, and custom **Corner Radii** for the search pill, cards, buttons, and thumbnails.
+- **Tunable Liquid Glass Material**: Enable the Direct2D/DXGI **Liquid Glass** shader on any custom theme and fine-tune blur, superellipse corner roundness, index of refraction, chromatic dispersion, glare scale, and glare angle—complete with multi-monitor, display rotation, and DPI scaling support.
+- **Full Palette & Tag Colors**: Edit core and advanced Material 3 color tokens plus all 8 cyclic **Tag Palette** colors using native Windows color pickers or `#RRGGBB` / `#RRGGBBAA` hex inputs, with per-property reset controls.
 
 ---
 
@@ -210,8 +223,9 @@ build/bin/
 | `USYSEEK_USYLIBPP_VERSION` | `main` | Git branch/tag for `usylibpp` |
 | `USYSEEK_GLAZE_VERSION` | `v9.1.0` | Git tag for `glaze` (high-performance JSON) |
 | `USYSEEK_MIMALLOC_VERSION` | `v3.5.3` | Git tag for `mimalloc` |
-| `USYSEEK_ORT_VERSION` | `1.31.1` | Prebuilt ONNX Runtime Windows x64 release |
+| `USYSEEK_ORT_VERSION` | `1.32.0` | Prebuilt ONNX Runtime Windows x64 release |
 | `USYSEEK_EVERYTHING_VERSION` | `1.5.0.1424b` | Voidtools Everything x64 portable release |
+| `USYSEEK_SQLITE_VERSION` | `3540100` | SQLite amalgamation release |
 
 ---
 
