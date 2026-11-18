@@ -3447,6 +3447,12 @@ private:
     }
 
     void caret_reset() noexcept {
+        if (!window_active_) {
+            field_.caret_on = false;
+            menu_field_.caret_on = false;
+            if (hwnd_) KillTimer(hwnd_, TIMER_CARET);
+            return;
+        }
         field_.caret_on = true;
         menu_field_.caret_on = true;
         SetTimer(hwnd_, TIMER_CARET, GetCaretBlinkTime(), nullptr);
@@ -4172,8 +4178,17 @@ private:
                 const bool active = LOWORD(wp) != WA_INACTIVE;
                 if (window_active_ != active) {
                     window_active_ = active;
-                    if (custom_pill_frame() && visible()) {
-                        full_dirty_ = true;
+                    if (active) {
+                        if (visible() && (field_.focused || menu_open_)) {
+                            caret_reset();
+                        }
+                    } else {
+                        KillTimer(hwnd_, TIMER_CARET);
+                        field_.caret_on = false;
+                        menu_field_.caret_on = false;
+                    }
+                    if (visible() && (custom_pill_frame() || field_.focused || menu_open_)) {
+                        if (custom_pill_frame()) full_dirty_ = true;
                         invalidate();
                     }
                 }
@@ -4256,6 +4271,12 @@ private:
             case WM_TIMER:
                 switch (wp) {
                     case TIMER_CARET:
+                        if (!window_active_) {
+                            KillTimer(hwnd_, TIMER_CARET);
+                            field_.caret_on = false;
+                            menu_field_.caret_on = false;
+                            return 0;
+                        }
                         if (glass_active() && in_sizemove_) return 0;
                         field_.caret_on = !field_.caret_on;
                         menu_field_.caret_on = field_.caret_on;

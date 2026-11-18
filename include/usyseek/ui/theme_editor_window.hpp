@@ -144,6 +144,7 @@ public:
         hover_.set(IdNone, 0, false);
         pending_dirty_.clear();
         full_dirty_ = true;
+        window_active_ = false;
         KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_DEVICE);
         KillTimer(hwnd_, TIMER_GLASS);
@@ -399,6 +400,7 @@ private:
         }
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
+        window_active_ = true;
         if (sh_.visibility_changed) sh_.visibility_changed();
         render();
         ValidateRect(hwnd_, nullptr);
@@ -1673,6 +1675,16 @@ private:
         if (dirty_) render();
     }
 
+    void sync_caret_timer(bool reset_on = true) noexcept {
+        if (!window_active_ || !active_field_) {
+            if (hwnd_) KillTimer(hwnd_, TIMER_CARET);
+            if (active_field_) active_field_->caret_on = false;
+            return;
+        }
+        if (reset_on) active_field_->caret_on = true;
+        if (hwnd_) SetTimer(hwnd_, TIMER_CARET, GetCaretBlinkTime(), nullptr);
+    }
+
     void set_active_field(TextField* tf, float click_x, bool dbl) {
         if (active_field_ && active_field_ != tf) {
             commit_field(active_field_);
@@ -1681,7 +1693,6 @@ private:
         active_field_ = tf;
         if (active_field_) {
             active_field_->focused = true;
-            active_field_->caret_on = true;
             Canvas cv{target_, sh_.fonts, hits_, sh_.theme};
             active_field_->click(cv, click_x, GetKeyState(VK_SHIFT) < 0);
             if (dbl) {
@@ -1691,9 +1702,9 @@ private:
                 selecting_text_ = true;
                 SetCapture(hwnd_);
             }
-            SetTimer(hwnd_, TIMER_CARET, GetCaretBlinkTime(), nullptr);
+            sync_caret_timer();
         } else {
-            KillTimer(hwnd_, TIMER_CARET);
+            sync_caret_timer(false);
         }
         invalidate();
     }
@@ -1710,7 +1721,7 @@ private:
             commit_field(active_field_);
             active_field_->focused = false;
             active_field_ = nullptr;
-            KillTimer(hwnd_, TIMER_CARET);
+            sync_caret_timer(false);
         }
 
         switch (id) {
@@ -1866,7 +1877,7 @@ private:
                 commit_field(active_field_);
                 active_field_->focused = false;
                 active_field_ = nullptr;
-                KillTimer(hwnd_, TIMER_CARET);
+                sync_caret_timer(false);
                 invalidate();
                 return;
             }
@@ -1874,7 +1885,7 @@ private:
                 load_draft_into_fields(false);
                 active_field_->focused = false;
                 active_field_ = nullptr;
-                KillTimer(hwnd_, TIMER_CARET);
+                sync_caret_timer(false);
                 invalidate();
                 return;
             }
@@ -1892,8 +1903,7 @@ private:
                     }
                 }
             }
-            active_field_->caret_on = true;
-            SetTimer(hwnd_, TIMER_CARET, GetCaretBlinkTime(), nullptr);
+            sync_caret_timer();
             invalidate();
             return;
         }
@@ -1919,8 +1929,7 @@ private:
                     if (active_field_ == &tag_fields_[i]) apply_tag_field_value(i, true);
                 }
             }
-            active_field_->caret_on = true;
-            SetTimer(hwnd_, TIMER_CARET, GetCaretBlinkTime(), nullptr);
+            sync_caret_timer();
             invalidate();
         }
     }
@@ -2052,6 +2061,15 @@ private:
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
                 const float s = static_cast<float>(GetDpiForWindow(hwnd_)) / 96.0f;
                 mmi->ptMinTrackSize = {.x = static_cast<LONG>(460.0f * s), .y = static_cast<LONG>(520.0f * s)};
+                return 0;
+            }
+            case WM_ACTIVATE: {
+                const bool active = LOWORD(wp) != WA_INACTIVE;
+                if (window_active_ != active) {
+                    window_active_ = active;
+                    sync_caret_timer();
+                    if (active_field_ && visible()) invalidate();
+                }
                 return 0;
             }
             case WM_SETCURSOR:
@@ -2189,11 +2207,13 @@ private:
             case WM_TIMER:
                 switch (wp) {
                     case TIMER_CARET:
-                        if (glass_active() && in_sizemove_) return 0;
-                        if (active_field_) {
-                            active_field_->caret_on = !active_field_->caret_on;
-                            invalidate();
+                        if (!window_active_ || !active_field_) {
+                            sync_caret_timer(false);
+                            return 0;
                         }
+                        if (glass_active() && in_sizemove_) return 0;
+                        active_field_->caret_on = !active_field_->caret_on;
+                        invalidate();
                         return 0;
                     case TIMER_DEVICE:
                         KillTimer(hwnd_, TIMER_DEVICE);
@@ -2245,6 +2265,7 @@ private:
     bool dirty_ = false;
     bool full_dirty_ = true;
     bool tracking_ = false;
+    bool window_active_ = false;
     bool anim_active_ = false;
     bool in_sizemove_ = false;
     bool resize_pending_ = false;
