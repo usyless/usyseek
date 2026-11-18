@@ -112,6 +112,75 @@ int main() {
         CHECK(approx(t.tag_palette[0].r, 0xe1 / 255.0f, 0.005f));
         CHECK(approx(t.tag_palette[1].b, 0xeb / 255.0f, 0.005f));
         CHECK(approx(t.tag_palette[2].r, 0xe1 / 255.0f, 0.005f));
+        CHECK(!t.is_liquid_glass);
+    }
+
+    // 6. Custom theme enabling liquid_glass uses liquid-glass base
+    {
+        ThemeSpec spec;
+        spec.name = "Tint Glass";
+        spec.liquid_glass = true;
+        spec.mode = "light";
+        spec.primary = "#e11d48";
+
+        const Theme lg_light = theme_liquid_glass(false);
+        const Theme t = apply_theme_spec(spec, "custom:tint-glass", "tint-glass");
+        CHECK(t.is_liquid_glass);
+        CHECK(!t.dark_mode);
+        CHECK(!t.follows_system_mode);
+        CHECK(t.pill_backdrop == DWMSBT_NONE);
+        CHECK(t.settings_backdrop == DWMSBT_NONE);
+        CHECK(approx(t.pill_bg_alpha, lg_light.pill_bg_alpha, 0.001f));
+        CHECK(approx(t.settings_bg_alpha, lg_light.settings_bg_alpha, 0.001f));
+        CHECK(approx(t.card_alpha, lg_light.card_alpha, 0.001f));
+        CHECK(approx(t.bg.r, lg_light.bg.r, 0.005f));
+        CHECK(approx(t.primary.r, 0xe1 / 255.0f, 0.005f));
+    }
+
+    // 7. Custom theme with liquid_glass without mode follows system mode & liquid-glass base
+    {
+        ThemeSpec spec;
+        spec.name = "Auto Glass";
+        spec.liquid_glass = true;
+
+        const Theme lg = theme_liquid_glass();
+        const Theme t = apply_theme_spec(spec, "custom:auto-glass", "auto-glass");
+        CHECK(t.is_liquid_glass);
+        CHECK(t.follows_system_mode);
+        CHECK(t.dark_mode == lg.dark_mode);
+        CHECK(t.pill_backdrop == DWMSBT_NONE);
+        CHECK(approx(t.pill_bg_alpha, lg.pill_bg_alpha, 0.001f));
+    }
+
+    // 8. Custom theme with explicit base + liquid_glass retains base palette and gets glass material defaults
+    {
+        ThemeSpec spec;
+        spec.name = "Nord Glass";
+        spec.base = "nord";
+        spec.liquid_glass = true;
+
+        const Theme nord = theme_nord();
+        const Theme lg_dark = theme_liquid_glass(true);
+        const Theme t = apply_theme_spec(spec, "custom:nord-glass", "nord-glass");
+        CHECK(t.is_liquid_glass);
+        CHECK(t.dark_mode);
+        CHECK(t.pill_backdrop == DWMSBT_NONE);
+        CHECK(t.settings_backdrop == DWMSBT_NONE);
+        CHECK(approx(t.pill_bg_alpha, lg_dark.pill_bg_alpha, 0.001f));
+        CHECK(approx(t.bg.r, nord.bg.r, 0.005f));
+        CHECK(approx(t.primary.g, nord.primary.g, 0.005f));
+    }
+
+    // 9. Explicit liquid_glass = false overrides base = "liquid-glass"
+    {
+        ThemeSpec spec;
+        spec.base = "liquid-glass";
+        spec.mode = "dark";
+        spec.liquid_glass = false;
+
+        const Theme t = apply_theme_spec(spec, "custom:flat-lg", "flat-lg");
+        CHECK(!t.is_liquid_glass);
+        CHECK(t.dark_mode);
     }
 
     return 0;

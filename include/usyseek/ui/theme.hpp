@@ -474,8 +474,7 @@ struct Theme {
     return theme_from_accent(windows_accent_color(), windows_uses_dark_mode());
 }
 
-[[nodiscard]] inline Theme theme_liquid_glass() {
-    const bool dark = windows_uses_dark_mode();
+[[nodiscard]] inline Theme theme_liquid_glass(bool dark) {
     Theme t = dark ? theme_dark() : theme_light();
     t.id = "liquid-glass";
     t.name = "Liquid Glass (Exp.)";
@@ -520,6 +519,10 @@ struct Theme {
     return t;
 }
 
+[[nodiscard]] inline Theme theme_liquid_glass() {
+    return theme_liquid_glass(windows_uses_dark_mode());
+}
+
 [[nodiscard]] inline Theme resolve_builtin_theme(std::string_view id) {
     if (id == "system") return theme_system();
     if (id == "accent") return theme_accent();
@@ -534,7 +537,7 @@ struct Theme {
 /// String-based theme override specification (deserialized from JSON or constructed directly in tests).
 struct ThemeSpec {
     std::string name;
-    std::string base;                     // optional: dark | light | system | accent | nord | mocha | oled
+    std::string base;                     // optional: dark | light | system | accent | nord | mocha | oled | liquid-glass
     std::string mode;                     // optional: dark | light | system
     std::string pill_backdrop;            // optional: acrylic | mica | tabbed | none
     std::string settings_backdrop;        // optional: acrylic | mica | tabbed | none
@@ -543,6 +546,7 @@ struct ThemeSpec {
     std::optional<float> card_alpha;
     std::optional<float> shadow_alpha_scale;
     std::optional<bool> round_corners;
+    std::optional<bool> liquid_glass;
 
     std::string bg;
     std::string surface_lowest;
@@ -581,8 +585,11 @@ struct ThemeSpec {
 /// Applies `spec` onto its `base` preset without altering any application logic.
 [[nodiscard]] inline Theme apply_theme_spec(const ThemeSpec& spec, std::string id, std::string_view fallback_name) {
     std::string_view base_id = spec.base;
+    const bool enable_glass = spec.liquid_glass.value_or(false);
     if (base_id.empty()) {
-        if (spec.mode == "light") {
+        if (enable_glass) {
+            base_id = "liquid-glass";
+        } else if (spec.mode == "light") {
             base_id = "light";
         } else if (spec.mode == "system") {
             base_id = "system";
@@ -590,7 +597,14 @@ struct ThemeSpec {
             base_id = "dark";
         }
     }
-    Theme t = resolve_builtin_theme(base_id);
+    const auto mode_is_dark = [&]() noexcept -> bool {
+        if (spec.mode == "dark") return true;
+        if (spec.mode == "light") return false;
+        return windows_uses_dark_mode();
+    };
+    Theme t = (base_id == "liquid-glass")
+        ? theme_liquid_glass(mode_is_dark())
+        : resolve_builtin_theme(base_id);
     t.id = std::move(id);
     t.name = !spec.name.empty() ? spec.name : std::string{fallback_name};
 
@@ -604,6 +618,18 @@ struct ThemeSpec {
         t.dark_mode = windows_uses_dark_mode();
         t.follows_system_mode = true;
     }
+
+    if (enable_glass && base_id != "liquid-glass") {
+        const Theme lg = theme_liquid_glass(t.dark_mode);
+        t.is_liquid_glass = true;
+        t.pill_backdrop = lg.pill_backdrop;
+        t.settings_backdrop = lg.settings_backdrop;
+        t.pill_bg_alpha = lg.pill_bg_alpha;
+        t.settings_bg_alpha = lg.settings_bg_alpha;
+        t.card_alpha = lg.card_alpha;
+        t.pill_border = lg.pill_border;
+    }
+    if (spec.liquid_glass.has_value()) t.is_liquid_glass = *spec.liquid_glass;
 
     if (auto b = parse_backdrop_name(spec.pill_backdrop)) t.pill_backdrop = *b;
     if (auto b = parse_backdrop_name(spec.settings_backdrop)) t.settings_backdrop = *b;
