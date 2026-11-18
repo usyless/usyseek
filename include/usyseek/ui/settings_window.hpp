@@ -545,7 +545,7 @@ private:
             if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, r, gs)) {
                 draw_glass_box(cv, r, rad, bg, bd, on ? 1.5f : 1.0f);
             } else {
-                cv.stroke_round(inset(r, -0.5f, -0.5f), rad + 0.5f, with_alpha(hex(0x000000), dark ? 0.24f : 0.08f), 1.0f);
+                cv.stroke_round(r, rad, with_alpha(hex(0x000000), dark ? 0.24f : 0.08f), 1.0f);
                 if (on) cv.stroke_round(r, rad, cv.theme().primary, 1.5f);
             }
         } else {
@@ -578,7 +578,7 @@ private:
             if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, r, gs)) {
                 draw_glass_box(cv, r, rad, bg, bd, selected ? 1.5f : 1.0f);
             } else {
-                cv.stroke_round(inset(r, -0.5f, -0.5f), rad + 0.5f, with_alpha(hex(0x000000), dark ? 0.26f : 0.09f), 1.0f);
+                cv.stroke_round(r, rad, with_alpha(hex(0x000000), dark ? 0.26f : 0.09f), 1.0f);
                 if (selected) cv.stroke_round(r, rad, cv.theme().primary, 1.5f);
             }
         } else {

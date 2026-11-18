@@ -200,7 +200,7 @@ inline void draw_button(Canvas& cv, WindowTarget& target, Gfx& gfx, LiquidGlassW
                 draw_glass_box(cv, r, rad, style == 3 ? with_alpha(hex(0xffffff), (dark ? 0.10f : 0.34f) * ha) : bg,
                                border, 1.0f, sheen);
             } else {
-                cv.stroke_round(inset(r, -0.5f, -0.5f), rad + 0.5f,
+                cv.stroke_round(r, rad,
                                 with_alpha(hex(0x000000), (dark ? 0.28f : 0.09f) * op), 1.0f);
                 if (style == 1 || style == 2) {
                     cv.stroke_round(r, rad, border, 1.0f);
@@ -257,7 +257,7 @@ inline void draw_switch(Canvas& cv, WindowTarget& target, Gfx& gfx, LiquidGlassW
         if (!glass.draw_cached_glass(cv, target, gfx, r, trk_gs)) {
             draw_glass_box(cv, r, 12.0f, trk_col, trk_bd);
         } else {
-            cv.stroke_round(inset(r, -0.5f, -0.5f), 12.5f, with_alpha(hex(0x000000), dark ? 0.28f : 0.10f), 1.0f);
+            cv.stroke_round(r, 12.0f, with_alpha(hex(0x000000), dark ? 0.28f : 0.10f), 1.0f);
             if (t > 0.05f) cv.stroke_round(r, 12.0f, with_alpha(cv.theme().primary_hover, 0.55f * t), 1.0f);
         }
 
@@ -273,7 +273,7 @@ inline void draw_switch(Canvas& cv, WindowTarget& target, Gfx& gfx, LiquidGlassW
             cv.fill_round(thumb_r, krad, knob_tint);
             cv.stroke_round(thumb_r, krad, with_alpha(hex(0x000000), dark ? 0.16f : 0.12f), 1.0f);
         } else {
-            cv.stroke_round(inset(thumb_r, -0.4f, -0.4f), krad + 0.4f, with_alpha(hex(0x000000), dark ? 0.26f : 0.14f), 0.9f);
+            cv.stroke_round(thumb_r, krad, with_alpha(hex(0x000000), dark ? 0.26f : 0.14f), 0.9f);
         }
     } else {
         const D2D1_COLOR_F off_track = lerp_color(cv.theme().surface_high, cv.theme().surface_highest, ha);
@@ -315,7 +315,7 @@ inline void draw_slider(Canvas& cv, WindowTarget& target, Gfx& gfx, LiquidGlassW
         if (!glass.draw_cached_glass(cv, target, gfx, knob, gs)) {
             draw_glass_box(cv, knob, krad, tint, with_alpha(hex(0xffffff), 0.78f));
         } else {
-            cv.stroke_round(inset(knob, -0.4f, -0.4f), krad + 0.4f, with_alpha(hex(0x000000), dark ? 0.28f : 0.14f), 0.9f);
+            cv.stroke_round(knob, krad, with_alpha(hex(0x000000), dark ? 0.28f : 0.14f), 0.9f);
         }
     } else {
         cv.fill_round(track, 3.0f, cv.theme().surface_highest);

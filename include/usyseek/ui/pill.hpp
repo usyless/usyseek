@@ -1348,7 +1348,7 @@ private:
                         : with_alpha(hex(0xffffff), (dark ? 0.28f : 0.68f) * op);
                     draw_glass_box(cv, r, rad, tint, border, 1.0f, (dark ? 0.08f : 0.30f) * op);
                 } else {
-                    cv.stroke_round(inset(r, -0.5f, -0.5f), rad + 0.5f,
+                    cv.stroke_round(r, rad,
                                     with_alpha(hex(0x000000), (dark ? 0.28f : 0.10f) * op), 1.0f);
                     if (active) {
                         cv.stroke_round(r, rad, with_alpha(cv.theme().primary, dark ? 0.58f : 0.52f), 1.0f);
@@ -1442,7 +1442,7 @@ private:
                                with_alpha(cv.theme().surface_high, dark ? 0.26f : 0.36f),
                                with_alpha(hex(0xffffff), dark ? 0.20f : 0.62f));
             } else {
-                cv.stroke_round(inset(seg, -0.5f, -0.5f), seg_rad + 0.5f, with_alpha(hex(0x000000), dark ? 0.24f : 0.08f), 1.0f);
+                cv.stroke_round(seg, seg_rad, with_alpha(hex(0x000000), dark ? 0.24f : 0.08f), 1.0f);
             }
         } else {
             cv.fill_round(seg, seg_rad, with_alpha(cv.theme().surface_highest, 0.85f));
@@ -2719,7 +2719,7 @@ private:
             if (!glass_.draw_scene_glass(cv, target_, sh_.gfx, knob, gs)) {
                 draw_glass_box(cv, knob, krad, knob_tint, with_alpha(hex(0xffffff), 0.78f));
             } else {
-                cv.stroke_round(inset(knob, -0.4f, -0.4f), krad + 0.4f, with_alpha(hex(0x000000), dark ? 0.30f : 0.16f), 0.8f);
+                cv.stroke_round(knob, krad, with_alpha(hex(0x000000), dark ? 0.30f : 0.16f), 0.8f);
             }
         } else {
             cv.fill_round(D2D1::RectF(bar.left, cy - 2.0f, bar.right, cy + 2.0f), 2.0f, cv.theme().surface_highest);
@@ -2760,7 +2760,7 @@ private:
                                with_alpha(cv.theme().surface_high, dark ? 0.36f : 0.50f),
                                with_alpha(hex(0xffffff), dark ? 0.24f : 0.64f));
             } else {
-                cv.stroke_round(inset(ctrl, -0.5f, -0.5f), ctrl_rad + 0.5f, with_alpha(hex(0x000000), dark ? 0.28f : 0.10f), 1.0f);
+                cv.stroke_round(ctrl, ctrl_rad, with_alpha(hex(0x000000), dark ? 0.28f : 0.10f), 1.0f);
             }
         } else {
             cv.fill_round(ctrl, ctrl_rad, with_alpha(cv.theme().surface_low, 0.92f));

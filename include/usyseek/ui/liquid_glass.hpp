@@ -80,6 +80,8 @@ struct GlassStyle {
     D2D1_COLOR_F tint{};
     bool force_opaque = false;
     float opacity = 1.0f;
+    /// Centre the edge antialiasing on the outline (like D2D geometry) instead of letting it bleed outward.
+    bool centered_edge = false;
 };
 
 namespace detail {
@@ -208,6 +210,9 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
         ? saturate((dCorner.x + cr) / cr) * saturate((dCorner.y + cr) / cr)
         : 0.0;
     float aaWidthPx = lerp(1.25, 2.25, cornerProx);
+    // extraParams.y > 0.5 centres the edge ramp on the shape outline (50% coverage at distPx == 0), matching how
+    // D2D antialiases fill_round/stroke_round. Otherwise coverage is full at the outline and bleeds aaWidthPx out.
+    float aaBiasPx = extraParams.y > 0.5 ? aaWidthPx * 0.5 : 0.0;
     float glassThresholdPx = max(2.5, aaWidthPx * 2.0);
 
     float4 outColor = float4(0.0, 0.0, 0.0, 0.0);
@@ -345,7 +350,7 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
         }
     }
 
-    float alpha = (1.0 - saturate(distPx / aaWidthPx)) * saturate(extraParams.x);
+    float alpha = (1.0 - saturate((distPx + aaBiasPx) / aaWidthPx)) * saturate(extraParams.x);
     return float4(outColor.rgb * alpha, alpha);
 }
 )hlsl";
@@ -1281,6 +1286,7 @@ private:
         float glare_angle_deg = 0.0f;
         D2D1_COLOR_F tint{};
         bool force_opaque = false;
+        bool centered_edge = false;
         bool use_dupl = false;
         uint64_t backdrop_ver = 0;
 
@@ -1299,7 +1305,7 @@ private:
                    glare_factor == o.glare_factor && glare_convergence == o.glare_convergence &&
                    glare_opposite_factor == o.glare_opposite_factor && glare_angle_deg == o.glare_angle_deg &&
                    tint.r == o.tint.r && tint.g == o.tint.g && tint.b == o.tint.b && tint.a == o.tint.a &&
-                   force_opaque == o.force_opaque && use_dupl == o.use_dupl && backdrop_ver == o.backdrop_ver;
+                   force_opaque == o.force_opaque && centered_edge == o.centered_edge && use_dupl == o.use_dupl && backdrop_ver == o.backdrop_ver;
         }
     };
 
@@ -1334,6 +1340,7 @@ private:
             .glare_angle_deg = s.glare_angle_deg,
             .tint = s.tint,
             .force_opaque = s.force_opaque,
+            .centered_edge = s.centered_edge,
             .use_dupl = use_dupl,
             .backdrop_ver = backdrop_ver,
         };
@@ -1765,7 +1772,7 @@ private:
             .glare_params = {style.glare_range, style.glare_hardness, style.glare_factor, style.glare_angle_deg},
             .shape_params = {style.glare_convergence, style.glare_opposite_factor, style.corner_radius, style.roundness},
             .misc_params = {target.scale(), style.force_opaque ? 1.0f : 0.0f, 1.5f, style.margin_dip},
-            .extra_params = {std::clamp(style.opacity, 0.0f, 1.0f), 0.0f, 0.0f, 0.0f},
+            .extra_params = {std::clamp(style.opacity, 0.0f, 1.0f), style.centered_edge ? 1.0f : 0.0f, 0.0f, 0.0f},
         };
 
         if (fx.blur && style.blur_std_dev > 0.05f) {
@@ -1932,6 +1939,7 @@ private:
     s.glare_angle_deg = t.glass.glare_angle;
     s.tint = tint;
     s.opacity = opacity;
+    s.centered_edge = true;
     return s;
 }
 
