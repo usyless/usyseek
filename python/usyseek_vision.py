@@ -20,11 +20,12 @@ from contextlib import nullcontext, suppress
 from pathlib import Path
 
 _torch = None
+_np = None
 _model = None
 _device = "cpu"
 _autocast = nullcontext()
 _mean = None
-_std = None
+_inv_std = None
 _dim = 0
 _size = 0
 _hint = 0
@@ -79,12 +80,14 @@ def _channel_triplet(value, default):
 
 
 def load(cfg):
-    global _torch, _model, _device, _autocast, _mean, _std, _dim, _size, _hint
+    global _torch, _np, _model, _device, _autocast, _mean, _inv_std, _dim, _size, _hint
+    import numpy as np
     import open_clip
     import torch
     from safetensors import safe_open
 
     _torch = torch
+    _np = np
     _hint = 0
     model_name = cfg["model_name"]
     weights, _ = _model_paths(cfg["model_dir"], model_name)
@@ -142,8 +145,10 @@ def load(cfg):
     dtype = torch.float16 if _device == "cuda" else torch.float32
     mean = _channel_triplet(pcfg.get("mean"), (0.5, 0.5, 0.5))
     std = _channel_triplet(pcfg.get("std"), (0.5, 0.5, 0.5))
-    _mean = torch.tensor(mean, device=_device, dtype=dtype).view(1, 3, 1, 1) * 255.0
-    _std = torch.tensor(std, device=_device, dtype=dtype).view(1, 3, 1, 1) * 255.0
+    if any(s == 0.0 for s in std):
+        raise ValueError(f"invalid zero std in preprocess_cfg: {std}")
+    _mean = (torch.tensor(mean, device=_device, dtype=torch.float32).view(1, 3, 1, 1) * 255.0).to(dtype)
+    _inv_std = (1.0 / (torch.tensor(std, device=_device, dtype=torch.float32).view(1, 3, 1, 1) * 255.0)).to(dtype)
 
     with torch.inference_mode(), _autocast:
         probe = torch.zeros((1, 3, _size, _size), device=_device, dtype=dtype)
@@ -169,19 +174,24 @@ def load(cfg):
 
 def _run(batch):
     torch = _torch
-    x = torch.from_numpy(batch).to(_device, non_blocking=False)
-    x = x.permute(0, 3, 1, 2).to(_mean.dtype)
-    x = (x - _mean) / _std
-    with torch.inference_mode(), _autocast:
-        feats = _model.encode_image(x).float()
-        feats = torch.nn.functional.normalize(feats, dim=-1)
+    with torch.inference_mode():
+        x = torch.from_numpy(batch).to(_device, non_blocking=False)
+        x = x.permute(0, 3, 1, 2).to(_mean.dtype)
+        x.sub_(_mean).mul_(_inv_std)
+        with _autocast:
+            feats = _model.encode_image(x).float()
+            feats = torch.nn.functional.normalize(feats, dim=-1)
     return feats.cpu().numpy()
 
 
 def embed(batch):
     """Splits the batch on out-of-memory and remembers the size that worked."""
-    global _hint
-    import numpy as np
+    global _hint, _np
+    np = _np
+    if np is None:
+        import numpy as np
+
+        _np = np
 
     if len(batch) == 0:
         return np.empty((0, _dim), dtype=np.float32)
