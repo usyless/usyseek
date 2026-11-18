@@ -4,6 +4,7 @@
 
 #include <usyseek/ui/pill.hpp>
 #include <usyseek/ui/settings_window.hpp>
+#include <usyseek/ui/theme_editor_window.hpp>
 
 #include <shellapi.h>
 
@@ -216,6 +217,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     Pill pill{sh};
     SettingsWindow settings_win{sh};
+    ThemeEditorWindow theme_editor_win{sh};
     if (!pill.create(hInstance)) {
         MessageBoxW(nullptr, L"Failed to create the search window.", APP_NAME, MB_ICONERROR | MB_OK);
         return 1;
@@ -224,6 +226,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         MessageBoxW(nullptr, L"Failed to create the settings window.", APP_NAME, MB_ICONERROR | MB_OK);
         return 1;
     }
+    if (!theme_editor_win.create(hInstance)) {
+        MessageBoxW(nullptr, L"Failed to create the theme editor window.", APP_NAME, MB_ICONERROR | MB_OK);
+        return 1;
+    }
+    settings_win.open_theme_editor = [&](const ThemeEntry* entry, bool edit_existing) {
+        if (!entry) {
+            theme_editor_win.open_new();
+        } else if (edit_existing) {
+            theme_editor_win.open_edit(*entry);
+        } else {
+            theme_editor_win.open_duplicate(*entry);
+        }
+    };
 
     sh.call_hwnd.store(pill.hwnd(), std::memory_order_release);
     sh.refresh_theme(true, true);
@@ -303,10 +318,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     sh.redraw_all = [&] {
         pill.invalidate();
         settings_win.invalidate();
+        theme_editor_win.invalidate();
     };
     sh.theme_changed = [&] {
         pill.apply_theme();
         settings_win.apply_theme();
+        theme_editor_win.apply_theme();
     };
     sh.settings_changed = [&] {
         sh.engine.encoder().load_async(to_wide(sh.settings.model_dir), sh.settings.model_name);
@@ -316,11 +333,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     const auto arm_idle_timer = [&] {
         KillTimer(pill.hwnd(), TIMER_IDLE_EXIT);
-        if (!pill.visible() && !settings_win.visible()) {
+        if (!pill.visible() && !settings_win.visible() && !theme_editor_win.visible()) {
             sh.desktop_dupl.reset();
         }
         // A download or package install keeps the process alive even with both windows closed
-        if (!pill.visible() && !settings_win.visible() && !sh.test_mode && sh.background_jobs == 0) {
+        if (!pill.visible() && !settings_win.visible() && !theme_editor_win.visible() && !sh.test_mode && sh.background_jobs == 0) {
             SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
             if (sh.settings.ui_idle_timeout_s == 0) {
                 PostQuitMessage(0);
@@ -393,7 +410,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         if (msg == WM_TIMER && wp == TIMER_IDLE_EXIT) {
             done = true;
             KillTimer(pill.hwnd(), TIMER_IDLE_EXIT);
-            if (!pill.visible() && !settings_win.visible() && sh.background_jobs == 0) PostQuitMessage(0);
+            if (!pill.visible() && !settings_win.visible() && !theme_editor_win.visible() && sh.background_jobs == 0) PostQuitMessage(0);
             return 0;
         }
         return 0;

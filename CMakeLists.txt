@@ -280,7 +280,7 @@ target_link_libraries(usyseek-ui PRIVATE
     usyseek_sqlite3
     "${ORT_ROOT}/lib/onnxruntime.lib"
     d2d1 dwrite d3d11 d3dcompiler dxgi dxguid dcomp dwmapi windowscodecs mfplat mfuuid
-    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys winhttp version
+    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys winhttp version comdlg32
 )
 add_custom_command(TARGET usyseek-ui POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${ORT_ROOT}/lib/onnxruntime.dll" "$<TARGET_FILE_DIR:usyseek-ui>/onnxruntime.dll"

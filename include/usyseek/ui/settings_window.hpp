@@ -1,7 +1,7 @@
 #pragma once
 
 #include "shared.hpp"
-#include "flow.hpp"
+#include "widgets.hpp"
 #include "textfield.hpp"
 #include "../http.hpp"
 #include "../path_rules.hpp"
@@ -22,51 +22,10 @@ struct NugetVersionIndex {
 
 namespace usyseek::ui {
 
-class Flow {
-public:
-    Flow(float gap_x, float gap_y) noexcept : gap_x_{gap_x}, gap_y_{gap_y} {}
-
-    void add(float w, float h, std::function<void(D2D1_RECT_F)> draw, bool grow = false) {
-        items_.emplace_back(w, h, grow);
-        draws_.push_back(std::move(draw));
-    }
-
-    void add_group(Flow inner, float avail, bool grow = false) {
-        const float group_w = std::min(inner.natural_width(), avail);
-        const float group_h = inner.height(group_w);
-        add(group_w, group_h, [inner = std::move(inner)](D2D1_RECT_F r) { inner.draw(r.left, r.top, width(r)); }, grow);
-    }
-
-    [[nodiscard]] float natural_width() const noexcept {
-        float total = 0.0f;
-        for (const FlowItem& item : items_) {
-            total += item.width;
-        }
-        return items_.empty() ? 0.0f : (total + (gap_x_ * static_cast<float>(items_.size() - 1)));
-    }
-
-    [[nodiscard]] float height(float avail) const {
-        return flow_layout(items_, gap_x_, gap_y_, avail).height;
-    }
-
-    void draw(float x, float y, float avail) const {
-        const FlowResult layout = flow_layout(items_, gap_x_, gap_y_, avail);
-        for (size_t i = 0; i < items_.size(); ++i) {
-            const FlowPlacement& p = layout.placements[i];
-            draws_[i](rect(x + p.x, y + p.y, p.width, items_[i].height));
-        }
-    }
-
-private:
-    float gap_x_;
-    float gap_y_;
-    std::vector<FlowItem> items_;
-    std::vector<std::function<void(D2D1_RECT_F)>> draws_;
-};
-
 class SettingsWindow {
 public:
     explicit SettingsWindow(Shared& s) : sh_{s} {}
+    std::function<void(const ThemeEntry*, bool)> open_theme_editor;
 
     bool create(HINSTANCE inst) {
         inst_ = inst;
@@ -359,6 +318,9 @@ private:
         IdThumbFit,
         IdThumbDblClick,
         IdThemeChip,
+        IdNewTheme,
+        IdDuplicateTheme,
+        IdEditTheme,
         IdOpenThemesDir,
         IdReloadThemes,
         IdBrowseModelDir,
@@ -538,145 +500,17 @@ private:
         return hover_.alpha(id, idx);
     }
 
-    /// Draws a button's icon and/or label centered inside `r`.
-    static void draw_button_content(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, D2D1_COLOR_F fg) {
-        if (icon_g && !label.empty()) {
-            const float tw = cv.measure(label, Font::SmallSemi);
-            const float total = 18.0f + 6.0f + tw;
-            const float sx = r.left + ((width(r) - total) * 0.5f);
-            cv.icon(icon_g, rect(sx, r.top, 18.0f, height(r)), fg, Font::IconSmall);
-            cv.text(label, rect(sx + 24.0f, r.top, tw + 4.0f, height(r)), Font::SmallSemi, fg);
-        } else if (icon_g) {
-            cv.icon(icon_g, r, fg, Font::IconSmall);
-        } else {
-            cv.text(label, r, Font::SmallSemi, fg, Align::Center);
-        }
-    }
-
     void draw_button(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, int id, int idx = 0,
                      int style = 0 /* 0=secondary, 1=primary, 2=danger, 3=ghost */) {
-        const float ha = hover_alpha(id, idx);
-        const float rad = std::min(cv.theme().button_radius, height(r) * 0.5f);
-        D2D1_COLOR_F fg = cv.theme().on_surface;
-        if (is_liquid_glass(cv.theme())) {
-            const bool dark = cv.theme().dark_mode;
-            D2D1_COLOR_F bg{};
-            D2D1_COLOR_F border{};
-            float sheen = dark ? 0.08f : 0.28f;
-            float op = 1.0f;
-            if (style == 1) {
-                bg = with_alpha(lerp_color(cv.theme().primary, cv.theme().primary_hover, ha),
-                                dark ? lerp(0.34f, 0.48f, ha) : lerp(0.76f, 0.88f, ha));
-                fg = dark ? cv.theme().on_primary_container : cv.theme().on_primary;
-                border = with_alpha(cv.theme().primary_hover, dark ? 0.65f : 0.82f);
-                sheen = dark ? 0.14f : 0.24f;
-            } else if (style == 2) {
-                bg = lerp_color(with_alpha(cv.theme().error, 0.18f), with_alpha(cv.theme().error, 0.30f), ha);
-                fg = cv.theme().error;
-                border = with_alpha(cv.theme().error, 0.50f);
-            } else if (style == 3) {
-                op = ha;
-                bg = with_alpha(cv.theme().surface_high, dark ? 0.26f : 0.38f);
-                fg = lerp_color(cv.theme().on_surface_variant, cv.theme().on_surface, ha);
-                border = with_alpha(hex(0xffffff), (dark ? 0.20f : 0.55f) * ha);
-                sheen = (dark ? 0.06f : 0.20f) * ha;
-            } else {
-                bg = with_alpha(cv.theme().surface_high, dark ? lerp(0.26f, 0.42f, ha) : lerp(0.38f, 0.56f, ha));
-                border = with_alpha(hex(0xffffff), dark ? lerp(0.16f, 0.32f, ha) : lerp(0.50f, 0.78f, ha));
-            }
-            if (op > 0.002f) {
-                const GlassStyle gs = make_control_glass_style(cv.theme(), rad, bg, op, 0.0f, 9.0f, lerp(1.07f, 1.12f, ha));
-                if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, r, gs)) {
-                    draw_glass_box(cv, r, rad, style == 3 ? with_alpha(hex(0xffffff), (dark ? 0.10f : 0.34f) * ha) : bg,
-                                   border, 1.0f, sheen);
-                } else {
-                    cv.stroke_round(inset(r, -0.5f, -0.5f), rad + 0.5f,
-                                    with_alpha(hex(0x000000), (dark ? 0.28f : 0.09f) * op), 1.0f);
-                    if (style == 1 || style == 2) {
-                        cv.stroke_round(r, rad, border, 1.0f);
-                    }
-                }
-            }
-        } else {
-            D2D1_COLOR_F bg = lerp_color(cv.theme().surface_high, cv.theme().surface_highest, ha);
-            D2D1_COLOR_F border = cv.theme().outline_variant;
-            if (style == 1) {
-                bg = lerp_color(cv.theme().primary, cv.theme().primary_hover, ha);
-                fg = cv.theme().on_primary;
-                border = bg;
-            } else if (style == 2) {
-                bg = lerp_color(with_alpha(cv.theme().error_container, 0.45f), with_alpha(cv.theme().error, 0.22f), ha);
-                fg = cv.theme().error;
-                border = with_alpha(cv.theme().error, 0.45f);
-            } else if (style == 3) {
-                bg = with_alpha(cv.theme().on_surface, 0.08f * ha);
-                fg = lerp_color(cv.theme().on_surface_variant, cv.theme().on_surface, ha);
-                border = hex(0, 0.0f);
-            }
-            if (bg.a > 0.0f) cv.fill_round(r, rad, bg);
-            if (border.a > 0.0f && style != 1) cv.stroke_round(r, rad, border);
-        }
-        draw_button_content(cv, r, icon_g, label, fg);
-        cv.hit(r, id, idx);
+        ui::draw_button(cv, target_, sh_.gfx, glass_, hover_alpha(id, idx), r, icon_g, label, id, idx, style);
     }
 
     static void draw_disabled_button(Canvas& cv, D2D1_RECT_F r, wchar_t icon_g, std::wstring_view label, int id, int idx = 0) {
-        const float rad = std::min(cv.theme().button_radius, height(r) * 0.5f);
-        cv.fill_round(r, rad, with_alpha(cv.theme().surface_high, 0.45f));
-        cv.stroke_round(r, rad, with_alpha(cv.theme().outline_variant, 0.40f));
-        const D2D1_COLOR_F dfg = with_alpha(cv.theme().on_surface_variant, 0.45f);
-        draw_button_content(cv, r, icon_g, label, dfg);
-        cv.hit(r, id, idx);
+        ui::draw_disabled_button(cv, r, icon_g, label, id, idx);
     }
 
     void draw_switch(Canvas& cv, float right_x, float cy, bool on, int id, int idx = 0) {
-        const D2D1_RECT_F r = rect(right_x - 44.0f, cy - 12.0f, 44.0f, 24.0f);
-        const float ha = hover_alpha(id, idx);
-        const float t = switch_anim_value(id, on);
-        const float kx = lerp(r.left + 12.0f, r.right - 12.0f, t);
-        const float kr = lerp(7.0f, 8.0f, t);
-        if (is_liquid_glass(cv.theme())) {
-            const bool dark = cv.theme().dark_mode;
-            const D2D1_COLOR_F off_track = with_alpha(cv.theme().surface_high,
-                                                      dark ? lerp(0.26f, 0.40f, ha) : lerp(0.38f, 0.52f, ha));
-            const D2D1_COLOR_F on_track = with_alpha(cv.theme().primary, dark ? 0.48f : 0.72f);
-            const D2D1_COLOR_F off_bd = with_alpha(hex(0xffffff), dark ? lerp(0.22f, 0.36f, ha) : lerp(0.58f, 0.80f, ha));
-            const D2D1_COLOR_F on_bd = with_alpha(cv.theme().primary_hover, 0.80f);
-            const D2D1_COLOR_F trk_col = lerp_color(off_track, on_track, t);
-            const D2D1_COLOR_F trk_bd = lerp_color(off_bd, on_bd, t);
-            const GlassStyle trk_gs = make_control_glass_style(cv.theme(), 12.0f, trk_col, 1.0f, 0.0f, 8.0f, 1.06f);
-            if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, r, trk_gs)) {
-                draw_glass_box(cv, r, 12.0f, trk_col, trk_bd);
-            } else {
-                cv.stroke_round(inset(r, -0.5f, -0.5f), 12.5f, with_alpha(hex(0x000000), dark ? 0.28f : 0.10f), 1.0f);
-                if (t > 0.05f) cv.stroke_round(r, 12.0f, with_alpha(cv.theme().primary_hover, 0.55f * t), 1.0f);
-            }
-
-            const float stretch = 4.0f * t * (1.0f - t);
-            const float kw = lerp(16.0f, 22.0f, stretch);
-            const float kh = 16.0f;
-            const float krad = kh * 0.5f;
-            const D2D1_RECT_F thumb_r = rect(kx - (kw * 0.5f), cy - (kh * 0.5f), kw, kh);
-            cv.shadow(thumb_r, krad, 4.0f, 0.28f);
-            const D2D1_COLOR_F knob_tint = with_alpha(hex(0xffffff), dark ? lerp(0.46f, 0.62f, t) : lerp(0.76f, 0.88f, t));
-            const GlassStyle knob_gs = make_control_glass_style(cv.theme(), krad, knob_tint, 1.0f, 0.0f, 6.5f, 1.14f);
-            if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, thumb_r, knob_gs)) {
-                cv.fill_round(thumb_r, krad, knob_tint);
-                cv.stroke_round(thumb_r, krad, with_alpha(hex(0x000000), dark ? 0.16f : 0.12f), 1.0f);
-            } else {
-                cv.stroke_round(inset(thumb_r, -0.4f, -0.4f), krad + 0.4f, with_alpha(hex(0x000000), dark ? 0.26f : 0.14f), 0.9f);
-            }
-        } else {
-            const D2D1_COLOR_F off_track = lerp_color(cv.theme().surface_high, cv.theme().surface_highest, ha);
-            cv.fill_round(r, 12.0f, lerp_color(off_track, cv.theme().primary, t));
-            if (t < 1.0f) cv.stroke_round(r, 12.0f, with_alpha(cv.theme().outline, 1.0f - t));
-            cv.fill_circle({.x = kx, .y = cy}, kr, lerp_color(cv.theme().outline, cv.theme().on_primary, t));
-        }
-        cv.hit(r, id, idx);
-    }
-
-    static float text_height(Canvas& cv, std::wstring_view s, Font f, float w, float min_h) {
-        return std::max(min_h, cv.measure_height(s, f, w));
+        ui::draw_switch(cv, target_, sh_.gfx, glass_, hover_alpha(id, idx), switch_anim_value(id, on), right_x, cy, id, idx);
     }
 
     static float error_row_height(Canvas& cv, std::wstring_view message, float row_w) {
@@ -686,62 +520,6 @@ private:
     static void draw_error_row(Canvas& cv, std::wstring_view message, float x, float y, float row_w, float h) {
         cv.icon(glyph::warning, rect(x, y, 18.0f, 20.0f), cv.theme().error, Font::IconSmall);
         cv.text_wrap(message, rect(x + 22.0f, y, row_w - 22.0f, h), Font::Caption, cv.theme().error);
-    }
-
-    static float mono_row_height(Canvas& cv, std::wstring_view s, float text_w, float min_h) {
-        return std::max(min_h, 12.0f + cv.measure_height(s, Font::MonoSmall, text_w));
-    }
-
-    static float button_width(Canvas& cv, std::wstring_view label, bool has_icon, float min_w) {
-        return std::max(min_w, cv.measure(label, Font::SmallSemi) + (has_icon ? 24.0f : 0.0f) + 28.0f);
-    }
-
-    static void text_middle(Canvas& cv, std::wstring_view s, D2D1_RECT_F r, Font f, D2D1_COLOR_F c) {
-        const float th = cv.measure_height(s, f, width(r));
-        cv.text_wrap(s, rect(r.left, r.top + std::max(0.0f, (height(r) - th) * 0.5f), width(r), th), f, c);
-    }
-
-    static void flow_text(Canvas& cv, Flow& flow, std::wstring_view s, Font f, D2D1_COLOR_F c, float avail, float line_h,
-                   bool grow = false, Align a = Align::Left) {
-        const float natural = cv.measure(s, f) + 4.0f;
-        if (natural <= avail) {
-            flow.add(natural, line_h, [&cv, text = std::wstring{s}, f, c, a](D2D1_RECT_F r) { cv.text(text, r, f, c, a); }, grow);
-            return;
-        }
-        const float wrapped_h = text_height(cv, s, f, avail, line_h);
-        flow.add(avail, wrapped_h, [&cv, text = std::wstring{s}, f, c, a](D2D1_RECT_F r) { cv.text_wrap(text, r, f, c, a); });
-    }
-
-    struct CardHeader {
-        std::wstring title;
-        std::wstring caption;
-        D2D1_COLOR_F title_color;
-        float side_w;
-        float side_h;
-        bool beside;
-        float text_w;
-        float title_h;
-        float caption_h;
-        float h;
-    };
-
-    static CardHeader make_header(Canvas& cv, float rw, std::wstring title, D2D1_COLOR_F title_color, std::wstring caption,
-                           float side_w = 0.0f, float side_h = 0.0f) {
-        CardHeader hd{.title = std::move(title), .caption = std::move(caption), .title_color = title_color, .side_w = side_w, .side_h = side_h};
-        const float beside_w = rw - side_w - (side_w > 0.0f ? 12.0f : 0.0f);
-        hd.beside = side_w <= 0.0f || beside_w >= 200.0f;
-        hd.text_w = hd.beside ? beside_w : rw;
-        hd.title_h = text_height(cv, hd.title, Font::Large, hd.text_w, 22.0f);
-        hd.caption_h = hd.caption.empty() ? 0.0f : text_height(cv, hd.caption, Font::Small, hd.text_w, 18.0f);
-        hd.h = hd.title_h + hd.caption_h + (hd.beside ? 0.0f : 8.0f + side_h);
-        return hd;
-    }
-
-    static D2D1_RECT_F draw_header(Canvas& cv, float lx, float y, float rw, const CardHeader& hd) {
-        cv.text_wrap(hd.title, rect(lx, y + 16.0f, hd.text_w, hd.title_h), Font::Large, hd.title_color);
-        cv.text_wrap(hd.caption, rect(lx, y + 16.0f + hd.title_h, hd.text_w, hd.caption_h), Font::Small, cv.theme().on_surface_variant);
-        if (hd.beside) return rect(lx + rw - hd.side_w, y + 18.0f, hd.side_w, hd.side_h);
-        return rect(lx, y + 16.0f + hd.title_h + hd.caption_h + 8.0f, hd.side_w, hd.side_h);
     }
 
     static float radio_height(Canvas& cv, float w, std::wstring_view title, std::wstring_view desc) {
@@ -817,38 +595,7 @@ private:
     }
 
     static float card_begin(Canvas& cv, float x, float y, float w, float h) {
-        const D2D1_RECT_F r = rect(x, y, w, h);
-        const float crad = offset_radius(cv.theme().card_radius, 2.0f);
-        if (is_liquid_glass(cv.theme())) {
-            const bool dark = cv.theme().dark_mode;
-            draw_glass_box(cv, r, crad,
-                           with_alpha(cv.theme().surface, dark ? 0.30f : 0.44f),
-                           with_alpha(hex(0xffffff), dark ? 0.16f : 0.58f));
-        } else {
-            cv.fill_round(r, crad, with_alpha(cv.theme().surface, cv.theme().card_alpha));
-            cv.stroke_round(r, crad, with_alpha(cv.theme().outline_variant, 0.65f));
-        }
-        return y + h + CARD_GAP;
-    }
-
-    /// Draws an input field, path row, or recessed well with translucent glass styling when active.
-    static void draw_well(Canvas& cv, D2D1_RECT_F r, float rad, bool stroke = false, bool focused = false, bool locked = false, float hover = 0.0f) {
-        const float eff_rad = std::min(height(r) * 0.5f, offset_radius(cv.theme().button_radius, rad - 10.0f));
-        if (is_liquid_glass(cv.theme())) {
-            const bool dark = cv.theme().dark_mode;
-            const float bg_a = locked ? (dark ? 0.18f : 0.28f) : (dark ? lerp(0.28f, 0.40f, hover) : lerp(0.42f, 0.56f, hover));
-            const D2D1_COLOR_F bg_col = locked ? cv.theme().surface_lowest : lerp_color(cv.theme().surface_lowest, cv.theme().surface_high, hover);
-            const D2D1_COLOR_F bd = focused
-                ? cv.theme().primary
-                : with_alpha(hex(0xffffff), stroke ? (dark ? lerp(0.22f, 0.34f, hover) : lerp(0.60f, 0.78f, hover))
-                                                   : (dark ? lerp(0.12f, 0.28f, hover) : lerp(0.42f, 0.70f, hover)));
-            draw_glass_box(cv, r, eff_rad, with_alpha(bg_col, bg_a), bd, focused ? 1.5f : 1.0f,
-                           dark ? lerp(0.05f, 0.10f, hover) : lerp(0.20f, 0.28f, hover));
-        } else {
-            cv.fill_round(r, eff_rad, locked ? with_alpha(cv.theme().surface_lowest, 0.7f)
-                                             : lerp_color(cv.theme().surface_low, cv.theme().surface_high, hover));
-            if (stroke) cv.stroke_round(r, eff_rad, focused ? cv.theme().primary : cv.theme().outline_variant, focused ? 1.5f : 1.0f);
-        }
+        return ui::card_begin(cv, x, y, w, h, CARD_GAP);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -1953,6 +1700,7 @@ private:
 
             const auto& entries = sh_.themes.entries();
             const std::string& active_id = sh_.theme.id;
+            const ThemeEntry* active_entry = sh_.themes.find(active_id);
             Flow chips{8.0f, 8.0f};
             for (size_t i = 0; i < entries.size(); ++i) {
                 const ThemeEntry& te = entries[i];
@@ -1962,6 +1710,24 @@ private:
                 chips.add(chip_w, 32.0f, [&, i, on](D2D1_RECT_F r) {
                     draw_theme_chip(cv, r, entries[i], on, static_cast<int>(i));
                 });
+            }
+
+            Flow theme_actions{8.0f, 8.0f};
+            const float new_w = button_width(cv, L"New Theme", true, 118.0f);
+            theme_actions.add(new_w, 32.0f, [&](D2D1_RECT_F r) {
+                draw_button(cv, r, glyph::add, L"New Theme", IdNewTheme, 0, 1);
+            });
+            if (active_entry) {
+                const float dup_w = button_width(cv, L"Duplicate", true, 108.0f);
+                theme_actions.add(dup_w, 32.0f, [&](D2D1_RECT_F r) {
+                    draw_button(cv, r, glyph::copy, L"Duplicate", IdDuplicateTheme);
+                });
+                if (active_entry->custom && !is_example_theme_entry(*active_entry)) {
+                    const float edit_w = button_width(cv, L"Edit Theme", true, 112.0f);
+                    theme_actions.add(edit_w, 32.0f, [&](D2D1_RECT_F r) {
+                        draw_button(cv, r, glyph::settings, L"Edit Theme", IdEditTheme);
+                    });
+                }
             }
 
             const std::wstring tdir = themes_dir().wstring();
@@ -1984,12 +1750,14 @@ private:
             });
 
             const float chips_y = y + 16.0f + hd.h + 12.0f;
-            const float dir_y = chips_y + chips.height(rw) + 12.0f;
+            const float actions_y = chips_y + chips.height(rw) + 10.0f;
+            const float dir_y = actions_y + theme_actions.height(rw) + 12.0f;
             const float h = dir_y + dir_row.height(rw) + 16.0f - y;
             const float next_y = card_begin(cv, x, y, w, h);
 
             draw_header(cv, lx, y, rw, hd);
             chips.draw(lx, chips_y, rw);
+            theme_actions.draw(lx, actions_y, rw);
             dir_row.draw(lx, dir_y, rw);
             y = next_y;
         }
@@ -3829,6 +3597,7 @@ private:
             case IdThemeChip: {
                 const auto& entries = sh_.themes.entries();
                 if (idx >= 0 && static_cast<size_t>(idx) < entries.size()) {
+                    sh_.theme_spec_override.reset();
                     sh_.theme_override.reset();
                     sh_.settings.theme = entries[static_cast<size_t>(idx)].id;
                     sh_.refresh_theme(false, false);
@@ -3836,6 +3605,18 @@ private:
                 }
                 break;
             }
+            case IdNewTheme:
+                if (open_theme_editor) open_theme_editor(nullptr, false);
+                break;
+            case IdDuplicateTheme:
+                if (open_theme_editor) open_theme_editor(sh_.themes.find(sh_.theme.id), false);
+                break;
+            case IdEditTheme:
+                if (const ThemeEntry* cur = sh_.themes.find(sh_.theme.id);
+                    cur && cur->custom && !is_example_theme_entry(*cur) && open_theme_editor) {
+                    open_theme_editor(cur, true);
+                }
+                break;
             case IdOpenThemesDir: {
                 ensure_themes_dir();
                 std::string err;
@@ -3845,6 +3626,7 @@ private:
                 break;
             }
             case IdReloadThemes:
+                sh_.theme_spec_override.reset();
                 sh_.refresh_theme(true, true);
                 break;
             case IdIdleStep: {

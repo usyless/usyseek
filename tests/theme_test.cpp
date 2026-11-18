@@ -214,5 +214,61 @@ int main() {
         CHECK(approx(offset_radius(1.0f, -5.0f), 0.0f, 0.001f));
     }
 
+    // 11. Hex formatting roundtrip (opaque and translucent)
+    {
+        CHECK(format_hex_color(hex(0xa8c7fa)) == "#a8c7fa");
+        CHECK(format_hex_color(hex(0xa8c7fa), true) == "#a8c7faff");
+        CHECK(format_hex_color(hex(0x112233, 0.50196f)) == "#11223380");
+    }
+
+    // 12. Liquid Glass material overrides & clamping
+    {
+        ThemeSpec def;
+        def.liquid_glass = true;
+        const Theme td = apply_theme_spec(def, "custom:lg-def", "lg-def");
+        CHECK(approx(td.glass.blur, 1.4f, 0.001f));
+        CHECK(approx(td.glass.roundness, 4.6f, 0.001f));
+        CHECK(approx(td.glass.refraction, 1.56f, 0.001f));
+        CHECK(approx(td.glass.dispersion, 5.5f, 0.001f));
+        CHECK(approx(td.glass.glare_scale, 1.0f, 0.001f));
+        CHECK(approx(td.glass.glare_angle, -45.0f, 0.001f));
+
+        ThemeSpec custom;
+        custom.liquid_glass = true;
+        custom.glass = LiquidGlassSpec{
+            .blur = 2.5f,
+            .roundness = 3.2f,
+            .refraction = 1.75f,
+            .dispersion = 8.0f,
+            .glare_scale = 0.6f,
+            .glare_angle = 30.0f,
+        };
+        const Theme tc = apply_theme_spec(custom, "custom:lg-custom", "lg-custom");
+        CHECK(approx(tc.glass.blur, 2.5f, 0.001f));
+        CHECK(approx(tc.glass.roundness, 3.2f, 0.001f));
+        CHECK(approx(tc.glass.refraction, 1.75f, 0.001f));
+        CHECK(approx(tc.glass.dispersion, 8.0f, 0.001f));
+        CHECK(approx(tc.glass.glare_scale, 0.6f, 0.001f));
+        CHECK(approx(tc.glass.glare_angle, 30.0f, 0.001f));
+
+        ThemeSpec clamped;
+        clamped.liquid_glass = true;
+        clamped.glass = LiquidGlassSpec{
+            .blur = 99.0f,
+            .roundness = 0.5f,
+            .refraction = 5.0f,
+            .dispersion = -2.0f,
+            .glare_scale = 9.0f,
+            .glare_angle = 720.0f,
+        };
+        const Theme tclamp = apply_theme_spec(clamped, "custom:lg-clamp", "lg-clamp");
+        CHECK(approx(tclamp.glass.blur, 6.0f, 0.001f));
+        CHECK(approx(tclamp.glass.roundness, 2.0f, 0.001f));
+        CHECK(approx(tclamp.glass.refraction, 2.0f, 0.001f));
+        CHECK(approx(tclamp.glass.dispersion, 0.0f, 0.001f));
+        CHECK(approx(tclamp.glass.glare_scale, 2.0f, 0.001f));
+        CHECK(approx(tclamp.glass.glare_angle, 180.0f, 0.001f));
+    }
+
     return 0;
 }

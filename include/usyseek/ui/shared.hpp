@@ -53,6 +53,7 @@ struct Shared {
     ThemeCatalog themes;
     Theme theme = theme_dark();
     std::optional<std::string> theme_override;
+    std::optional<ThemeSpec> theme_spec_override;
     Engine engine;
     Thumbs thumbs;
     Thumbs previews{4, true}; // full-size viewer images: the shown one and its neighbours
@@ -269,8 +270,13 @@ struct Shared {
         } else {
             themes.refresh_dynamic_swatches();
         }
-        const std::string& wanted = theme_override ? *theme_override : settings.theme;
-        theme = themes.resolve(wanted);
+        if (theme_spec_override) {
+            theme = apply_theme_spec(*theme_spec_override, "preview",
+                                     theme_spec_override->name.empty() ? "Custom Theme" : theme_spec_override->name);
+        } else {
+            const std::string& wanted = theme_override ? *theme_override : settings.theme;
+            theme = themes.resolve(wanted);
+        }
         if (theme_changed) {
             theme_changed();
         } else if (redraw_all) {

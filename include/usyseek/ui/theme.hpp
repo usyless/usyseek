@@ -136,6 +136,40 @@ struct Hsl {
     return hex(rgb, a);
 }
 
+[[nodiscard]] inline std::string format_hex_color(D2D1_COLOR_F c, bool include_alpha = false) {
+    const auto byte = [](float v) -> unsigned {
+        return static_cast<unsigned>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+    };
+    static constexpr std::string_view kHex = "0123456789abcdef";
+    const unsigned r = byte(c.r);
+    const unsigned g = byte(c.g);
+    const unsigned b = byte(c.b);
+    const unsigned a = byte(c.a);
+    const bool with_a = include_alpha || a < 255u;
+    std::string out(with_a ? 9u : 7u, '#');
+    out[1] = kHex[(r >> 4u) & 0xFu];
+    out[2] = kHex[r & 0xFu];
+    out[3] = kHex[(g >> 4u) & 0xFu];
+    out[4] = kHex[g & 0xFu];
+    out[5] = kHex[(b >> 4u) & 0xFu];
+    out[6] = kHex[b & 0xFu];
+    if (with_a) {
+        out[7] = kHex[(a >> 4u) & 0xFu];
+        out[8] = kHex[a & 0xFu];
+    }
+    return out;
+}
+
+/// Tunable material parameters for Liquid Glass themes.
+struct LiquidGlassSettings {
+    float blur = 1.4f;          // desktop Gaussian blur std dev [0, 6]
+    float roundness = 4.6f;     // superellipse corner exponent [2, 8]
+    float refraction = 1.56f;   // index of refraction [1.0, 2.0]
+    float dispersion = 5.5f;    // chromatic dispersion [0, 12]
+    float glare_scale = 1.0f;   // Fresnel + specular glare intensity scale [0, 2]
+    float glare_angle = -45.0f; // specular glare light angle in degrees [-180, 180]
+};
+
 /// Complete visual token set consumed by `Canvas` and window chrome helpers.
 struct Theme {
     std::string id = "dark";
@@ -181,6 +215,7 @@ struct Theme {
     float card_radius = 14.0f;
     float button_radius = 10.0f;
     float thumb_radius = 10.0f;
+    LiquidGlassSettings glass{};
 
     std::array<D2D1_COLOR_F, 8> tag_palette{};
 };
@@ -551,6 +586,16 @@ inline void apply_liquid_glass_material(Theme& t) noexcept {
     return theme_dark();
 }
 
+/// Optional Liquid Glass material overrides (nested under `"glass"` in JSON).
+struct LiquidGlassSpec {
+    std::optional<float> blur;
+    std::optional<float> roundness;
+    std::optional<float> refraction;
+    std::optional<float> dispersion;
+    std::optional<float> glare_scale;
+    std::optional<float> glare_angle;
+};
+
 /// String-based theme override specification (deserialized from JSON or constructed directly in tests).
 struct ThemeSpec {
     std::string name;
@@ -568,6 +613,7 @@ struct ThemeSpec {
     std::optional<float> card_radius;
     std::optional<float> button_radius;
     std::optional<float> thumb_radius;
+    std::optional<LiquidGlassSpec> glass;
 
     std::string bg;
     std::string surface_lowest;
@@ -656,6 +702,14 @@ struct ThemeSpec {
     if (spec.card_radius) t.card_radius = std::clamp(*spec.card_radius, 0.0f, 64.0f);
     if (spec.button_radius) t.button_radius = std::clamp(*spec.button_radius, 0.0f, 64.0f);
     if (spec.thumb_radius) t.thumb_radius = std::clamp(*spec.thumb_radius, 0.0f, 64.0f);
+    if (spec.glass) {
+        if (spec.glass->blur) t.glass.blur = std::clamp(*spec.glass->blur, 0.0f, 6.0f);
+        if (spec.glass->roundness) t.glass.roundness = std::clamp(*spec.glass->roundness, 2.0f, 8.0f);
+        if (spec.glass->refraction) t.glass.refraction = std::clamp(*spec.glass->refraction, 1.0f, 2.0f);
+        if (spec.glass->dispersion) t.glass.dispersion = std::clamp(*spec.glass->dispersion, 0.0f, 12.0f);
+        if (spec.glass->glare_scale) t.glass.glare_scale = std::clamp(*spec.glass->glare_scale, 0.0f, 2.0f);
+        if (spec.glass->glare_angle) t.glass.glare_angle = std::clamp(*spec.glass->glare_angle, -180.0f, 180.0f);
+    }
 
     const auto apply_hex = [](std::string_view s, D2D1_COLOR_F& dst) -> bool {
         if (s.empty()) return false;

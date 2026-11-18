@@ -1849,48 +1849,48 @@ private:
 
 [[nodiscard]] inline GlassStyle make_desktop_glass_style(const Theme& t, float corner_radius, bool fullscreen = false) noexcept {
     GlassStyle s;
-    s.blur_std_dev = 1.4f;
+    s.blur_std_dev = t.glass.blur;
     s.corner_radius = fullscreen ? 0.0f : corner_radius;
-    s.roundness = 4.6f;
+    s.roundness = t.glass.roundness;
     s.margin_dip = fullscreen ? 0.0f : 0.5f;
     s.ref_thickness = fullscreen ? 14.0f : 18.0f;
-    s.ref_factor = 1.56f;
-    s.ref_dispersion = 5.5f;
+    s.ref_factor = t.glass.refraction;
+    s.ref_dispersion = t.glass.dispersion;
     s.dispersion_range = 0.70f;
     s.fresnel_range = 28.0f;
     s.fresnel_hardness = 12.0f;
-    s.fresnel_factor = t.dark_mode ? 34.0f : 44.0f;
+    s.fresnel_factor = (t.dark_mode ? 34.0f : 44.0f) * t.glass.glare_scale;
     s.magnification = 1.035f;
     s.glare_range = 26.0f;
     s.glare_hardness = 18.0f;
-    s.glare_factor = t.dark_mode ? 70.0f : 88.0f;
+    s.glare_factor = (t.dark_mode ? 70.0f : 88.0f) * t.glass.glare_scale;
     s.glare_convergence = 58.0f;
     s.glare_opposite_factor = 72.0f;
-    s.glare_angle_deg = -45.0f;
+    s.glare_angle_deg = t.glass.glare_angle;
     s.tint = with_alpha(t.bg, t.pill_bg_alpha);
     return s;
 }
 
 [[nodiscard]] inline GlassStyle make_overlay_glass_style(const Theme& t, float corner_radius, float blur_std = 1.8f) noexcept {
     GlassStyle s;
-    s.blur_std_dev = blur_std;
+    s.blur_std_dev = std::clamp(blur_std * (t.glass.blur / 1.4f), 0.0f, 8.0f);
     s.corner_radius = corner_radius;
-    s.roundness = 4.5f;
+    s.roundness = std::clamp(t.glass.roundness - 0.1f, 2.0f, 8.0f);
     s.margin_dip = 0.5f;
     s.ref_thickness = 16.0f;
-    s.ref_factor = 1.56f;
-    s.ref_dispersion = 4.5f;
+    s.ref_factor = t.glass.refraction;
+    s.ref_dispersion = t.glass.dispersion * (4.5f / 5.5f);
     s.dispersion_range = 0.65f;
     s.fresnel_range = 26.0f;
     s.fresnel_hardness = 12.0f;
-    s.fresnel_factor = t.dark_mode ? 36.0f : 46.0f;
+    s.fresnel_factor = (t.dark_mode ? 36.0f : 46.0f) * t.glass.glare_scale;
     s.magnification = 1.045f;
     s.glare_range = 26.0f;
     s.glare_hardness = 18.0f;
-    s.glare_factor = t.dark_mode ? 74.0f : 92.0f;
+    s.glare_factor = (t.dark_mode ? 74.0f : 92.0f) * t.glass.glare_scale;
     s.glare_convergence = 60.0f;
     s.glare_opposite_factor = 74.0f;
-    s.glare_angle_deg = -45.0f;
+    s.glare_angle_deg = t.glass.glare_angle;
     s.tint = with_alpha(t.surface_high, t.dark_mode ? 0.28f : 0.36f);
     return s;
 }
@@ -1904,19 +1904,19 @@ private:
     s.roundness = 2.0f;
     s.margin_dip = 0.0f;
     s.ref_thickness = thickness;
-    s.ref_factor = 1.48f;
-    s.ref_dispersion = 3.0f;
+    s.ref_factor = 1.0f + ((t.glass.refraction - 1.0f) * (0.48f / 0.56f));
+    s.ref_dispersion = t.glass.dispersion * (3.0f / 5.5f);
     s.dispersion_range = 0.65f;
     s.fresnel_range = 13.0f;
     s.fresnel_hardness = 0.0f;
-    s.fresnel_factor = t.dark_mode ? 24.0f : 32.0f;
+    s.fresnel_factor = (t.dark_mode ? 24.0f : 32.0f) * t.glass.glare_scale;
     s.magnification = mag;
     s.glare_range = 12.0f;
     s.glare_hardness = 0.0f;
-    s.glare_factor = t.dark_mode ? 42.0f : 56.0f;
+    s.glare_factor = (t.dark_mode ? 42.0f : 56.0f) * t.glass.glare_scale;
     s.glare_convergence = 75.0f;
     s.glare_opposite_factor = 48.0f;
-    s.glare_angle_deg = -45.0f;
+    s.glare_angle_deg = t.glass.glare_angle;
     s.tint = tint;
     s.opacity = opacity;
     return s;
