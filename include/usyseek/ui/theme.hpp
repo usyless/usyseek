@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -136,8 +137,8 @@ struct Hsl {
     return hex(rgb, a);
 }
 
-[[nodiscard]] inline std::string format_hex_color(D2D1_COLOR_F c, bool include_alpha = false) {
-    const auto byte = [](float v) -> unsigned {
+[[nodiscard]] inline std::string_view format_hex_color_into(D2D1_COLOR_F c, std::span<char, 10> buf, bool include_alpha = false) noexcept {
+    const auto byte = [](float v) noexcept -> unsigned {
         return static_cast<unsigned>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
     };
     static constexpr std::string_view kHex = "0123456789abcdef";
@@ -146,18 +147,45 @@ struct Hsl {
     const unsigned b = byte(c.b);
     const unsigned a = byte(c.a);
     const bool with_a = include_alpha || a < 255u;
-    std::string out(with_a ? 9u : 7u, '#');
-    out[1] = kHex[(r >> 4u) & 0xFu];
-    out[2] = kHex[r & 0xFu];
-    out[3] = kHex[(g >> 4u) & 0xFu];
-    out[4] = kHex[g & 0xFu];
-    out[5] = kHex[(b >> 4u) & 0xFu];
-    out[6] = kHex[b & 0xFu];
+    buf[0] = '#';
+    buf[1] = kHex[(r >> 4u) & 0xFu];
+    buf[2] = kHex[r & 0xFu];
+    buf[3] = kHex[(g >> 4u) & 0xFu];
+    buf[4] = kHex[g & 0xFu];
+    buf[5] = kHex[(b >> 4u) & 0xFu];
+    buf[6] = kHex[b & 0xFu];
     if (with_a) {
-        out[7] = kHex[(a >> 4u) & 0xFu];
-        out[8] = kHex[a & 0xFu];
+        buf[7] = kHex[(a >> 4u) & 0xFu];
+        buf[8] = kHex[a & 0xFu];
+        buf[9] = '\0';
+        return {buf.data(), 9u};
     }
-    return out;
+    buf[7] = '\0';
+    return {buf.data(), 7u};
+}
+
+[[nodiscard]] inline std::wstring_view format_hex_color_w_into(D2D1_COLOR_F c, std::span<wchar_t, 10> buf, bool include_alpha = false) noexcept {
+    std::array<char, 10> narrow{};
+    const std::string_view s = format_hex_color_into(c, narrow, include_alpha);
+    for (size_t i = 0; i < s.size(); ++i) {
+        buf[i] = static_cast<wchar_t>(s[i]);
+    }
+    buf[s.size()] = L'\0';
+    return {buf.data(), s.size()};
+}
+
+[[nodiscard]] inline std::string format_hex_color(D2D1_COLOR_F c, bool include_alpha = false) {
+    std::array<char, 10> buf{};
+    return std::string{format_hex_color_into(c, buf, include_alpha)};
+}
+
+[[nodiscard]] inline bool same_hex_color(D2D1_COLOR_F a, D2D1_COLOR_F b, bool include_alpha = false) noexcept {
+    const auto byte = [](float v) noexcept -> unsigned {
+        return static_cast<unsigned>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+    };
+    if (byte(a.r) != byte(b.r) || byte(a.g) != byte(b.g) || byte(a.b) != byte(b.b)) return false;
+    if (include_alpha || byte(a.a) < 255u || byte(b.a) < 255u) return byte(a.a) == byte(b.a);
+    return true;
 }
 
 /// Tunable material parameters for Liquid Glass themes.

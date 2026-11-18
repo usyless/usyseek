@@ -129,7 +129,7 @@ float RoundedRectSDF(float2 p, float2 center, float2 half0, float cr, float n)
     return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
 }
 
-float2 RoundedRectUnitNormal(float2 fragCoord, float2 center, float2 halfPx, float cr, float n)
+float2 RoundedRectUnitNormal(float2 fragCoord, float2 center, float2 halfPx, float cr, float n, float dpr)
 {
     float2 p = fragCoord - center;
     cr = min(cr, min(halfPx.x, halfPx.y));
@@ -138,8 +138,9 @@ float2 RoundedRectUnitNormal(float2 fragCoord, float2 center, float2 halfPx, flo
     float2 inner = max(halfPx - cr, 0.0);
 
     // Smoothly round the inner reference box with radius k so the normal field is C1 continuous
-    // everywhere inside the panel, completely eliminating the 45-degree ridge bisector at the corners.
-    float k = min(max(cr * 1.25, 18.0), min(inner.x, inner.y));
+    // everywhere inside the panel when cr is small, while keeping innerSm at the exact corner center
+    // when cr is already large (e.g. collapsed pill with cr >= 24 DIPs).
+    float k = min(max(24.0 * dpr - cr, 0.0), min(inner.x, inner.y));
     float2 innerSm = max(inner - k, 0.0);
     float2 q = max(ap - innerSm, 0.0);
     float2 g = (n <= 2.01) ? q : float2(q.x > 1e-6 ? pow(q.x, n - 1.0) : 0.0, q.y > 1e-6 ? pow(q.y, n - 1.0) : 0.0);
@@ -221,7 +222,7 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
         float edgeFactor = EdgeSlopeFactor(nmerged, refThickness, refFactor);
         float ef1 = EdgeSlopeFactor(nmerged + 1.0, refThickness, refFactor);
 
-        float2 unitN = RoundedRectUnitNormal(fragCoord, center, halfPx, cr, n);
+        float2 unitN = RoundedRectUnitNormal(fragCoord, center, halfPx, cr, n, dpr);
         float nLen = length(unitN);
         float2 safeN = nLen > 1e-6 ? (unitN / nLen) : float2(0.0, 0.0);
 
@@ -1149,6 +1150,8 @@ public:
         cv.dc()->GetTarget(&prev_target);
         D2D1_MATRIX_3X2_F prev_xf{};
         cv.dc()->GetTransform(&prev_xf);
+        const auto dc_clip = cv.dirty_clip();
+        if (dc_clip) cv.dc()->PopAxisAlignedClip();
         cv.dc()->SetTransform(D2D1::Matrix3x2F::Identity());
         cv.dc()->SetTarget(cached_glass_bmp_.get());
         cv.dc()->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
@@ -1157,6 +1160,9 @@ public:
             panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), s, desktop_fx_);
         cv.dc()->SetTarget(prev_target.get());
         cv.dc()->SetTransform(prev_xf);
+        if (dc_clip) {
+            cv.dc()->PushAxisAlignedClip(*dc_clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        }
         if (!ok) {
             cached_glass_valid_ = false;
             return false;
@@ -1851,7 +1857,7 @@ private:
     GlassStyle s;
     s.blur_std_dev = t.glass.blur;
     s.corner_radius = fullscreen ? 0.0f : corner_radius;
-    s.roundness = t.glass.roundness;
+    s.roundness = t.pill_radius.has_value() ? 2.0f : t.glass.roundness;
     s.margin_dip = fullscreen ? 0.0f : 0.5f;
     s.ref_thickness = fullscreen ? 14.0f : 18.0f;
     s.ref_factor = t.glass.refraction;

@@ -82,8 +82,8 @@ inline void flow_text(Canvas& cv, Flow& flow, std::wstring_view s, Font f, D2D1_
 }
 
 struct CardHeader {
-    std::wstring title;
-    std::wstring caption;
+    std::wstring_view title;
+    std::wstring_view caption;
     D2D1_COLOR_F title_color;
     float side_w;
     float side_h;
@@ -94,9 +94,9 @@ struct CardHeader {
     float h;
 };
 
-[[nodiscard]] inline CardHeader make_header(Canvas& cv, float rw, std::wstring title, D2D1_COLOR_F title_color,
-                                            std::wstring caption, float side_w = 0.0f, float side_h = 0.0f) {
-    CardHeader hd{.title = std::move(title), .caption = std::move(caption), .title_color = title_color, .side_w = side_w, .side_h = side_h};
+[[nodiscard]] inline CardHeader make_header(Canvas& cv, float rw, std::wstring_view title, D2D1_COLOR_F title_color,
+                                            std::wstring_view caption, float side_w = 0.0f, float side_h = 0.0f) {
+    CardHeader hd{.title = title, .caption = caption, .title_color = title_color, .side_w = side_w, .side_h = side_h};
     const float beside_w = rw - side_w - (side_w > 0.0f ? 12.0f : 0.0f);
     hd.beside = side_w <= 0.0f || beside_w >= 200.0f;
     hd.text_w = hd.beside ? beside_w : rw;

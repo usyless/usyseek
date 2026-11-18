@@ -63,7 +63,7 @@ public:
             SetWindowPos(hwnd_, nullptr, 0, 0, sz.cx, sz.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
         icons_.apply(hwnd_, inst, 101);
-        apply_window_theme(hwnd_, sh_.theme, false, true);
+        cloak_window(hwnd_, true);
         if (!target_.attach(sh_.gfx, hwnd_, glass_active())) return false;
 
         cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
@@ -91,7 +91,7 @@ public:
     WindowTarget& target() noexcept { return target_; }
 
     void apply_theme() noexcept {
-        apply_window_theme(hwnd_, sh_.theme, false, true);
+        if (visible()) apply_window_theme(hwnd_, sh_.theme, false, true);
         target_.set_liquid_glass(glass_active());
         if (glass_active()) {
             if (visible() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
@@ -137,6 +137,8 @@ public:
         full_dirty_ = true;
         pending_dirty_.clear();
         last_tooltip_dirty_.reset();
+        apply_window_theme(hwnd_, sh_.theme, false, true);
+        cloak_window(hwnd_, false);
         ShowWindow(hwnd_, SW_SHOWNORMAL);
         if (glass_active()) ensure_window_capture_affinity(hwnd_, true);
         SetForegroundWindow(hwnd_);
@@ -168,6 +170,7 @@ public:
         KillTimer(hwnd_, TIMER_POLL);
         KillTimer(hwnd_, TIMER_DEVICE);
         KillTimer(hwnd_, TIMER_GLASS);
+        cloak_window(hwnd_, true);
         ShowWindow(hwnd_, SW_HIDE);
         ValidateRect(hwnd_, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
@@ -589,8 +592,7 @@ private:
         const D2D1_POINT_2F dot{.x = r.left + 15.0f, .y = (r.top + r.bottom) * 0.5f};
         cv.fill_circle(dot, 5.0f, te.swatch);
         cv.stroke_circle(dot, 5.0f, with_alpha(cv.theme().on_surface, 0.25f), 1.0f);
-        const std::wstring wname = to_wide(te.name);
-        cv.text(wname, rect(r.left + 26.0f, r.top, width(r) - 34.0f, height(r)), Font::SmallSemi, fg);
+        cv.text(te.name_w, rect(r.left + 26.0f, r.top, width(r) - 34.0f, height(r)), Font::SmallSemi, fg);
         cv.hit(r, IdThemeChip, idx);
     }
 
@@ -628,12 +630,19 @@ private:
         return s;
     }
 
-    FlowResult tab_layout(float total_w) const {
+    struct TabLayout {
+        std::array<FlowPlacement, 4> placements{};
+        float height = 0.0f;
+    };
+
+    TabLayout tab_layout(float total_w) const {
         std::array<FlowItem, 4> items; // NOLINT(cppcoreguidelines-pro-type-member-init)
         for (size_t i = 0; i < items.size(); ++i) {
             items[i] = {.width = sh_.fonts.measure(tab_label(static_cast<int>(i)), Font::BodySemi) + 46.0f, .height = TABS_H - 16.0f, .grow = false};
         }
-        return flow_layout(items, 8.0f, 8.0f, total_w - (PAD * 2.0f));
+        TabLayout out;
+        out.height = flow_layout_into(items, 8.0f, 8.0f, total_w - (PAD * 2.0f), out.placements);
+        return out;
     }
 
     [[nodiscard]] float tabs_height(float total_w) const {
@@ -645,7 +654,7 @@ private:
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         const bool glass = glass_active();
-        const FlowResult tlayout = tab_layout(sz.width);
+        const TabLayout tlayout = tab_layout(sz.width);
         const float strip_h = tlayout.height + 16.0f;
         const bool need_scene = glass && (!cv.dirty_clip() || cv.dirty_clip()->top < strip_h + 24.0f);
         const bool has_scene = need_scene && glass_.begin_scene(target_, sh_.gfx);
@@ -717,7 +726,7 @@ private:
         }
     }
 
-    void draw_tabs(Canvas& cv, D2D1_SIZE_F sz, float strip_h, const FlowResult& layout) {
+    void draw_tabs(Canvas& cv, D2D1_SIZE_F sz, float strip_h, const TabLayout& layout) {
         if (!glass_active()) {
             cv.fill(D2D1::RectF(0, 0, sz.width, strip_h), with_alpha(cv.theme().surface_lowest, 0.75f));
         }
@@ -1704,8 +1713,7 @@ private:
             Flow chips{8.0f, 8.0f};
             for (size_t i = 0; i < entries.size(); ++i) {
                 const ThemeEntry& te = entries[i];
-                const std::wstring lbl = to_wide(te.name);
-                const float chip_w = cv.measure(lbl, Font::SmallSemi) + 38.0f;
+                const float chip_w = cv.measure(te.name_w, Font::SmallSemi) + 38.0f;
                 const bool on = te.id == active_id;
                 chips.add(chip_w, 32.0f, [&, i, on](D2D1_RECT_F r) {
                     draw_theme_chip(cv, r, entries[i], on, static_cast<int>(i));
@@ -1730,7 +1738,7 @@ private:
                 }
             }
 
-            const std::wstring tdir = themes_dir().wstring();
+            const std::wstring& tdir = themes_dir().native();
             const float open_w = button_width(cv, L"Open Folder", true, 122.0f);
             const float reload_w = button_width(cv, L"Reload", true, 92.0f);
             const float btns_w = open_w + 8.0f + reload_w;

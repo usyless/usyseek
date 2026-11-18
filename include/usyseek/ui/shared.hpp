@@ -336,6 +336,13 @@ inline void ensure_window_capture_affinity(HWND hwnd, bool exclude) noexcept {
     }
 }
 
+/// Cloaks or uncloaks a window in DWM so hidden `WS_EX_NOREDIRECTIONBITMAP` windows never materialize a blank frame.
+inline void cloak_window(HWND hwnd, bool cloak) noexcept {
+    if (!hwnd) return;
+    const BOOL val = cloak ? TRUE : FALSE;
+    DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &val, sizeof(val));
+}
+
 /// Applies theme-driven immersive dark/light mode, corner preference, backdrop, and border to a window.
 inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool round = true) noexcept {
     if (!hwnd) return;
@@ -345,8 +352,10 @@ inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
 
     const bool custom_pill = is_pill && round && theme.pill_radius.has_value();
-    const DWMNCRENDERINGPOLICY ncrp = custom_pill ? DWMNCRP_DISABLED : DWMNCRP_USEWINDOWSTYLE;
-    DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &ncrp, sizeof(ncrp));
+    if (!custom_pill) {
+        constexpr DWMNCRENDERINGPOLICY use_style = DWMNCRP_USEWINDOWSTYLE;
+        DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &use_style, sizeof(use_style));
+    }
 
     const DWM_WINDOW_CORNER_PREFERENCE corner = custom_pill
         ? DWMWCP_DONOTROUND
@@ -363,6 +372,11 @@ inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool
         ? MARGINS{.cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 0}
         : MARGINS{.cxLeftWidth = -1, .cxRightWidth = -1, .cyTopHeight = -1, .cyBottomHeight = -1};
     DwmExtendFrameIntoClientArea(hwnd, &m);
+
+    if (custom_pill) {
+        constexpr DWMNCRENDERINGPOLICY disabled = DWMNCRP_DISABLED;
+        DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &disabled, sizeof(disabled));
+    }
 }
 
 /// Applies the dark immersive frame + backdrop attributes used by both windows.

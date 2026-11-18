@@ -18,8 +18,8 @@ inline const fs::path& themes_dir() {
     return p;
 }
 
-inline constexpr std::wstring_view EXAMPLE_THEME_FILENAME = L"example-sakura (copy but do not edit).json";
-inline constexpr std::wstring_view THEME_SCHEMA_FILENAME = L"theme.schema.json";
+inline constexpr const wchar_t* EXAMPLE_THEME_FILENAME = L"example-sakura (copy but do not edit).json";
+inline constexpr const wchar_t* THEME_SCHEMA_FILENAME = L"theme.schema.json";
 
 inline std::string_view theme_schema_json() noexcept {
     return R"json({
@@ -204,16 +204,17 @@ inline void ensure_themes_dir() {
 struct ThemeEntry {
     std::string id;
     std::string name;
+    std::wstring name_w;
     bool custom = false;
+    bool is_example = false;
     fs::path path;
     std::optional<ThemeSpec> spec;
     D2D1_COLOR_F swatch{};
 };
 
 /// True for the built-in synced example file (`example-sakura (copy but do not edit).json`).
-[[nodiscard]] inline bool is_example_theme_entry(const ThemeEntry& e) {
-    if (!e.custom || e.path.empty()) return false;
-    return lower(e.path.filename().wstring()) == lower(EXAMPLE_THEME_FILENAME);
+[[nodiscard]] inline bool is_example_theme_entry(const ThemeEntry& e) noexcept {
+    return e.is_example;
 }
 
 /// Converts a display name into a safe filename stem for `data/themes/<stem>.json`.
@@ -393,7 +394,8 @@ public:
             "system", "accent", "dark", "light", "nord", "mocha", "oled", "liquid-glass",};
         for (const std::string_view id : builtin_ids) {
             Theme t = resolve_builtin_theme(id);
-            entries_.emplace_back(std::move(t.id), std::move(t.name), false, fs::path{}, std::nullopt, t.primary);
+            std::wstring nw = to_wide(t.name);
+            entries_.emplace_back(std::move(t.id), std::move(t.name), std::move(nw), false, false, fs::path{}, std::nullopt, t.primary);
         }
 
         ensure_themes_dir();
@@ -401,39 +403,44 @@ public:
         std::vector<fs::path> files;
         for (const auto& e : fs::directory_iterator(themes_dir(), ec)) {
             if (!e.is_regular_file(ec)) continue;
-            const std::wstring fname = lower(e.path().filename().wstring());
-            if (lower(e.path().extension().wstring()) == L".json" && !fname.ends_with(L".schema.json")) {
-                files.push_back(e.path());
-            }
+            const fs::path& ep = e.path();
+            if (_wcsicmp(ep.extension().c_str(), L".json") != 0) continue;
+            const std::wstring_view fname{ep.filename().native()};
+            if (fname.size() >= 12 && _wcsicmp(fname.data() + fname.size() - 12, L".schema.json") == 0) continue;
+            files.push_back(ep);
         }
         std::ranges::sort(files);
 
         for (const fs::path& p : files) {
             const auto bytes = ulp::fs::read_as_bytes(p);
             if (!bytes) {
-                if (errors) errors->push_back(ulp::str::concat_strings("Could not read theme file: ", to_utf8(p.filename().wstring())));
+                if (errors) errors->push_back(ulp::str::concat_strings("Could not read theme file: ", to_utf8(p.filename().native())));
                 continue;
             }
             ThemeSpec spec;
             const auto err = glz::read<JSON_READ>(spec, *bytes);
             if (err) {
-                if (errors) errors->push_back(ulp::str::concat_strings("Invalid JSON in theme file: ", to_utf8(p.filename().wstring())));
+                if (errors) errors->push_back(ulp::str::concat_strings("Invalid JSON in theme file: ", to_utf8(p.filename().native())));
                 continue;
             }
-            const std::string stem = to_utf8(p.stem().wstring());
+            const std::string stem = to_utf8(p.stem().native());
             std::string id = ulp::str::concat_strings("custom:", stem);
             std::string disp = spec.name.empty() ? stem : spec.name;
+            std::wstring disp_w = to_wide(disp);
+            const bool is_ex = _wcsicmp(p.filename().c_str(), EXAMPLE_THEME_FILENAME) == 0;
             const Theme preview = apply_theme_spec(spec, id, disp);
-            entries_.emplace_back(std::move(id), std::move(disp), true, p, std::move(spec), preview.primary);
+            entries_.emplace_back(std::move(id), std::move(disp), std::move(disp_w), true, is_ex, p, std::move(spec), preview.primary);
         }
     }
 
     [[nodiscard]] const std::vector<ThemeEntry>& entries() const noexcept { return entries_; }
 
-    [[nodiscard]] const ThemeEntry* find(std::string_view id_or_name) const {
+    [[nodiscard]] const ThemeEntry* find(std::string_view id_or_name) const noexcept {
         for (const ThemeEntry& e : entries_) {
             if (e.id == id_or_name || e.name == id_or_name) return &e;
-            if (e.custom && !e.path.empty() && to_utf8(e.path.stem().wstring()) == id_or_name) return &e;
+            if (e.custom && std::string_view{e.id}.starts_with("custom:") && std::string_view{e.id}.substr(7) == id_or_name) {
+                return &e;
+            }
         }
         return nullptr;
     }
@@ -456,7 +463,7 @@ public:
         }
         for (const ThemeEntry& e : entries_) {
             if (!e.custom || !e.spec) continue;
-            const std::string stem = to_utf8(e.path.stem().wstring());
+            const std::string_view stem = std::string_view{e.id}.starts_with("custom:") ? std::string_view{e.id}.substr(7) : std::string_view{};
             if (e.id == id_or_name || stem == id_or_name || e.name == id_or_name) {
                 return apply_theme_spec(*e.spec, e.id, e.name);
             }

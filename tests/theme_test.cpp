@@ -214,11 +214,19 @@ int main() {
         CHECK(approx(offset_radius(1.0f, -5.0f), 0.0f, 0.001f));
     }
 
-    // 11. Hex formatting roundtrip (opaque and translucent)
+    // 11. Hex formatting roundtrip (opaque and translucent) + stack helpers
     {
         CHECK(format_hex_color(hex(0xa8c7fa)) == "#a8c7fa");
         CHECK(format_hex_color(hex(0xa8c7fa), true) == "#a8c7faff");
         CHECK(format_hex_color(hex(0x112233, 0.50196f)) == "#11223380");
+
+        std::array<char, 10> nbuf{};
+        CHECK(format_hex_color_into(hex(0xa8c7fa), nbuf) == "#a8c7fa");
+        std::array<wchar_t, 10> wbuf{};
+        CHECK(format_hex_color_w_into(hex(0xa8c7fa), wbuf) == L"#a8c7fa");
+        CHECK(same_hex_color(hex(0xa8c7fa), *parse_hex_color("#a8c7fa")));
+        CHECK(!same_hex_color(hex(0xa8c7fa), hex(0xa8c7fb)));
+        CHECK(!same_hex_color(hex(0xa8c7fa, 1.0f), hex(0xa8c7fa, 0.5f), true));
     }
 
     // 12. Liquid Glass material overrides & clamping

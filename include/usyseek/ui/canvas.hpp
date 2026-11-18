@@ -267,6 +267,22 @@ inline D2D1_RECT_F inset(D2D1_RECT_F r, float dx, float dy) noexcept { return D2
 inline float width(const D2D1_RECT_F& r) noexcept { return r.right - r.left; }
 inline float height(const D2D1_RECT_F& r) noexcept { return r.bottom - r.top; }
 
+/// Returns true iff the axis-aligned rectangle `sub` lies completely inside the rounded rectangle `(r, radius)`.
+[[nodiscard]] inline bool rect_inside_rounded_rect(D2D1_RECT_F sub, D2D1_RECT_F r, float radius) noexcept {
+    if (sub.left < r.left || sub.top < r.top || sub.right > r.right || sub.bottom > r.bottom) return false;
+    if (radius <= 0.0f) return true;
+    const float cx = (r.left + r.right) * 0.5f;
+    const float cy = (r.top + r.bottom) * 0.5f;
+    const float hw = (r.right - r.left) * 0.5f;
+    const float hh = (r.bottom - r.top) * 0.5f;
+    const float cr = std::min({radius, hw, hh});
+    const float dx = std::max(std::abs(sub.left - cx), std::abs(sub.right - cx));
+    const float dy = std::max(std::abs(sub.top - cy), std::abs(sub.bottom - cy));
+    const float qx = std::max(0.0f, dx - (hw - cr));
+    const float qy = std::max(0.0f, dy - (hh - cr));
+    return ((qx * qx) + (qy * qy)) <= (cr * cr);
+}
+
 /// Immediate-mode drawing helpers over one device context, plus hit-region recording.
 class Canvas {
 public:
@@ -481,10 +497,11 @@ public:
         if (clip_depth_ > 0) --clip_depth_;
     }
 
-    /// Pushes an anti-aliased rounded-rectangle layer mask (falls back to axis-aligned clip if `radius <= 0`).
+    /// Pushes an anti-aliased rounded-rectangle layer mask (falls back to axis-aligned clip if `radius <= 0`
+    /// or when the active dirty clip lies strictly inside the rounded interior).
     /// Returns true when a D2D layer was pushed and must be paired with `pop_round_clip(true)`.
     [[nodiscard]] bool push_round_clip(D2D1_RECT_F r, float radius) noexcept {
-        if (radius <= 0.0f) {
+        if (radius <= 0.0f || (dirty_clip_ && rect_inside_rounded_rect(*dirty_clip_, inset(r, 1.0f, 1.0f), std::max(0.0f, radius - 1.0f)))) {
             push_clip(r);
             return false;
         }
@@ -495,6 +512,12 @@ public:
         }
         D2D1_LAYER_PARAMETERS1 lp{};
         lp.contentBounds = r;
+        if (dirty_clip_) {
+            lp.contentBounds.left = std::max(lp.contentBounds.left, dirty_clip_->left);
+            lp.contentBounds.top = std::max(lp.contentBounds.top, dirty_clip_->top);
+            lp.contentBounds.right = std::min(lp.contentBounds.right, dirty_clip_->right);
+            lp.contentBounds.bottom = std::min(lp.contentBounds.bottom, dirty_clip_->bottom);
+        }
         lp.geometricMask = geom;
         lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
         lp.maskTransform = D2D1::Matrix3x2F::Identity();

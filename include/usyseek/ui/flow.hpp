@@ -25,14 +25,11 @@ struct FlowResult {
     float height = 0.0f;
 };
 
-/// Places items left to right, starting a new line when the next item no longer fits in `avail`.
-/// An item wider than `avail` gets a line of its own, is clamped to `avail` and flagged `oversize`.
-/// Items marked `grow` share the unused width of their line equally.
-inline FlowResult flow_layout(std::span<const FlowItem> items, float gap_x, float gap_y, float avail) {
+/// Places items left to right into `out` (`out.size() >= items.size()`), starting a new line when the next
+/// item no longer fits in `avail`. Returns total layout height. Zero heap allocations.
+inline float flow_layout_into(std::span<const FlowItem> items, float gap_x, float gap_y, float avail,
+                              std::span<FlowPlacement> out) noexcept {
     constexpr float tolerance = 0.001f;
-    FlowResult result;
-    result.placements.reserve(items.size());
-
     size_t line_begin = 0;
     float y = 0.0f;
     int line = 0;
@@ -59,7 +56,9 @@ inline FlowResult flow_layout(std::span<const FlowItem> items, float gap_x, floa
         float x = 0.0f;
         for (size_t i = line_begin; i < line_end; ++i) {
             const float w = std::min(items[i].width, avail) + (items[i].grow ? extra : 0.0f);
-            result.placements.emplace_back(x, y, w, line, items[i].width > avail + tolerance);
+            if (i < out.size()) {
+                out[i] = FlowPlacement{.x = x, .y = y, .width = w, .line = line, .oversize = items[i].width > avail + tolerance};
+            }
             x += w + gap_x;
         }
 
@@ -68,7 +67,16 @@ inline FlowResult flow_layout(std::span<const FlowItem> items, float gap_x, floa
         line_begin = line_end;
     }
 
-    result.height = items.empty() ? 0.0f : y - gap_y;
+    return items.empty() ? 0.0f : y - gap_y;
+}
+
+/// Places items left to right, starting a new line when the next item no longer fits in `avail`.
+/// An item wider than `avail` gets a line of its own, is clamped to `avail` and flagged `oversize`.
+/// Items marked `grow` share the unused width of their line equally.
+inline FlowResult flow_layout(std::span<const FlowItem> items, float gap_x, float gap_y, float avail) {
+    FlowResult result;
+    result.placements.resize(items.size());
+    result.height = flow_layout_into(items, gap_x, gap_y, avail, result.placements);
     return result;
 }
 

@@ -57,26 +57,6 @@ public:
     WindowTarget& target() noexcept { return target_; }
 
     void apply_theme() noexcept {
-        const ShadowPad prev = applied_pad_;
-        const ShadowPad next = active_pad();
-        applied_pad_ = next;
-        apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
-        if (hwnd_ && !fullscreen_ && prev != next && visible()) {
-            RECT wr{};
-            GetWindowRect(hwnd_, &wr);
-            const UINT dpi = GetDpiForWindow(hwnd_);
-            const float s = dpi > 0 ? static_cast<float>(dpi) / 96.0f : target_.scale();
-            const LONG pl = static_cast<LONG>(std::lround((next.left - prev.left) * s));
-            const LONG pt = static_cast<LONG>(std::lround((next.top - prev.top) * s));
-            const LONG pr = static_cast<LONG>(std::lround((next.right - prev.right) * s));
-            const LONG pb = static_cast<LONG>(std::lround((next.bottom - prev.bottom) * s));
-            SetWindowPos(hwnd_, nullptr, wr.left - pl, wr.top - pt,
-                         (wr.right - wr.left) + pl + pr, (wr.bottom - wr.top) + pt + pb,
-                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        } else if (hwnd_) {
-            SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        }
         target_.set_liquid_glass(glass_active());
         if (glass_active()) {
             if (visible() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
@@ -86,14 +66,38 @@ public:
             sh_.desktop_dupl.reset();
         }
         full_dirty_ = true;
-        invalidate();
+        if (hwnd_ && visible() && !fading_out_) {
+            const ShadowPad prev = applied_pad_;
+            const ShadowPad next = active_pad();
+            applied_pad_ = next;
+            apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
+            if (!fullscreen_ && prev != next) {
+                RECT wr{};
+                GetWindowRect(hwnd_, &wr);
+                const UINT dpi = GetDpiForWindow(hwnd_);
+                const float s = dpi > 0 ? static_cast<float>(dpi) / 96.0f : target_.scale();
+                const LONG pl = static_cast<LONG>(std::lround((next.left - prev.left) * s));
+                const LONG pt = static_cast<LONG>(std::lround((next.top - prev.top) * s));
+                const LONG pr = static_cast<LONG>(std::lround((next.right - prev.right) * s));
+                const LONG pb = static_cast<LONG>(std::lround((next.bottom - prev.bottom) * s));
+                SetWindowPos(hwnd_, nullptr, wr.left - pl, wr.top - pt,
+                             (wr.right - wr.left) + pl + pr, (wr.bottom - wr.top) + pt + pb,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            } else {
+                SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
+            invalidate();
+        }
     }
 
     void show() {
         blur_hide_tick_ = 0;
-        if (!visible()) {
+        const bool was_visible = visible() && !fading_out_;
+        apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
+        if (!was_visible || applied_pad_ != active_pad()) {
             place();
-            fade_ = sh_.test_mode ? 1.0f : 0.0f;
+            if (!visible()) fade_ = sh_.test_mode ? 1.0f : 0.0f;
         }
         fading_out_ = false;
         target_fade_ = 1.0f;
@@ -492,7 +496,7 @@ private:
     }
 
     [[nodiscard]] ShadowPad active_pad() const noexcept {
-        return custom_pill_frame() ? ShadowPad{.left = 24.0f, .top = 14.0f, .right = 24.0f, .bottom = 32.0f} : ShadowPad{};
+        return custom_pill_frame() ? ShadowPad{.left = 24.0f, .top = 18.0f, .right = 24.0f, .bottom = 28.0f} : ShadowPad{};
     }
 
     [[nodiscard]] D2D1_RECT_F pill_bounds(D2D1_SIZE_F sz) const noexcept {
@@ -1220,32 +1224,33 @@ private:
         if (theme_s <= 0.002f) return;
         if (const auto dc_clip = cv.dirty_clip()) {
             const D2D1_RECT_F inner = inset(pr, 0.5f, 0.5f);
-            if (dc_clip->left >= inner.left && dc_clip->top >= inner.top &&
-                dc_clip->right <= inner.right && dc_clip->bottom <= inner.bottom) {
+            if (rect_inside_rounded_rect(*dc_clip, inner, std::max(0.0f, radius - 0.5f))) {
                 return;
             }
         }
         constexpr int steps = 14;
-        const float spread = focused ? 24.0f : 16.0f;
-        const float dy_max = focused ? 6.0f : 3.0f;
+        const float spread = focused ? 22.0f : 15.0f;
+        const float dy_max = focused ? 4.0f : 2.0f;
         const float intensity = (focused ? 0.78f : 0.34f) * theme_s;
+        const float max_d = spread * 0.80f;
         const D2D1_RECT_F bounds = D2D1::RectF(
-            pr.left - (spread * 0.80f) - 1.0f,
-            pr.top - (spread * 0.60f) - 1.0f,
-            pr.right + (spread * 0.80f) + 1.0f,
-            pr.bottom + (spread * 0.90f) + dy_max + 1.0f);
+            pr.left - max_d - 1.0f,
+            pr.top - max_d - 1.0f,
+            pr.right + max_d + 1.0f,
+            pr.bottom + max_d + dy_max + 1.0f);
         if (!cv.intersects_clip(bounds, 1.0f)) return;
 
         for (int i = steps; i >= 1; --i) {
             const float t = static_cast<float>(i) / static_cast<float>(steps);
             const float g = spread * t;
+            const float d = g * 0.80f;
             const float dy = dy_max * t;
             const float falloff = (1.0f - t) * (1.0f - t);
             const float a = std::clamp(intensity * (0.045f + (0.085f * falloff)), 0.0f, 0.9f);
             cv.fill_round(
-                D2D1::RectF(pr.left - (g * 0.80f), pr.top - (g * 0.60f) + dy,
-                            pr.right + (g * 0.80f), pr.bottom + (g * 0.90f) + dy),
-                radius > 0.0f ? (radius + (g * 0.80f)) : (g * 0.65f),
+                D2D1::RectF(pr.left - d, pr.top - d + dy,
+                            pr.right + d, pr.bottom + d + dy),
+                radius > 0.0f ? (radius + d) : (g * 0.65f),
                 hex(0x000000, a));
         }
         cv.fill_round(inset(pr, -0.75f, -0.75f), radius > 0.0f ? (radius + 0.75f) : 0.75f,
