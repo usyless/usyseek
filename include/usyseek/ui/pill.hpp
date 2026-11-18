@@ -1357,7 +1357,7 @@ private:
                 }
             }
         } else if (custom_frame) {
-            cv.fill_round(pr, outer_r, with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
+            cv.fill_round(pr, outer_r, with_alpha(cv.theme().bg, cv.theme().pill_custom_bg_alpha));
         } else {
             cv.fill(pr, with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
         }

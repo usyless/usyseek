@@ -270,6 +270,7 @@ private:
 
     enum SliderIdx : uint8_t {
         SlPillAlpha = 0,
+        SlPillCustomAlpha,
         SlSettingsAlpha,
         SlCardAlpha,
         SlShadowScale,
@@ -476,6 +477,7 @@ private:
             if (opt && std::abs(*opt - base_v) < (step * 0.25f)) opt.reset();
         };
         strip_float(draft_.pill_bg_alpha, bt.pill_bg_alpha, slider_spec(SlPillAlpha).step);
+        strip_float(draft_.pill_custom_bg_alpha, bt.pill_custom_bg_alpha, slider_spec(SlPillCustomAlpha).step);
         strip_float(draft_.settings_bg_alpha, bt.settings_bg_alpha, slider_spec(SlSettingsAlpha).step);
         strip_float(draft_.card_alpha, bt.card_alpha, slider_spec(SlCardAlpha).step);
         strip_float(draft_.shadow_alpha_scale, bt.shadow_alpha_scale, slider_spec(SlShadowScale).step);
@@ -826,6 +828,7 @@ private:
     static constexpr SliderSpec slider_spec(int idx) noexcept {
         switch (idx) {
             case SlPillAlpha: return {.min_v = 0.05f, .max_v = 1.0f, .step = 0.01f, .label = L"Search Pill Opacity", .unit = L"", .decimals = 2};
+            case SlPillCustomAlpha: return {.min_v = 0.05f, .max_v = 1.0f, .step = 0.01f, .label = L"Custom-Radius Pill Opacity", .unit = L"", .decimals = 2};
             case SlSettingsAlpha: return {.min_v = 0.05f, .max_v = 1.0f, .step = 0.01f, .label = L"Settings & Editor Opacity", .unit = L"", .decimals = 2};
             case SlCardAlpha: return {.min_v = 0.05f, .max_v = 1.0f, .step = 0.01f, .label = L"Card Background Opacity", .unit = L"", .decimals = 2};
             case SlShadowScale: return {.min_v = 0.0f, .max_v = 2.0f, .step = 0.05f, .label = L"Shadow Intensity", .unit = L"\u00d7", .decimals = 2};
@@ -851,6 +854,7 @@ private:
         const Theme& bt = base_theme();
         switch (idx) {
             case SlPillAlpha: return bt.pill_bg_alpha;
+            case SlPillCustomAlpha: return bt.pill_custom_bg_alpha;
             case SlSettingsAlpha: return bt.settings_bg_alpha;
             case SlCardAlpha: return bt.card_alpha;
             case SlShadowScale: return bt.shadow_alpha_scale;
@@ -871,6 +875,7 @@ private:
     [[nodiscard]] std::optional<float> raw_slider_opt(int idx) const noexcept {
         switch (idx) {
             case SlPillAlpha: return draft_.pill_bg_alpha;
+            case SlPillCustomAlpha: return draft_.pill_custom_bg_alpha;
             case SlSettingsAlpha: return draft_.settings_bg_alpha;
             case SlCardAlpha: return draft_.card_alpha;
             case SlShadowScale: return draft_.shadow_alpha_scale;
@@ -926,6 +931,7 @@ private:
         const Theme& t = resolved_preview();
         switch (idx) {
             case SlPillAlpha: return t.pill_bg_alpha;
+            case SlPillCustomAlpha: return t.pill_custom_bg_alpha;
             case SlSettingsAlpha: return t.settings_bg_alpha;
             case SlCardAlpha: return t.card_alpha;
             case SlShadowScale: return t.shadow_alpha_scale;
@@ -960,6 +966,7 @@ private:
         };
         switch (idx) {
             case SlPillAlpha: draft_.pill_bg_alpha = next; break;
+            case SlPillCustomAlpha: draft_.pill_custom_bg_alpha = next; break;
             case SlSettingsAlpha: draft_.settings_bg_alpha = next; break;
             case SlCardAlpha: draft_.card_alpha = next; break;
             case SlShadowScale: draft_.shadow_alpha_scale = next; break;
@@ -981,6 +988,7 @@ private:
     void reset_slider(int idx) {
         switch (idx) {
             case SlPillAlpha: draft_.pill_bg_alpha.reset(); break;
+            case SlPillCustomAlpha: draft_.pill_custom_bg_alpha.reset(); break;
             case SlSettingsAlpha: draft_.settings_bg_alpha.reset(); break;
             case SlCardAlpha: draft_.card_alpha.reset(); break;
             case SlShadowScale: draft_.shadow_alpha_scale.reset(); break;
@@ -1266,14 +1274,23 @@ private:
             cur_y += 32.0f;
             float pbk_lbl_y = 0.0f;
             float pbk_y = 0.0f;
+            float pbk_warn_y = 0.0f;
+            float pbk_warn_h = 0.0f;
             float sbk_lbl_y = 0.0f;
             float sbk_y = 0.0f;
+            static constexpr std::wstring_view kCustomRadiusBackdropWarn =
+                L"Note: Windows DWM backdrops (Acrylic, Mica, Tabbed) cannot clip to custom corner radii and are disabled on the search pill while a custom pill radius is active.";
             if (!prev.is_liquid_glass) {
                 cur_y += 6.0f;
                 pbk_lbl_y = cur_y;
                 cur_y += 22.0f;
                 pbk_y = cur_y;
                 cur_y += bk_lay.height + 10.0f;
+                if (draft_.pill_radius.has_value()) {
+                    pbk_warn_y = cur_y;
+                    pbk_warn_h = std::max(34.0f, text_height(cv, kCustomRadiusBackdropWarn, Font::Caption, rw - 38.0f, 16.0f) + 14.0f);
+                    cur_y += pbk_warn_h + 10.0f;
+                }
                 sbk_lbl_y = cur_y;
                 cur_y += 22.0f;
                 sbk_y = cur_y;
@@ -1323,6 +1340,15 @@ private:
                     draw_choice_chip(cv, rect(lx + p.x, pbk_y + p.y, p.width, 28.0f),
                                      kBackdropOptions[i].label, ap, IdPillBackdropChip, static_cast<int>(i));
                 }
+                if (draft_.pill_radius.has_value()) {
+                    const D2D1_RECT_F wr = rect(lx, pbk_warn_y, rw, pbk_warn_h);
+                    const float wr_rad = std::min(cv.theme().button_radius, 8.0f);
+                    cv.fill_round(wr, wr_rad, with_alpha(cv.theme().amber, cv.theme().dark_mode ? 0.14f : 0.18f));
+                    cv.stroke_round(wr, wr_rad, with_alpha(cv.theme().amber, 0.45f));
+                    cv.icon(glyph::warning, rect(lx + 10.0f, pbk_warn_y, 18.0f, pbk_warn_h), cv.theme().amber, Font::IconSmall);
+                    cv.text_wrap(kCustomRadiusBackdropWarn, rect(lx + 32.0f, pbk_warn_y + 7.0f, rw - 38.0f, pbk_warn_h - 14.0f),
+                                 Font::Caption, cv.theme().on_surface);
+                }
                 cv.text(L"Settings & Editor DWM Backdrop", rect(lx, sbk_lbl_y, rw, 20.0f), Font::SmallSemi, cv.theme().on_surface_variant);
                 for (size_t i = 0; i < kBackdropOptions.size(); ++i) {
                     const FlowPlacement& p = bk_lay.placements[i];
@@ -1345,7 +1371,14 @@ private:
                 const float dh = desc.empty() ? 0.0f : text_height(cv, desc, Font::Caption, rw, 16.0f) + 4.0f;
                 return th + 4.0f + dh + 28.0f;
             };
-            cur_y += sim_slider_h(SlPillAlpha, L"");
+            const bool show_custom_pill_alpha = !prev.is_liquid_glass && draft_.pill_radius.has_value();
+            const std::wstring_view pill_alpha_desc = show_custom_pill_alpha
+                ? L"Used when custom pill corner radius is off (DWM backdrop active)"
+                : L"";
+            static constexpr std::wstring_view kCustomPillAlphaDesc =
+                L"Used when custom pill corner radius is enabled in non-Liquid-Glass themes (since DWM backdrop is disabled)";
+            cur_y += sim_slider_h(SlPillAlpha, pill_alpha_desc);
+            if (show_custom_pill_alpha) cur_y += sim_slider_h(SlPillCustomAlpha, kCustomPillAlphaDesc);
             cur_y += sim_slider_h(SlSettingsAlpha, L"");
             cur_y += sim_slider_h(SlCardAlpha, L"");
             cur_y += sim_slider_h(SlShadowScale, L"Scales custom drop shadows on cards, knobs, and rounded-radius pill");
@@ -1353,7 +1386,10 @@ private:
             const float next_y = card_begin(cv, x, y, w, h, CARD_GAP);
             draw_header(cv, lx, y, rw, hd);
             float sy = y0;
-            sy = draw_slider_row(cv, lx, sy, rw, SlPillAlpha, L"");
+            sy = draw_slider_row(cv, lx, sy, rw, SlPillAlpha, pill_alpha_desc);
+            if (show_custom_pill_alpha) {
+                sy = draw_slider_row(cv, lx, sy, rw, SlPillCustomAlpha, kCustomPillAlphaDesc);
+            }
             sy = draw_slider_row(cv, lx, sy, rw, SlSettingsAlpha, L"");
             sy = draw_slider_row(cv, lx, sy, rw, SlCardAlpha, L"");
             (void)draw_slider_row(cv, lx, sy, rw, SlShadowScale, L"Scales custom drop shadows on cards, knobs, and rounded-radius pill");
@@ -1372,6 +1408,15 @@ private:
             float cur_y = y + 16.0f + hd.h + 12.0f;
             const float toggle_y = cur_y;
             cur_y += 38.0f;
+            float warn_y = 0.0f;
+            float warn_h = 0.0f;
+            static constexpr std::wstring_view kCornerDwmWarn =
+                L"In non-Liquid-Glass themes, enabling a custom pill radius disables Windows DWM backdrops (Mica, Acrylic, Tabbed) on the search pill and uses Custom-Radius Pill Opacity instead.";
+            if (!prev.is_liquid_glass) {
+                warn_y = cur_y;
+                warn_h = std::max(34.0f, text_height(cv, kCornerDwmWarn, Font::Caption, rw - 38.0f, 16.0f) + 14.0f);
+                cur_y += warn_h + 10.0f;
+            }
             const float pr_y = cur_y;
             if (draft_.pill_radius.has_value()) cur_y += sim_slider_h(SlPillRadius, L"Overrides OS DWM rounding with custom radius + outer shadow");
             const float cr_y = cur_y;
@@ -1386,6 +1431,17 @@ private:
             cv.text(L"Off uses native Windows corner preference", rect(lx, toggle_y + 18.0f, rw - 54.0f, 16.0f),
                     Font::Caption, cv.theme().on_surface_variant);
             draw_switch(cv, lx + rw, toggle_y + 14.0f, sw_pill_rad_.value, IdTogglePillRadius);
+            if (!prev.is_liquid_glass) {
+                const D2D1_RECT_F wr = rect(lx, warn_y, rw, warn_h);
+                const float wr_rad = std::min(cv.theme().button_radius, 8.0f);
+                const D2D1_COLOR_F accent = draft_.pill_radius.has_value() ? cv.theme().amber : cv.theme().outline_variant;
+                cv.fill_round(wr, wr_rad, with_alpha(accent, draft_.pill_radius.has_value() ? (cv.theme().dark_mode ? 0.14f : 0.18f) : 0.12f));
+                cv.stroke_round(wr, wr_rad, with_alpha(accent, 0.45f));
+                cv.icon(glyph::warning, rect(lx + 10.0f, warn_y, 18.0f, warn_h),
+                        draft_.pill_radius.has_value() ? cv.theme().amber : cv.theme().on_surface_variant, Font::IconSmall);
+                cv.text_wrap(kCornerDwmWarn, rect(lx + 32.0f, warn_y + 7.0f, rw - 38.0f, warn_h - 14.0f),
+                             Font::Caption, draft_.pill_radius.has_value() ? cv.theme().on_surface : cv.theme().on_surface_variant);
+            }
 
             float sy = pr_y;
             if (draft_.pill_radius.has_value()) {

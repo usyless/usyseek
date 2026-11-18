@@ -230,6 +230,7 @@ struct Theme {
     D2D1_COLOR_F scrim{};
 
     float pill_bg_alpha = 0.80f;
+    float pill_custom_bg_alpha = 0.98f;
     float settings_bg_alpha = 0.88f;
     float card_alpha = 0.90f;
     float shadow_alpha_scale = 1.0f;
@@ -553,10 +554,12 @@ inline void apply_liquid_glass_material(Theme& t) noexcept {
     t.settings_backdrop = DWMSBT_NONE;
     if (t.dark_mode) {
         t.pill_bg_alpha = 0.18f;
+        t.pill_custom_bg_alpha = 0.18f;
         t.settings_bg_alpha = 0.24f;
         t.card_alpha = 0.56f;
     } else {
         t.pill_bg_alpha = 0.22f;
+        t.pill_custom_bg_alpha = 0.22f;
         t.settings_bg_alpha = 0.28f;
         t.card_alpha = 0.64f;
     }
@@ -632,6 +635,7 @@ struct ThemeSpec {
     std::string pill_backdrop;            // optional: acrylic | mica | tabbed | none
     std::string settings_backdrop;        // optional: acrylic | mica | tabbed | none
     std::optional<float> pill_bg_alpha;
+    std::optional<float> pill_custom_bg_alpha;
     std::optional<float> settings_bg_alpha;
     std::optional<float> card_alpha;
     std::optional<float> shadow_alpha_scale;
@@ -722,6 +726,7 @@ struct ThemeSpec {
     if (auto b = parse_backdrop_name(spec.pill_backdrop)) t.pill_backdrop = *b;
     if (auto b = parse_backdrop_name(spec.settings_backdrop)) t.settings_backdrop = *b;
     if (spec.pill_bg_alpha) t.pill_bg_alpha = std::clamp(*spec.pill_bg_alpha, 0.0f, 1.0f);
+    if (spec.pill_custom_bg_alpha) t.pill_custom_bg_alpha = std::clamp(*spec.pill_custom_bg_alpha, 0.0f, 1.0f);
     if (spec.settings_bg_alpha) t.settings_bg_alpha = std::clamp(*spec.settings_bg_alpha, 0.0f, 1.0f);
     if (spec.card_alpha) t.card_alpha = std::clamp(*spec.card_alpha, 0.0f, 1.0f);
     if (spec.shadow_alpha_scale) t.shadow_alpha_scale = std::clamp(*spec.shadow_alpha_scale, 0.0f, 2.0f);

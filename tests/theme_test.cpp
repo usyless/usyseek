@@ -198,9 +198,16 @@ int main() {
 
         const Theme t = apply_theme_spec(spec, "custom:rounded", "rounded");
         CHECK(t.pill_radius.has_value() && approx(*t.pill_radius, 22.0f, 0.001f));
+        CHECK(approx(t.pill_custom_bg_alpha, 0.98f, 0.001f));
         CHECK(approx(t.card_radius, 18.0f, 0.001f));
         CHECK(approx(t.button_radius, 4.0f, 0.001f));
         CHECK(approx(t.thumb_radius, 0.0f, 0.001f));
+
+        ThemeSpec custom_alpha;
+        custom_alpha.pill_radius = 24.0f;
+        custom_alpha.pill_custom_bg_alpha = 0.72f;
+        const Theme tca = apply_theme_spec(custom_alpha, "custom:alpha", "alpha");
+        CHECK(approx(tca.pill_custom_bg_alpha, 0.72f, 0.001f));
 
         ThemeSpec clamped;
         clamped.pill_radius = 999.0f;

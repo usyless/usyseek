@@ -63,6 +63,12 @@ inline std::string_view theme_schema_json() noexcept {
       "description": "DWM backdrop behind Settings & Theme Editor windows (ignored when liquid_glass is true)."
     },
     "pill_bg_alpha": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+    "pill_custom_bg_alpha": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "description": "Search pill background opacity when custom pill_radius is enabled in non-Liquid-Glass themes (since DWM backdrops are disabled)."
+    },
     "settings_bg_alpha": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
     "card_alpha": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
     "shadow_alpha_scale": { "type": "number", "minimum": 0.0, "maximum": 2.0 },
@@ -132,6 +138,7 @@ inline std::string_view example_theme_json() noexcept {
   "pill_backdrop": "acrylic",
   "settings_backdrop": "mica",
   "pill_bg_alpha": 0.82,
+  "pill_custom_bg_alpha": 0.98,
   "settings_bg_alpha": 0.88,
   "card_alpha": 0.90,
   "shadow_alpha_scale": 1.0,
@@ -307,6 +314,7 @@ inline bool save_theme_file(const fs::path& path, const ThemeSpec& spec) {
     append_str("pill_backdrop", spec.pill_backdrop);
     append_str("settings_backdrop", spec.settings_backdrop);
     append_float("pill_bg_alpha", spec.pill_bg_alpha);
+    append_float("pill_custom_bg_alpha", spec.pill_custom_bg_alpha);
     append_float("settings_bg_alpha", spec.settings_bg_alpha);
     append_float("card_alpha", spec.card_alpha);
     append_float("shadow_alpha_scale", spec.shadow_alpha_scale);
