@@ -1185,6 +1185,8 @@ public:
         const bool ok = ensure_effects(target, gfx) && draw_bitmap_glass_with(
             cv, target, src_bmp, full_dest,
             panel_rect, D2D1::Point2F(panel_rect.left, panel_rect.top), s, desktop_fx_);
+        // Materialize effect draws into `cached_glass_bmp_` before switching targets and reading it as an effect input.
+        (void)cv.dc()->Flush();
         cv.dc()->SetTarget(prev_target.get());
         cv.dc()->SetTransform(prev_xf);
         if (dc_clip) {
@@ -1239,6 +1241,8 @@ public:
         scene_active_ = false;
         if (!target.ready() || !target.target_bitmap() || !scene_bmp_) return;
         ID2D1DeviceContext6* dc = target.dc();
+        // Flush effect draws targeting `scene_bmp_` before downstream `draw_scene_glass` effects bind it as input.
+        (void)dc->Flush();
         dc->SetTarget(target.target_bitmap());
         const D2D1_SIZE_F sz = target.size();
         const D2D1_RECT_F full = D2D1::RectF(0.0f, 0.0f, sz.width, sz.height);
@@ -1962,6 +1966,38 @@ private:
     s.opacity = opacity;
     s.centered_edge = true;
     return s;
+}
+
+/// Builds a Liquid Glass style tuned for compact floating tooltips.
+[[nodiscard]] inline GlassStyle make_tooltip_glass_style(const Theme& t, float corner_radius, float opacity = 1.0f) noexcept {
+    GlassStyle s = make_overlay_glass_style(t, corner_radius, 1.6f);
+    s.ref_thickness = 10.0f;
+    s.tint = with_alpha(t.surface_high, t.dark_mode ? 0.36f : 0.48f);
+    s.opacity = opacity;
+    // Tooltips are often ~27 DIPs tall, so inset the rim slope slightly to avoid pulling distant colours into an edge line.
+    s.rim_inset_dip = 1.0f;
+    return s;
+}
+
+/// Draws a floating wrapped tooltip anchored near `anchor`, rendering its surface as live Liquid Glass when active.
+inline void draw_tooltip(Canvas& cv, LiquidGlassWindow& glass, WindowTarget& target, Gfx& gfx,
+                         D2D1_RECT_F bounds, D2D1_RECT_F anchor, std::wstring_view title,
+                         std::wstring_view subtitle = {}, float opacity = 1.0f, float bounds_radius = 0.0f) {
+    detail::draw_tooltip_impl(cv, bounds, anchor, title, subtitle, opacity, bounds_radius,
+                              [&](D2D1_RECT_F r, const Theme& t, float rad, float op) {
+                                  if (!glass.draw_scene_glass(cv, target, gfx, r, make_tooltip_glass_style(t, rad, op))) {
+                                      return false;
+                                  }
+                                  cv.stroke_round(r, rad, with_alpha(t.outline_variant, 0.55f));
+                                  return true;
+                              });
+}
+
+/// Draws a floating wrapped tooltip anchored near `anchor` within `win_sz`, rendering as live Liquid Glass when active.
+inline void draw_tooltip(Canvas& cv, LiquidGlassWindow& glass, WindowTarget& target, Gfx& gfx,
+                         D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std::wstring_view title,
+                         std::wstring_view subtitle = {}, float opacity = 1.0f) {
+    draw_tooltip(cv, glass, target, gfx, D2D1::RectF(0.0f, 0.0f, win_sz.width, win_sz.height), anchor, title, subtitle, opacity, 0.0f);
 }
 
 } // namespace usyseek::ui

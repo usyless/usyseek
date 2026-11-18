@@ -766,15 +766,17 @@ struct TooltipLayout {
     bool valid = false;
 };
 
-/// Computes the screen-space box and shadow-inflated dirty rect for a tooltip anchored near `anchor`.
-[[nodiscard]] inline TooltipLayout measure_tooltip_layout(Fonts& fonts, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor,
-                                                          std::wstring_view title, std::wstring_view subtitle) {
+/// Computes the screen-space box and shadow-inflated dirty rect for a tooltip anchored near `anchor`,
+/// clamped within `bounds` (and inset from any rounded corners of radius `bounds_radius`).
+[[nodiscard]] inline TooltipLayout measure_tooltip_layout(Fonts& fonts, D2D1_RECT_F bounds, D2D1_RECT_F anchor,
+                                                          std::wstring_view title, std::wstring_view subtitle,
+                                                          float bounds_radius = 0.0f) {
     TooltipLayout out;
     if (title.empty() && subtitle.empty()) return out;
     constexpr float pad_x = 10.0f;
     constexpr float pad_y = 6.0f;
     constexpr float gap = 2.0f;
-    const float max_w = std::min(460.0f, std::max(140.0f, win_sz.width - 16.0f));
+    const float max_w = std::min(460.0f, std::max(140.0f, width(bounds) - 16.0f));
     out.text_max_w = std::max(40.0f, max_w - (pad_x * 2.0f));
     out.title_font = subtitle.empty() ? Font::SmallWrap : Font::SmallSemi;
     if (!title.empty()) {
@@ -787,18 +789,53 @@ struct TooltipLayout {
     const float content_h = out.title_sz.height + (!title.empty() && !subtitle.empty() ? gap : 0.0f) + out.sub_sz.height;
     const float box_w = std::ceil(content_w) + (pad_x * 2.0f);
     const float box_h = std::ceil(content_h) + (pad_y * 2.0f);
-    float x = (anchor.left + anchor.right - box_w) * 0.5f;
-    x = std::clamp(x, 8.0f, std::max(8.0f, win_sz.width - 8.0f - box_w));
+
+    const float min_y = bounds.top + 8.0f;
+    const float max_y = std::max(min_y, bounds.bottom - 8.0f - box_h);
     float y = anchor.bottom + 8.0f;
-    if (y + box_h > win_sz.height - 8.0f && anchor.top - box_h - 8.0f >= 8.0f) {
+    if (y + box_h > bounds.bottom - 8.0f && anchor.top - box_h - 8.0f >= min_y) {
         y = anchor.top - box_h - 8.0f;
     }
-    y = std::clamp(y, 8.0f, std::max(8.0f, win_sz.height - 8.0f - box_h));
+    y = std::clamp(y, min_y, max_y);
+
+    // Keep the tooltip box inside rounded outer pill corners so neither the tooltip nor its glass blur samples outside.
+    float edge_margin = 8.0f;
+    const float cr = std::clamp(bounds_radius, 0.0f, std::min(width(bounds), height(bounds)) * 0.5f);
+    if (cr > 0.0f) {
+        const auto corner_inset = [cr](float d) noexcept {
+            if (d >= cr) return 0.0f;
+            const float dy = cr - std::max(0.0f, d);
+            return cr - std::sqrt(std::max(0.0f, (cr * cr) - (dy * dy)));
+        };
+        const float arc = std::max(corner_inset(y - bounds.top), corner_inset(bounds.bottom - (y + box_h)));
+        edge_margin = std::max(edge_margin, arc + 6.0f);
+    }
+
+    const float min_x = bounds.left + edge_margin;
+    const float max_x = bounds.right - edge_margin - box_w;
+    float x = (anchor.left + anchor.right - box_w) * 0.5f;
+    if (max_x >= min_x) {
+        x = std::clamp(x, min_x, max_x);
+    } else {
+        x = std::clamp(x, bounds.left + 8.0f, std::max(bounds.left + 8.0f, bounds.right - 8.0f - box_w));
+    }
+
     out.box = rect(x, y, box_w, box_h);
-    // Covers the 10.0 DIP drop shadow in Canvas::shadow(r, 8.0f, 10.0f, 0.38f)
+    // Covers the 10.0 DIP drop shadow in Canvas::shadow(r, rad, 10.0f, 0.38f)
     out.dirty = D2D1::RectF(out.box.left - 6.0f, out.box.top - 2.0f, out.box.right + 6.0f, out.box.bottom + 10.0f);
     out.valid = true;
     return out;
+}
+
+/// Computes the screen-space box and shadow-inflated dirty rect for a tooltip anchored near `anchor`.
+[[nodiscard]] inline TooltipLayout measure_tooltip_layout(Fonts& fonts, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor,
+                                                          std::wstring_view title, std::wstring_view subtitle) {
+    return measure_tooltip_layout(fonts, D2D1::RectF(0.0f, 0.0f, win_sz.width, win_sz.height), anchor, title, subtitle, 0.0f);
+}
+
+/// Returns the tooltip corner radius derived from the active theme.
+[[nodiscard]] inline float tooltip_corner_radius(const Theme& t, float box_h) noexcept {
+    return std::min({box_h * 0.5f, 14.0f, std::max(0.0f, t.button_radius * 0.8f)});
 }
 
 /// Returns true when the active theme is the Liquid Glass theme.
@@ -817,11 +854,13 @@ inline void draw_glass_box(Canvas& cv, D2D1_RECT_F r, float radius, D2D1_COLOR_F
     if (border.a > 0.0f && border_w > 0.0f) cv.stroke_round(r, radius, border, border_w);
 }
 
-/// Draws a floating wrapped tooltip anchored near `anchor`, clamped within `win_sz`.
-inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std::wstring_view title,
-                         std::wstring_view subtitle = {}, float opacity = 1.0f) {
+namespace detail {
+
+template <typename GlassFn>
+inline void draw_tooltip_impl(Canvas& cv, D2D1_RECT_F bounds, D2D1_RECT_F anchor, std::wstring_view title,
+                              std::wstring_view subtitle, float opacity, float bounds_radius, GlassFn&& draw_glass) {
     if (opacity <= 0.008f || (title.empty() && subtitle.empty())) return;
-    const TooltipLayout tl = measure_tooltip_layout(cv.fonts(), win_sz, anchor, title, subtitle);
+    const TooltipLayout tl = measure_tooltip_layout(cv.fonts(), bounds, anchor, title, subtitle, bounds_radius);
     if (!tl.valid || !cv.intersects_clip(tl.dirty, 1.0f)) return;
     const Canvas::ScopedOpacity op{cv, opacity};
     constexpr float pad_x = 10.0f;
@@ -829,14 +868,17 @@ inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std
     constexpr float gap = 2.0f;
     const D2D1_RECT_F r = tl.box;
     const Theme& t = cv.theme();
-    cv.shadow(r, 8.0f, 10.0f, 0.38f);
+    const float rad = tooltip_corner_radius(t, height(r));
+    cv.shadow(r, rad, 10.0f, 0.38f);
     if (is_liquid_glass(t)) {
-        draw_glass_box(cv, r, 8.0f,
-                       with_alpha(t.surface_high, t.dark_mode ? 0.56f : 0.76f),
-                       with_alpha(hex(0xffffff), t.dark_mode ? 0.24f : 0.68f));
+        if (!draw_glass(r, t, rad, std::clamp(opacity, 0.0f, 1.0f))) {
+            draw_glass_box(cv, r, rad,
+                           with_alpha(t.surface_high, t.dark_mode ? 0.56f : 0.76f),
+                           with_alpha(hex(0xffffff), t.dark_mode ? 0.24f : 0.68f));
+        }
     } else {
-        cv.fill_round(r, 8.0f, t.surface_highest);
-        cv.stroke_round(r, 8.0f, with_alpha(t.outline_variant, 0.85f));
+        cv.fill_round(r, rad, t.surface_highest);
+        cv.stroke_round(r, rad, with_alpha(t.outline_variant, 0.85f));
     }
 
     float ty = r.top + pad_y;
@@ -847,6 +889,21 @@ inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std
     if (!subtitle.empty()) {
         cv.text_wrap(subtitle, rect(r.left + pad_x, ty, tl.text_max_w, tl.sub_sz.height + 2.0f), Font::MonoSmall, t.on_surface_variant);
     }
+}
+
+} // namespace detail
+
+/// Draws a floating wrapped tooltip anchored near `anchor`, clamped within `bounds`.
+inline void draw_tooltip(Canvas& cv, D2D1_RECT_F bounds, D2D1_RECT_F anchor, std::wstring_view title,
+                         std::wstring_view subtitle = {}, float opacity = 1.0f, float bounds_radius = 0.0f) {
+    detail::draw_tooltip_impl(cv, bounds, anchor, title, subtitle, opacity, bounds_radius,
+                              [](D2D1_RECT_F, const Theme&, float, float) noexcept { return false; });
+}
+
+/// Draws a floating wrapped tooltip anchored near `anchor`, clamped within `win_sz`.
+inline void draw_tooltip(Canvas& cv, D2D1_SIZE_F win_sz, D2D1_RECT_F anchor, std::wstring_view title,
+                         std::wstring_view subtitle = {}, float opacity = 1.0f) {
+    draw_tooltip(cv, D2D1::RectF(0.0f, 0.0f, win_sz.width, win_sz.height), anchor, title, subtitle, opacity, 0.0f);
 }
 
 } // namespace usyseek::ui

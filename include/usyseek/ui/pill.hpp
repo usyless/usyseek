@@ -288,14 +288,17 @@ public:
         }
 
         const bool anim = step_anim();
-        if (scroll_ != prev_scroll || chip_anim_.value != prev_chip) {
+        if (scroll_ != prev_scroll || chip_anim_.value != prev_chip || glass_scene_needed()) {
             full_dirty_ = true;
         }
 
+        const D2D1_RECT_F tip_bounds = pill_bounds(target_.size());
+        const float tip_bounds_r = (!fullscreen_ && (custom_pill_frame() || glass_active()))
+                                       ? effective_pill_radius(tip_bounds)
+                                       : 0.0f;
         std::optional<D2D1_RECT_F> curr_tip_dirty;
-        if (!menu_open_ && !drop_open_ && tooltip_.alpha.value > 0.008f &&
-            (!tooltip_.title.empty() || !tooltip_.subtitle.empty())) {
-            const TooltipLayout tl = measure_tooltip_layout(sh_.fonts, target_.size(), tooltip_.anchor, tooltip_.title, tooltip_.subtitle);
+        if (tooltip_visible()) {
+            const TooltipLayout tl = measure_tooltip_layout(sh_.fonts, tip_bounds, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tip_bounds_r);
             if (tl.valid) curr_tip_dirty = tl.dirty;
         }
         if (!full_dirty_) {
@@ -1210,14 +1213,24 @@ private:
         }
     }
 
-    void draw_active_tooltip(Canvas& cv, D2D1_SIZE_F sz) const {
+    [[nodiscard]] bool tooltip_visible() const noexcept {
+        return !menu_open_ && !drop_open_ && tooltip_.alpha.value > 0.008f &&
+               (!tooltip_.title.empty() || !tooltip_.subtitle.empty());
+    }
+
+    void draw_active_tooltip(Canvas& cv, D2D1_RECT_F bounds, bool custom_frame, float outer_r) {
         if (menu_open_ || drop_open_) return;
-        draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
+        const bool round_bounds = custom_frame || (glass_active() && !fullscreen_);
+        const float bounds_r = round_bounds ? outer_r : 0.0f;
+        const bool clipped = round_bounds && cv.push_round_clip(bounds, bounds_r);
+        draw_tooltip(cv, glass_, target_, sh_.gfx, bounds, tooltip_.anchor, tooltip_.title, tooltip_.subtitle,
+                     tooltip_.alpha.value, bounds_r);
+        if (round_bounds) cv.pop_round_clip(clipped);
     }
 
     [[nodiscard]] bool glass_active() const noexcept { return sh_.theme.is_liquid_glass; }
     [[nodiscard]] bool glass_scene_needed() const noexcept {
-        return glass_active() && (preview_ >= 0 || menu_open_ || drop_open_ || show_help());
+        return glass_active() && (preview_ >= 0 || menu_open_ || drop_open_ || show_help() || tooltip_visible());
     }
 
     struct ShadowLayer {
@@ -1376,20 +1389,16 @@ private:
                 cv.stroke_round(pr, outer_r, cv.theme().pill_border, 1.0f);
             }
             if (menu_open_) draw_menu(cv);
-            draw_active_tooltip(cv, sz);
+            draw_active_tooltip(cv, pr, custom_frame, outer_r);
             return;
         }
         if (has_scene) {
-            if (expanded()) {
-                const bool clipped = custom_frame && cv.push_round_clip(pr, outer_r);
-                draw_grid(cv);
-                if (custom_frame) cv.pop_round_clip(clipped);
-            }
-            glass_.end_scene(target_);
             const bool clipped = custom_frame && cv.push_round_clip(pr, outer_r);
+            if (expanded()) draw_grid(cv);
             draw_header(cv, pr);
             draw_status(cv, pr);
             if (custom_frame) cv.pop_round_clip(clipped);
+            glass_.end_scene(target_);
         } else {
             const bool clipped = custom_frame && cv.push_round_clip(pr, outer_r);
             if (expanded()) draw_grid(cv);
@@ -1403,7 +1412,7 @@ private:
         if (drop_open_) draw_dropdown(cv, pr);
         if (show_help()) draw_help(cv, pr);
         if (menu_open_) draw_menu(cv);
-        draw_active_tooltip(cv, sz);
+        draw_active_tooltip(cv, pr, custom_frame, outer_r);
     }
 
     void icon_button(Canvas& cv, D2D1_RECT_F r, wchar_t g, int id, bool active = false) {

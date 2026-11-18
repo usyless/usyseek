@@ -234,7 +234,7 @@ public:
         }
 
         std::optional<D2D1_RECT_F> curr_tip_dirty;
-        if (tooltip_.alpha.value > 0.008f && (!tooltip_.title.empty() || !tooltip_.subtitle.empty())) {
+        if (tooltip_visible()) {
             const TooltipLayout tl = measure_tooltip_layout(sh_.fonts, target_.size(), tooltip_.anchor, tooltip_.title, tooltip_.subtitle);
             if (tl.valid) curr_tip_dirty = tl.dirty;
         }
@@ -244,11 +244,15 @@ public:
                 dirty_dips_scratch_.push_back(*last_tooltip_dirty_);
             }
             if (glass_active()) {
-                const float scene_guard_y = tabs_height(target_.size().width) + 32.0f;
-                for (const D2D1_RECT_F& r : dirty_dips_scratch_) {
-                    if (r.top < scene_guard_y) {
-                        full_dirty_ = true;
-                        break;
+                if (curr_tip_dirty) {
+                    full_dirty_ = true;
+                } else {
+                    const float scene_guard_y = tabs_height(target_.size().width) + 32.0f;
+                    for (const D2D1_RECT_F& r : dirty_dips_scratch_) {
+                        if (r.top < scene_guard_y) {
+                            full_dirty_ = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -653,12 +657,16 @@ private:
 
     [[nodiscard]] bool glass_active() const noexcept { return sh_.theme.is_liquid_glass; }
 
+    [[nodiscard]] bool tooltip_visible() const noexcept {
+        return tooltip_.alpha.value > 0.008f && (!tooltip_.title.empty() || !tooltip_.subtitle.empty());
+    }
+
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
         const bool glass = glass_active();
         const TabLayout tlayout = tab_layout(sz.width);
         const float strip_h = tlayout.height + 16.0f;
-        const bool need_scene = glass && (!cv.dirty_clip() || cv.dirty_clip()->top < strip_h + 24.0f);
+        const bool need_scene = glass && (!cv.dirty_clip() || cv.dirty_clip()->top < strip_h + 24.0f || tooltip_visible());
         const bool has_scene = need_scene && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
             if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
@@ -709,7 +717,7 @@ private:
                                     make_overlay_glass_style(cv.theme(), 0.0f, 1.8f));
             draw_tabs(cv, sz, strip_h, tlayout);
         }
-        draw_tooltip(cv, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
+        draw_tooltip(cv, glass_, target_, sh_.gfx, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
     }
 
     [[nodiscard]] const wchar_t* tooltip_text(int id) const noexcept {
