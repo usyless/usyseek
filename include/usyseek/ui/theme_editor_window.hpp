@@ -432,7 +432,7 @@ private:
         }
     }
 
-    void mark_preview_dirty(bool live = true) noexcept {
+    void mark_preview_dirty(bool live = true) {
         preview_dirty_ = true;
         if (live) schedule_live_preview();
     }
@@ -727,7 +727,7 @@ private:
         sh_.refresh_theme(false, false);
     }
 
-    void schedule_live_preview() noexcept {
+    void schedule_live_preview() {
         if (!hwnd_ || !visible() || sh_.test_mode) return;
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_live_apply_).count();

@@ -1253,7 +1253,10 @@ private:
         // Pill edges in window pixels, and the bitmap layout: `e` px of shadow margin around a pill whose fractional
         // pixel offsets match the real one, so every slice maps 1:1 onto the pixel grid.
         const float e = std::ceil(reach * s);
-        const float pl = pr.left * s, pt = pr.top * s, prr = pr.right * s, pb = pr.bottom * s;
+        const float pl = pr.left * s;
+        const float pt = pr.top * s;
+        const float prr = pr.right * s;
+        const float pb = pr.bottom * s;
         const float req = std::ceil(((2.0f * r) + (2.0f * max_dy)) * s) + 6.0f;
         const auto span = [req](float lo, float hi) noexcept {
             const float actual = hi - lo;
@@ -1268,7 +1271,7 @@ private:
         const auto bh = static_cast<UINT>(std::floor(bb) + e + 1.0f);
 
         const ShadowKey key{.gfx_epoch = sh_.gfx.epoch(), .target_epoch = target_.target_epoch(), .scale = s, .radius = r,
-                            .strength = theme_s, .focused = focused, .left = bl, .top = bt, .right = br, .bottom = bb};
+                            .strength = theme_s, .focused = focused, .left = bl, .top = bt, .right = br, .bottom = bb,};
         if (!shadow_bmp_ || !(key == shadow_key_)) {
             shadow_bmp_.reset();
             shadow_px_.assign(static_cast<size_t>(bw) * bh * 4u, 0);
@@ -1276,7 +1279,7 @@ private:
             const float hy = (bb - bt) * 0.5f / s;
             const float cx = (bl + br) * 0.5f / s;
             const float cy = (bt + bb) * 0.5f / s;
-            const float rr = std::min(r, std::min(hx, hy));
+            const float rr = std::min({r, hx, hy});
             constexpr float inv_sqrt2 = 0.70710678f;
             for (UINT y = 0; y < bh; ++y) {
                 const float py = (static_cast<float>(y) + 0.5f) / s;
@@ -1291,7 +1294,7 @@ private:
                         const float a = std::min(0.95f, l.alpha * theme_s) * 0.5f * std::erfc(sdf * inv_sqrt2 / l.sigma);
                         keep *= 1.0f - a;
                     }
-                    shadow_px_[((static_cast<size_t>(y) * bw) + x) * 4u + 3u] =
+                    shadow_px_[(((static_cast<size_t>(y) * bw) + x) * 4u) + 3u] =
                         static_cast<uint8_t>(std::lround(std::clamp(1.0f - keep, 0.0f, 1.0f) * 255.0f));
                 }
             }
