@@ -1516,8 +1516,11 @@ private:
         const bool glass_ui = is_liquid_glass(cv.theme());
         const bool dark = cv.theme().dark_mode;
         if (glass_ui) {
-            const GlassStyle seg_gs = make_control_glass_style(
+            GlassStyle seg_gs = make_control_glass_style(
                 cv.theme(), seg_rad, with_alpha(cv.theme().surface_high, dark ? 0.24f : 0.34f), 1.0f, 0.0f, 10.0f, 1.05f);
+            // The filter segment is only 34 DIPs tall, so full rim refraction samples well outside its bounds
+            // and shows up as a solid coloured line along the edge.
+            seg_gs.rim_inset_dip = 1.0f;
             if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, seg, seg_gs)) {
                 draw_glass_box(cv, seg, seg_rad,
                                with_alpha(cv.theme().surface_high, dark ? 0.26f : 0.36f),
@@ -3081,8 +3084,11 @@ private:
         const D2D1_RECT_F pr = rect(x, cy - 13, pw, 26);
         const float pos_rad = std::min(13.0f, offset_radius(cv.theme().button_radius, 3.0f));
         if (is_liquid_glass(cv.theme())) {
-            const GlassStyle pgs = make_control_glass_style(
+            GlassStyle pgs = make_control_glass_style(
                 cv.theme(), pos_rad, with_alpha(cv.theme().surface_high, dark ? 0.28f : 0.40f), 1.0f, 1.2f, 8.0f, 1.08f);
+            // The position pill is only 26 DIPs tall, so full rim refraction samples well outside its bounds
+            // and shows up as a solid coloured line along the edge.
+            pgs.rim_inset_dip = 1.0f;
             if (!glass_.draw_scene_glass(cv, target_, sh_.gfx, pr, pgs)) {
                 draw_glass_box(cv, pr, pos_rad,
                                with_alpha(cv.theme().surface_high, dark ? 0.30f : 0.44f),
