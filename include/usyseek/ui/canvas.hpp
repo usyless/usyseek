@@ -141,8 +141,8 @@ public:
                     const DWRITE_TRIMMING trim{.granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER, .delimiter = 0, .delimiterCount = 0};
                     fmt->SetTrimming(&trim, ellipsis.get());
                 }
-                if (!d.is_icon) center_cap_metrics(sys.get(), fmt.get(), *d.family, d.weight, d.size);
             }
+            if (!d.is_icon) center_cap_metrics(sys.get(), fmt.get(), *d.family, d.weight, d.size);
             formats_[static_cast<size_t>(d.f)] = std::move(fmt);
         }
         return true;
