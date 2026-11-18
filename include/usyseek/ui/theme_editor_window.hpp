@@ -123,12 +123,14 @@ public:
     }
 
     void hide(bool revert_preview = true) {
-        if (revert_preview) clear_unsaved_preview();
+        if (hwnd_) KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
+        live_apply_pending_ = false;
         if (active_field_) {
-            commit_field(active_field_);
+            if (!revert_preview) commit_field(active_field_, false);
             active_field_->focused = false;
             active_field_ = nullptr;
         }
+        if (revert_preview) clear_unsaved_preview();
         if (active_slider_ >= 0 || dragging_scroll_ || selecting_text_) {
             active_slider_ = -1;
             dragging_scroll_ = false;
@@ -530,7 +532,7 @@ private:
         }
     }
 
-    void commit_field(TextField* tf) {
+    void commit_field(TextField* tf, bool live = true) {
         if (!tf) return;
         if (tf == &name_field_) {
             std::string trimmed = to_utf8(trim(name_field_.text));
@@ -541,24 +543,24 @@ private:
         }
         for (size_t i = 0; i < color_fields_.size(); ++i) {
             if (tf == &color_fields_[i]) {
-                apply_hex_field_value(i, false);
+                apply_hex_field_value(i, false, live);
                 return;
             }
         }
         for (size_t i = 0; i < tag_fields_.size(); ++i) {
             if (tf == &tag_fields_[i]) {
-                apply_tag_field_value(i, false);
+                apply_tag_field_value(i, false, live);
                 return;
             }
         }
     }
 
-    void apply_hex_field_value(size_t i, bool live_typing) {
+    void apply_hex_field_value(size_t i, bool live_typing, bool live = true) {
         const std::wstring trimmed_w = trim(color_fields_[i].text);
         std::string& slot = draft_.*kColorDefs[i].spec_member;
         if (trimmed_w.empty()) {
             slot.clear();
-            mark_preview_dirty();
+            mark_preview_dirty(live);
             return;
         }
         const std::string val = to_utf8(trimmed_w);
@@ -577,19 +579,19 @@ private:
                     color_fields_[i].set(std::wstring{wv});
                 }
             }
-            mark_preview_dirty();
+            mark_preview_dirty(live);
         } else if (!live_typing) {
             color_fields_[i].set(to_wide(slot));
         }
     }
 
-    void apply_tag_field_value(size_t i, bool live_typing) {
+    void apply_tag_field_value(size_t i, bool live_typing, bool live = true) {
         const std::wstring trimmed_w = trim(tag_fields_[i].text);
         if (trimmed_w.empty()) {
             if (i < draft_.tag_palette.size()) {
                 draft_.tag_palette[i].clear();
                 trim_empty_tag_palette();
-                mark_preview_dirty();
+                mark_preview_dirty(live);
             }
             return;
         }
@@ -613,7 +615,7 @@ private:
                     tag_fields_[i].set(std::wstring{wv});
                 }
             }
-            mark_preview_dirty();
+            mark_preview_dirty(live);
         } else if (!live_typing) {
             const std::string_view cur = i < draft_.tag_palette.size() ? std::string_view{draft_.tag_palette[i]} : std::string_view{};
             tag_fields_[i].set(to_wide(cur));
@@ -750,7 +752,7 @@ private:
     }
 
     void save_and_apply() {
-        commit_field(active_field_);
+        commit_field(active_field_, false);
         live_apply_pending_ = false;
         if (hwnd_) KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
         error_msg_.clear();
@@ -2143,7 +2145,11 @@ private:
                         return 0;
                     case TIMER_LIVE_PREVIEW:
                         KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
-                        if (live_apply_pending_) apply_live_preview();
+                        if (live_apply_pending_ && visible()) {
+                            apply_live_preview();
+                        } else {
+                            live_apply_pending_ = false;
+                        }
                         return 0;
                     default:
                         break;
