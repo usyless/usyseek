@@ -37,6 +37,7 @@ public:
                                 WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN, 0, 0, 100, 100, nullptr, nullptr, inst, this);
         if (!hwnd_) return false;
         SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
+        applied_pad_ = active_pad();
         apply_window_theme(hwnd_, sh_.theme, true, true);
         if (!target_.attach(sh_.gfx, hwnd_, glass_active())) return false;
         gfx_epoch_ = sh_.gfx.epoch();
@@ -56,7 +57,26 @@ public:
     WindowTarget& target() noexcept { return target_; }
 
     void apply_theme() noexcept {
+        const ShadowPad prev = applied_pad_;
+        const ShadowPad next = active_pad();
+        applied_pad_ = next;
         apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
+        if (hwnd_ && !fullscreen_ && prev != next && visible()) {
+            RECT wr{};
+            GetWindowRect(hwnd_, &wr);
+            const UINT dpi = GetDpiForWindow(hwnd_);
+            const float s = dpi > 0 ? static_cast<float>(dpi) / 96.0f : target_.scale();
+            const LONG pl = static_cast<LONG>(std::lround((next.left - prev.left) * s));
+            const LONG pt = static_cast<LONG>(std::lround((next.top - prev.top) * s));
+            const LONG pr = static_cast<LONG>(std::lround((next.right - prev.right) * s));
+            const LONG pb = static_cast<LONG>(std::lround((next.bottom - prev.bottom) * s));
+            SetWindowPos(hwnd_, nullptr, wr.left - pl, wr.top - pt,
+                         (wr.right - wr.left) + pl + pr, (wr.bottom - wr.top) + pt + pb,
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        } else if (hwnd_) {
+            SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
         target_.set_liquid_glass(glass_active());
         if (glass_active()) {
             if (visible() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
@@ -458,6 +478,35 @@ private:
         placing_dpi_ = 0;
     }
 
+    struct ShadowPad {
+        float left = 0.0f;
+        float top = 0.0f;
+        float right = 0.0f;
+        float bottom = 0.0f;
+        [[nodiscard]] bool operator==(const ShadowPad&) const noexcept = default;
+    };
+
+    [[nodiscard]] bool custom_pill_frame() const noexcept {
+        return !fullscreen_ && sh_.theme.pill_radius.has_value();
+    }
+
+    [[nodiscard]] ShadowPad active_pad() const noexcept {
+        return custom_pill_frame() ? ShadowPad{.left = 14.0f, .top = 8.0f, .right = 14.0f, .bottom = 20.0f} : ShadowPad{};
+    }
+
+    [[nodiscard]] D2D1_RECT_F pill_bounds(D2D1_SIZE_F sz) const noexcept {
+        const ShadowPad p = active_pad();
+        return D2D1::RectF(p.left, p.top,
+                           std::max(p.left + 1.0f, sz.width - p.right),
+                           std::max(p.top + 1.0f, sz.height - p.bottom));
+    }
+
+    [[nodiscard]] float effective_pill_radius(D2D1_RECT_F pr) const noexcept {
+        if (fullscreen_) return 0.0f;
+        const float raw = sh_.theme.pill_radius.value_or(sh_.theme.round_corners ? 12.0f : 0.0f);
+        return std::clamp(raw, 0.0f, std::min(width(pr), height(pr)) * 0.5f);
+    }
+
     void place() noexcept {
         if (fullscreen_) return;
         POINT cur;
@@ -465,7 +514,9 @@ private:
         HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
         const POINT saved{.x = sh_.settings.pill_x, .y = sh_.settings.pill_y};
         bool use_saved = sh_.settings.pill_x != INT32_MIN;
-        const auto size_on = [&](HMONITOR m) noexcept {
+        const ShadowPad pad = active_pad();
+        applied_pad_ = pad;
+        const auto content_size_on = [&](HMONITOR m) noexcept {
             const float s = static_cast<float>(monitor_dpi(m)) / 96.0f;
             return SIZE{.cx = static_cast<LONG>((sh_.settings.pill_w > 0 ? static_cast<float>(sh_.settings.pill_w) : DEFAULT_W) * s),
                         .cy = static_cast<LONG>(current_height_dip() * s)};
@@ -474,7 +525,7 @@ private:
             // Windows gives a window the DPI of the monitor holding most of it, not the one under its top-left corner.
             HMONITOR guess = MonitorFromPoint(saved, MONITOR_DEFAULTTONULL);
             if (!guess) guess = MonitorFromPoint(saved, MONITOR_DEFAULTTONEAREST);
-            const SIZE est = size_on(guess);
+            const SIZE est = content_size_on(guess);
             const RECT predicted{.left = saved.x, .top = saved.y, .right = saved.x + est.cx, .bottom = saved.y + est.cy};
             if (HMONITOR m = MonitorFromRect(&predicted, MONITOR_DEFAULTTONULL)) {
                 mon = m;
@@ -483,16 +534,21 @@ private:
             }
         }
         const UINT dpi = monitor_dpi(mon);
-        const SIZE sz = size_on(mon);
+        const float s = static_cast<float>(dpi) / 96.0f;
+        const SIZE csz = content_size_on(mon);
+        const int pad_l = static_cast<int>(std::lround(pad.left * s));
+        const int pad_t = static_cast<int>(std::lround(pad.top * s));
+        const int pad_r = static_cast<int>(std::lround(pad.right * s));
+        const int pad_b = static_cast<int>(std::lround(pad.bottom * s));
         MONITORINFO mi{.cbSize = sizeof(mi)};
         GetMonitorInfoW(mon, &mi);
         const RECT& wa = mi.rcWork;
         const int wa_w = std::max<int>(1, wa.right - wa.left);
         const int wa_h = std::max<int>(1, wa.bottom - wa.top);
-        const int w = std::min<int>(sz.cx, wa_w);
-        const int h = std::min<int>(sz.cy, wa_h);
-        int x = use_saved ? saved.x : wa.left + ((wa_w - w) / 2);
-        int y = use_saved ? saved.y : wa.top + ((wa_h - h) / 5);
+        const int w = std::min<int>(csz.cx + pad_l + pad_r, wa_w);
+        const int h = std::min<int>(csz.cy + pad_t + pad_b, wa_h);
+        int x = (use_saved ? saved.x : wa.left + ((wa_w - csz.cx) / 2)) - pad_l;
+        int y = (use_saved ? saved.y : wa.top + ((wa_h - csz.cy) / 5)) - pad_t;
         x = std::clamp<int>(x, wa.left, wa.right - w);
         y = std::clamp<int>(y, wa.top, wa.bottom - h);
         set_pos_for_dpi(HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE, dpi);
@@ -642,12 +698,13 @@ private:
         GetWindowRect(hwnd_, &wr);
         const UINT dpi = GetDpiForWindow(hwnd_);
         const float s = dpi > 0 ? static_cast<float>(dpi) / 96.0f : target_.scale();
+        const ShadowPad pad = active_pad();
         MONITORINFO mi{.cbSize = sizeof(mi)};
         int max_h = INT_MAX;
         if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) {
             max_h = std::max<int>(1, mi.rcWork.bottom - mi.rcWork.top);
         }
-        const int h = std::min(static_cast<int>(current_height_dip() * s), max_h);
+        const int h = std::min(static_cast<int>(std::lround((current_height_dip() + pad.top + pad.bottom) * s)), max_h);
         if (wr.bottom - wr.top != h) SetWindowPos(hwnd_, nullptr, 0, 0, wr.right - wr.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
@@ -655,10 +712,14 @@ private:
         if (fullscreen_) return;
         RECT wr;
         GetWindowRect(hwnd_, &wr);
-        sh_.settings.pill_x = wr.left;
-        sh_.settings.pill_y = wr.top;
-        sh_.settings.pill_w = static_cast<int32_t>(static_cast<float>(wr.right - wr.left) / target_.scale());
-        if (expanded()) sh_.settings.pill_h = static_cast<int32_t>(static_cast<float>(wr.bottom - wr.top) / target_.scale());
+        const float s = target_.scale();
+        const ShadowPad pad = active_pad();
+        sh_.settings.pill_x = wr.left + static_cast<int32_t>(std::lround(pad.left * s));
+        sh_.settings.pill_y = wr.top + static_cast<int32_t>(std::lround(pad.top * s));
+        sh_.settings.pill_w = std::max<int32_t>(1, static_cast<int32_t>(std::lround((static_cast<float>(wr.right - wr.left) / s) - pad.left - pad.right)));
+        if (expanded()) {
+            sh_.settings.pill_h = std::max<int32_t>(1, static_cast<int32_t>(std::lround((static_cast<float>(wr.bottom - wr.top) / s) - pad.top - pad.bottom)));
+        }
         sh_.save();
     }
 
@@ -666,30 +727,42 @@ private:
         if (!fullscreen_) {
             GetWindowRect(hwnd_, &restore_rect_);
             restore_dpi_ = GetDpiForWindow(hwnd_);
+            const float rs = (restore_dpi_ > 0 ? static_cast<float>(restore_dpi_) : 96.0f) / 96.0f;
+            restore_rect_.left += static_cast<LONG>(std::lround(applied_pad_.left * rs));
+            restore_rect_.top += static_cast<LONG>(std::lround(applied_pad_.top * rs));
+            restore_rect_.right -= static_cast<LONG>(std::lround(applied_pad_.right * rs));
+            restore_rect_.bottom -= static_cast<LONG>(std::lround(applied_pad_.bottom * rs));
             HMONITOR mon = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
             MONITORINFO mi{.cbSize = sizeof(mi)};
             GetMonitorInfoW(mon, &mi);
             fullscreen_ = true;
+            applied_pad_ = active_pad();
             apply_window_theme(hwnd_, sh_.theme, true, false);
             const RECT& r = mi.rcMonitor;
             set_pos_for_dpi(HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED, monitor_dpi(mon));
         } else {
             fullscreen_ = false;
+            applied_pad_ = active_pad();
             apply_window_theme(hwnd_, sh_.theme, true, true);
             // The restore rect was captured at `restore_dpi_`; rescale it if that monitor's scale changed meanwhile.
             const RECT& r = restore_rect_;
             HMONITOR mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
             const UINT dpi_now = monitor_dpi(mon);
             const float k = restore_dpi_ > 0 ? static_cast<float>(dpi_now) / static_cast<float>(restore_dpi_) : 1.0f;
+            const float ns = static_cast<float>(dpi_now) / 96.0f;
+            const int pad_l = static_cast<int>(std::lround(applied_pad_.left * ns));
+            const int pad_t = static_cast<int>(std::lround(applied_pad_.top * ns));
+            const int pad_r = static_cast<int>(std::lround(applied_pad_.right * ns));
+            const int pad_b = static_cast<int>(std::lround(applied_pad_.bottom * ns));
             MONITORINFO mi{.cbSize = sizeof(mi)};
             GetMonitorInfoW(mon, &mi);
             const RECT& wa = mi.rcWork;
             const int wa_w = std::max<int>(1, wa.right - wa.left);
             const int wa_h = std::max<int>(1, wa.bottom - wa.top);
-            const int w = std::min<int>(static_cast<int>(std::lround(static_cast<float>(r.right - r.left) * k)), wa_w);
-            const int h = std::min<int>(static_cast<int>(std::lround(static_cast<float>(r.bottom - r.top) * k)), wa_h);
-            const int x = std::clamp<int>(r.left, wa.left, wa.right - w);
-            const int y = std::clamp<int>(r.top, wa.top, wa.bottom - h);
+            const int w = std::min<int>(static_cast<int>(std::lround(static_cast<float>(r.right - r.left) * k)) + pad_l + pad_r, wa_w);
+            const int h = std::min<int>(static_cast<int>(std::lround(static_cast<float>(r.bottom - r.top) * k)) + pad_t + pad_b, wa_h);
+            const int x = std::clamp<int>(r.left - pad_l, wa.left, wa.right - w);
+            const int y = std::clamp<int>(r.top - pad_t, wa.top, wa.bottom - h);
             set_pos_for_dpi(HWND_TOPMOST, x, y, w, h, SWP_FRAMECHANGED, dpi_now);
             apply_height();
         }
@@ -885,9 +958,9 @@ private:
 
     [[nodiscard]] Grid grid() const noexcept {
         Grid g;
-        const D2D1_SIZE_F sz = target_.size();
-        g.view = D2D1::RectF(0, HEADER_H + STATUS_H + 1.0f, sz.width, sz.height);
-        const float avail = sz.width - (PAD * 2);
+        const D2D1_RECT_F pr = pill_bounds(target_.size());
+        g.view = D2D1::RectF(pr.left, pr.top + HEADER_H + STATUS_H + 1.0f, pr.right, pr.bottom);
+        const float avail = width(pr) - (PAD * 2);
         g.cols = cols_for_zoom(avail, effective_grid_zoom());
         g.card_w = std::floor((avail - (GAP * static_cast<float>(g.cols - 1))) / static_cast<float>(g.cols));
         g.thumb_h = std::round((g.card_w - 12.0f) * 10.0f / 16.0f);
@@ -926,7 +999,7 @@ private:
     }
 
     void step_grid_zoom(int dir) {
-        const float avail = std::max(1.0f, target_.size().width - (PAD * 2.0f));
+        const float avail = std::max(1.0f, width(pill_bounds(target_.size())) - (PAD * 2.0f));
         const Grid g = grid();
         if (dir > 0) {
             if (g.cols <= 1) return;
@@ -957,7 +1030,7 @@ private:
     [[nodiscard]] D2D1_RECT_F card_rect(const Grid& g, int i) const noexcept {
         const int row = i / g.cols;
         const int col = i % g.cols;
-        const float x = PAD + (static_cast<float>(col) * (g.card_w + GAP));
+        const float x = g.view.left + PAD + (static_cast<float>(col) * (g.card_w + GAP));
         const float y = g.view.top + PAD + (static_cast<float>(row) * (g.card_h + GAP)) - scroll_;
         return rect(x, y, g.card_w, g.card_h);
     }
@@ -1141,39 +1214,102 @@ private:
         return glass_active() && (preview_ >= 0 || menu_open_ || drop_open_ || show_help());
     }
 
+    static void draw_pill_shadow(Canvas& cv, D2D1_RECT_F pr, float radius) noexcept {
+        const float scaled = 0.34f * cv.theme().shadow_alpha_scale;
+        if (scaled <= 0.002f) return;
+        if (const auto dc_clip = cv.dirty_clip()) {
+            const D2D1_RECT_F inner = inset(pr, 0.5f, 0.5f);
+            if (dc_clip->left >= inner.left && dc_clip->top >= inner.top &&
+                dc_clip->right <= inner.right && dc_clip->bottom <= inner.bottom) {
+                return;
+            }
+        }
+        constexpr int steps = 10;
+        constexpr float spread = 16.0f;
+        const D2D1_RECT_F bounds = D2D1::RectF(
+            pr.left - (spread * 0.65f) - 1.0f,
+            pr.top - (spread * 0.25f) - 1.0f,
+            pr.right + (spread * 0.65f) + 1.0f,
+            pr.bottom + spread + 1.0f);
+        if (!cv.intersects_clip(bounds, 1.0f)) return;
+
+        for (int i = steps; i >= 1; --i) {
+            const float t = static_cast<float>(i) / static_cast<float>(steps);
+            const float g = spread * t;
+            const float falloff = (1.0f - t) * (1.0f - t);
+            const float a = (scaled / static_cast<float>(steps)) * (0.25f + (1.5f * falloff));
+            cv.fill_round(
+                D2D1::RectF(pr.left - (g * 0.65f), pr.top - (g * 0.25f), pr.right + (g * 0.65f), pr.bottom + g),
+                radius > 0.0f ? (radius + (g * 0.85f)) : (g * 0.65f),
+                hex(0x000000, a));
+        }
+        // Punch out the pill interior so translucent themes/glass never darken from the shadow fill underneath.
+        ID2D1DeviceContext6* dc = cv.dc();
+        dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+        cv.fill_round(inset(pr, 0.5f, 0.5f), std::max(0.0f, radius - 0.5f), D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+        dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+    }
+
     void draw(Canvas& cv) {
         const D2D1_SIZE_F sz = target_.size();
+        const D2D1_RECT_F pr = pill_bounds(sz);
+        const bool custom_frame = custom_pill_frame();
+        const float outer_r = effective_pill_radius(pr);
+        if (custom_frame) draw_pill_shadow(cv, pr, outer_r);
+
         const bool glass = glass_active();
         const bool need_scene = glass_scene_needed();
         const bool has_scene = need_scene && glass_.begin_scene(target_, sh_.gfx);
         if (glass) {
-            const float outer_r = fullscreen_ ? 0.0f : 12.0f;
-            if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
+            if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, pr,
                                            make_desktop_glass_style(cv.theme(), outer_r, fullscreen_))) {
-                cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
+                if (custom_frame) {
+                    cv.fill_round(pr, outer_r, with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
+                } else {
+                    cv.fill(pr, with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
+                }
             }
+        } else if (custom_frame) {
+            cv.fill_round(pr, outer_r, with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
         } else {
-            cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
+            cv.fill(pr, with_alpha(cv.theme().bg, cv.theme().pill_bg_alpha));
         }
         if (preview_ >= 0) {
-            draw_preview(cv, sz);
+            draw_preview(cv, pr, custom_frame, outer_r);
+            if (custom_frame && !glass && cv.theme().pill_border.a > 0.0f) {
+                cv.stroke_round(pr, outer_r, cv.theme().pill_border, 1.0f);
+            }
             if (menu_open_) draw_menu(cv);
             draw_active_tooltip(cv, sz);
             return;
         }
-        if (expanded()) draw_grid(cv);
+        if (expanded()) {
+            const bool clipped = custom_frame && cv.push_round_clip(pr, outer_r);
+            if (custom_frame && !clipped) cv.push_clip(pr);
+            draw_grid(cv);
+            if (custom_frame) cv.pop_round_clip(clipped);
+        }
         if (has_scene) glass_.end_scene(target_);
-        draw_header(cv, sz);
-        draw_status(cv, sz);
-        if (drop_open_) draw_dropdown(cv);
-        if (show_help()) draw_help(cv, sz);
+        {
+            const bool clipped = custom_frame && cv.push_round_clip(pr, outer_r);
+            if (custom_frame && !clipped) cv.push_clip(pr);
+            draw_header(cv, pr);
+            draw_status(cv, pr);
+            if (custom_frame) cv.pop_round_clip(clipped);
+        }
+        if (custom_frame && !glass && cv.theme().pill_border.a > 0.0f) {
+            cv.stroke_round(pr, outer_r, cv.theme().pill_border, 1.0f);
+        }
+        if (drop_open_) draw_dropdown(cv, pr);
+        if (show_help()) draw_help(cv, pr);
         if (menu_open_) draw_menu(cv);
         draw_active_tooltip(cv, sz);
     }
 
     void icon_button(Canvas& cv, D2D1_RECT_F r, wchar_t g, int id, bool active = false) {
         const float ha = hover_.alpha(id);
-        const float rad = height(r) * 0.5f;
+        const float btn_r = cv.theme().button_radius;
+        const float rad = std::min(height(r) * 0.5f, btn_r <= 0.0f ? 0.0f : (btn_r + 8.0f));
         if (is_liquid_glass(cv.theme())) {
             const bool dark = cv.theme().dark_mode;
             if (active || ha > 0.002f) {
@@ -1211,17 +1347,17 @@ private:
         cv.hit(r, id);
     }
 
-    void draw_header(Canvas& cv, D2D1_SIZE_F sz) {
-        const float cy = HEADER_H / 2;
+    void draw_header(Canvas& cv, D2D1_RECT_F pr) {
+        const float cy = pr.top + (HEADER_H / 2);
         // Search glyph with a status dot
-        const D2D1_RECT_F ic = rect(16, cy - 12, 24, 24);
+        const D2D1_RECT_F ic = rect(pr.left + 16, cy - 12, 24, 24);
         cv.icon(glyph::search, ic, cv.theme().on_surface_variant, Font::IconLarge);
         const D2D1_COLOR_F dot = status_dot_color();
         cv.fill_circle({.x = ic.left + 20, .y = ic.top + 20}, 4.5f, cv.theme().bg);
         cv.fill_circle({.x = ic.left + 20, .y = ic.top + 20}, 3.0f, dot);
 
         // Right cluster: close, fullscreen, settings | tag, chips
-        float x = sz.width - 12;
+        float x = pr.right - 12;
         const auto btn = [&](wchar_t g, int id, bool active = false) {
             x -= 36;
             icon_button(cv, rect(x, cy - 18, 36, 36), g, id, active);
@@ -1229,6 +1365,7 @@ private:
         btn(glyph::close, IdClose);
         btn(fullscreen_ ? glyph::exit_fullscreen : glyph::fullscreen, IdFullscreen);
         btn(glyph::settings, IdSettings);
+        const float btn_r = cv.theme().button_radius;
         if (!sh_.notifications.empty()) {
             const bool has_err = sh_.error_notification_count() > 0;
             const D2D1_COLOR_F ncol = has_err ? cv.theme().error : cv.theme().amber;
@@ -1237,19 +1374,20 @@ private:
             const float bw = std::max(44.0f, 26.0f + cv.measure(cnt, Font::Caption) + 12.0f);
             x -= bw + 4;
             const D2D1_RECT_F nr = rect(x, cy - 15, bw, 30);
+            const float nr_rad = std::min(15.0f, offset_radius(btn_r, 5.0f));
             const float ha = hover_.alpha(IdNotifyBtn);
             if (is_liquid_glass(cv.theme())) {
                 const GlassStyle gs = make_control_glass_style(
-                    cv.theme(), 15.0f, with_alpha(ncol, lerp(0.20f, 0.34f, ha)), 1.0f, 0.0f, 8.0f, 1.08f);
+                    cv.theme(), nr_rad, with_alpha(ncol, lerp(0.20f, 0.34f, ha)), 1.0f, 0.0f, 8.0f, 1.08f);
                 if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, nr, gs)) {
-                    draw_glass_box(cv, nr, 15.0f, with_alpha(ncol, lerp(0.18f, 0.30f, ha)),
+                    draw_glass_box(cv, nr, nr_rad, with_alpha(ncol, lerp(0.18f, 0.30f, ha)),
                                    with_alpha(ncol, lerp(0.45f, 0.75f, ha)));
                 } else {
-                    cv.stroke_round(nr, 15.0f, with_alpha(ncol, lerp(0.40f, 0.70f, ha)), 1.0f);
+                    cv.stroke_round(nr, nr_rad, with_alpha(ncol, lerp(0.40f, 0.70f, ha)), 1.0f);
                 }
             } else {
-                cv.fill_round(nr, 15, lerp_color(with_alpha(ncol, 0.16f), with_alpha(ncol, 0.28f), ha));
-                cv.stroke_round(nr, 15, with_alpha(ncol, lerp(0.45f, 0.75f, ha)));
+                cv.fill_round(nr, nr_rad, lerp_color(with_alpha(ncol, 0.16f), with_alpha(ncol, 0.28f), ha));
+                cv.stroke_round(nr, nr_rad, with_alpha(ncol, lerp(0.45f, 0.75f, ha)));
             }
             cv.icon(glyph::warning, rect(nr.left + 8, nr.top, 16, 30), ncol, Font::IconSmall);
             cv.text(cnt, rect(nr.left + 25, nr.top, bw - 31, 30), Font::Caption, ncol);
@@ -1273,20 +1411,22 @@ private:
         }
         x -= total;
         const D2D1_RECT_F seg = rect(x, cy - 17, total, 34);
+        const float seg_rad = std::min(17.0f, offset_radius(btn_r, 7.0f));
+        const float chip_rad = std::min(14.0f, offset_radius(btn_r, 4.0f));
         const bool glass_ui = is_liquid_glass(cv.theme());
         const bool dark = cv.theme().dark_mode;
         if (glass_ui) {
             const GlassStyle seg_gs = make_control_glass_style(
-                cv.theme(), 17.0f, with_alpha(cv.theme().surface_high, dark ? 0.24f : 0.34f), 1.0f, 0.0f, 10.0f, 1.05f);
+                cv.theme(), seg_rad, with_alpha(cv.theme().surface_high, dark ? 0.24f : 0.34f), 1.0f, 0.0f, 10.0f, 1.05f);
             if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, seg, seg_gs)) {
-                draw_glass_box(cv, seg, 17,
+                draw_glass_box(cv, seg, seg_rad,
                                with_alpha(cv.theme().surface_high, dark ? 0.26f : 0.36f),
                                with_alpha(hex(0xffffff), dark ? 0.20f : 0.62f));
             } else {
-                cv.stroke_round(inset(seg, -0.5f, -0.5f), 17.5f, with_alpha(hex(0x000000), dark ? 0.24f : 0.08f), 1.0f);
+                cv.stroke_round(inset(seg, -0.5f, -0.5f), seg_rad + 0.5f, with_alpha(hex(0x000000), dark ? 0.24f : 0.08f), 1.0f);
             }
         } else {
-            cv.fill_round(seg, 17, with_alpha(cv.theme().surface_highest, 0.85f));
+            cv.fill_round(seg, seg_rad, with_alpha(cv.theme().surface_highest, 0.85f));
         }
         std::array<D2D1_RECT_F, 3> chip_rects; // NOLINT(cppcoreguidelines-pro-type-member-init)
         float cx = x + 3;
@@ -1301,12 +1441,12 @@ private:
             if (ha > 0.002f) {
                 if (glass_ui) {
                     const GlassStyle h_gs = make_control_glass_style(
-                        cv.theme(), 14.0f, with_alpha(hex(0xffffff), dark ? 0.12f : 0.34f), ha, 0.0f, 7.0f, 1.06f);
+                        cv.theme(), chip_rad, with_alpha(hex(0xffffff), dark ? 0.12f : 0.34f), ha, 0.0f, 7.0f, 1.06f);
                     if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, chip_rects[i], h_gs)) {
-                        cv.fill_round(chip_rects[i], 14, with_alpha(hex(0xffffff), (dark ? 0.10f : 0.32f) * ha));
+                        cv.fill_round(chip_rects[i], chip_rad, with_alpha(hex(0xffffff), (dark ? 0.10f : 0.32f) * ha));
                     }
                 } else {
-                    cv.fill_round(chip_rects[i], 14, with_alpha(cv.theme().on_surface, 0.07f * ha));
+                    cv.fill_round(chip_rects[i], chip_rad, with_alpha(cv.theme().on_surface, 0.07f * ha));
                 }
             }
         }
@@ -1315,16 +1455,16 @@ private:
         const D2D1_RECT_F active_chip = lerp_rect(chip_rects[lo], chip_rects[lo + 1], frac);
         if (glass_ui) {
             const GlassStyle act_gs = make_control_glass_style(
-                cv.theme(), 14.0f, with_alpha(cv.theme().primary, dark ? 0.34f : 0.28f), 1.0f, 0.0f, 9.0f, 1.12f);
+                cv.theme(), chip_rad, with_alpha(cv.theme().primary, dark ? 0.34f : 0.28f), 1.0f, 0.0f, 9.0f, 1.12f);
             if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, active_chip, act_gs)) {
-                draw_glass_box(cv, active_chip, 14,
+                draw_glass_box(cv, active_chip, chip_rad,
                                with_alpha(cv.theme().primary, dark ? 0.28f : 0.22f),
                                with_alpha(cv.theme().primary, dark ? 0.65f : 0.58f));
             } else {
-                cv.stroke_round(active_chip, 14, with_alpha(cv.theme().primary, dark ? 0.55f : 0.50f), 1.0f);
+                cv.stroke_round(active_chip, chip_rad, with_alpha(cv.theme().primary, dark ? 0.55f : 0.50f), 1.0f);
             }
         } else {
-            cv.fill_round(active_chip, 14, cv.theme().primary_container);
+            cv.fill_round(active_chip, chip_rad, cv.theme().primary_container);
         }
         for (int i = 0; i < 3; ++i) {
             const float act = std::max(0.0f, 1.0f - std::abs(ct - static_cast<float>(i)));
@@ -1334,10 +1474,10 @@ private:
         }
 
         // Text field
-        const D2D1_RECT_F fr = D2D1::RectF(52, 8, x - 14, HEADER_H - 8);
+        const D2D1_RECT_F fr = D2D1::RectF(pr.left + 52, pr.top + 8, x - 14, pr.top + HEADER_H - 8);
         cv.hit(fr, IdField);
         field_.draw(cv, D2D1::RectF(fr.left, fr.top, fr.right, fr.bottom), Font::Input, cv.theme().on_surface, cv.theme().outline);
-        cv.hline(0, sz.width, HEADER_H, with_alpha(cv.theme().outline_variant, 0.7f));
+        cv.hline(pr.left, pr.right, pr.top + HEADER_H, with_alpha(cv.theme().outline_variant, 0.7f));
     }
 
     [[nodiscard]] D2D1_COLOR_F status_dot_color() const noexcept {
@@ -1351,9 +1491,9 @@ private:
         return sh_.theme.mint;
     }
 
-    void draw_status(Canvas& cv, D2D1_SIZE_F sz) {
-        const float y = HEADER_H + 1;
-        float x = 18;
+    void draw_status(Canvas& cv, D2D1_RECT_F pr) {
+        const float y = pr.top + HEADER_H + 1;
+        float x = pr.left + 18;
         auto piece = [&](std::wstring_view s, D2D1_COLOR_F c, Font f = Font::Caption) {
             if (s.empty()) return;
             const float w = cv.measure(s, f);
@@ -1435,6 +1575,7 @@ private:
             hk_msg.append(L" is taken by another app");
             piece(hk_msg, cv.theme().amber);
         }
+        const float badge_rad = std::min(6.0f, cv.theme().button_radius * 0.6f);
         if (!sh_.notifications.empty()) {
             sep();
             const bool has_err = sh_.error_notification_count() > 0;
@@ -1445,18 +1586,18 @@ private:
             const float nw = cv.measure(ntxt, Font::SmallSemi);
             const D2D1_RECT_F nr = rect(x - 4, y + 3, nw + 8, STATUS_H - 6);
             if (const float ha = hover_.alpha(IdStatusNotify); ha > 0.002f) {
-                cv.fill_round(nr, 6, with_alpha(nc, 0.14f * ha));
+                cv.fill_round(nr, badge_rad, with_alpha(nc, 0.14f * ha));
             }
             cv.text(ntxt, rect(x, y, nw + 2, STATUS_H), Font::SmallSemi, nc);
             cv.hit(nr, IdStatusNotify);
             x += nw;
         }
 
-        float right_edge = sz.width - 18.0f;
+        float right_edge = pr.right - 18.0f;
         if (is_grid_zoomed()) {
             const D2D1_RECT_F zr = rect(right_edge - 24.0f, y + 3.0f, 24.0f, STATUS_H - 6.0f);
             const float ha = hover_.alpha(IdZoomReset);
-            cv.fill_round(zr, 6.0f, lerp_color(with_alpha(cv.theme().primary, 0.14f), with_alpha(cv.theme().primary, 0.26f), ha));
+            cv.fill_round(zr, badge_rad, lerp_color(with_alpha(cv.theme().primary, 0.14f), with_alpha(cv.theme().primary, 0.26f), ha));
             cv.icon(glyph::search, zr, lerp_color(cv.theme().primary, cv.theme().on_primary_container, ha * 0.35f), Font::IconSmall);
             cv.hit(zr, IdZoomReset);
             right_edge -= 32.0f;
@@ -1472,7 +1613,7 @@ private:
             right.append(L" results");
             cv.text(right, D2D1::RectF(x + 12, y, right_edge, y + STATUS_H), Font::Caption, cv.theme().outline, Align::Right);
         }
-        if (expanded()) cv.hline(0, sz.width, HEADER_H + STATUS_H, with_alpha(cv.theme().outline_variant, 0.5f));
+        if (expanded()) cv.hline(pr.left, pr.right, pr.top + HEADER_H + STATUS_H, with_alpha(cv.theme().outline_variant, 0.5f));
     }
 
     void draw_grid(Canvas& cv) {
@@ -1556,6 +1697,8 @@ private:
 
         const bool glass_ui = is_liquid_glass(cv.theme());
         const bool dark = cv.theme().dark_mode;
+        const float crad = cv.theme().card_radius;
+        const float trad = cv.theme().thumb_radius;
         if (glass_ui) {
             const D2D1_COLOR_F card_fill = with_alpha(lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha),
                                                       dark ? lerp(0.28f, 0.40f, ha) : lerp(0.38f, 0.52f, ha));
@@ -1563,15 +1706,15 @@ private:
                 ? cv.theme().primary
                 : (focus ? with_alpha(cv.theme().primary, 0.72f)
                          : with_alpha(hex(0xffffff), dark ? lerp(0.18f, 0.36f, ha) : lerp(0.55f, 0.85f, ha)));
-            draw_glass_box(cv, r, 14, card_fill, card_border, sel ? 2.0f : 1.0f);
+            draw_glass_box(cv, r, crad, card_fill, card_border, sel ? 2.0f : 1.0f);
         } else {
-            cv.fill_round(r, 14, with_alpha(lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha), 0.92f));
+            cv.fill_round(r, crad, with_alpha(lerp_color(cv.theme().surface_low, cv.theme().surface_high, ha), 0.92f));
             if (sel) {
-                cv.stroke_round(r, 14, cv.theme().primary, 2.0f);
+                cv.stroke_round(r, crad, cv.theme().primary, 2.0f);
             } else if (focus) {
-                cv.stroke_round(r, 14, with_alpha(cv.theme().primary, 0.6f), 1.0f);
+                cv.stroke_round(r, crad, with_alpha(cv.theme().primary, 0.6f), 1.0f);
             } else {
-                cv.stroke_round(r, 14, with_alpha(cv.theme().outline_variant, lerp(0.45f, 0.9f, ha)));
+                cv.stroke_round(r, crad, with_alpha(cv.theme().outline_variant, lerp(0.45f, 0.9f, ha)));
             }
         }
         cv.hit(r, IdCard, i);
@@ -1581,11 +1724,11 @@ private:
         if (ID2D1Bitmap1* bmp = sh_.thumbs.get(it.pt.id)) {
             const ThumbFit fit = parse_thumb_fit(sh_.settings.thumb_fit);
             if (fit == ThumbFit::Contain) {
-                cv.fill_round(tr, 10, glass_ui ? with_alpha(cv.theme().surface_lowest, dark ? 0.24f : 0.35f) : cv.theme().surface_lowest);
+                cv.fill_round(tr, trad, glass_ui ? with_alpha(cv.theme().surface_lowest, dark ? 0.24f : 0.35f) : cv.theme().surface_lowest);
             }
-            cv.fill_bitmap_round(bmp, tr, 10.0f, fit);
+            cv.fill_bitmap_round(bmp, tr, trad, fit);
         } else {
-            cv.fill_round(tr, 10, with_alpha(cv.theme().surface_highest, glass_ui ? (dark ? 0.24f : 0.36f) : 0.6f));
+            cv.fill_round(tr, trad, with_alpha(cv.theme().surface_highest, glass_ui ? (dark ? 0.24f : 0.36f) : 0.6f));
             cv.icon(it.pt.p.k == 1 ? glyph::video : glyph::photo, tr, with_alpha(cv.theme().outline, 0.6f), Font::IconLarge);
         }
 
@@ -1593,12 +1736,13 @@ private:
             const std::wstring_view dur = it.duration_w;
             const float dw = cv.measure(dur, Font::Caption);
             const D2D1_RECT_F b = rect(tr.right - dw - 34, tr.bottom - 30, dw + 26, 22);
-            cv.fill_round(b, 11, hex(0x000000, 0.62f));
+            cv.fill_round(b, std::min(11.0f, offset_radius(cv.theme().button_radius, 1.0f)), hex(0x000000, 0.62f));
             cv.icon(glyph::play, rect(b.left + 6, b.top, 14, 22), hex(0xffffff), Font::IconSmall);
             cv.text(dur, rect(b.left + 21, b.top, dw + 2, 22), Font::Caption, hex(0xffffff));
         }
         if (ha > 0.002f) {
             const Canvas::ScopedOpacity op{cv, ha};
+            const float ob_rad = std::min(14.0f, offset_radius(cv.theme().button_radius, 4.0f));
             const auto overlay_btn = [&](float x, wchar_t g, int id) {
                 const D2D1_RECT_F sb = rect(x, tr.top + 8, 28, 28);
                 const float ba = hover_.alpha(id, i);
@@ -1607,10 +1751,10 @@ private:
                                                         with_alpha(cv.theme().surface_high, dark ? 0.56f : 0.74f), ba);
                     const D2D1_COLOR_F obd = lerp_color(with_alpha(hex(0xffffff), 0.38f),
                                                         with_alpha(cv.theme().primary, 0.72f), ba);
-                    draw_glass_box(cv, sb, 14.0f, obg, obd, 1.0f, dark ? 0.24f : 0.44f);
+                    draw_glass_box(cv, sb, ob_rad, obg, obd, 1.0f, dark ? 0.24f : 0.44f);
                     cv.icon(g, sb, lerp_color(hex(0xffffff), cv.theme().primary, ba), Font::IconSmall);
                 } else {
-                    cv.fill_circle({.x = sb.left + 14, .y = sb.top + 14}, 14, lerp_color(hex(0x000000, 0.55f), with_alpha(cv.theme().surface_high, 0.95f), ba));
+                    cv.fill_round(sb, ob_rad, lerp_color(hex(0x000000, 0.55f), with_alpha(cv.theme().surface_high, 0.95f), ba));
                     cv.icon(g, sb, lerp_color(hex(0xffffff), cv.theme().primary, ba), Font::IconSmall);
                 }
                 cv.hit(sb, id, i);
@@ -1735,18 +1879,20 @@ private:
         run_search(0);
     }
 
-    void draw_dropdown(Canvas& cv) {
-        const float x = 44.0f;
-        const float y = HEADER_H - 4.0f;
+    void draw_dropdown(Canvas& cv, D2D1_RECT_F pr) {
+        const float x = pr.left + 44.0f;
+        const float y = pr.top + HEADER_H - 4.0f;
         const float w = 300.0f;
         const float row = 32.0f;
         const float h = drop_items_.empty() ? 44.0f : (8.0f + (row * static_cast<float>(drop_items_.size())));
         const D2D1_RECT_F r = rect(x, y, w, h);
-        cv.shadow(r, 12);
-        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 12.0f, 1.8f))) {
-            cv.fill_round(r, 12, cv.theme().surface_high);
+        const float pop_rad = offset_radius(cv.theme().card_radius, -2.0f);
+        const float row_rad = offset_radius(cv.theme().button_radius, -2.0f);
+        cv.shadow(r, pop_rad);
+        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), pop_rad, 1.8f))) {
+            cv.fill_round(r, pop_rad, cv.theme().surface_high);
         }
-        cv.stroke_round(r, 12, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
+        cv.stroke_round(r, pop_rad, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
         cv.hit(r, IdDrop);
         if (drop_items_.empty()) {
             cv.text(L"No tags yet", inset(r, 14, 0), Font::Small, cv.theme().outline);
@@ -1755,7 +1901,7 @@ private:
         for (size_t i = 0; i < drop_items_.size(); ++i) {
             const auto& t = drop_items_[i];
             const D2D1_RECT_F rr = rect(x + 4, y + 4 + (row * static_cast<float>(i)), w - 8, row);
-            if (std::cmp_equal(i, drop_sel_)) cv.fill_round(rr, 8, with_alpha(cv.theme().primary, 0.14f));
+            if (std::cmp_equal(i, drop_sel_)) cv.fill_round(rr, row_rad, with_alpha(cv.theme().primary, 0.14f));
             const D2D1_COLOR_F c = cv.tag_color(t.v);
             cv.fill_circle({.x=rr.left + 14, .y=(rr.top + rr.bottom) / 2}, 4, c);
             cv.text(to_wide(t.v), D2D1::RectF(rr.left + 28, rr.top, rr.right - 60, rr.bottom), Font::Body, cv.theme().on_surface);
@@ -1779,26 +1925,29 @@ private:
         {.syntax=L"type:image", .desc=L"Filter media type (image or video)", .insert=L"type:image "},
     },};
 
-    void draw_help(Canvas& cv, D2D1_SIZE_F sz) {
-        const float x = std::clamp(help_btn_x_ + 36.0f - HELP_W, 14.0f, std::max(14.0f, sz.width - HELP_W - 14.0f));
-        const float y = HEADER_H - 4.0f;
+    void draw_help(Canvas& cv, D2D1_RECT_F pr) {
+        const float x = std::clamp(help_btn_x_ + 36.0f - HELP_W, pr.left + 14.0f, std::max(pr.left + 14.0f, pr.right - HELP_W - 14.0f));
+        const float y = pr.top + HEADER_H - 4.0f;
         const D2D1_RECT_F r = rect(x, y, HELP_W, HELP_H);
-        cv.shadow(r, 12, 12, 0.35f);
-        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 12.0f, 1.8f))) {
-            cv.fill_round(r, 12, cv.theme().surface_high);
+        const float pop_rad = offset_radius(cv.theme().card_radius, -2.0f);
+        const float row_rad = offset_radius(cv.theme().button_radius, -2.0f);
+        const float badge_rad = std::min(6.0f, cv.theme().button_radius * 0.6f);
+        cv.shadow(r, pop_rad, 12, 0.35f);
+        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), pop_rad, 1.8f))) {
+            cv.fill_round(r, pop_rad, cv.theme().surface_high);
         }
-        cv.stroke_round(r, 12, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
-        cv.hit(rect(x, HEADER_H - 18.0f, HELP_W, HELP_H + 14.0f), IdHelp);
+        cv.stroke_round(r, pop_rad, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
+        cv.hit(rect(x, pr.top + HEADER_H - 18.0f, HELP_W, HELP_H + 14.0f), IdHelp);
 
         cv.text(L"SEARCH SYNTAX  ·  CLICK TO INSERT", rect(x + 14.0f, y + 8.0f, HELP_W - 28.0f, 22.0f), Font::Label, cv.theme().primary);
         float ry = y + 34.0f;
         for (int i = 0; std::cmp_less(i, std::size(HELP_ROWS)); ++i) {
             const D2D1_RECT_F rr = rect(x + 6.0f, ry, HELP_W - 12.0f, 28.0f);
             if (const float ha = hover_.alpha(IdHelpItem, i); ha > 0.002f && HELP_ROWS[i].insert[0] != 0) {
-                cv.fill_round(rr, 8.0f, with_alpha(cv.theme().primary, 0.12f * ha));
+                cv.fill_round(rr, row_rad, with_alpha(cv.theme().primary, 0.12f * ha));
             }
             const D2D1_RECT_F badge = rect(rr.left + 6.0f, rr.top + 3.0f, 114.0f, 22.0f);
-            cv.fill_round(badge, 6.0f, with_alpha(cv.theme().surface_highest, 0.9f));
+            cv.fill_round(badge, badge_rad, with_alpha(cv.theme().surface_highest, 0.9f));
             cv.text(HELP_ROWS[i].syntax, inset(badge, 8.0f, 0.0f), Font::MonoSmall, cv.theme().primary);
             cv.text(HELP_ROWS[i].desc, D2D1::RectF(rr.left + 130.0f, rr.top, rr.right - 8.0f, rr.bottom), Font::Small, cv.theme().on_surface_variant);
             if (HELP_ROWS[i].insert[0] != 0) cv.hit(rr, IdHelpItem, i);
@@ -1975,21 +2124,24 @@ private:
     }
 
     [[nodiscard]] D2D1_RECT_F menu_rect() const noexcept {
-        const D2D1_SIZE_F sz = target_.size();
+        const D2D1_RECT_F pr = pill_bounds(target_.size());
         const float h = (static_cast<float>(ActCount) * 36.0f) + 16.0f + 30.0f + (static_cast<float>(std::min<size_t>(menu_tags_.size(), 10)) * 32.0f) + 48.0f;
-        const float x = std::min(menu_at_.x, sz.width - MENU_W - 8);
+        const float x = std::min(menu_at_.x, pr.right - MENU_W - 8);
         float y = menu_at_.y;
-        if (y + h > sz.height - 8) y = std::max(8.0f, sz.height - 8 - h);
-        return rect(std::max(8.0f, x), y, MENU_W, h);
+        if (y + h > pr.bottom - 8) y = std::max(pr.top + 8.0f, pr.bottom - 8 - h);
+        return rect(std::max(pr.left + 8.0f, x), y, MENU_W, h);
     }
 
     void draw_menu(Canvas& cv) {
         const D2D1_RECT_F r = menu_rect();
-        cv.shadow(r, 14, 14, 0.4f);
-        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), 14.0f, 2.0f))) {
-            cv.fill_round(r, 14, cv.theme().surface_high);
+        const float menu_rad = cv.theme().card_radius;
+        const float row_rad = offset_radius(cv.theme().button_radius, -2.0f);
+        const float box_rad = std::min(4.0f, cv.theme().button_radius * 0.4f);
+        cv.shadow(r, menu_rad, 14, 0.4f);
+        if (!glass_active() || !glass_.draw_scene_glass(cv, target_, sh_.gfx, r, make_overlay_glass_style(cv.theme(), menu_rad, 2.0f))) {
+            cv.fill_round(r, menu_rad, cv.theme().surface_high);
         }
-        cv.stroke_round(r, 14, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
+        cv.stroke_round(r, menu_rad, with_alpha(cv.theme().outline_variant, glass_active() ? 0.55f : 1.0f));
         cv.hit(r, IdMenu);
 
         struct Act {
@@ -2008,7 +2160,7 @@ private:
         float y = r.top + 6;
         for (int i = 0; i < ActCount; ++i) {
             const D2D1_RECT_F rr = rect(r.left + 6, y, MENU_W - 12, 36);
-            if (const float ha = hover_.alpha(IdMenuItem, i); ha > 0.002f) cv.fill_round(rr, 8, with_alpha(cv.theme().on_surface, 0.08f * ha));
+            if (const float ha = hover_.alpha(IdMenuItem, i); ha > 0.002f) cv.fill_round(rr, row_rad, with_alpha(cv.theme().on_surface, 0.08f * ha));
             cv.icon(acts[i].g, rect(rr.left + 8, rr.top, 20, 36), cv.theme().on_surface_variant);
             cv.text(acts[i].label, D2D1::RectF(rr.left + 38, rr.top, rr.right - 86, rr.bottom), Font::Body, cv.theme().on_surface);
             cv.text(acts[i].key, D2D1::RectF(rr.right - 96, rr.top, rr.right - 10, rr.bottom), Font::Caption, cv.theme().outline, Align::Right);
@@ -2029,14 +2181,14 @@ private:
         for (size_t i = 0; i < menu_tags_.size() && i < 10; ++i) {
             const auto& t = menu_tags_[i];
             const D2D1_RECT_F rr = rect(r.left + 6, y, MENU_W - 12, 32);
-            if (const float ha = hover_.alpha(IdMenuTag, static_cast<int>(i)); ha > 0.002f) cv.fill_round(rr, 8, with_alpha(cv.theme().on_surface, 0.08f * ha));
+            if (const float ha = hover_.alpha(IdMenuTag, static_cast<int>(i)); ha > 0.002f) cv.fill_round(rr, row_rad, with_alpha(cv.theme().on_surface, 0.08f * ha));
             const int st = tag_state(t);
             const D2D1_RECT_F box = rect(rr.left + 10, rr.top + 8, 16, 16);
             if (st == 2) {
-                cv.fill_round(box, 4, cv.theme().primary);
+                cv.fill_round(box, box_rad, cv.theme().primary);
                 cv.icon(glyph::check, box, cv.theme().on_primary, Font::IconSmall);
             } else {
-                cv.stroke_round(box, 4, st == 1 ? cv.theme().primary : cv.theme().outline, 1.5f);
+                cv.stroke_round(box, box_rad, st == 1 ? cv.theme().primary : cv.theme().outline, 1.5f);
                 if (st == 1) cv.fill(rect(box.left + 4, box.top + 7, 8, 2), cv.theme().primary);
             }
             const D2D1_COLOR_F c = cv.tag_color(t);
@@ -2046,8 +2198,8 @@ private:
             y += 32;
         }
         const D2D1_RECT_F fr = rect(r.left + 10, y + 6, MENU_W - 20, 34);
-        cv.fill_round(fr, 8, cv.theme().surface_highest);
-        if (menu_field_.focused) cv.stroke_round(fr, 8, cv.theme().primary, 1.5f);
+        cv.fill_round(fr, row_rad, cv.theme().surface_highest);
+        if (menu_field_.focused) cv.stroke_round(fr, row_rad, cv.theme().primary, 1.5f);
         cv.icon(glyph::add, rect(fr.left + 4, fr.top, 24, 34), cv.theme().outline, Font::IconSmall);
         menu_field_.draw(cv, D2D1::RectF(fr.left + 30, fr.top, fr.right - 10, fr.bottom), Font::Body, cv.theme().on_surface, cv.theme().outline);
         cv.hit(fr, IdMenuField);
@@ -2194,9 +2346,9 @@ private:
         return false;
     }
 
-    [[nodiscard]] static D2D1_RECT_F preview_media_area(D2D1_SIZE_F sz, bool has_controls) noexcept {
-        const float bottom = std::max(PV_TOP + 48.0f, sz.height - PV_BOTTOM - (has_controls ? PV_CONTROLS_H : 0.0f));
-        return D2D1::RectF(16.0f, PV_TOP, std::max(32.0f, sz.width - 16.0f), bottom);
+    [[nodiscard]] static D2D1_RECT_F preview_media_area(D2D1_RECT_F bounds, bool has_controls) noexcept {
+        const float bottom = std::max(bounds.top + PV_TOP + 48.0f, bounds.bottom - PV_BOTTOM - (has_controls ? PV_CONTROLS_H : 0.0f));
+        return D2D1::RectF(bounds.left + 16.0f, bounds.top + PV_TOP, std::max(bounds.left + 32.0f, bounds.right - 16.0f), bottom);
     }
 
     [[nodiscard]] D2D1_RECT_F preview_dest_dims(uint32_t src_w, uint32_t src_h, uint32_t meta_w, uint32_t meta_h, D2D1_RECT_F area) const noexcept {
@@ -2223,7 +2375,7 @@ private:
                 const uint32_t nw = video_.native_width();
                 const uint32_t nh = video_.native_height();
                 if (nw > 0 && nh > 0) {
-                    const D2D1_RECT_F area = preview_media_area(target_.size(), preview_has_controls());
+                    const D2D1_RECT_F area = preview_media_area(pill_bounds(target_.size()), preview_has_controls());
                     const D2D1_RECT_F dest = preview_dest_dims(nw, nh, nw, nh, area);
                     const auto px_w = static_cast<uint32_t>(std::max(1.0f, std::round(width(dest) * target_.scale())));
                     const auto px_h = static_cast<uint32_t>(std::max(1.0f, std::round(height(dest) * target_.scale())));
@@ -2561,7 +2713,7 @@ private:
         cv.hit(D2D1::RectF(bar.left - pad_l, bar.top, bar.right + pad_r, bar.bottom), id);
     }
 
-    void draw_preview_controls(Canvas& cv, D2D1_SIZE_F sz, D2D1_RECT_F area, D2D1_RECT_F dest,
+    void draw_preview_controls(Canvas& cv, D2D1_RECT_F bounds, D2D1_RECT_F area, D2D1_RECT_F dest,
                                const Item& it, bool is_video, bool is_gif) {
         const bool is_video_ctrl = is_video && video_.active() && !video_.failed();
         const bool is_gif_ctrl = is_gif && gif_.has_animation();
@@ -2572,27 +2724,28 @@ private:
             return;
         }
 
-        const float max_bar_w = std::max(280.0f, sz.width - 140.0f);
+        const float max_bar_w = std::max(280.0f, width(bounds) - 140.0f);
         const float min_ctrl_w = is_video_ctrl ? 380.0f : 320.0f;
         const float cw = std::clamp(std::max(min_ctrl_w, width(dest)), 280.0f, max_bar_w);
-        const float cx = (sz.width - cw) * 0.5f;
+        const float cx = bounds.left + ((width(bounds) - cw) * 0.5f);
         const D2D1_RECT_F ctrl = rect(cx, area.bottom + 4.0f, cw, 34.0f);
         pv_ctrl_rect_ = ctrl;
 
+        const float ctrl_rad = std::min(17.0f, offset_radius(cv.theme().button_radius, 7.0f));
         if (is_liquid_glass(cv.theme())) {
             const bool dark = cv.theme().dark_mode;
             const GlassStyle bar_gs = make_control_glass_style(
-                cv.theme(), 17.0f, with_alpha(cv.theme().surface_high, dark ? 0.30f : 0.42f), 1.0f, 1.6f, 12.0f, 1.06f);
+                cv.theme(), ctrl_rad, with_alpha(cv.theme().surface_high, dark ? 0.30f : 0.42f), 1.0f, 1.6f, 12.0f, 1.06f);
             if (!glass_.draw_scene_glass(cv, target_, sh_.gfx, ctrl, bar_gs)) {
-                draw_glass_box(cv, ctrl, 17.0f,
+                draw_glass_box(cv, ctrl, ctrl_rad,
                                with_alpha(cv.theme().surface_high, dark ? 0.36f : 0.50f),
                                with_alpha(hex(0xffffff), dark ? 0.24f : 0.64f));
             } else {
-                cv.stroke_round(inset(ctrl, -0.5f, -0.5f), 17.5f, with_alpha(hex(0x000000), dark ? 0.28f : 0.10f), 1.0f);
+                cv.stroke_round(inset(ctrl, -0.5f, -0.5f), ctrl_rad + 0.5f, with_alpha(hex(0x000000), dark ? 0.28f : 0.10f), 1.0f);
             }
         } else {
-            cv.fill_round(ctrl, 17.0f, with_alpha(cv.theme().surface_low, 0.92f));
-            cv.stroke_round(ctrl, 17.0f, cv.theme().outline_variant, 1.0f);
+            cv.fill_round(ctrl, ctrl_rad, with_alpha(cv.theme().surface_low, 0.92f));
+            cv.stroke_round(ctrl, ctrl_rad, cv.theme().outline_variant, 1.0f);
         }
         cv.hit(ctrl, IdPvBar);
 
@@ -2674,24 +2827,31 @@ private:
         }
     }
 
-    void draw_preview(Canvas& cv, D2D1_SIZE_F sz) {
+    void draw_preview(Canvas& cv, D2D1_RECT_F bounds, bool custom_frame, float outer_r) {
         if (!preview_valid()) {
             preview_ = -1;
+            if (glass_active()) glass_.end_scene(target_);
             return;
         }
         const Item& it = items_[preview_];
         const int count = static_cast<int>(items_.size());
         const bool glass_ui = is_liquid_glass(cv.theme());
         const bool dark = cv.theme().dark_mode;
+        const bool scene_clipped = custom_frame && cv.push_round_clip(bounds, outer_r);
+        if (custom_frame && !scene_clipped) cv.push_clip(bounds);
         if (!glass_ui) {
-            cv.fill(D2D1::RectF(0, 0, sz.width, sz.height), with_alpha(cv.theme().surface_lowest, 0.94f));
+            if (custom_frame) {
+                cv.fill_round(bounds, outer_r, with_alpha(cv.theme().surface_lowest, 0.94f));
+            } else {
+                cv.fill(bounds, with_alpha(cv.theme().surface_lowest, 0.94f));
+            }
         }
         // Backdrop below the title bar closes the viewer; the bar itself still drags the window
-        cv.hit(D2D1::RectF(0, PV_TOP, sz.width, sz.height), IdPreview);
+        cv.hit(D2D1::RectF(bounds.left, bounds.top + PV_TOP, bounds.right, bounds.bottom), IdPreview);
 
         const bool is_video = (it.pt.p.k == 1);
         const bool is_gif_ready = !is_video && gif_.has_animation() && gif_.has_frame() && gif_.bitmap();
-        const D2D1_RECT_F area = preview_media_area(sz, preview_has_controls());
+        const D2D1_RECT_F area = preview_media_area(bounds, preview_has_controls());
         const D2D1_INTERPOLATION_MODE img_interp = in_sizemove_
             ? D2D1_INTERPOLATION_MODE_LINEAR
             : D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
@@ -2747,17 +2907,21 @@ private:
                 const wchar_t* msg = L"Video playback failed — click Play to open externally";
                 const float mw = cv.measure(msg, Font::Caption) + 20.0f;
                 const D2D1_RECT_F badge = rect(c.x - (mw * 0.5f), c.y + 38.0f, mw, 24.0f);
-                cv.fill_round(badge, 12.0f, hex(0x000000, 0.72f));
+                cv.fill_round(badge, std::min(12.0f, offset_radius(cv.theme().button_radius, 2.0f)), hex(0x000000, 0.72f));
                 cv.text(msg, badge, Font::Caption, cv.theme().amber, Align::Center);
             }
         }
         pv_media_rect_ = dest;
+        if (custom_frame) cv.pop_round_clip(scene_clipped);
         if (glass_active()) glass_.end_scene(target_);
 
-        draw_preview_controls(cv, sz, area, dest, it, is_video, is_gif_ready);
+        const bool overlay_clipped = custom_frame && cv.push_round_clip(bounds, outer_r);
+        if (custom_frame && !overlay_clipped) cv.push_clip(bounds);
+
+        draw_preview_controls(cv, bounds, area, dest, it, is_video, is_gif_ready);
 
         // Previous / next
-        const D2D1_RECT_F nav_area = preview_media_area(sz, false);
+        const D2D1_RECT_F nav_area = preview_media_area(bounds, false);
         const auto arrow = [&](bool next) {
             const bool can = next ? preview_ + 1 < count : preview_ > 0;
             if (!can) return;
@@ -2793,8 +2957,8 @@ private:
         arrow(true);
 
         // Title bar: name and folder, position, actions
-        float x = sz.width - 12;
-        const float cy = PV_TOP / 2;
+        float x = bounds.right - 12;
+        const float cy = bounds.top + (PV_TOP / 2);
         const auto btn = [&](wchar_t g, int id) {
             x -= 36;
             icon_button(cv, rect(x, cy - 18, 36, 36), g, id);
@@ -2814,28 +2978,29 @@ private:
         const float pw = cv.measure(pos, Font::SmallSemi) + 24;
         x -= pw + 6;
         const D2D1_RECT_F pr = rect(x, cy - 13, pw, 26);
+        const float pos_rad = std::min(13.0f, offset_radius(cv.theme().button_radius, 3.0f));
         if (is_liquid_glass(cv.theme())) {
             const GlassStyle pgs = make_control_glass_style(
-                cv.theme(), 13.0f, with_alpha(cv.theme().surface_high, dark ? 0.28f : 0.40f), 1.0f, 1.2f, 8.0f, 1.08f);
+                cv.theme(), pos_rad, with_alpha(cv.theme().surface_high, dark ? 0.28f : 0.40f), 1.0f, 1.2f, 8.0f, 1.08f);
             if (!glass_.draw_scene_glass(cv, target_, sh_.gfx, pr, pgs)) {
-                draw_glass_box(cv, pr, 13,
+                draw_glass_box(cv, pr, pos_rad,
                                with_alpha(cv.theme().surface_high, dark ? 0.30f : 0.44f),
                                with_alpha(hex(0xffffff), dark ? 0.20f : 0.58f));
             }
         } else {
-            cv.fill_round(pr, 13, with_alpha(cv.theme().surface_highest, 0.85f));
+            cv.fill_round(pr, pos_rad, with_alpha(cv.theme().surface_highest, 0.85f));
         }
         cv.text(pos, pr, Font::SmallSemi, cv.theme().on_surface_variant, Align::Center);
-        const float path_w = std::max(40.0f, x - 34.0f);
+        const float path_w = std::max(40.0f, x - bounds.left - 34.0f);
         if (pv_dir_disp_id_ != it.pt.id || std::abs(pv_dir_disp_w_ - path_w) > 0.25f) {
             middle_truncate_dir_into(cv, it.dir, Font::MonoSmall, path_w, pv_dir_disp_);
             pv_dir_disp_w_ = path_w;
             pv_dir_disp_id_ = it.pt.id;
         }
-        cv.text(it.name, D2D1::RectF(18, 9, x - 16, 29), Font::BodySemi, cv.theme().on_surface);
-        cv.text(pv_dir_disp_, D2D1::RectF(18, 29, x - 16, 46), Font::MonoSmall, cv.theme().outline);
+        cv.text(it.name, D2D1::RectF(bounds.left + 18, bounds.top + 9, x - 16, bounds.top + 29), Font::BodySemi, cv.theme().on_surface);
+        cv.text(pv_dir_disp_, D2D1::RectF(bounds.left + 18, bounds.top + 29, x - 16, bounds.top + 46), Font::MonoSmall, cv.theme().outline);
         if (cv.measure(it.name, Font::BodySemi) > path_w || cv.measure(it.dir, Font::MonoSmall) > path_w) {
-            cv.hit(D2D1::RectF(18, 9, x - 16, 46), IdPvPath, preview_);
+            cv.hit(D2D1::RectF(bounds.left + 18, bounds.top + 9, x - 16, bounds.top + 46), IdPvPath, preview_);
         }
 
         // Footer: size, date, duration
@@ -2849,7 +3014,8 @@ private:
             meta.append(L"  •  ");
             meta.append(it.date);
         }
-        cv.text(meta, D2D1::RectF(18, sz.height - PV_BOTTOM, sz.width - 18, sz.height), Font::Caption, cv.theme().outline, Align::Center);
+        cv.text(meta, D2D1::RectF(bounds.left + 18, bounds.bottom - PV_BOTTOM, bounds.right - 18, bounds.bottom), Font::Caption, cv.theme().outline, Align::Center);
+        if (custom_frame) cv.pop_round_clip(overlay_clipped);
     }
 
     bool preview_seek_to_x(float x, bool force = false) noexcept {
@@ -3703,14 +3869,21 @@ private:
         flush();
         POINT pt{.x = GET_X_LPARAM(lp), .y = GET_Y_LPARAM(lp)};
         ScreenToClient(hwnd_, &pt);
-        RECT rc;
-        GetClientRect(hwnd_, &rc);
         if (fullscreen_) return HTCLIENT;
-        const int b = static_cast<int>(6 * target_.scale());
-        const bool l = pt.x < b;
-        const bool r = pt.x >= rc.right - b;
-        const bool t = pt.y < b;
-        const bool btm = pt.y >= rc.bottom - b;
+        const float s = target_.scale();
+        const D2D1_POINT_2F p{.x = static_cast<float>(pt.x) / s, .y = static_cast<float>(pt.y) / s};
+        const D2D1_RECT_F pr = pill_bounds(target_.size());
+        if (custom_pill_frame()) {
+            constexpr float margin = 2.0f;
+            if (p.x < pr.left - margin || p.x >= pr.right + margin || p.y < pr.top - margin || p.y >= pr.bottom + margin) {
+                return HTNOWHERE;
+            }
+        }
+        constexpr float b = 6.0f;
+        const bool l = p.x < pr.left + b;
+        const bool r = p.x >= pr.right - b;
+        const bool t = p.y < pr.top + b;
+        const bool btm = p.y >= pr.bottom - b;
         const bool vert = expanded();
         if (t && l && vert) return HTTOPLEFT;
         if (t && r && vert) return HTTOPRIGHT;
@@ -3720,8 +3893,7 @@ private:
         if (r) return HTRIGHT;
         if (t && vert) return HTTOP;
         if (btm && vert) return HTBOTTOM;
-        const D2D1_POINT_2F p{.x = static_cast<float>(pt.x) / target_.scale(), .y = static_cast<float>(pt.y) / target_.scale()};
-        if (p.y < HEADER_H + STATUS_H && !menu_open_ && !drop_open_ && !show_help()) {
+        if (p.y < pr.top + HEADER_H + STATUS_H && !menu_open_ && !drop_open_ && !show_help()) {
             const Hit* h = hit_test(hits_, p);
             if (!h) return HTCAPTION;
         }
@@ -3891,7 +4063,11 @@ private:
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
                 const UINT dpi = placing_dpi_ ? placing_dpi_ : GetDpiForWindow(hwnd_);
                 const float s = static_cast<float>(dpi > 0 ? dpi : 96u) / 96.0f;
-                mmi->ptMinTrackSize = {.x = static_cast<LONG>(520 * s), .y = static_cast<LONG>((HEADER_H + STATUS_H) * s)};
+                const ShadowPad pad = active_pad();
+                mmi->ptMinTrackSize = {
+                    .x = static_cast<LONG>((520.0f + pad.left + pad.right) * s),
+                    .y = static_cast<LONG>((HEADER_H + STATUS_H + pad.top + pad.bottom) * s),
+                };
                 return 0;
             }
             case WM_ACTIVATE:
@@ -4112,6 +4288,7 @@ private:
     D2D1_RECT_F scroll_thumb_{};
 
     bool fullscreen_ = false;
+    ShadowPad applied_pad_{};
     bool placing_ = false;
     UINT placing_dpi_ = 0;
     RECT restore_rect_{};

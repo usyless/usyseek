@@ -474,21 +474,45 @@ public:
 
     void push_clip(D2D1_RECT_F r) noexcept {
         dc_->PushAxisAlignedClip(r, D2D1_ANTIALIAS_MODE_ALIASED);
-        if (clip_depth_ > 0) {
-            const D2D1_RECT_F& c = current_clip();
-            r.left = std::max(r.left, c.left);
-            r.top = std::max(r.top, c.top);
-            r.right = std::min(r.right, c.right);
-            r.bottom = std::min(r.bottom, c.bottom);
-        }
-        if (clip_depth_ < clips_.size()) {
-            clips_[clip_depth_++] = r;
-        } else {
-            ++clip_depth_;
-        }
+        record_clip_rect(r);
     }
     void pop_clip() noexcept {
         dc_->PopAxisAlignedClip();
+        if (clip_depth_ > 0) --clip_depth_;
+    }
+
+    /// Pushes an anti-aliased rounded-rectangle layer mask (falls back to axis-aligned clip if `radius <= 0`).
+    /// Returns true when a D2D layer was pushed and must be paired with `pop_round_clip(true)`.
+    [[nodiscard]] bool push_round_clip(D2D1_RECT_F r, float radius) noexcept {
+        if (radius <= 0.0f) {
+            push_clip(r);
+            return false;
+        }
+        wil::com_ptr<ID2D1Factory> factory;
+        dc_->GetFactory(&factory);
+        wil::com_ptr<ID2D1RoundedRectangleGeometry> geom;
+        if (!factory || FAILED(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(r, radius, radius), &geom))) {
+            push_clip(r);
+            return false;
+        }
+        D2D1_LAYER_PARAMETERS1 lp{};
+        lp.contentBounds = r;
+        lp.geometricMask = geom.get();
+        lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
+        lp.maskTransform = D2D1::Matrix3x2F::Identity();
+        lp.opacity = 1.0f;
+        lp.layerOptions = D2D1_LAYER_OPTIONS1_NONE;
+        dc_->PushLayer(&lp, nullptr);
+        record_clip_rect(r);
+        return true;
+    }
+
+    void pop_round_clip(bool layered) noexcept {
+        if (!layered) {
+            pop_clip();
+            return;
+        }
+        dc_->PopLayer();
         if (clip_depth_ > 0) --clip_depth_;
     }
 
@@ -507,6 +531,21 @@ public:
     }
 
 private:
+    void record_clip_rect(D2D1_RECT_F r) noexcept {
+        if (clip_depth_ > 0) {
+            const D2D1_RECT_F& c = current_clip();
+            r.left = std::max(r.left, c.left);
+            r.top = std::max(r.top, c.top);
+            r.right = std::min(r.right, c.right);
+            r.bottom = std::min(r.bottom, c.bottom);
+        }
+        if (clip_depth_ < clips_.size()) {
+            clips_[clip_depth_++] = r;
+        } else {
+            ++clip_depth_;
+        }
+    }
+
     [[nodiscard]] const D2D1_RECT_F& current_clip() const noexcept {
         return clips_[std::min(clip_depth_, clips_.size()) - 1];
     }

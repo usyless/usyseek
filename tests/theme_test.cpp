@@ -181,6 +181,38 @@ int main() {
         const Theme t = apply_theme_spec(spec, "custom:flat-lg", "flat-lg");
         CHECK(!t.is_liquid_glass);
         CHECK(t.dark_mode);
+        CHECK(!t.pill_radius.has_value());
+        CHECK(approx(t.card_radius, 14.0f, 0.001f));
+        CHECK(approx(t.button_radius, 10.0f, 0.001f));
+        CHECK(approx(t.thumb_radius, 10.0f, 0.001f));
+    }
+
+    // 10. Corner radius overrides & clamping + offset_radius helper
+    {
+        ThemeSpec spec;
+        spec.name = "Rounded";
+        spec.pill_radius = 22.0f;
+        spec.card_radius = 18.0f;
+        spec.button_radius = 4.0f;
+        spec.thumb_radius = 0.0f;
+
+        const Theme t = apply_theme_spec(spec, "custom:rounded", "rounded");
+        CHECK(t.pill_radius.has_value());
+        CHECK(approx(*t.pill_radius, 22.0f, 0.001f));
+        CHECK(approx(t.card_radius, 18.0f, 0.001f));
+        CHECK(approx(t.button_radius, 4.0f, 0.001f));
+        CHECK(approx(t.thumb_radius, 0.0f, 0.001f));
+
+        ThemeSpec clamped;
+        clamped.pill_radius = 999.0f;
+        clamped.card_radius = -5.0f;
+        const Theme tc = apply_theme_spec(clamped, "custom:clamped", "clamped");
+        CHECK(tc.pill_radius.has_value() && approx(*tc.pill_radius, 128.0f, 0.001f));
+        CHECK(approx(tc.card_radius, 0.0f, 0.001f));
+
+        CHECK(approx(offset_radius(0.0f, 2.0f), 0.0f, 0.001f));
+        CHECK(approx(offset_radius(14.0f, -2.0f), 12.0f, 0.001f));
+        CHECK(approx(offset_radius(1.0f, -5.0f), 0.0f, 0.001f));
     }
 
     return 0;

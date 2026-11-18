@@ -23,12 +23,18 @@ inline std::string_view example_theme_json() noexcept {
   "name": "Sakura (Example)",
   "base": "dark",
   "mode": "dark",
+  "liquid_glass": false,
   "pill_backdrop": "acrylic",
   "settings_backdrop": "mica",
   "pill_bg_alpha": 0.82,
   "settings_bg_alpha": 0.88,
   "card_alpha": 0.90,
+  "shadow_alpha_scale": 1.0,
   "round_corners": true,
+  "pill_radius": null,
+  "card_radius": 14.0,
+  "button_radius": 10.0,
+  "thumb_radius": 10.0,
   "bg": "#1a1118",
   "surface_lowest": "#130c12",
   "surface_low": "#221720",
@@ -66,26 +72,16 @@ inline std::string_view example_theme_json() noexcept {
 )json";
 }
 
-/// Ensures `data/themes/` exists and seeds `example-sakura.json` if no JSON themes exist yet.
+/// Ensures `data/themes/` exists and keeps `example-sakura (copy but do not edit).json` synced to the current schema.
 inline void ensure_themes_dir() {
     const fs::path& dir = themes_dir();
     std::error_code ec;
-    const bool existed = fs::exists(dir, ec);
     fs::create_directories(dir, ec);
-    bool has_json = false;
-    if (existed) {
-        for (const auto& entry : fs::directory_iterator(dir, ec)) {
-            if (entry.is_regular_file(ec) && lower(entry.path().extension().wstring()) == L".json") {
-                has_json = true;
-                break;
-            }
-        }
-    }
-    if (!has_json) {
-        const fs::path ex = dir / L"example-sakura.json";
-        if (!fs::exists(ex, ec)) {
-            (void)ulp::fs::write(ex, example_theme_json());
-        }
+    const fs::path ex = dir / L"example-sakura (copy but do not edit).json";
+    const std::string_view want = example_theme_json();
+    const auto cur = ulp::fs::read_as_bytes(ex);
+    if (!cur || *cur != want) {
+        (void)ulp::fs::write(ex, want);
     }
 }
 

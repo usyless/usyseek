@@ -177,9 +177,18 @@ struct Theme {
     D2D1_COLOR_F pill_border{};
     bool round_corners = true;
     bool is_liquid_glass = false;
+    std::optional<float> pill_radius;
+    float card_radius = 14.0f;
+    float button_radius = 10.0f;
+    float thumb_radius = 10.0f;
 
     std::array<D2D1_COLOR_F, 8> tag_palette{};
 };
+
+/// Offsets a theme corner radius while keeping 0 (square) as 0.
+[[nodiscard]] inline float offset_radius(float r, float delta) noexcept {
+    return r <= 0.0f ? 0.0f : std::max(0.0f, r + delta);
+}
 
 /// Reads Windows Settings -> Personalize -> AppsUseLightTheme (returns true for dark mode).
 [[nodiscard]] inline bool windows_uses_dark_mode() noexcept {
@@ -547,6 +556,10 @@ struct ThemeSpec {
     std::optional<float> shadow_alpha_scale;
     std::optional<bool> round_corners;
     std::optional<bool> liquid_glass;
+    std::optional<float> pill_radius;
+    std::optional<float> card_radius;
+    std::optional<float> button_radius;
+    std::optional<float> thumb_radius;
 
     std::string bg;
     std::string surface_lowest;
@@ -638,6 +651,10 @@ struct ThemeSpec {
     if (spec.card_alpha) t.card_alpha = std::clamp(*spec.card_alpha, 0.0f, 1.0f);
     if (spec.shadow_alpha_scale) t.shadow_alpha_scale = std::clamp(*spec.shadow_alpha_scale, 0.0f, 2.0f);
     if (spec.round_corners) t.round_corners = *spec.round_corners;
+    if (spec.pill_radius) t.pill_radius = std::clamp(*spec.pill_radius, 0.0f, 128.0f);
+    if (spec.card_radius) t.card_radius = std::clamp(*spec.card_radius, 0.0f, 64.0f);
+    if (spec.button_radius) t.button_radius = std::clamp(*spec.button_radius, 0.0f, 64.0f);
+    if (spec.thumb_radius) t.thumb_radius = std::clamp(*spec.thumb_radius, 0.0f, 64.0f);
 
     const auto apply_hex = [](std::string_view s, D2D1_COLOR_F& dst) -> bool {
         if (s.empty()) return false;

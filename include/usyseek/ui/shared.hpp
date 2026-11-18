@@ -337,15 +337,25 @@ inline void apply_window_theme(HWND hwnd, const Theme& theme, bool is_pill, bool
     ulp::win::dark::allow_dark_mode_for_window(hwnd, theme.dark_mode);
     const BOOL dark = theme.dark_mode ? TRUE : FALSE;
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
-    const DWM_WINDOW_CORNER_PREFERENCE corner = (round && theme.round_corners) ? DWMWCP_ROUND : DWMWCP_DONOTROUND;
+
+    const bool custom_pill = is_pill && round && theme.pill_radius.has_value();
+    const DWMNCRENDERINGPOLICY ncrp = custom_pill ? DWMNCRP_DISABLED : DWMNCRP_USEWINDOWSTYLE;
+    DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &ncrp, sizeof(ncrp));
+
+    const DWM_WINDOW_CORNER_PREFERENCE corner = custom_pill
+        ? DWMWCP_DONOTROUND
+        : ((round && theme.round_corners) ? DWMWCP_ROUND : DWMWCP_DONOTROUND);
     DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
-    const int backdrop = is_pill ? theme.pill_backdrop : theme.settings_backdrop;
+
+    const int backdrop = custom_pill ? DWMSBT_NONE : (is_pill ? theme.pill_backdrop : theme.settings_backdrop);
     DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
     if (is_pill) {
-        const COLORREF border = theme.is_liquid_glass ? DWMWA_COLOR_NONE : to_colorref(theme.pill_border);
+        const COLORREF border = (custom_pill || theme.is_liquid_glass) ? DWMWA_COLOR_NONE : to_colorref(theme.pill_border);
         DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, &border, sizeof(border));
     }
-    const MARGINS m{.cxLeftWidth = -1, .cxRightWidth = -1, .cyTopHeight = -1, .cyBottomHeight = -1};
+    const MARGINS m = custom_pill
+        ? MARGINS{.cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 0}
+        : MARGINS{.cxLeftWidth = -1, .cxRightWidth = -1, .cyTopHeight = -1, .cyBottomHeight = -1};
     DwmExtendFrameIntoClientArea(hwnd, &m);
 }
 
