@@ -499,6 +499,12 @@ private:
         strip_float(draft_.settings_bg_alpha, bt.settings_bg_alpha, slider_spec(SlSettingsAlpha).step);
         strip_float(draft_.card_alpha, bt.card_alpha, slider_spec(SlCardAlpha).step);
         strip_float(draft_.shadow_alpha_scale, bt.shadow_alpha_scale, slider_spec(SlShadowScale).step);
+        if (draft_.pill_radius.is_null() && !bt.pill_radius.has_value()) {
+            draft_.pill_radius.reset();
+        } else if (draft_.pill_radius.has_value() && bt.pill_radius.has_value() &&
+                   std::abs(*draft_.pill_radius - *bt.pill_radius) < (slider_spec(SlPillRadius).step * 0.25f)) {
+            draft_.pill_radius.reset();
+        }
         strip_float(draft_.card_radius, bt.card_radius, slider_spec(SlCardRadius).step);
         strip_float(draft_.button_radius, bt.button_radius, slider_spec(SlButtonRadius).step);
         strip_float(draft_.thumb_radius, bt.thumb_radius, slider_spec(SlThumbRadius).step);
@@ -897,7 +903,7 @@ private:
             case SlSettingsAlpha: return draft_.settings_bg_alpha;
             case SlCardAlpha: return draft_.card_alpha;
             case SlShadowScale: return draft_.shadow_alpha_scale;
-            case SlPillRadius: return draft_.pill_radius;
+            case SlPillRadius: return draft_.pill_radius.to_optional();
             case SlCardRadius: return draft_.card_radius;
             case SlButtonRadius: return draft_.button_radius;
             case SlThumbRadius: return draft_.thumb_radius;
@@ -972,8 +978,14 @@ private:
         const float snapped = std::round(std::clamp(v, sp.min_v, sp.max_v) / sp.step) * sp.step;
         const std::optional<float> prev_opt = raw_slider_opt(idx);
         if (idx == SlPillRadius) {
-            draft_.pill_radius = snapped;
-            if (draft_.pill_radius != prev_opt) mark_preview_dirty();
+            const NullableFloatOverride prev_pr = draft_.pill_radius;
+            const auto base_pr = base_theme().pill_radius;
+            if (base_pr.has_value() && std::abs(snapped - *base_pr) < (sp.step * 0.25f)) {
+                draft_.pill_radius.reset();
+            } else {
+                draft_.pill_radius = snapped;
+            }
+            if (draft_.pill_radius != prev_pr) mark_preview_dirty();
             return;
         }
         const bool at_base = std::abs(snapped - base_slider_value(idx)) < (sp.step * 0.25f);
@@ -1310,7 +1322,7 @@ private:
                 cur_y += 22.0f;
                 pbk_y = cur_y;
                 cur_y += bk_lay.height + 10.0f;
-                if (draft_.pill_radius.has_value()) {
+                if (prev.pill_radius.has_value()) {
                     pbk_warn_y = cur_y;
                     pbk_warn_h = std::max(34.0f, text_height(cv, kCustomRadiusBackdropWarn, Font::Caption, rw - 38.0f, 16.0f) + 14.0f);
                     cur_y += pbk_warn_h + 10.0f;
@@ -1364,7 +1376,7 @@ private:
                     draw_choice_chip(cv, rect(lx + p.x, pbk_y + p.y, p.width, 28.0f),
                                      kBackdropOptions[i].label, ap, IdPillBackdropChip, static_cast<int>(i));
                 }
-                if (draft_.pill_radius.has_value()) {
+                if (prev.pill_radius.has_value()) {
                     const D2D1_RECT_F wr = rect(lx, pbk_warn_y, rw, pbk_warn_h);
                     const float wr_rad = std::min(cv.theme().button_radius, 8.0f);
                     cv.fill_round(wr, wr_rad, with_alpha(cv.theme().amber, cv.theme().dark_mode ? 0.14f : 0.18f));
@@ -1395,7 +1407,7 @@ private:
                 const float dh = desc.empty() ? 0.0f : text_height(cv, desc, Font::Caption, rw, 16.0f) + 4.0f;
                 return th + 4.0f + dh + 28.0f;
             };
-            const bool show_custom_pill_alpha = !prev.is_liquid_glass && draft_.pill_radius.has_value();
+            const bool show_custom_pill_alpha = !prev.is_liquid_glass && prev.pill_radius.has_value();
             const std::wstring_view pill_alpha_desc = show_custom_pill_alpha
                 ? L"Used when custom pill corner radius is off (DWM backdrop active)"
                 : L"";
@@ -1761,6 +1773,10 @@ private:
                     } else {
                         draft_.liquid_glass.reset();
                     }
+                    mark_preview_dirty(false);
+                    if (draft_.pill_radius.is_null() && !base_theme().pill_radius.has_value()) {
+                        draft_.pill_radius.reset();
+                    }
                     mark_preview_dirty();
                     sync_switch_targets(true);
                 }
@@ -1797,15 +1813,26 @@ private:
                     mark_preview_dirty();
                 }
                 break;
-            case IdTogglePillRadius:
-                if (base_theme().pill_radius.has_value() || draft_.pill_radius.has_value()) {
-                    draft_.pill_radius.reset();
+            case IdTogglePillRadius: {
+                const bool cur = resolved_preview().pill_radius.has_value();
+                const bool base_has = base_theme().pill_radius.has_value();
+                if (cur) {
+                    if (base_has) {
+                        draft_.pill_radius.set_null();
+                    } else {
+                        draft_.pill_radius.reset();
+                    }
                 } else {
-                    draft_.pill_radius = default_pill_radius();
+                    if (base_has) {
+                        draft_.pill_radius.reset();
+                    } else {
+                        draft_.pill_radius = default_pill_radius();
+                    }
                 }
                 mark_preview_dirty();
                 sync_switch_targets(true);
                 break;
+            }
             case IdSlider:
                 if (idx >= 0 && idx < SlCount) {
                     active_slider_ = idx;

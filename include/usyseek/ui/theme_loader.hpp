@@ -11,6 +11,25 @@
 #include <string_view>
 #include <vector>
 
+namespace glz {
+
+template <>
+struct from<JSON, usyseek::ui::NullableFloatOverride> {
+    template <auto Options>
+    static void op(usyseek::ui::NullableFloatOverride& value, is_context auto&& ctx, auto&& it, auto end) {
+        std::optional<float> parsed;
+        parse<JSON>::op<Options>(parsed, ctx, it, end);
+        if (bool(ctx.error)) return;
+        if (parsed.has_value()) {
+            value = *parsed;
+        } else {
+            value.set_null();
+        }
+    }
+};
+
+} // namespace glz
+
 namespace usyseek::ui {
 
 inline const fs::path& themes_dir() {
@@ -319,7 +338,11 @@ inline bool save_theme_file(const fs::path& path, const ThemeSpec& spec) {
     append_float("card_alpha", spec.card_alpha);
     append_float("shadow_alpha_scale", spec.shadow_alpha_scale);
     append_bool("round_corners", spec.round_corners);
-    append_float("pill_radius", spec.pill_radius);
+    if (spec.pill_radius.is_null()) {
+        out += ",\n  \"pill_radius\": null";
+    } else {
+        append_float("pill_radius", spec.pill_radius.to_optional());
+    }
     append_float("card_radius", spec.card_radius);
     append_float("button_radius", spec.button_radius);
     append_float("thumb_radius", spec.thumb_radius);

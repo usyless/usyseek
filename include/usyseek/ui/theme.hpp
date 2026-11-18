@@ -15,6 +15,7 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -633,6 +634,46 @@ inline void apply_liquid_glass_material(Theme& t) noexcept {
     return theme_dark();
 }
 
+/// Tri-state override for a nullable float theme property:
+/// - `Inherit` (default): key omitted; inherits the base preset's value.
+/// - `Null`: explicitly set to `null`; clears the base preset's value.
+/// - `Value`: explicitly overrides with a numeric value.
+struct NullableFloatOverride {
+    enum class State : uint8_t { Inherit, Null, Value };
+
+    State state = State::Inherit;
+    float value = 0.0f;
+
+    [[nodiscard]] constexpr bool is_inherit() const noexcept { return state == State::Inherit; }
+    [[nodiscard]] constexpr bool is_null() const noexcept { return state == State::Null; }
+    [[nodiscard]] constexpr bool has_value() const noexcept { return state == State::Value; }
+    [[nodiscard]] constexpr explicit operator bool() const noexcept { return has_value(); }
+    [[nodiscard]] constexpr float operator*() const noexcept { return value; }
+    [[nodiscard]] constexpr std::optional<float> to_optional() const noexcept {
+        return has_value() ? std::optional<float>{value} : std::nullopt;
+    }
+
+    constexpr NullableFloatOverride& operator=(float v) noexcept {
+        state = State::Value;
+        value = v;
+        return *this;
+    }
+    constexpr NullableFloatOverride& operator=(std::nullptr_t) noexcept {
+        state = State::Null;
+        value = 0.0f;
+        return *this;
+    }
+    constexpr void reset() noexcept {
+        state = State::Inherit;
+        value = 0.0f;
+    }
+    constexpr void set_null() noexcept {
+        state = State::Null;
+        value = 0.0f;
+    }
+    constexpr bool operator==(const NullableFloatOverride&) const noexcept = default;
+};
+
 /// Optional Liquid Glass material overrides (nested under `"glass"` in JSON).
 struct LiquidGlassSpec {
     std::optional<float> blur;
@@ -657,7 +698,7 @@ struct ThemeSpec {
     std::optional<float> shadow_alpha_scale;
     std::optional<bool> round_corners;
     std::optional<bool> liquid_glass;
-    std::optional<float> pill_radius;
+    NullableFloatOverride pill_radius;
     std::optional<float> card_radius;
     std::optional<float> button_radius;
     std::optional<float> thumb_radius;
@@ -749,7 +790,11 @@ struct ThemeSpec {
     if (spec.card_alpha) t.card_alpha = std::clamp(*spec.card_alpha, 0.0f, 1.0f);
     if (spec.shadow_alpha_scale) t.shadow_alpha_scale = std::clamp(*spec.shadow_alpha_scale, 0.0f, 2.0f);
     if (spec.round_corners) t.round_corners = *spec.round_corners;
-    if (spec.pill_radius) t.pill_radius = std::clamp(*spec.pill_radius, 0.0f, 128.0f);
+    if (spec.pill_radius.is_null()) {
+        t.pill_radius.reset();
+    } else if (spec.pill_radius.has_value()) {
+        t.pill_radius = std::clamp(*spec.pill_radius, 0.0f, 128.0f);
+    }
     if (spec.card_radius) t.card_radius = std::clamp(*spec.card_radius, 0.0f, 64.0f);
     if (spec.button_radius) t.button_radius = std::clamp(*spec.button_radius, 0.0f, 64.0f);
     if (spec.thumb_radius) t.thumb_radius = std::clamp(*spec.thumb_radius, 0.0f, 64.0f);

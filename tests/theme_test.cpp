@@ -222,6 +222,21 @@ void test_theme_specs_and_glass() {
         CHECK(approx(t.card_radius, 24.0f, 0.001f));
         CHECK(approx(t.button_radius, 24.0f, 0.001f));
         CHECK(approx(t.thumb_radius, 19.0f, 0.001f));
+
+        // Explicit null clears inherited custom pill_radius while preserving other rounder radii
+        spec.pill_radius = nullptr;
+        CHECK(spec.pill_radius.is_null());
+        const Theme t_off = apply_theme_spec(spec, "custom:light-rounder-off", "light-rounder-off");
+        CHECK(!t_off.pill_radius.has_value());
+        CHECK(approx(t_off.card_radius, 24.0f, 0.001f));
+        CHECK(approx(t_off.button_radius, 24.0f, 0.001f));
+        CHECK(approx(t_off.thumb_radius, 19.0f, 0.001f));
+
+        // Resetting returns to inherit (28.0f)
+        spec.pill_radius.reset();
+        CHECK(spec.pill_radius.is_inherit());
+        const Theme t_inherit = apply_theme_spec(spec, "custom:light-rounder-inherit", "light-rounder-inherit");
+        CHECK(t_inherit.pill_radius.has_value() && approx(*t_inherit.pill_radius, 28.0f, 0.001f));
     }
 
     // 10. Corner radius overrides & clamping + offset_radius helper
