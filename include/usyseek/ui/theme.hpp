@@ -566,7 +566,7 @@ inline void apply_liquid_glass_material(Theme& t) noexcept {
 [[nodiscard]] inline Theme theme_liquid_glass(bool dark) {
     Theme t = dark ? theme_dark() : theme_light();
     t.id = "liquid-glass";
-    t.name = "Liquid Glass (Exp.)";
+    t.name = "Liquid Glass";
     t.follows_system_mode = true;
     if (dark) {
         t.bg = hex(0x0c1018);
