@@ -483,14 +483,28 @@ struct Theme {
     return theme_from_accent(windows_accent_color(), windows_uses_dark_mode());
 }
 
+/// Applies Liquid Glass backdrop, alpha, and border defaults matching `t.dark_mode`.
+inline void apply_liquid_glass_material(Theme& t) noexcept {
+    t.is_liquid_glass = true;
+    t.pill_backdrop = DWMSBT_NONE;
+    t.settings_backdrop = DWMSBT_NONE;
+    if (t.dark_mode) {
+        t.pill_bg_alpha = 0.18f;
+        t.settings_bg_alpha = 0.24f;
+        t.card_alpha = 0.56f;
+    } else {
+        t.pill_bg_alpha = 0.22f;
+        t.settings_bg_alpha = 0.28f;
+        t.card_alpha = 0.64f;
+    }
+    t.pill_border = with_alpha(hex(0xffffff), t.dark_mode ? 0.28f : 0.65f);
+}
+
 [[nodiscard]] inline Theme theme_liquid_glass(bool dark) {
     Theme t = dark ? theme_dark() : theme_light();
     t.id = "liquid-glass";
     t.name = "Liquid Glass (Exp.)";
     t.follows_system_mode = true;
-    t.is_liquid_glass = true;
-    t.pill_backdrop = DWMSBT_NONE;
-    t.settings_backdrop = DWMSBT_NONE;
     if (dark) {
         t.bg = hex(0x0c1018);
         t.surface_lowest = hex(0x080b12);
@@ -504,9 +518,6 @@ struct Theme {
         t.on_primary = hex(0x042438);
         t.primary_container = hex(0x0c4a6e);
         t.on_primary_container = hex(0xe0f2fe);
-        t.pill_bg_alpha = 0.18f;
-        t.settings_bg_alpha = 0.24f;
-        t.card_alpha = 0.56f;
     } else {
         t.bg = hex(0xf2f6fc);
         t.surface_lowest = hex(0xffffff);
@@ -520,11 +531,8 @@ struct Theme {
         t.on_primary = hex(0xffffff);
         t.primary_container = hex(0xd1e9ff);
         t.on_primary_container = hex(0x002447);
-        t.pill_bg_alpha = 0.22f;
-        t.settings_bg_alpha = 0.28f;
-        t.card_alpha = 0.64f;
     }
-    t.pill_border = with_alpha(hex(0xffffff), dark ? 0.28f : 0.65f);
+    apply_liquid_glass_material(t);
     return t;
 }
 
@@ -610,7 +618,7 @@ struct ThemeSpec {
             base_id = "dark";
         }
     }
-    const auto mode_is_dark = [&]() noexcept -> bool {
+    const auto mode_is_dark = [&] noexcept -> bool {
         if (spec.mode == "dark") return true;
         if (spec.mode == "light") return false;
         return windows_uses_dark_mode();
@@ -633,14 +641,7 @@ struct ThemeSpec {
     }
 
     if (enable_glass && base_id != "liquid-glass") {
-        const Theme lg = theme_liquid_glass(t.dark_mode);
-        t.is_liquid_glass = true;
-        t.pill_backdrop = lg.pill_backdrop;
-        t.settings_backdrop = lg.settings_backdrop;
-        t.pill_bg_alpha = lg.pill_bg_alpha;
-        t.settings_bg_alpha = lg.settings_bg_alpha;
-        t.card_alpha = lg.card_alpha;
-        t.pill_border = lg.pill_border;
+        apply_liquid_glass_material(t);
     }
     if (spec.liquid_glass.has_value()) t.is_liquid_glass = *spec.liquid_glass;
 

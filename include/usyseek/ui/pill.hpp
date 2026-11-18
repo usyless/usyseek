@@ -519,7 +519,7 @@ private:
         const auto content_size_on = [&](HMONITOR m) noexcept {
             const float s = static_cast<float>(monitor_dpi(m)) / 96.0f;
             return SIZE{.cx = static_cast<LONG>((sh_.settings.pill_w > 0 ? static_cast<float>(sh_.settings.pill_w) : DEFAULT_W) * s),
-                        .cy = static_cast<LONG>(current_height_dip() * s)};
+                        .cy = static_cast<LONG>(current_height_dip() * s),};
         };
         if (use_saved) {
             // Windows gives a window the DPI of the monitor holding most of it, not the one under its top-left corner.
@@ -1283,16 +1283,20 @@ private:
             draw_active_tooltip(cv, sz);
             return;
         }
-        if (expanded()) {
+        if (has_scene) {
+            if (expanded()) {
+                const bool clipped = custom_frame && cv.push_round_clip(pr, outer_r);
+                draw_grid(cv);
+                if (custom_frame) cv.pop_round_clip(clipped);
+            }
+            glass_.end_scene(target_);
             const bool clipped = custom_frame && cv.push_round_clip(pr, outer_r);
-            if (custom_frame && !clipped) cv.push_clip(pr);
-            draw_grid(cv);
+            draw_header(cv, pr);
+            draw_status(cv, pr);
             if (custom_frame) cv.pop_round_clip(clipped);
-        }
-        if (has_scene) glass_.end_scene(target_);
-        {
+        } else {
             const bool clipped = custom_frame && cv.push_round_clip(pr, outer_r);
-            if (custom_frame && !clipped) cv.push_clip(pr);
+            if (expanded()) draw_grid(cv);
             draw_header(cv, pr);
             draw_status(cv, pr);
             if (custom_frame) cv.pop_round_clip(clipped);
@@ -2838,7 +2842,6 @@ private:
         const bool glass_ui = is_liquid_glass(cv.theme());
         const bool dark = cv.theme().dark_mode;
         const bool scene_clipped = custom_frame && cv.push_round_clip(bounds, outer_r);
-        if (custom_frame && !scene_clipped) cv.push_clip(bounds);
         if (!glass_ui) {
             if (custom_frame) {
                 cv.fill_round(bounds, outer_r, with_alpha(cv.theme().surface_lowest, 0.94f));
@@ -2916,7 +2919,6 @@ private:
         if (glass_active()) glass_.end_scene(target_);
 
         const bool overlay_clipped = custom_frame && cv.push_round_clip(bounds, outer_r);
-        if (custom_frame && !overlay_clipped) cv.push_clip(bounds);
 
         draw_preview_controls(cv, bounds, area, dest, it, is_video, is_gif_ready);
 

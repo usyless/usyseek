@@ -488,21 +488,19 @@ public:
             push_clip(r);
             return false;
         }
-        wil::com_ptr<ID2D1Factory> factory;
-        dc_->GetFactory(&factory);
-        wil::com_ptr<ID2D1RoundedRectangleGeometry> geom;
-        if (!factory || FAILED(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(r, radius, radius), &geom))) {
+        ID2D1RoundedRectangleGeometry* geom = target_.round_clip_geom(r, radius);
+        if (!geom) {
             push_clip(r);
             return false;
         }
         D2D1_LAYER_PARAMETERS1 lp{};
         lp.contentBounds = r;
-        lp.geometricMask = geom.get();
+        lp.geometricMask = geom;
         lp.maskAntialiasMode = D2D1_ANTIALIAS_MODE_PER_PRIMITIVE;
         lp.maskTransform = D2D1::Matrix3x2F::Identity();
         lp.opacity = 1.0f;
         lp.layerOptions = D2D1_LAYER_OPTIONS1_NONE;
-        dc_->PushLayer(&lp, nullptr);
+        dc_->PushLayer(&lp, target_.clip_layer());
         record_clip_rect(r);
         return true;
     }

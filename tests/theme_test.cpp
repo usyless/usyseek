@@ -197,8 +197,7 @@ int main() {
         spec.thumb_radius = 0.0f;
 
         const Theme t = apply_theme_spec(spec, "custom:rounded", "rounded");
-        CHECK(t.pill_radius.has_value());
-        CHECK(approx(*t.pill_radius, 22.0f, 0.001f));
+        CHECK(t.pill_radius.has_value() && approx(*t.pill_radius, 22.0f, 0.001f));
         CHECK(approx(t.card_radius, 18.0f, 0.001f));
         CHECK(approx(t.button_radius, 4.0f, 0.001f));
         CHECK(approx(t.thumb_radius, 0.0f, 0.001f));

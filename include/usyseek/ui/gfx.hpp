@@ -292,6 +292,33 @@ public:
         return bmp_brush_.get();
     }
 
+    /// Reusable layer for anti-aliased rounded clipping without per-frame allocations.
+    [[nodiscard]] ID2D1Layer* clip_layer() noexcept {
+        if (!clip_layer_ && dc_) {
+            dc_->CreateLayer(nullptr, &clip_layer_);
+        }
+        return clip_layer_.get();
+    }
+
+    /// Cached rounded-rectangle geometry for `(r, radius)`, recreated only when bounds, radius, or D2D factory epoch change.
+    [[nodiscard]] ID2D1RoundedRectangleGeometry* round_clip_geom(D2D1_RECT_F r, float radius) noexcept {
+        if (!gfx_ || !gfx_->d2d_factory()) return nullptr;
+        const uint64_t ep = gfx_->epoch();
+        if (clip_geom_ && clip_geom_epoch_ == ep && clip_radius_ == radius &&
+            clip_rect_.left == r.left && clip_rect_.top == r.top &&
+            clip_rect_.right == r.right && clip_rect_.bottom == r.bottom) {
+            return clip_geom_.get();
+        }
+        clip_geom_.reset();
+        if (FAILED(gfx_->d2d_factory()->CreateRoundedRectangleGeometry(D2D1::RoundedRect(r, radius, radius), &clip_geom_))) {
+            return nullptr;
+        }
+        clip_rect_ = r;
+        clip_radius_ = radius;
+        clip_geom_epoch_ = ep;
+        return clip_geom_.get();
+    }
+
     bool resize(UINT w, UINT h) noexcept {
         if (w == 0 || h == 0) return ready();
         const auto dpi = static_cast<float>(GetDpiForWindow(hwnd_));
@@ -408,6 +435,9 @@ private:
         if (bmp_brush_) bmp_brush_->SetBitmap(nullptr);
         bmp_brush_.reset();
         solid_brush_.reset();
+        clip_layer_.reset();
+        clip_geom_.reset();
+        clip_geom_epoch_ = 0;
         dirty_tracker_.reset();
         if (dc_) dc_->SetTarget(nullptr);
         target_.reset();
@@ -478,6 +508,11 @@ private:
     wil::com_ptr<ID2D1Bitmap1> target_;
     wil::com_ptr<ID2D1SolidColorBrush> solid_brush_;
     wil::com_ptr<ID2D1BitmapBrush1> bmp_brush_;
+    wil::com_ptr<ID2D1Layer> clip_layer_;
+    wil::com_ptr<ID2D1RoundedRectangleGeometry> clip_geom_;
+    D2D1_RECT_F clip_rect_{};
+    float clip_radius_ = -1.0f;
+    uint64_t clip_geom_epoch_ = 0;
     wil::com_ptr<IDXGISwapChain1> swap_;
     wil::com_ptr<IDCompositionDevice> dcomp_;
     wil::com_ptr<IDCompositionTarget> dcomp_target_;
