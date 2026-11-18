@@ -1540,8 +1540,11 @@ private:
             const float ha = hover_.alpha(IdChip, i) * indicator_hover_fade(act);
             if (ha > 0.002f) {
                 if (glass_ui) {
-                    const GlassStyle h_gs = make_control_glass_style(
+                    GlassStyle h_gs = make_control_glass_style(
                         cv.theme(), chip_rad, with_alpha(hex(0xffffff), dark ? 0.12f : 0.34f), ha, 0.0f, 7.0f, 1.06f);
+                    // These chips are only 28 DIPs tall, so full rim refraction samples well outside the filter
+                    // segment and shows up as a coloured line along the bottom edge.
+                    h_gs.rim_inset_dip = 1.0f;
                     if (!glass_.draw_cached_glass(cv, target_, sh_.gfx, chip_rects[i], h_gs)) {
                         cv.fill_round(chip_rects[i], chip_rad, with_alpha(hex(0xffffff), (dark ? 0.10f : 0.32f) * ha));
                     }

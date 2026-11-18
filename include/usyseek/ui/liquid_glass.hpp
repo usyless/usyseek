@@ -53,7 +53,7 @@ struct alignas(16) LiquidGlassShaderParams {
     std::array<float, 4> glare_params{};   // glareRange, glareHardness, glareFactor, glareAngleDeg
     std::array<float, 4> shape_params{};   // glareConvergence, glareOppositeFactor, cornerRadiusDip, roundnessN
     std::array<float, 4> misc_params{};    // dpr (overridden from the effect context), forceOpaque, edgeAaPx, shapeMarginDip
-    std::array<float, 4> extra_params{};   // opacity, reserved, reserved, reserved
+    std::array<float, 4> extra_params{};   // opacity, centeredEdge, rimInsetDip, reserved
 };
 static_assert(sizeof(LiquidGlassShaderParams) == 144);
 
@@ -82,6 +82,10 @@ struct GlassStyle {
     float opacity = 1.0f;
     /// Centre the edge antialiasing on the outline (like D2D geometry) instead of letting it bleed outward.
     bool centered_edge = false;
+    /// Evaluate the refraction slope at least this far (DIPs) inside the rim. 0 keeps the full rim refraction;
+    /// raise it on small elements whose rim would otherwise reach far outside their own bounds and pick up
+    /// unrelated colours (e.g. a thin coloured line along the bottom edge).
+    float rim_inset_dip = 0.0f;
 };
 
 namespace detail {
@@ -105,7 +109,7 @@ cbuffer LiquidGlassParams : register(b0)
     float4 glareParams;   // x=glareRange, y=glareHardness, z=glareFactor, w=glareAngleDeg
     float4 shapeParams;   // x=glareConvergence, y=glareOppositeFactor, z=cornerRadiusDip, w=roundnessN
     float4 miscParams;    // x=dpr, y=forceOpaque, z=edgeAaPx, w=shapeMarginDip
-    float4 extraParams;   // x=opacity, yzw=reserved
+    float4 extraParams;   // x=opacity, y=centeredEdge, z=rimInsetDip, w=reserved
 };
 
 float superellipseCornerSDF(float2 p, float r, float n)
@@ -189,6 +193,13 @@ float EdgeSlopeFactor(float depthPx, float thicknessPx, float ior)
     return -tan(thetaT - thetaI);
 }
 
+float EaseRimDepth(float depthPx, float easePx)
+{
+    float d = max(depthPx, 0.0);
+    float w = max(easePx, 1e-3);
+    return d < w ? (d * d) / (2.0 * w) : d - 0.5 * w;
+}
+
 float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET
 {
     float dpr = max(miscParams.x, 0.25);
@@ -224,11 +235,17 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
         float dispersionRange = max(refractParams.w, 0.001);
 
         float nmerged = -distPx;
-        // The slope profile is near-vertical at the rim (asin'(1) is infinite), so neighbouring rim pixels would
-        // sample backdrop texels far apart and alias into grain. Evaluate it at least 1px inside the shape.
-        float slopeDepth = max(nmerged, 1.0);
-        float edgeFactor = EdgeSlopeFactor(slopeDepth, refThickness, refFactor);
-        float ef1 = EdgeSlopeFactor(slopeDepth + 1.0, refThickness, refFactor);
+        // The slope profile is near-vertical at the rim: near depth 0 it behaves like A - B*sqrt(depth), whose
+        // derivative is infinite, so neighbouring rim pixels would sample backdrop texels far apart and alias into
+        // grain. Rather than clamping the depth (which also throws away the strongest rim refraction), ease the
+        // depth quadratically over the first rimEasePx: s = d^2 / (2w) for d < w, d - w/2 beyond (C1 at d == w).
+        // sqrt(d^2 / 2w) is linear in d, so the slope becomes finite (~B / sqrt(2w)) while the full rim magnitude
+        // EdgeSlopeFactor(0) is kept. extraParams.z optionally starts the profile further inside the rim (DIPs),
+        // trading rim reach for less sampling from outside small elements.
+        float rimEasePx = min(2.0 * dpr, refThickness * 0.5);
+        float rimInsetPx = max(extraParams.z, 0.0) * dpr;
+        float edgeFactor = EdgeSlopeFactor(rimInsetPx + EaseRimDepth(nmerged, rimEasePx), refThickness, refFactor);
+        float ef1 = EdgeSlopeFactor(rimInsetPx + EaseRimDepth(nmerged + 1.0, rimEasePx), refThickness, refFactor);
 
         float2 unitN = RoundedRectUnitNormal(fragCoord, center, halfPx, cr, n, dpr);
         float nLen = length(unitN);
@@ -1287,6 +1304,7 @@ private:
         D2D1_COLOR_F tint{};
         bool force_opaque = false;
         bool centered_edge = false;
+        float rim_inset_dip = 0.0f;
         bool use_dupl = false;
         uint64_t backdrop_ver = 0;
 
@@ -1305,7 +1323,8 @@ private:
                    glare_factor == o.glare_factor && glare_convergence == o.glare_convergence &&
                    glare_opposite_factor == o.glare_opposite_factor && glare_angle_deg == o.glare_angle_deg &&
                    tint.r == o.tint.r && tint.g == o.tint.g && tint.b == o.tint.b && tint.a == o.tint.a &&
-                   force_opaque == o.force_opaque && centered_edge == o.centered_edge && use_dupl == o.use_dupl && backdrop_ver == o.backdrop_ver;
+                   force_opaque == o.force_opaque && centered_edge == o.centered_edge && rim_inset_dip == o.rim_inset_dip &&
+                   use_dupl == o.use_dupl && backdrop_ver == o.backdrop_ver;
         }
     };
 
@@ -1341,6 +1360,7 @@ private:
             .tint = s.tint,
             .force_opaque = s.force_opaque,
             .centered_edge = s.centered_edge,
+            .rim_inset_dip = s.rim_inset_dip,
             .use_dupl = use_dupl,
             .backdrop_ver = backdrop_ver,
         };
@@ -1772,7 +1792,8 @@ private:
             .glare_params = {style.glare_range, style.glare_hardness, style.glare_factor, style.glare_angle_deg},
             .shape_params = {style.glare_convergence, style.glare_opposite_factor, style.corner_radius, style.roundness},
             .misc_params = {target.scale(), style.force_opaque ? 1.0f : 0.0f, 1.5f, style.margin_dip},
-            .extra_params = {std::clamp(style.opacity, 0.0f, 1.0f), style.centered_edge ? 1.0f : 0.0f, 0.0f, 0.0f},
+            .extra_params = {std::clamp(style.opacity, 0.0f, 1.0f), style.centered_edge ? 1.0f : 0.0f,
+                             std::max(style.rim_inset_dip, 0.0f), 0.0f},
         };
 
         if (fx.blur && style.blur_std_dev > 0.05f) {
