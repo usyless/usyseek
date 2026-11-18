@@ -497,7 +497,7 @@ private:
     }
 
     [[nodiscard]] ShadowPad active_pad() const noexcept {
-        return custom_pill_frame() ? ShadowPad{.left = 24.0f, .top = 18.0f, .right = 24.0f, .bottom = 28.0f} : ShadowPad{};
+        return custom_pill_frame() ? ShadowPad{.left = 52.0f, .top = 34.0f, .right = 52.0f, .bottom = 78.0f} : ShadowPad{};
     }
 
     [[nodiscard]] D2D1_RECT_F pill_bounds(D2D1_SIZE_F sz) const noexcept {
@@ -1240,35 +1240,41 @@ private:
             }
         }
         const std::array<ShadowLayer, 2> layers = focused
-            ? std::array<ShadowLayer, 2>{{{.sigma = 8.0f, .dy = 6.0f, .alpha = 0.30f}, {.sigma = 2.0f, .dy = 1.0f, .alpha = 0.12f}}}
-            : std::array<ShadowLayer, 2>{{{.sigma = 5.0f, .dy = 3.0f, .alpha = 0.16f}, {.sigma = 1.5f, .dy = 0.5f, .alpha = 0.08f}}};
-        const float reach = (layers[0].sigma * 3.0f) + layers[0].dy + 2.0f;
-        if (!cv.intersects_clip(inset(pr, -reach, -reach), 1.0f)) return;
+            ? std::array<ShadowLayer, 2>{{{.sigma = 23.0f, .dy = 24.0f, .alpha = 0.52f}, {.sigma = 10.0f, .dy = 0.0f, .alpha = 0.28f}}}
+            : std::array<ShadowLayer, 2>{{{.sigma = 23.0f, .dy = 22.0f, .alpha = 0.34f}, {.sigma = 5.0f, .dy = 1.0f, .alpha = 0.23f}}};
+        const float reach_x = (layers[0].sigma * 2.8f) + 2.0f;
+        const float reach_t = std::max(0.0f, (layers[0].sigma * 2.8f) - layers[0].dy) + 2.0f;
+        const float reach_b = (layers[0].sigma * 2.8f) + layers[0].dy + 2.0f;
+        const D2D1_RECT_F shadow_bounds = D2D1::RectF(pr.left - reach_x, pr.top - reach_t, pr.right + reach_x, pr.bottom + reach_b);
+        if (!cv.intersects_clip(shadow_bounds, 1.0f)) return;
 
         ID2D1DeviceContext6* dc = cv.dc();
         const float s = target_.scale();
         const float r = std::clamp(radius, 0.0f, std::min(width(pr), height(pr)) * 0.5f);
         const float max_dy = std::max(layers[0].dy, layers[1].dy);
 
-        // Pill edges in window pixels, and the bitmap layout: `e` px of shadow margin around a pill whose fractional
+        // Pill edges in window pixels, and the bitmap layout: directional shadow margins around a pill whose fractional
         // pixel offsets match the real one, so every slice maps 1:1 onto the pixel grid.
-        const float e = std::ceil(reach * s);
+        const float ex = std::ceil(reach_x * s);
+        const float et = std::ceil(reach_t * s);
+        const float eb = std::ceil(reach_b * s);
         const float pl = pr.left * s;
         const float pt = pr.top * s;
         const float prr = pr.right * s;
         const float pb = pr.bottom * s;
-        const float req = std::ceil(((2.0f * r) + (2.0f * max_dy)) * s) + 6.0f;
-        const auto span = [req](float lo, float hi) noexcept {
+        const float req_x = std::ceil(2.0f * r * s) + 6.0f;
+        const float req_y = std::ceil(((2.0f * r) + (2.0f * max_dy)) * s) + 6.0f;
+        const auto span = [](float req, float lo, float hi) noexcept {
             const float actual = hi - lo;
             if (actual < req + 2.0f) return actual; // too small to shrink: rasterise at full size
             return req + ((hi - std::floor(hi)) - (lo - std::floor(lo)));
         };
-        const float bl = e + (pl - std::floor(pl));
-        const float bt = e + (pt - std::floor(pt));
-        const float br = bl + span(pl, prr);
-        const float bb = bt + span(pt, pb);
-        const auto bw = static_cast<UINT>(std::floor(br) + e + 1.0f);
-        const auto bh = static_cast<UINT>(std::floor(bb) + e + 1.0f);
+        const float bl = ex + (pl - std::floor(pl));
+        const float bt = et + (pt - std::floor(pt));
+        const float br = bl + span(req_x, pl, prr);
+        const float bb = bt + span(req_y, pt, pb);
+        const auto bw = static_cast<UINT>(std::floor(br) + ex + 1.0f);
+        const auto bh = static_cast<UINT>(std::floor(bb) + eb + 1.0f);
 
         const ShadowKey key{.gfx_epoch = sh_.gfx.epoch(), .target_epoch = target_.target_epoch(), .scale = s, .radius = r,
                             .strength = theme_s, .focused = focused, .left = bl, .top = bt, .right = br, .bottom = bb,};
@@ -1311,9 +1317,9 @@ private:
 
         // 9-slice: the 1px column/row through the bitmap's centre lies on the pill's straight edges, so stretching it
         // reproduces the shadow of the full-size pill exactly.
-        const float ox = std::floor(pl) - e;
+        const float ox = std::floor(pl) - ex;
         const float oxr = std::floor(prr) - std::floor(br);
-        const float oy = std::floor(pt) - e;
+        const float oy = std::floor(pt) - et;
         const float oyb = std::floor(pb) - std::floor(bb);
         const float cx1 = std::floor((bl + br) * 0.5f);
         const float cy1 = std::floor((bt + bb) * 0.5f);
