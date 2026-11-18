@@ -105,6 +105,7 @@ public:
         if (glass_active()) ensure_window_capture_affinity(hwnd_, true);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
+        window_active_ = true;
         field_.focused = !preview_valid();
         if (field_.focused) field_.select_all();
         caret_reset();
@@ -491,7 +492,7 @@ private:
     }
 
     [[nodiscard]] ShadowPad active_pad() const noexcept {
-        return custom_pill_frame() ? ShadowPad{.left = 14.0f, .top = 8.0f, .right = 14.0f, .bottom = 20.0f} : ShadowPad{};
+        return custom_pill_frame() ? ShadowPad{.left = 24.0f, .top = 14.0f, .right = 24.0f, .bottom = 32.0f} : ShadowPad{};
     }
 
     [[nodiscard]] D2D1_RECT_F pill_bounds(D2D1_SIZE_F sz) const noexcept {
@@ -1214,9 +1215,9 @@ private:
         return glass_active() && (preview_ >= 0 || menu_open_ || drop_open_ || show_help());
     }
 
-    static void draw_pill_shadow(Canvas& cv, D2D1_RECT_F pr, float radius) noexcept {
-        const float scaled = 0.34f * cv.theme().shadow_alpha_scale;
-        if (scaled <= 0.002f) return;
+    static void draw_pill_shadow(Canvas& cv, D2D1_RECT_F pr, float radius, bool focused) noexcept {
+        const float theme_s = cv.theme().shadow_alpha_scale;
+        if (theme_s <= 0.002f) return;
         if (const auto dc_clip = cv.dirty_clip()) {
             const D2D1_RECT_F inner = inset(pr, 0.5f, 0.5f);
             if (dc_clip->left >= inner.left && dc_clip->top >= inner.top &&
@@ -1224,25 +1225,31 @@ private:
                 return;
             }
         }
-        constexpr int steps = 10;
-        constexpr float spread = 16.0f;
+        constexpr int steps = 14;
+        const float spread = focused ? 24.0f : 16.0f;
+        const float dy_max = focused ? 6.0f : 3.0f;
+        const float intensity = (focused ? 0.78f : 0.34f) * theme_s;
         const D2D1_RECT_F bounds = D2D1::RectF(
-            pr.left - (spread * 0.65f) - 1.0f,
-            pr.top - (spread * 0.25f) - 1.0f,
-            pr.right + (spread * 0.65f) + 1.0f,
-            pr.bottom + spread + 1.0f);
+            pr.left - (spread * 0.80f) - 1.0f,
+            pr.top - (spread * 0.60f) - 1.0f,
+            pr.right + (spread * 0.80f) + 1.0f,
+            pr.bottom + (spread * 0.90f) + dy_max + 1.0f);
         if (!cv.intersects_clip(bounds, 1.0f)) return;
 
         for (int i = steps; i >= 1; --i) {
             const float t = static_cast<float>(i) / static_cast<float>(steps);
             const float g = spread * t;
+            const float dy = dy_max * t;
             const float falloff = (1.0f - t) * (1.0f - t);
-            const float a = (scaled / static_cast<float>(steps)) * (0.25f + (1.5f * falloff));
+            const float a = std::clamp(intensity * (0.045f + (0.085f * falloff)), 0.0f, 0.9f);
             cv.fill_round(
-                D2D1::RectF(pr.left - (g * 0.65f), pr.top - (g * 0.25f), pr.right + (g * 0.65f), pr.bottom + g),
-                radius > 0.0f ? (radius + (g * 0.85f)) : (g * 0.65f),
+                D2D1::RectF(pr.left - (g * 0.80f), pr.top - (g * 0.60f) + dy,
+                            pr.right + (g * 0.80f), pr.bottom + (g * 0.90f) + dy),
+                radius > 0.0f ? (radius + (g * 0.80f)) : (g * 0.65f),
                 hex(0x000000, a));
         }
+        cv.fill_round(inset(pr, -0.75f, -0.75f), radius > 0.0f ? (radius + 0.75f) : 0.75f,
+                      hex(0x000000, std::clamp(0.18f * (focused ? 1.0f : 0.55f) * theme_s, 0.0f, 0.6f)));
         // Punch out the pill interior so translucent themes/glass never darken from the shadow fill underneath.
         ID2D1DeviceContext6* dc = cv.dc();
         dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
@@ -1255,7 +1262,10 @@ private:
         const D2D1_RECT_F pr = pill_bounds(sz);
         const bool custom_frame = custom_pill_frame();
         const float outer_r = effective_pill_radius(pr);
-        if (custom_frame) draw_pill_shadow(cv, pr, outer_r);
+        if (custom_frame) {
+            const bool focused = window_active_ || (hwnd_ && GetForegroundWindow() == hwnd_);
+            draw_pill_shadow(cv, pr, outer_r, focused);
+        }
 
         const bool glass = glass_active();
         const bool need_scene = glass_scene_needed();
@@ -4072,17 +4082,25 @@ private:
                 };
                 return 0;
             }
-            case WM_ACTIVATE:
-                if (LOWORD(wp) == WA_INACTIVE && sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && !dragging_out_) {
-                    if (GetTickCount64() - shown_tick_ > 250) {
-                        if (visible() && !fading_out_) {
-                            GetCursorPos(&blur_hide_cursor_);
-                            blur_hide_tick_ = GetTickCount64();
-                        }
-                        hide();
+            case WM_ACTIVATE: {
+                const bool active = LOWORD(wp) != WA_INACTIVE;
+                if (window_active_ != active) {
+                    window_active_ = active;
+                    if (custom_pill_frame() && visible()) {
+                        full_dirty_ = true;
+                        invalidate();
                     }
                 }
+                if (!active && sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && !dragging_out_ &&
+                    GetTickCount64() - shown_tick_ > 250) {
+                    if (visible() && !fading_out_) {
+                        GetCursorPos(&blur_hide_cursor_);
+                        blur_hide_tick_ = GetTickCount64();
+                    }
+                    hide();
+                }
                 return 0;
+            }
             case WM_CAPTURECHANGED:
                 selecting_text_ = false;
                 dragging_scroll_ = false;
@@ -4290,6 +4308,7 @@ private:
     D2D1_RECT_F scroll_thumb_{};
 
     bool fullscreen_ = false;
+    bool window_active_ = false;
     ShadowPad applied_pad_{};
     bool placing_ = false;
     UINT placing_dpi_ = 0;
