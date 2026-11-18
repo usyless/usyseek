@@ -254,6 +254,10 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
             accA += tap.a;
         }
         float4 blurredPixel = float4(accRgb / 8.0, accA / 8.0);
+        // Per-channel premultiplied alpha. Dispersion builds each channel from different taps, so each channel
+        // must be unpremultiplied by the alpha mixed with the same weights; dividing all channels by one shared
+        // alpha pushes single channels far above 1 near transparent backdrop texels (bright saturated pixels).
+        float3 chanA = blurredPixel.aaa;
 
         float depthInZone = nmerged / refThickness;
         float tt = saturate(depthInZone / dispersionRange);
@@ -282,16 +286,14 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
             disp.g = sOrange.g / 7.0 + (sYellow.g + blurredPixel.g + sCyan.g) / 3.5;
             disp.b = (blurredPixel.b + sCyan.b + sBlue.b + sPurple.b) / 4.0;
             blurredPixel.rgb = disp;
+            chanA.r = (sRed.a + sOrange.a + sYellow.a) / 3.5 + sPurple.a / 7.0;
+            chanA.g = sOrange.a / 7.0 + (sYellow.a + blurredPixel.a + sCyan.a) / 3.5;
+            chanA.b = (blurredPixel.a + sCyan.a + sBlue.a + sPurple.a) / 4.0;
         }
 
-        if (blurredPixel.a > 0.001)
-        {
-            blurredPixel.rgb /= blurredPixel.a;
-        }
-        else
-        {
-            blurredPixel.rgb = float3(0.0, 0.0, 0.0);
-        }
+        // The alpha floor keeps 8-bit quantisation noise in near-transparent texels (e.g. rgb 2/255 over a 1/255)
+        // from being amplified into a fully saturated colour; such texels fade to black instead.
+        blurredPixel.rgb = saturate(blurredPixel.rgb / max(chanA, 0.04));
 
         float3 tintRgb = tintColor.rgb;
         float tintA = tintColor.a;
