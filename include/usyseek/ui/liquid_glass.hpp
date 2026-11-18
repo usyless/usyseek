@@ -219,8 +219,11 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
         float dispersionRange = max(refractParams.w, 0.001);
 
         float nmerged = -distPx;
-        float edgeFactor = EdgeSlopeFactor(nmerged, refThickness, refFactor);
-        float ef1 = EdgeSlopeFactor(nmerged + 1.0, refThickness, refFactor);
+        // The slope profile is near-vertical at the rim (asin'(1) is infinite), so neighbouring rim pixels would
+        // sample backdrop texels far apart and alias into grain. Evaluate it at least 1px inside the shape.
+        float slopeDepth = max(nmerged, 1.0);
+        float edgeFactor = EdgeSlopeFactor(slopeDepth, refThickness, refFactor);
+        float ef1 = EdgeSlopeFactor(slopeDepth + 1.0, refThickness, refFactor);
 
         float2 unitN = RoundedRectUnitNormal(fragCoord, center, halfPx, cr, n, dpr);
         float nLen = length(unitN);
