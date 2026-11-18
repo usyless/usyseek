@@ -305,14 +305,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     sh.engine.start(sh.settings);
     sh.engine.encoder().load_async(to_wide(sh.settings.model_dir), sh.settings.model_name);
 
-    sh.open_settings = [&] {
-        settings_win.show(0);
-        if (pill.visible()) pill.hide();
+    const auto open_settings_tab = [&](int tab) {
+        settings_win.show(tab);
+        if (sh.settings.hide_on_focus_loss && pill.visible()) pill.hide();
     };
-    sh.open_notifications = [&] {
-        settings_win.show(2);
-        if (pill.visible()) pill.hide();
-    };
+    sh.open_settings = [&] { open_settings_tab(0); };
+    sh.open_notifications = [&] { open_settings_tab(2); };
     sh.on_ui_opened = [&] { settings_win.maybe_auto_check_updates(); };
     sh.tags_refreshed = [&] { pill.on_tags_refreshed(); };
     sh.redraw_all = [&] {
@@ -379,8 +377,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         }
         if (msg == m_settings && m_settings) {
             done = true;
-            settings_win.show(wp > 0 ? static_cast<int>(wp - 1) : -1);
-            if (pill.visible()) pill.hide();
+            open_settings_tab(wp > 0 ? static_cast<int>(wp - 1) : -1);
             return 0;
         }
         if (msg == m_open_notifs && m_open_notifs) {
