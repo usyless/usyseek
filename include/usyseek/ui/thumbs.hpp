@@ -123,7 +123,7 @@ public:
         {
             const std::scoped_lock lk{m_};
             if (!pending_.insert(id).second) return;
-            queue_.push_front({.id = id, .path = path, .px = px});
+            queue_.push_front({.id = id, .path = path, .px = px, .gen = clear_gen_});
             while (queue_.size() > (full_ ? 6u : 64u)) {
                 pending_.erase(queue_.back().id);
                 queue_.pop_back();
@@ -191,7 +191,8 @@ public:
     void clear() {
         {
             const std::scoped_lock lk{m_};
-            for (const auto& q : queue_) pending_.erase(q.id);
+            ++clear_gen_;
+            pending_.clear();
             queue_.clear();
             done_.clear();
         }
@@ -209,6 +210,7 @@ private:
         uint64_t id = 0;
         std::wstring path;
         UINT px = 0;
+        uint64_t gen = 0;
     };
     struct Done {
         uint64_t id = 0;
@@ -252,12 +254,16 @@ private:
             } else {
                 load(r, d);
             }
+            bool should_notify = false;
             {
                 const std::scoped_lock lk{m_};
-                pending_.erase(r.id);
-                done_.push_back(std::move(d));
+                if (r.gen == clear_gen_) {
+                    pending_.erase(r.id);
+                    done_.push_back(std::move(d));
+                    should_notify = true;
+                }
             }
-            if (notify_) PostMessageW(notify_, msg_, 0, 0);
+            if (should_notify && notify_) PostMessageW(notify_, msg_, 0, 0);
         }
     }
 
@@ -340,6 +346,7 @@ private:
     std::unordered_set<uint64_t> pending_;
     std::vector<Done> done_;
     std::vector<Done> done_scratch_;
+    uint64_t clear_gen_ = 0;
     bool stopping_ = false;
     std::vector<std::jthread> workers_;
 

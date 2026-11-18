@@ -3,6 +3,7 @@
 #include "shared.hpp"
 #include "textfield.hpp"
 #include "widgets.hpp"
+#include "window_lifecycle.hpp"
 
 #include <commdlg.h>
 #include <imm.h>
@@ -18,6 +19,15 @@ namespace usyseek::ui {
 class ThemeEditorWindow {
 public:
     explicit ThemeEditorWindow(Shared& s) : sh_{s} {}
+    ThemeEditorWindow(const ThemeEditorWindow&) = delete;
+    ThemeEditorWindow& operator=(const ThemeEditorWindow&) = delete;
+    ThemeEditorWindow(ThemeEditorWindow&&) = delete;
+    ThemeEditorWindow& operator=(ThemeEditorWindow&&) = delete;
+    ~ThemeEditorWindow() {
+        glass_.release();
+        target_.release();
+        if (hwnd_) DestroyWindow(hwnd_);
+    }
 
     bool create(HINSTANCE inst) {
         inst_ = inst;
@@ -111,32 +121,33 @@ public:
         if (!hwnd_) return;
         if (visible()) apply_window_theme(hwnd_, sh_.theme, false, true);
         target_.set_liquid_glass(glass_active());
-        if (glass_active()) {
-            if (visible() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
-        } else {
-            KillTimer(hwnd_, TIMER_GLASS);
+        if (!glass_active()) {
             glass_.release();
             sh_.desktop_dupl.reset();
         }
+        sync_live_timers();
         full_dirty_ = true;
         invalidate();
     }
 
     void hide(bool revert_preview = true) {
+        if (in_modal_) return;
         if (hwnd_) KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
         live_apply_pending_ = false;
         if (active_field_) {
             if (!revert_preview) commit_field(active_field_, false);
             active_field_->focused = false;
+            active_field_->caret_on = false;
             active_field_ = nullptr;
         }
         if (revert_preview) clear_unsaved_preview();
-        if (active_slider_ >= 0 || dragging_scroll_ || selecting_text_) {
-            active_slider_ = -1;
-            dragging_scroll_ = false;
-            selecting_text_ = false;
-            ReleaseCapture();
-        }
+        active_slider_ = -1;
+        dragging_scroll_ = false;
+        selecting_text_ = false;
+        in_sizemove_ = false;
+        resize_pending_ = false;
+        tracking_ = false;
+        release_capture_if_owned();
         snap_anims();
         anim_active_ = false;
         raw_hover_id_ = IdNone;
@@ -150,6 +161,7 @@ public:
         KillTimer(hwnd_, TIMER_GLASS);
         KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
         live_apply_pending_ = false;
+        glass_.release();
         cloak_window(hwnd_, true);
         ShowWindow(hwnd_, SW_HIDE);
         ValidateRect(hwnd_, nullptr);
@@ -160,24 +172,24 @@ public:
     void invalidate() noexcept {
         dirty_ = true;
         full_dirty_ = true;
-        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+        if (live_visible()) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     /// Advances pending repaints, animations, and glass backdrop updates when another window's paced drag starves WM_TIMER/WM_PAINT.
     void pump_during_other_drag() {
-        if (!visible() || in_sizemove_ || rendering_ || sh_.test_mode) return;
+        if (!live_visible() || in_sizemove_ || rendering_ || sh_.test_mode) return;
         if (glass_active() && !full_dirty_ && !dirty_ && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
             full_dirty_ = true;
             dirty_ = true;
         }
         if (dirty_ || anim_active_) {
             render(true);
-            if (visible() && !anim_active_ && !dirty_) ValidateRect(hwnd_, nullptr);
+            if (live_visible() && !anim_active_ && !dirty_) ValidateRect(hwnd_, nullptr);
         }
     }
 
     void render(bool from_drag_pump = false) {
-        if (rendering_ || (!visible() && !sh_.test_mode)) return;
+        if (rendering_ || (!live_visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         rendering_ = true;
         dirty_ = false;
@@ -245,7 +257,7 @@ public:
         glass_.end_frame();
         if (!ok) recover();
         rendering_ = false;
-        anim_active_ = visible() && anim;
+        anim_active_ = live_visible() && anim;
         if (did_pace && !from_drag_pump && sh_.on_drag_paced) sh_.on_drag_paced(hwnd_);
     }
 
@@ -409,13 +421,12 @@ private:
         apply_window_theme(hwnd_, sh_.theme, false, true);
         cloak_window(hwnd_, false);
         ShowWindow(hwnd_, SW_SHOWNORMAL);
-        if (glass_active()) {
-            ensure_window_capture_affinity(hwnd_, true);
-            if (!sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
-        }
+        if (glass_active()) ensure_window_capture_affinity(hwnd_, true);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
-        window_active_ = true;
+        window_active_ = hwnd_ != nullptr && (GetForegroundWindow() == hwnd_ || GetActiveWindow() == hwnd_);
+        sync_caret_timer();
+        sync_live_timers();
         if (sh_.visibility_changed) sh_.visibility_changed();
         render();
         ValidateRect(hwnd_, nullptr);
@@ -430,8 +441,10 @@ private:
         error_msg_.clear();
         if (active_field_) {
             active_field_->focused = false;
+            active_field_->caret_on = false;
             active_field_ = nullptr;
         }
+        sync_caret_timer(false);
         mark_preview_dirty(false);
         load_draft_into_fields(true);
         sync_switch_targets(false);
@@ -499,12 +512,11 @@ private:
         strip_float(draft_.settings_bg_alpha, bt.settings_bg_alpha, slider_spec(SlSettingsAlpha).step);
         strip_float(draft_.card_alpha, bt.card_alpha, slider_spec(SlCardAlpha).step);
         strip_float(draft_.shadow_alpha_scale, bt.shadow_alpha_scale, slider_spec(SlShadowScale).step);
-        if (draft_.pill_radius.is_null() && !bt.pill_radius.has_value()) {
-            draft_.pill_radius.reset();
-        } else if (draft_.pill_radius.has_value() && bt.pill_radius.has_value() &&
-                   std::abs(*draft_.pill_radius - *bt.pill_radius) < (slider_spec(SlPillRadius).step * 0.25f)) {
-            draft_.pill_radius.reset();
-        }
+        const bool pill_rad_matches_base =
+            (draft_.pill_radius.is_null() && !bt.pill_radius.has_value()) ||
+            (draft_.pill_radius.has_value() && bt.pill_radius.has_value() &&
+             std::abs(*draft_.pill_radius - *bt.pill_radius) < (slider_spec(SlPillRadius).step * 0.25f));
+        if (pill_rad_matches_base) draft_.pill_radius.reset();
         strip_float(draft_.card_radius, bt.card_radius, slider_spec(SlCardRadius).step);
         strip_float(draft_.button_radius, bt.button_radius, slider_spec(SlButtonRadius).step);
         strip_float(draft_.thumb_radius, bt.thumb_radius, slider_spec(SlThumbRadius).step);
@@ -1691,8 +1703,24 @@ private:
         return active;
     }
 
+    [[nodiscard]] bool minimized() const noexcept { return hwnd_ != nullptr && IsIconic(hwnd_) != FALSE; }
+    [[nodiscard]] bool live_visible() const noexcept { return window_can_render_live(visible(), minimized()); }
+
+    void release_capture_if_owned() noexcept {
+        if (hwnd_ && GetCapture() == hwnd_) ReleaseCapture();
+    }
+
+    void sync_live_timers() noexcept {
+        if (!hwnd_) return;
+        if (glass_active() && live_visible() && !sh_.test_mode) {
+            SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
+        } else {
+            KillTimer(hwnd_, TIMER_GLASS);
+        }
+    }
+
     void start_anim() noexcept {
-        if (!visible()) return;
+        if (!live_visible()) return;
         if (!anim_active_) last_anim_ = std::chrono::steady_clock::now();
         anim_active_ = true;
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1703,13 +1731,21 @@ private:
     }
 
     void sync_caret_timer(bool reset_on = true) noexcept {
-        if (!window_active_ || !active_field_) {
+        const auto blink_ms = caret_blink_interval_ms(GetCaretBlinkTime());
+        const CaretDecision d = caret_timer_decision(visible(), minimized(), false, window_active_, active_field_ != nullptr, blink_ms);
+        if (!d.visible) {
             if (hwnd_) KillTimer(hwnd_, TIMER_CARET);
             if (active_field_) active_field_->caret_on = false;
             return;
         }
-        if (reset_on) active_field_->caret_on = true;
-        if (hwnd_) SetTimer(hwnd_, TIMER_CARET, GetCaretBlinkTime(), nullptr);
+        if (reset_on || !d.run_timer) active_field_->caret_on = true;
+        if (hwnd_) {
+            if (d.run_timer && blink_ms) {
+                SetTimer(hwnd_, TIMER_CARET, *blink_ms, nullptr);
+            } else {
+                KillTimer(hwnd_, TIMER_CARET);
+            }
+        }
     }
 
     void set_active_field(TextField* tf, float click_x, bool dbl) {
@@ -1982,6 +2018,13 @@ private:
             self->hwnd_ = hwnd;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
         }
+        if (msg == WM_NCDESTROY) {
+            if (auto* self = reinterpret_cast<ThemeEditorWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) {
+                self->hwnd_ = nullptr;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
         if (auto* self = reinterpret_cast<ThemeEditorWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) {
             return self->handle(msg, wp, lp);
         }
@@ -1999,14 +2042,14 @@ private:
             case WM_PAINT: {
                 PAINTSTRUCT ps;
                 BeginPaint(hwnd_, &ps);
-                if (visible() || sh_.test_mode) render();
+                if (live_visible() || sh_.test_mode) render();
                 EndPaint(hwnd_, &ps);
-                if (visible() && anim_active_) {
+                if (live_visible() && anim_active_) {
                     MSG m;
                     while (PeekMessageW(&m, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE)) {
                         DispatchMessageW(&m);
                     }
-                    if (visible() && anim_active_) InvalidateRect(hwnd_, nullptr, FALSE);
+                    if (live_visible() && anim_active_) InvalidateRect(hwnd_, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -2041,7 +2084,13 @@ private:
             }
             case WM_SIZE:
                 resize_pending_ = false;
-                if (wp != SIZE_MINIMIZED) {
+                if (wp == SIZE_MINIMIZED) {
+                    snap_anims();
+                    anim_active_ = false;
+                    sync_caret_timer(false);
+                    sync_live_timers();
+                } else {
+                    sync_live_timers();
                     target_.resize(LOWORD(lp), HIWORD(lp));
                     scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
                     full_dirty_ = true;
@@ -2080,8 +2129,14 @@ private:
                 if (glass_active() && visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
                 return 0;
             case WM_DISPLAYCHANGE:
-                if (sh_.gfx.adapter_stale(hwnd_)) recover();
-                invalidate();
+                if (visible()) {
+                    if (sh_.gfx.adapter_stale(hwnd_)) recover();
+                    invalidate();
+                } else if (sh_.gfx.adapter_stale(hwnd_)) {
+                    target_.release();
+                    glass_.release();
+                    full_dirty_ = true;
+                }
                 return 0;
             case WM_SETTINGCHANGE:
                 if (!lp || _wcsicmp(reinterpret_cast<const wchar_t*>(lp), L"ImmersiveColorSet") == 0) {
@@ -2106,13 +2161,13 @@ private:
                 return 0;
             }
             case WM_ACTIVATE: {
-                const bool active = LOWORD(wp) != WA_INACTIVE;
+                const bool active = wm_activate_is_active(LOWORD(wp), HIWORD(wp) != 0);
                 if (window_active_ != active) {
                     window_active_ = active;
                     sync_caret_timer();
                     if (active_field_ && visible()) invalidate();
                 }
-                return 0;
+                break;
             }
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) {
@@ -2138,7 +2193,7 @@ private:
                 if (selecting_text_) {
                     if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u || !active_field_) {
                         selecting_text_ = false;
-                        ReleaseCapture();
+                        release_capture_if_owned();
                     } else {
                         Canvas cv{target_, sh_.fonts, hits_, sh_.theme};
                         active_field_->click(cv, p.x, true);
@@ -2150,7 +2205,7 @@ private:
                 if (active_slider_ >= 0) {
                     if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                         active_slider_ = -1;
-                        ReleaseCapture();
+                        release_capture_if_owned();
                     } else {
                         update_slider_from_x(active_slider_, p.x);
                         return 0;
@@ -2159,7 +2214,7 @@ private:
                 if (dragging_scroll_) {
                     if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                         dragging_scroll_ = false;
-                        ReleaseCapture();
+                        release_capture_if_owned();
                     } else {
                         const float track = view_height() - 8.0f - height(scroll_thumb_);
                         if (track > 0.0f) {
@@ -2220,7 +2275,7 @@ private:
                     active_slider_ = -1;
                     dragging_scroll_ = false;
                     selecting_text_ = false;
-                    ReleaseCapture();
+                    release_capture_if_owned();
                     invalidate();
                 }
                 return 0;
@@ -2249,7 +2304,7 @@ private:
             case WM_TIMER:
                 switch (wp) {
                     case TIMER_CARET:
-                        if (!window_active_ || !active_field_) {
+                        if (!live_visible() || !window_active_ || !active_field_) {
                             sync_caret_timer(false);
                             return 0;
                         }
@@ -2263,7 +2318,11 @@ private:
                         render();
                         return 0;
                     case TIMER_GLASS:
-                        if (glass_active() && visible() && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
+                        if (!glass_active() || !live_visible()) {
+                            KillTimer(hwnd_, TIMER_GLASS);
+                            return 0;
+                        }
+                        if (glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
                             full_dirty_ = true;
                             invalidate();
                         }
@@ -2281,7 +2340,13 @@ private:
                 }
                 return 0;
             case WM_CLOSE:
-                hide(true);
+                if (should_allow_close(in_modal_)) hide(true);
+                return 0;
+            case WM_DESTROY:
+                KillTimer(hwnd_, TIMER_CARET);
+                KillTimer(hwnd_, TIMER_GLASS);
+                KillTimer(hwnd_, TIMER_DEVICE);
+                KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
                 return 0;
             default:
                 break;

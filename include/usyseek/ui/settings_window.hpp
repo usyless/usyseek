@@ -3,6 +3,7 @@
 #include "shared.hpp"
 #include "widgets.hpp"
 #include "textfield.hpp"
+#include "window_lifecycle.hpp"
 #include "../http.hpp"
 #include "../path_rules.hpp"
 #include "../storage_info.hpp"
@@ -25,6 +26,16 @@ namespace usyseek::ui {
 class SettingsWindow {
 public:
     explicit SettingsWindow(Shared& s) : sh_{s} {}
+    SettingsWindow(const SettingsWindow&) = delete;
+    SettingsWindow& operator=(const SettingsWindow&) = delete;
+    SettingsWindow(SettingsWindow&&) = delete;
+    SettingsWindow& operator=(SettingsWindow&&) = delete;
+    ~SettingsWindow() {
+        stop();
+        glass_.release();
+        target_.release();
+        if (hwnd_) DestroyWindow(hwnd_);
+    }
     std::function<void(const ThemeEntry*, bool)> open_theme_editor;
 
     bool create(HINSTANCE inst) {
@@ -93,19 +104,18 @@ public:
     void apply_theme() noexcept {
         if (visible()) apply_window_theme(hwnd_, sh_.theme, false, true);
         target_.set_liquid_glass(glass_active());
-        if (glass_active()) {
-            if (visible() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
-        } else {
-            KillTimer(hwnd_, TIMER_GLASS);
+        if (!glass_active()) {
             glass_.release();
             sh_.desktop_dupl.reset();
         }
+        sync_live_timers();
         full_dirty_ = true;
         invalidate();
     }
 
     /// Cancels and joins background download/install jobs before tearing down the window.
     void stop() noexcept {
+        stop_recording();
         venv_job_.thread = {};
         model_job_.thread = {};
         update_job_.thread = {};
@@ -118,7 +128,9 @@ public:
 
     void show(int tab = -1) {
         if (tab >= 0) {
-            tab_ = std::clamp(tab, 0, 3);
+            const int next_tab = std::clamp(tab, 0, 3);
+            if (next_tab != tab_) clear_active_field();
+            tab_ = next_tab;
             scroll_ = target_scroll_ = 0.0f;
         }
         sync_fields();
@@ -143,21 +155,29 @@ public:
         if (glass_active()) ensure_window_capture_affinity(hwnd_, true);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
-        window_active_ = true;
-        SetTimer(hwnd_, TIMER_POLL, 500, nullptr);
-        if (glass_active() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
+        window_active_ = hwnd_ != nullptr && (GetForegroundWindow() == hwnd_ || GetActiveWindow() == hwnd_);
+        sync_caret_timer();
+        sync_live_timers();
         if (sh_.visibility_changed) sh_.visibility_changed();
         render();
         ValidateRect(hwnd_, nullptr);
     }
 
     void hide() {
+        if (in_modal_) return;
         stop_recording();
-        if (active_field_) {
+        if (TextField* const tf = std::exchange(active_field_, nullptr)) {
+            tf->focused = false;
+            tf->caret_on = false;
+            sync_caret_timer(false);
             commit_fields();
-            active_field_->focused = false;
-            active_field_ = nullptr;
+            if (in_modal_) return;
         }
+        dragging_scroll_ = false;
+        in_sizemove_ = false;
+        resize_pending_ = false;
+        tracking_ = false;
+        release_capture_if_owned();
         snap_anims();
         anim_active_ = false;
         raw_hover_id_ = IdNone;
@@ -172,6 +192,7 @@ public:
         KillTimer(hwnd_, TIMER_POLL);
         KillTimer(hwnd_, TIMER_DEVICE);
         KillTimer(hwnd_, TIMER_GLASS);
+        glass_.release();
         cloak_window(hwnd_, true);
         ShowWindow(hwnd_, SW_HIDE);
         ValidateRect(hwnd_, nullptr);
@@ -179,11 +200,11 @@ public:
     }
 
     void set_tab(int t) noexcept {
-        const bool animate = visible() && !sh_.test_mode;
+        const bool animate = live_visible() && !sh_.test_mode;
         tab_ = t;
         tab_anim_.set(static_cast<float>(t), animate);
         scroll_ = target_scroll_ = 0.0f;
-        active_field_ = nullptr;
+        clear_active_field();
         if (animate) start_anim();
         invalidate();
     }
@@ -192,24 +213,24 @@ public:
     void invalidate() noexcept {
         dirty_ = true;
         full_dirty_ = true;
-        if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
+        if (live_visible()) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     /// Advances pending repaints, animations, and glass backdrop updates when another window's paced drag starves WM_TIMER/WM_PAINT.
     void pump_during_other_drag() {
-        if (!visible() || in_sizemove_ || rendering_ || sh_.test_mode) return;
+        if (!live_visible() || in_sizemove_ || rendering_ || sh_.test_mode) return;
         if (glass_active() && !full_dirty_ && !dirty_ && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
             full_dirty_ = true;
             dirty_ = true;
         }
         if (dirty_ || anim_active_) {
             render(true);
-            if (visible() && !anim_active_ && !dirty_) ValidateRect(hwnd_, nullptr);
+            if (live_visible() && !anim_active_ && !dirty_) ValidateRect(hwnd_, nullptr);
         }
     }
 
     void render(bool from_drag_pump = false) {
-        if (rendering_ || (!visible() && !sh_.test_mode)) return;
+        if (rendering_ || (!live_visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         rendering_ = true;
         dirty_ = false;
@@ -289,7 +310,7 @@ public:
         if (!ok) recover();
         last_tooltip_dirty_ = curr_tip_dirty;
         rendering_ = false;
-        anim_active_ = visible() && anim;
+        anim_active_ = live_visible() && anim;
         if (did_pace && !from_drag_pump && sh_.on_drag_paced) sh_.on_drag_paced(hwnd_);
     }
 
@@ -2991,7 +3012,7 @@ private:
     }
 
     void start_anim() noexcept {
-        if (!visible()) return;
+        if (!live_visible()) return;
         if (!anim_active_) last_anim_ = std::chrono::steady_clock::now();
         anim_active_ = true;
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -3953,14 +3974,53 @@ private:
         }
     }
 
+    [[nodiscard]] bool minimized() const noexcept { return hwnd_ != nullptr && IsIconic(hwnd_) != FALSE; }
+    [[nodiscard]] bool live_visible() const noexcept { return window_can_render_live(visible(), minimized()); }
+
+    void release_capture_if_owned() noexcept {
+        if (hwnd_ && GetCapture() == hwnd_) ReleaseCapture();
+    }
+
+    void clear_active_field() noexcept {
+        if (active_field_) {
+            active_field_->focused = false;
+            active_field_->caret_on = false;
+            active_field_ = nullptr;
+        }
+        sync_caret_timer(false);
+    }
+
+    void sync_live_timers() noexcept {
+        if (!hwnd_) return;
+        const bool live = live_visible();
+        if (live) {
+            SetTimer(hwnd_, TIMER_POLL, 500, nullptr);
+        } else {
+            KillTimer(hwnd_, TIMER_POLL);
+        }
+        if (live && glass_active() && !sh_.test_mode) {
+            SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
+        } else {
+            KillTimer(hwnd_, TIMER_GLASS);
+        }
+    }
+
     void sync_caret_timer(bool reset_on = true) noexcept {
-        if (!window_active_ || !active_field_) {
+        const auto blink_ms = caret_blink_interval_ms(GetCaretBlinkTime());
+        const CaretDecision d = caret_timer_decision(visible(), minimized(), false, window_active_, active_field_ != nullptr, blink_ms);
+        if (!d.visible) {
             if (hwnd_) KillTimer(hwnd_, TIMER_CARET);
             if (active_field_) active_field_->caret_on = false;
             return;
         }
-        if (reset_on) active_field_->caret_on = true;
-        if (hwnd_) SetTimer(hwnd_, TIMER_CARET, GetCaretBlinkTime(), nullptr);
+        if (reset_on || !d.run_timer) active_field_->caret_on = true;
+        if (hwnd_) {
+            if (d.run_timer && blink_ms) {
+                SetTimer(hwnd_, TIMER_CARET, *blink_ms, nullptr);
+            } else {
+                KillTimer(hwnd_, TIMER_CARET);
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------------------
@@ -3972,6 +4032,13 @@ private:
             auto* self = static_cast<SettingsWindow*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
             self->hwnd_ = hwnd;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        if (msg == WM_NCDESTROY) {
+            if (auto* self = reinterpret_cast<SettingsWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) {
+                self->hwnd_ = nullptr;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
         }
         if (auto* self = reinterpret_cast<SettingsWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) {
             return self->handle(msg, wp, lp);
@@ -3989,15 +4056,15 @@ private:
             case WM_PAINT: {
                 PAINTSTRUCT ps;
                 BeginPaint(hwnd_, &ps);
-                if (visible() || sh_.test_mode) render();
+                if (live_visible() || sh_.test_mode) render();
                 EndPaint(hwnd_, &ps);
-                if (visible() && anim_active_) {
+                if (live_visible() && anim_active_) {
                     // Drain any due timers while QS_PAINT is clear so VSync frames don't starve timers.
                     MSG m;
                     while (PeekMessageW(&m, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE)) {
                         DispatchMessageW(&m);
                     }
-                    if (visible() && anim_active_) InvalidateRect(hwnd_, nullptr, FALSE);
+                    if (live_visible() && anim_active_) InvalidateRect(hwnd_, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -4032,7 +4099,14 @@ private:
             }
             case WM_SIZE:
                 resize_pending_ = false;
-                if (wp != SIZE_MINIMIZED) {
+                if (wp == SIZE_MINIMIZED) {
+                    snap_anims();
+                    anim_active_ = false;
+                    tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+                    sync_caret_timer(false);
+                    sync_live_timers();
+                } else {
+                    sync_live_timers();
                     target_.resize(LOWORD(lp), HIWORD(lp));
                     scroll_ = target_scroll_ = std::clamp(scroll_, 0.0f, max_scroll());
                     full_dirty_ = true;
@@ -4078,8 +4152,14 @@ private:
                 }
                 return 0;
             case WM_DISPLAYCHANGE:
-                if (sh_.gfx.adapter_stale(hwnd_)) recover();
-                invalidate();
+                if (visible()) {
+                    if (sh_.gfx.adapter_stale(hwnd_)) recover();
+                    invalidate();
+                } else if (sh_.gfx.adapter_stale(hwnd_)) {
+                    target_.release();
+                    glass_.release();
+                    full_dirty_ = true;
+                }
                 return 0;
             case WM_SETTINGCHANGE:
                 if (!lp || _wcsicmp(reinterpret_cast<const wchar_t*>(lp), L"ImmersiveColorSet") == 0) {
@@ -4104,13 +4184,20 @@ private:
                 return 0;
             }
             case WM_ACTIVATE: {
-                const bool active = LOWORD(wp) != WA_INACTIVE;
+                const bool active = wm_activate_is_active(LOWORD(wp), HIWORD(wp) != 0);
                 if (window_active_ != active) {
                     window_active_ = active;
+                    if (!active) {
+                        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+                        if (recording_hotkey_) {
+                            stop_recording();
+                            if (visible()) invalidate();
+                        }
+                    }
                     sync_caret_timer();
                     if (active_field_ && visible()) invalidate();
                 }
-                return 0;
+                break;
             }
             case WM_SETCURSOR:
                 if (LOWORD(lp) == HTCLIENT) {
@@ -4135,7 +4222,7 @@ private:
                 if (dragging_scroll_) {
                     if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                         dragging_scroll_ = false;
-                        ReleaseCapture();
+                        release_capture_if_owned();
                     } else {
                         const float track = view_height() - 8.0f - height(scroll_thumb_);
                         if (track > 0.0f) {
@@ -4207,7 +4294,7 @@ private:
                 return 0;
             case WM_LBUTTONUP:
                 dragging_scroll_ = false;
-                ReleaseCapture();
+                release_capture_if_owned();
                 return 0;
             case WM_CAPTURECHANGED:
                 dragging_scroll_ = false;
@@ -4232,7 +4319,7 @@ private:
             case WM_TIMER:
                 switch (wp) {
                     case TIMER_CARET:
-                        if (!window_active_ || !active_field_) {
+                        if (!live_visible() || !window_active_ || !active_field_) {
                             sync_caret_timer(false);
                             return 0;
                         }
@@ -4241,6 +4328,10 @@ private:
                         invalidate();
                         return 0;
                     case TIMER_POLL:
+                        if (!live_visible()) {
+                            KillTimer(hwnd_, TIMER_POLL);
+                            return 0;
+                        }
                         if (!(glass_active() && in_sizemove_) && poll_status()) invalidate();
                         return 0;
                     case TIMER_DEVICE:
@@ -4249,8 +4340,12 @@ private:
                         render();
                         return 0;
                     case TIMER_TOOLTIP: {
+                        if (!live_visible() || !window_active_) {
+                            tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+                            return 0;
+                        }
                         const wchar_t* tip = tooltip_text(raw_hover_id_);
-                        const bool animate = visible() && !sh_.test_mode;
+                        const bool animate = live_visible() && !sh_.test_mode;
                         if (tooltip_.on_timer(hwnd_, TIMER_TOOLTIP, raw_hover_id_ != IdNone && tip != nullptr, tip ? tip : L"", {}, animate)) {
                             if (animate) {
                                 start_anim();
@@ -4261,7 +4356,11 @@ private:
                         return 0;
                     }
                     case TIMER_GLASS:
-                        if (glass_active() && visible() && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
+                        if (!glass_active() || !live_visible()) {
+                            KillTimer(hwnd_, TIMER_GLASS);
+                            return 0;
+                        }
+                        if (glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
                             full_dirty_ = true;
                             invalidate();
                         }
@@ -4275,7 +4374,14 @@ private:
                 invalidate();
                 return 0;
             case WM_CLOSE:
-                hide();
+                if (should_allow_close(in_modal_)) hide();
+                return 0;
+            case WM_DESTROY:
+                KillTimer(hwnd_, TIMER_CARET);
+                KillTimer(hwnd_, TIMER_POLL);
+                KillTimer(hwnd_, TIMER_DEVICE);
+                KillTimer(hwnd_, TIMER_TOOLTIP);
+                KillTimer(hwnd_, TIMER_GLASS);
                 return 0;
             default:
                 break;

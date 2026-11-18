@@ -264,7 +264,9 @@ public:
     }
 
     void set_playing(bool on) noexcept {
-        if (!has_animation() || ui_playing_ == on) return;
+        if (!ui_active_ || ui_settled_static_) return;
+        if (on && !has_animation()) return;
+        if (ui_playing_ == on) return;
         ui_playing_ = on;
         if (ui_playing_) {
             ui_frame_deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(ui_current_delay_ms_);

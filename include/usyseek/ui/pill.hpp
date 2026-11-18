@@ -5,6 +5,7 @@
 #include "shared.hpp"
 #include "textfield.hpp"
 #include "video_player.hpp"
+#include "window_lifecycle.hpp"
 
 #include <shellscalingapi.h>
 
@@ -23,6 +24,16 @@ namespace usyseek::ui {
 class Pill {
 public:
     explicit Pill(Shared& s) : sh_{s} {}
+    Pill(const Pill&) = delete;
+    Pill& operator=(const Pill&) = delete;
+    Pill(Pill&&) = delete;
+    Pill& operator=(Pill&&) = delete;
+    ~Pill() {
+        stop_workers();
+        glass_.release();
+        target_.release();
+        if (hwnd_) DestroyWindow(hwnd_);
+    }
 
     bool create(HINSTANCE inst) {
         WNDCLASSEXW wc{.cbSize = sizeof(wc)};
@@ -60,7 +71,7 @@ public:
     void apply_theme() noexcept {
         target_.set_liquid_glass(glass_active());
         if (glass_active()) {
-            if (visible() && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
+            if (visible() && !fading_out_ && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
         } else {
             KillTimer(hwnd_, TIMER_GLASS);
             glass_.release();
@@ -110,7 +121,7 @@ public:
         if (glass_active()) ensure_window_capture_affinity(hwnd_, true);
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
-        window_active_ = true;
+        window_active_ = hwnd_ != nullptr && (GetForegroundWindow() == hwnd_ || GetActiveWindow() == hwnd_);
         field_.focused = !preview_valid();
         if (field_.focused) field_.select_all();
         caret_reset();
@@ -130,16 +141,27 @@ public:
         if (!sh_.test_mode && fade_ < 1.0f) {
             last_fade_ = std::chrono::steady_clock::now();
             SetTimer(hwnd_, TIMER_FADE, 15, nullptr);
+        } else {
+            KillTimer(hwnd_, TIMER_FADE);
         }
     }
 
     void finish_hide() {
         fading_out_ = false;
+        window_active_ = false;
+        tracking_ = false;
+        in_sizemove_ = false;
+        resize_pending_ = false;
+        drag_pending_ = false;
+        deferred_select_.reset();
         fade_ = target_fade_ = 0.0f;
         chip_anim_.snap(static_cast<float>(chip_ + 1));
+        ++seq_;
         searching_ = false;
         loading_more_ = false;
         debounce_pending_ = false;
+        field_.caret_on = false;
+        menu_field_.caret_on = false;
         KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_DEBOUNCE);
         KillTimer(hwnd_, TIMER_STATUS);
@@ -148,6 +170,7 @@ public:
         KillTimer(hwnd_, TIMER_GIF);
         KillTimer(hwnd_, TIMER_GLASS);
         set_video_timer(false);
+        release_capture_if_owned();
         dragging_seek_ = false;
         dragging_volume_ = false;
         gif_scrub_resume_ = false;
@@ -155,6 +178,7 @@ public:
         gif_.close();
         video_.close();
         sh_.previews.clear();
+        glass_.release();
         anim_active_ = false;
         raw_hover_id_ = IdNone;
         raw_hover_index_ = 0;
@@ -171,16 +195,29 @@ public:
 
     void hide() {
         if (!visible()) return;
+        if (!sh_.test_mode && fading_out_) return;
+        fading_out_ = true;
+        window_active_ = false;
         selecting_text_ = false;
         dragging_scroll_ = false;
         dragging_seek_ = false;
         dragging_volume_ = false;
         gif_scrub_resume_ = false;
-        ReleaseCapture();
+        drag_pending_ = false;
+        deferred_select_.reset();
+        in_sizemove_ = false;
+        resize_pending_ = false;
+        debounce_pending_ = false;
+        glass_.set_sizemove(false, sh_.desktop_dupl, sh_.gfx);
+        release_capture_if_owned();
         close_popups();
+        field_.caret_on = false;
+        menu_field_.caret_on = false;
         KillTimer(hwnd_, TIMER_CARET);
+        KillTimer(hwnd_, TIMER_DEBOUNCE);
         KillTimer(hwnd_, TIMER_STATUS);
         KillTimer(hwnd_, TIMER_GIF);
+        KillTimer(hwnd_, TIMER_GLASS);
         set_video_timer(false);
         gif_.set_playing(false);
         video_.suspend();
@@ -188,8 +225,6 @@ public:
             finish_hide();
             return;
         }
-        if (fading_out_) return;
-        fading_out_ = true;
         target_fade_ = 0.0f;
         last_fade_ = std::chrono::steady_clock::now();
         SetTimer(hwnd_, TIMER_FADE, 15, nullptr);
@@ -946,9 +981,10 @@ public:
         deferred_thumbs_ = false;
         const bool thumbs = sh_.thumbs.process(target_.dc());
         const bool previews = sh_.previews.process(target_.dc());
-        // A full-size decode that lands after the viewer closed is not kept around
-        if (preview_ < 0 && previews) sh_.previews.clear();
-        if (thumbs || (previews && preview_ >= 0)) invalidate();
+        // A full-size decode that lands after the viewer or window closed is not kept around
+        const bool keep_preview = should_keep_preview_decode(visible(), fading_out_, preview_);
+        if (!keep_preview && previews) sh_.previews.clear();
+        if (thumbs || (previews && keep_preview)) invalidate();
     }
 
     void on_indexer_changed() {
@@ -2021,6 +2057,7 @@ private:
         drop_open_ = false;
         drop_from_button_ = false;
         field_.focused = true;
+        caret_reset();
         run_search(0);
     }
 
@@ -2159,8 +2196,9 @@ private:
         drop_open_ = false;
         drop_from_button_ = false;
         help_pinned_ = false;
-        field_.focused = true;
-        apply_height();
+        field_.focused = !preview_valid();
+        sync_caret_timer();
+        if (!fading_out_) apply_height();
     }
 
     /// 0 = none of the selection has it, 1 = some, 2 = all
@@ -2392,6 +2430,7 @@ private:
     void find_similar(const Item& it) {
         field_.replace_all(ulp::str::concat_strings(L"similar:", item_path(it)));
         field_.focused = true;
+        caret_reset();
         run_search(0);
     }
 
@@ -2582,7 +2621,7 @@ private:
 
     void sync_preview_timers() noexcept {
         if (!hwnd_) return;
-        if (!visible() || !preview_valid()) {
+        if (!visible() || fading_out_ || !preview_valid()) {
             KillTimer(hwnd_, TIMER_GIF);
             set_video_timer(false);
             return;
@@ -2658,7 +2697,7 @@ private:
     }
 
     bool step_gif_playback() {
-        if (!visible() || !preview_valid() || items_[preview_].pt.p.k == 1 || !gif_.has_animation() || !gif_.playing()) {
+        if (!visible() || fading_out_ || !preview_valid() || items_[preview_].pt.p.k == 1 || !gif_.has_animation() || !gif_.playing()) {
             return false;
         }
         const auto [advanced, wait_ms] = gif_.tick(std::chrono::steady_clock::now());
@@ -2705,7 +2744,7 @@ private:
     }
 
     void on_video_timer() {
-        if (!visible() || !preview_valid() || items_[preview_].pt.p.k != 1 || !video_.active() || !video_.needs_timer()) {
+        if (!visible() || fading_out_ || !preview_valid() || items_[preview_].pt.p.k != 1 || !video_.active() || !video_.needs_timer()) {
             set_video_timer(false);
             return;
         }
@@ -2772,6 +2811,7 @@ private:
                 scroll_ = target_scroll_ = preview_initial_scroll_;
             }
         }
+        sync_caret_timer(false);
         invalidate();
     }
 
@@ -2786,6 +2826,7 @@ private:
         focus_ = index;
         selected_ = {items_[index].pt.id};
         field_.focused = false;
+        sync_caret_timer(false);
         // Browsing towards the end pulls in the next page, as scrolling the grid would
         if (index >= static_cast<int>(items_.size()) - 3 && has_more_ && !loading_more_ && !searching_) run_search(pagination_.next_offset());
         request_preview();
@@ -3477,7 +3518,7 @@ private:
     void start_drag() {
         drag_pending_ = false;
         deferred_select_.reset();
-        ReleaseCapture();
+        release_capture_if_owned();
         if (drag_index_ < 0 || std::cmp_greater_equal(drag_index_, items_.size())) return;
         const uint64_t id = items_[drag_index_].pt.id;
         if (!selected_.contains(id)) selected_ = {id};
@@ -3517,17 +3558,38 @@ private:
         return {.x = GET_X_LPARAM(lp) / s, .y = GET_Y_LPARAM(lp) / s};
     }
 
-    void caret_reset() noexcept {
-        if (!window_active_) {
+    void release_capture_if_owned() noexcept {
+        if (hwnd_ && GetCapture() == hwnd_) ReleaseCapture();
+    }
+
+    [[nodiscard]] bool caret_field_focused() const noexcept {
+        return menu_open_ || (!preview_valid() && field_.focused);
+    }
+
+    void sync_caret_timer(bool reset_on = true) noexcept {
+        const bool minimized = hwnd_ != nullptr && IsIconic(hwnd_) != FALSE;
+        const auto blink_ms = caret_blink_interval_ms(GetCaretBlinkTime());
+        const CaretDecision d = caret_timer_decision(visible(), minimized, fading_out_, window_active_, caret_field_focused(), blink_ms);
+        if (!d.visible) {
             field_.caret_on = false;
             menu_field_.caret_on = false;
             if (hwnd_) KillTimer(hwnd_, TIMER_CARET);
             return;
         }
-        field_.caret_on = true;
-        menu_field_.caret_on = true;
-        SetTimer(hwnd_, TIMER_CARET, GetCaretBlinkTime(), nullptr);
+        if (reset_on || !d.run_timer) {
+            field_.caret_on = true;
+            menu_field_.caret_on = true;
+        }
+        if (hwnd_) {
+            if (d.run_timer && blink_ms) {
+                SetTimer(hwnd_, TIMER_CARET, *blink_ms, nullptr);
+            } else {
+                KillTimer(hwnd_, TIMER_CARET);
+            }
+        }
     }
+
+    void caret_reset() noexcept { sync_caret_timer(true); }
 
     void on_mouse_move(D2D1_POINT_2F p) {
         if (fading_out_) return;
@@ -3539,7 +3601,7 @@ private:
         if (drag_pending_) {
             if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                 end_drag_detect();
-                ReleaseCapture();
+                release_capture_if_owned();
             } else {
                 POINT c;
                 GetCursorPos(&c);
@@ -3554,7 +3616,7 @@ private:
         if (dragging_seek_) {
             if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                 end_seek_drag();
-                ReleaseCapture();
+                release_capture_if_owned();
             } else {
                 if (preview_seek_to_x(p.x)) {
                     invalidate_preview_media();
@@ -3565,7 +3627,7 @@ private:
         if (dragging_volume_) {
             if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                 end_volume_drag();
-                ReleaseCapture();
+                release_capture_if_owned();
             } else {
                 if (apply_volume_from_x(p.x)) {
                     invalidate_preview_controls();
@@ -3576,7 +3638,7 @@ private:
         if (dragging_scroll_) {
             if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                 dragging_scroll_ = false;
-                ReleaseCapture();
+                release_capture_if_owned();
             } else {
                 const Grid g = grid();
                 const float track = height(g.view) - 8 - height(scroll_thumb_);
@@ -3590,7 +3652,7 @@ private:
         if (selecting_text_) {
             if ((static_cast<uint16_t>(GetAsyncKeyState(VK_LBUTTON)) & 0x8000u) == 0u) {
                 selecting_text_ = false;
-                ReleaseCapture();
+                release_capture_if_owned();
             } else {
                 Canvas cv{target_, sh_.fonts, hits_, sh_.theme};
                 field_.click(cv, p.x, true);
@@ -3644,6 +3706,7 @@ private:
     }
 
     void on_lbutton_down(D2D1_POINT_2F p, bool dbl) {
+        if (fading_out_) return;
         flush();
         clear_tooltip_now();
         selecting_text_ = false;
@@ -3771,6 +3834,7 @@ private:
                 }
                 if (!shift) focus_ = idx;
                 field_.focused = false; // keys now act on the cards (Space, Ctrl+C, Ctrl+A)
+                sync_caret_timer(false);
                 begin_drag_detect(idx);
                 break;
             }
@@ -3796,6 +3860,7 @@ private:
                 menu_field_.focused = true;
                 Canvas cv{target_, sh_.fonts, hits_, sh_.theme};
                 menu_field_.click(cv, p.x, shift);
+                caret_reset();
                 break;
             }
             case IdDropItem: accept_dropdown(idx); return;
@@ -3809,6 +3874,7 @@ private:
     }
 
     void on_rbutton_down(D2D1_POINT_2F p) {
+        if (fading_out_) return;
         flush();
         clear_tooltip_now();
         const Hit* h = hit_test(hits_, p);
@@ -3835,6 +3901,7 @@ private:
     }
 
     void on_wheel(int delta) {
+        if (fading_out_) return;
         clear_tooltip_now();
         if (menu_open_) return;
         if (preview_valid()) {
@@ -3890,11 +3957,13 @@ private:
             selected_ = {items_[f].pt.id};
         }
         field_.focused = false;
+        sync_caret_timer(false);
         scroll_to(f);
         invalidate();
     }
 
     void on_key(UINT vk) {
+        if (fading_out_) return;
         clear_tooltip_now();
         const bool ctrl = GetKeyState(VK_CONTROL) < 0;
         const bool shift = GetKeyState(VK_SHIFT) < 0;
@@ -3911,6 +3980,7 @@ private:
                 selected_.clear();
                 focus_ = -1;
                 field_.focused = true;
+                caret_reset();
             } else {
                 hide();
             }
@@ -3967,6 +4037,7 @@ private:
         if (ctrl && vk == 'F') {
             field_.focused = true;
             field_.select_all();
+            caret_reset();
             invalidate();
             return;
         }
@@ -3993,6 +4064,7 @@ private:
                 field_.focused = true;
                 focus_ = -1;
                 selected_.clear();
+                caret_reset();
                 invalidate();
                 return;
             }
@@ -4019,6 +4091,7 @@ private:
     }
 
     void on_char(wchar_t c) {
+        if (fading_out_) return;
         if (swallow_space_) {
             swallow_space_ = false;
             if (c == L' ') return;
@@ -4084,6 +4157,13 @@ private:
             auto* self = static_cast<Pill*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
             self->hwnd_ = hwnd;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        if (msg == WM_NCDESTROY) {
+            if (auto* self = reinterpret_cast<Pill*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) {
+                self->hwnd_ = nullptr;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
         }
         if (auto* self = reinterpret_cast<Pill*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) return self->handle(msg, wp, lp);
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -4201,8 +4281,14 @@ private:
                 if (glass_active() && visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
                 return 0;
             case WM_DISPLAYCHANGE:
-                if (sh_.gfx.adapter_stale(hwnd_)) recover();
-                invalidate();
+                if (visible()) {
+                    if (sh_.gfx.adapter_stale(hwnd_)) recover();
+                    invalidate();
+                } else if (sh_.gfx.adapter_stale(hwnd_)) {
+                    target_.release();
+                    glass_.release();
+                    full_dirty_ = true;
+                }
                 return 0;
             case WM_SETTINGCHANGE:
                 if (!lp || _wcsicmp(reinterpret_cast<const wchar_t*>(lp), L"ImmersiveColorSet") == 0) {
@@ -4246,19 +4332,12 @@ private:
                 return 0;
             }
             case WM_ACTIVATE: {
-                const bool active = LOWORD(wp) != WA_INACTIVE;
+                const bool active = wm_activate_is_active(LOWORD(wp), HIWORD(wp) != 0);
                 if (window_active_ != active) {
                     window_active_ = active;
-                    if (active) {
-                        if (visible() && (field_.focused || menu_open_)) {
-                            caret_reset();
-                        }
-                    } else {
-                        KillTimer(hwnd_, TIMER_CARET);
-                        field_.caret_on = false;
-                        menu_field_.caret_on = false;
-                    }
-                    if (visible() && (custom_pill_frame() || field_.focused || menu_open_)) {
+                    if (!active) tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+                    sync_caret_timer();
+                    if (visible() && (custom_pill_frame() || caret_field_focused())) {
                         if (custom_pill_frame()) full_dirty_ = true;
                         invalidate();
                     }
@@ -4271,7 +4350,7 @@ private:
                     }
                     hide();
                 }
-                return 0;
+                break;
             }
             case WM_CAPTURECHANGED:
                 selecting_text_ = false;
@@ -4325,7 +4404,7 @@ private:
                 if (dragging_seek_) end_seek_drag();
                 if (dragging_volume_) end_volume_drag();
                 end_drag_detect();
-                ReleaseCapture();
+                release_capture_if_owned();
                 return 0;
             case WM_RBUTTONDOWN: on_rbutton_down(to_dip(lp)); return 0;
             case WM_MOUSEWHEEL: on_wheel(GET_WHEEL_DELTA_WPARAM(wp)); return 0;
@@ -4342,19 +4421,28 @@ private:
             case WM_TIMER:
                 switch (wp) {
                     case TIMER_CARET:
-                        if (!window_active_) {
-                            KillTimer(hwnd_, TIMER_CARET);
-                            field_.caret_on = false;
-                            menu_field_.caret_on = false;
+                        if (!visible() || fading_out_ || !window_active_ || !caret_field_focused()) {
+                            sync_caret_timer(false);
                             return 0;
                         }
                         if (glass_active() && in_sizemove_) return 0;
                         field_.caret_on = !field_.caret_on;
                         menu_field_.caret_on = field_.caret_on;
-                        if (field_.focused || menu_open_) invalidate();
+                        invalidate();
                         return 0;
-                    case TIMER_DEBOUNCE: run_search(0); return 0;
+                    case TIMER_DEBOUNCE:
+                        if (!visible() || fading_out_) {
+                            KillTimer(hwnd_, TIMER_DEBOUNCE);
+                            debounce_pending_ = false;
+                            return 0;
+                        }
+                        run_search(0);
+                        return 0;
                     case TIMER_STATUS:
+                        if (!visible() || fading_out_) {
+                            KillTimer(hwnd_, TIMER_STATUS);
+                            return 0;
+                        }
                         if (!(glass_active() && in_sizemove_) && sh_.poll_indexer()) invalidate();
                         return 0;
                     case TIMER_DEVICE:
@@ -4381,6 +4469,10 @@ private:
                     }
                     case TIMER_COPY: set_clipboard(); return 0;
                     case TIMER_TOOLTIP: {
+                        if (!visible() || fading_out_ || !window_active_) {
+                            tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+                            return 0;
+                        }
                         std::wstring tt;
                         std::wstring ts;
                         const bool allow = raw_hover_id_ != IdNone && !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_ && tooltip_for(raw_hover_id_, raw_hover_index_, tt, ts);
@@ -4397,7 +4489,11 @@ private:
                     case TIMER_GIF: on_gif_timer(); return 0;
                     case TIMER_VIDEO: on_video_timer(); return 0;
                     case TIMER_GLASS:
-                        if (glass_active() && visible() && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
+                        if (!glass_active() || !visible() || fading_out_) {
+                            KillTimer(hwnd_, TIMER_GLASS);
+                            return 0;
+                        }
+                        if (glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
                             full_dirty_ = true;
                             invalidate();
                         }
@@ -4419,7 +4515,23 @@ private:
                     (*fn)();
                 }
                 return 0;
-            case WM_CLOSE: hide(); return 0;
+            case WM_CLOSE:
+                if (should_allow_close(false, dragging_out_)) hide();
+                return 0;
+            case WM_DESTROY:
+                KillTimer(hwnd_, TIMER_CARET);
+                KillTimer(hwnd_, TIMER_DEBOUNCE);
+                KillTimer(hwnd_, TIMER_STATUS);
+                KillTimer(hwnd_, TIMER_DEVICE);
+                KillTimer(hwnd_, TIMER_FADE);
+                KillTimer(hwnd_, TIMER_DROP);
+                KillTimer(hwnd_, TIMER_COPY);
+                KillTimer(hwnd_, TIMER_TOOLTIP);
+                KillTimer(hwnd_, TIMER_GIF);
+                KillTimer(hwnd_, TIMER_VIDEO);
+                KillTimer(hwnd_, TIMER_GLASS);
+                video_timer_active_ = false;
+                return 0;
             default: break;
         }
         return DefWindowProcW(hwnd_, msg, wp, lp);
