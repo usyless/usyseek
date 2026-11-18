@@ -4,6 +4,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -22,14 +23,22 @@ struct TempDbDir {
         path = fs::temp_directory_path() / ("usyseek_" + std::string{tag} + "_" + std::to_string(stamp));
         fs::create_directories(path);
     }
+    TempDbDir(const TempDbDir&) = delete;
+    TempDbDir& operator=(const TempDbDir&) = delete;
+    TempDbDir(TempDbDir&&) = delete;
+    TempDbDir& operator=(TempDbDir&&) = delete;
     ~TempDbDir() {
-        std::error_code ec;
-        fs::remove_all(path, ec);
+        try {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+        } catch (...) {
+            (void)std::fputs("tag_store_test: failed to remove temp dir\n", stderr);
+        }
     }
 };
 
 void roundtrips_tags_and_high_bit_ids() {
-    TempDbDir dir("tagstore");
+    const TempDbDir dir("tagstore");
     const fs::path db_path = dir.path / "tags.db";
 
     TagStore store;
@@ -44,22 +53,26 @@ void roundtrips_tags_and_high_bit_ids() {
 
     auto all = store.load_all(&err);
     CHECK(all.has_value());
-    CHECK(all->size() == 2);
-    CHECK((*all)[high_id].path == "C:\\Media\\hero.png");
-    CHECK((*all)[high_id].tags == (std::vector<std::string>{"art", "fav"}));
-    CHECK((*all)[low_id].tags == (std::vector<std::string>{"clip"}));
+    if (all.has_value()) {
+        CHECK(all->size() == 2);
+        CHECK((*all)[high_id].path == "C:\\Media\\hero.png");
+        CHECK((*all)[high_id].tags == (std::vector<std::string>{"art", "fav"}));
+        CHECK((*all)[low_id].tags == (std::vector<std::string>{"clip"}));
+    }
 
     // Empty tag list deletes the file row cleanly
     CHECK(store.set_file_tags(low_id, "D:\\Clips\\vid.mp4", std::array<std::string_view, 0>{}, &err));
     auto st = store.stats(&err);
     CHECK(st.has_value());
-    CHECK(st->file_count == 1);
-    CHECK(st->tag_count == 2);
-    CHECK(st->bytes > 0);
+    if (st.has_value()) {
+        CHECK(st->file_count == 1);
+        CHECK(st->tag_count == 2);
+        CHECK(st->bytes > 0);
+    }
 }
 
 void merges_backfill_and_tracks_collections() {
-    TempDbDir dir("tagmerge");
+    const TempDbDir dir("tagmerge");
     const fs::path db_path = dir.path / "tags.db";
 
     TagStore store;
@@ -77,9 +90,11 @@ void merges_backfill_and_tracks_collections() {
 
     auto all = store.load_all(&err);
     CHECK(all.has_value());
-    CHECK(all->size() == 2);
-    CHECK((*all)[10].tags == (std::vector<std::string>{"fav", "portrait"}));
-    CHECK((*all)[20].tags == (std::vector<std::string>{"landscape"}));
+    if (all.has_value()) {
+        CHECK(all->size() == 2);
+        CHECK((*all)[10].tags == (std::vector<std::string>{"fav", "portrait"}));
+        CHECK((*all)[20].tags == (std::vector<std::string>{"landscape"}));
+    }
 
     auto bf = store.is_collection_backfilled("PE-Core-L-14-336", &err);
     CHECK(bf.has_value() && !*bf);
@@ -93,12 +108,14 @@ void merges_backfill_and_tracks_collections() {
     CHECK(store.remove_ids(std::array<uint64_t, 1>{10}, &err));
     all = store.load_all(&err);
     CHECK(all.has_value());
-    CHECK(all->size() == 1);
-    CHECK(all->contains(20));
+    if (all.has_value()) {
+        CHECK(all->size() == 1);
+        CHECK(all->contains(20));
+    }
 }
 
 void supports_concurrent_connections_in_wal_mode() {
-    TempDbDir dir("tagwal");
+    const TempDbDir dir("tagwal");
     const fs::path db_path = dir.path / "tags.db";
 
     TagStore ui_store;
@@ -110,16 +127,23 @@ void supports_concurrent_connections_in_wal_mode() {
     CHECK(ui_store.set_file_tags(100, "C:\\x.png", std::array<std::string_view, 1>{"hero"}, &err));
     auto list = idx_store.list_all(&err);
     CHECK(list.has_value());
-    CHECK(list->size() == 1);
-    CHECK((*list)[0].id == 100);
-    CHECK((*list)[0].tags == (std::vector<std::string>{"hero"}));
+    if (list.has_value()) {
+        CHECK(list->size() == 1);
+        CHECK((*list)[0].id == 100);
+        CHECK((*list)[0].tags == (std::vector<std::string>{"hero"}));
+    }
 }
 
 } // namespace
 
 int main() {
-    roundtrips_tags_and_high_bit_ids();
-    merges_backfill_and_tracks_collections();
-    supports_concurrent_connections_in_wal_mode();
+    try {
+        roundtrips_tags_and_high_bit_ids();
+        merges_backfill_and_tracks_collections();
+        supports_concurrent_connections_in_wal_mode();
+    } catch (...) {
+        (void)std::fputs("tag_store_test: unexpected exception\n", stderr);
+        return 1;
+    }
     return usyseek::test::failures != 0;
 }

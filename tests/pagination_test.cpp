@@ -3,6 +3,7 @@
 #include <usyseek/ui/pagination.hpp>
 
 #include <cstdint>
+#include <cstdio>
 #include <print>
 #include <vector>
 
@@ -13,7 +14,7 @@ namespace {
 void run_pagination_tests() {
     PaginationTracker tr;
     std::vector<uint64_t> items;
-    auto push_page = [&](std::vector<uint64_t> page, bool append, bool ok, uint64_t next_off) {
+    const auto push_page = [&](std::vector<uint64_t> page, bool append, bool ok, uint64_t next_off) {
         return tr.apply_page(
             page, append, ok, next_off,
             [](uint64_t id) { return id; },
@@ -62,10 +63,10 @@ void run_pagination_tests() {
 int main() {
     try {
         run_pagination_tests();
+        std::println("pagination_test: {} failures", usyseek::test::failures);
     } catch (...) {
-        std::println(stderr, "pagination_test: unexpected exception");
+        (void)std::fputs("pagination_test: unexpected exception\n", stderr);
         return 1;
     }
-    std::println("pagination_test: {} failures", usyseek::test::failures);
     return usyseek::test::failures == 0 ? 0 : 1;
 }

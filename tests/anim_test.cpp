@@ -3,11 +3,14 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <print>
 
 using usyseek::ui::AnimFloat;
 using usyseek::ui::lerp;
 
-int main() {
+namespace {
+
+void run_anim_tests() {
     assert(std::abs(lerp(10.0f, 30.0f, 0.25f) - 15.0f) < 1e-6f);
 
     AnimFloat a;
@@ -38,6 +41,17 @@ int main() {
     assert(!a.active());
     assert(!a.step(0.016f));
 
-    std::printf("anim_test: all assertions passed (%d frames to converge)\n", steps);
+    std::println("anim_test: all assertions passed ({} frames to converge)", steps);
+}
+
+} // namespace
+
+int main() {
+    try {
+        run_anim_tests();
+    } catch (...) {
+        (void)std::fputs("anim_test: unexpected exception\n", stderr);
+        return 1;
+    }
     return 0;
 }

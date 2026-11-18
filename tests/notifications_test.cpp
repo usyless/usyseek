@@ -1,7 +1,11 @@
 #include "check.hpp"
 #include "usyseek/notification_store.hpp"
 
-int main() {
+#include <cstdio>
+
+namespace {
+
+void run_notifications_tests() {
     using namespace usyseek;
 
     NotificationStoreData store;
@@ -67,6 +71,16 @@ int main() {
     CHECK(capped.items.size() == 5);
     CHECK(capped.items[0].unix_ts == 1009);
     CHECK(capped.items[4].unix_ts == 1005);
+}
 
+} // namespace
+
+int main() {
+    try {
+        run_notifications_tests();
+    } catch (...) {
+        (void)std::fputs("notifications_test: unexpected exception\n", stderr);
+        return 1;
+    }
     return usyseek::test::failures;
 }

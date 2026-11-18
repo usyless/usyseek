@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <print>
 #include <vector>
@@ -67,22 +68,22 @@ void test_path_and_timing_helpers() {
     CHECK(fit_scaled_size(2000, 1, 100) == (std::pair<uint32_t, uint32_t>{100u, 1u}));
 
     // Native 1:1 display without upscaling.
-    const FitBox b1 = compute_preview_box(400, 200, 0, 0, 1.0f, FitBox{10.0f, 20.0f, 800.0f, 600.0f});
+    const FitBox b1 = compute_preview_box(400, 200, 0, 0, 1.0f, FitBox{.left = 10.0f, .top = 20.0f, .width = 800.0f, .height = 600.0f});
     CHECK(approx(b1.left, 210.0f) && approx(b1.top, 220.0f));
     CHECK(approx(b1.width, 400.0f) && approx(b1.height, 200.0f));
 
     // Downscaled preview thumbnail using meta dimensions and HiDPI 2.0x scaling fits cleanly without 2x shrink/crop.
-    const FitBox b2 = compute_preview_box(160, 90, 1920, 1080, 2.0f, FitBox{0.0f, 0.0f, 800.0f, 600.0f});
+    const FitBox b2 = compute_preview_box(160, 90, 1920, 1080, 2.0f, FitBox{.left = 0.0f, .top = 0.0f, .width = 800.0f, .height = 600.0f});
     CHECK(approx(b2.left, 0.0f) && approx(b2.top, 75.0f));
     CHECK(approx(b2.width, 800.0f) && approx(b2.height, 450.0f));
 
     // Invalid dpi_scale <= 0 safely defaults to 1.0.
-    const FitBox b3 = compute_preview_box(200, 100, 0, 0, 0.0f, FitBox{0.0f, 0.0f, 400.0f, 400.0f});
+    const FitBox b3 = compute_preview_box(200, 100, 0, 0, 0.0f, FitBox{.left = 0.0f, .top = 0.0f, .width = 400.0f, .height = 400.0f});
     CHECK(approx(b3.width, 200.0f) && approx(b3.height, 100.0f));
 
     // Fractional DPI scales snap preview box edges to whole device pixels.
     for (const float scale : {1.25f, 1.5f}) {
-        const FitBox bf = compute_preview_box(101, 75, 0, 0, scale, FitBox{10.0f, 20.0f, 400.0f, 300.0f});
+        const FitBox bf = compute_preview_box(101, 75, 0, 0, scale, FitBox{.left = 10.0f, .top = 20.0f, .width = 400.0f, .height = 300.0f});
         CHECK(approx(bf.width * scale, 101.0f));
         CHECK(approx(bf.height * scale, 75.0f));
         CHECK(approx(bf.left * scale, std::round(bf.left * scale)));
@@ -134,7 +135,7 @@ void test_gif_compositor() {
     CHECK(!comp.apply_frame(0, 0, 2, 2, red, GifDisposal::Keep, out));
 
     comp.reset();
-    for (uint8_t b : comp.canvas()) {
+    for (const uint8_t b : comp.canvas()) {
         CHECK(b == 0);
     }
 }
@@ -218,10 +219,10 @@ int main() {
         test_path_and_timing_helpers();
         test_gif_compositor();
         test_seek_state();
+        std::println("preview_media_test: {} failures", usyseek::test::failures);
     } catch (...) {
-        std::println(stderr, "preview_media_test: unexpected exception");
+        (void)std::fputs("preview_media_test: unexpected exception\n", stderr);
         return 1;
     }
-    std::println("preview_media_test: {} failures", usyseek::test::failures);
     return usyseek::test::failures == 0 ? 0 : 1;
 }

@@ -3,6 +3,7 @@
 #include <usyseek/storage_info.hpp>
 
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <string>
 
@@ -22,9 +23,17 @@ struct TempDir {
         path = fs::temp_directory_path() / ("usyseek_" + std::string{tag} + "_" + std::to_string(stamp));
         fs::create_directories(path);
     }
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+    TempDir(TempDir&&) = delete;
+    TempDir& operator=(TempDir&&) = delete;
     ~TempDir() {
-        std::error_code ec;
-        fs::remove_all(path, ec);
+        try {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+        } catch (...) {
+            (void)std::fputs("storage_info_test: failed to remove temp dir\n", stderr);
+        }
     }
 };
 
@@ -36,7 +45,7 @@ void write_bytes(const fs::path& p, size_t n) {
 }
 
 void scans_and_deletes_downloaded_models() {
-    TempDir dir("models");
+    const TempDir dir("models");
 
     // Full model
     write_bytes(dir.path / "PE-Core-L-14-336.safetensors", 100);
@@ -81,7 +90,7 @@ void scans_and_deletes_downloaded_models() {
 }
 
 void scans_edge_collections_on_disk() {
-    TempDir dir("edge");
+    const TempDir dir("edge");
 
     write_bytes(dir.path / "Model-B" / "edge_config.json", 12);
     write_bytes(dir.path / "Model-B" / "segments" / "seg0" / "data.bin", 88);
@@ -98,7 +107,12 @@ void scans_edge_collections_on_disk() {
 } // namespace
 
 int main() {
-    scans_and_deletes_downloaded_models();
-    scans_edge_collections_on_disk();
+    try {
+        scans_and_deletes_downloaded_models();
+        scans_edge_collections_on_disk();
+    } catch (...) {
+        (void)std::fputs("storage_info_test: unexpected exception\n", stderr);
+        return 1;
+    }
     return usyseek::test::failures != 0;
 }

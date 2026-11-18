@@ -1,6 +1,7 @@
 #include "check.hpp"
 #include "usyseek/indexer/everything_config.hpp"
 
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -11,12 +12,10 @@ using usyseek::indexer::build_everything_args;
 namespace {
 
 bool has_line(std::string_view text, std::string_view line) {
-    return text.find("\r\n" + std::string{line} + "\r\n") != std::string_view::npos;
+    return text.contains("\r\n" + std::string{line} + "\r\n");
 }
 
-} // namespace
-
-int main() {
+void run_everything_config_tests() {
     CHECK(EVERYTHING_LEAN_CONFIG.starts_with("[Everything]\r\n"));
     CHECK(EVERYTHING_LEAN_CONFIG.ends_with("\r\n"));
 
@@ -27,8 +26,8 @@ int main() {
         const std::size_t eol = EVERYTHING_LEAN_CONFIG.find("\r\n", pos);
         CHECK(eol != std::string_view::npos);
         const std::string_view line = EVERYTHING_LEAN_CONFIG.substr(pos, eol - pos);
-        CHECK(line.find('\r') == std::string_view::npos);
-        CHECK(line.find('\n') == std::string_view::npos);
+        CHECK(!line.contains('\r'));
+        CHECK(!line.contains('\n'));
         if (pos > 0) {
             const std::size_t eq = line.find('=');
             CHECK(eq != std::string_view::npos && eq > 0);
@@ -75,6 +74,16 @@ int main() {
           L" -add-config \"C:\\Program Files\\usyseek\\data\\Everything\\everything-lean.ini\"");
     CHECK(build_everything_args(L"C:", L"") ==
           L"-safe-mode -no-auto-index -volumes \"C:\" -exclude-folders \"\"");
+}
 
+} // namespace
+
+int main() {
+    try {
+        run_everything_config_tests();
+    } catch (...) {
+        (void)std::fputs("everything_config_test: unexpected exception\n", stderr);
+        return 1;
+    }
     return usyseek::test::failures != 0;
 }

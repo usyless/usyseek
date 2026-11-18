@@ -1,7 +1,11 @@
 #include "check.hpp"
 #include "usyseek/update_logic.hpp"
 
-int main() {
+#include <cstdio>
+
+namespace {
+
+void run_update_logic_tests() {
     using namespace usyseek;
 
     // 1. Semver parsing & comparison
@@ -52,6 +56,16 @@ int main() {
     CHECK(!pick_release_asset(only_7z, false).has_value());
     CHECK(pick_release_asset(only_7z, true).has_value());
     CHECK(extract_sha256_digest("sha256:short").empty());
+}
 
-    return 0;
+} // namespace
+
+int main() {
+    try {
+        run_update_logic_tests();
+    } catch (...) {
+        (void)std::fputs("update_logic_test: unexpected exception\n", stderr);
+        return 1;
+    }
+    return usyseek::test::failures != 0;
 }

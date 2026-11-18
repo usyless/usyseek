@@ -3,6 +3,7 @@
 #include <usyseek/ui/theme.hpp>
 
 #include <cmath>
+#include <cstdio>
 
 namespace {
 
@@ -10,24 +11,26 @@ bool approx(float a, float b, float eps = 0.02f) {
     return std::abs(a - b) <= eps;
 }
 
-} // namespace
-
-int main() {
+void test_theme_hex_and_presets() {
     using namespace usyseek::ui;
 
     // 1. Hex parsing
     {
         const auto c6 = parse_hex_color(" #a8c7fa ");
         CHECK(c6.has_value());
-        CHECK(approx(c6->r, 0xa8 / 255.0f, 0.005f));
-        CHECK(approx(c6->g, 0xc7 / 255.0f, 0.005f));
-        CHECK(approx(c6->b, 0xfa / 255.0f, 0.005f));
-        CHECK(approx(c6->a, 1.0f, 0.001f));
+        if (c6.has_value()) {
+            CHECK(approx(c6->r, 0xa8 / 255.0f, 0.005f));
+            CHECK(approx(c6->g, 0xc7 / 255.0f, 0.005f));
+            CHECK(approx(c6->b, 0xfa / 255.0f, 0.005f));
+            CHECK(approx(c6->a, 1.0f, 0.001f));
+        }
 
         const auto c8 = parse_hex_color("11223380");
         CHECK(c8.has_value());
-        CHECK(approx(c8->r, 0x11 / 255.0f, 0.005f));
-        CHECK(approx(c8->a, 0x80 / 255.0f, 0.005f));
+        if (c8.has_value()) {
+            CHECK(approx(c8->r, 0x11 / 255.0f, 0.005f));
+            CHECK(approx(c8->a, 0x80 / 255.0f, 0.005f));
+        }
 
         CHECK(!parse_hex_color("#12345").has_value());
         CHECK(!parse_hex_color("#zzzzzz").has_value());
@@ -81,7 +84,7 @@ int main() {
 
     // 4. Windows accent theme derivation across dark & light modes
     {
-        for (uint32_t rgb : {0xef4444u, 0x10b981u, 0x3b82f6u, 0xf59e0bu, 0xa855f7u}) {
+        for (const uint32_t rgb : {0xef4444u, 0x10b981u, 0x3b82f6u, 0xf59e0bu, 0xa855f7u}) {
             const Theme td = theme_from_accent(hex(rgb), true);
             CHECK(td.dark_mode);
             CHECK(relative_luminance(td.bg) < 0.08f);
@@ -95,6 +98,10 @@ int main() {
             CHECK(relative_luminance(tl.primary) < 0.45f);
         }
     }
+}
+
+void test_theme_specs_and_glass() {
+    using namespace usyseek::ui;
 
     // 5. ThemeSpec partial overrides + auto-derived hover/border + short tag palette cycling
     {
@@ -261,7 +268,11 @@ int main() {
         CHECK(format_hex_color_into(hex(0xa8c7fa), nbuf) == "#a8c7fa");
         std::array<wchar_t, 10> wbuf{};
         CHECK(format_hex_color_w_into(hex(0xa8c7fa), wbuf) == L"#a8c7fa");
-        CHECK(same_hex_color(hex(0xa8c7fa), *parse_hex_color("#a8c7fa")));
+        const auto parsed = parse_hex_color("#a8c7fa");
+        CHECK(parsed.has_value());
+        if (parsed.has_value()) {
+            CHECK(same_hex_color(hex(0xa8c7fa), *parsed));
+        }
         CHECK(!same_hex_color(hex(0xa8c7fa), hex(0xa8c7fb)));
         CHECK(!same_hex_color(hex(0xa8c7fa, 1.0f), hex(0xa8c7fa, 0.5f), true));
     }
@@ -314,6 +325,17 @@ int main() {
         CHECK(approx(tclamp.glass.glare_scale, 2.0f, 0.001f));
         CHECK(approx(tclamp.glass.glare_angle, 180.0f, 0.001f));
     }
+}
 
-    return 0;
+} // namespace
+
+int main() {
+    try {
+        test_theme_hex_and_presets();
+        test_theme_specs_and_glass();
+    } catch (...) {
+        (void)std::fputs("theme_test: unexpected exception\n", stderr);
+        return 1;
+    }
+    return usyseek::test::failures != 0;
 }

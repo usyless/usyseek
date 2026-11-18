@@ -5,7 +5,7 @@
 using namespace usyseek::ui;
 
 int main() {
-    const FitRect tile{10.0f, 20.0f, 200.0f, 100.0f};
+    const FitRect tile{.left = 10.0f, .top = 20.0f, .width = 200.0f, .height = 100.0f};
 
     CHECK((fit_image(400, 100, tile, ThumbFit::Crop) == FitRect{-90.0f, 20.0f, 400.0f, 100.0f}));
     CHECK((fit_image(100, 400, tile, ThumbFit::Crop) == FitRect{10.0f, -330.0f, 200.0f, 800.0f}));

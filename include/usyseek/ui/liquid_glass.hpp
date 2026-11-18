@@ -1797,7 +1797,7 @@ private:
             .shape_params = {style.glare_convergence, style.glare_opposite_factor, style.corner_radius, style.roundness},
             .misc_params = {target.scale(), style.force_opaque ? 1.0f : 0.0f, 1.5f, style.margin_dip},
             .extra_params = {std::clamp(style.opacity, 0.0f, 1.0f), style.centered_edge ? 1.0f : 0.0f,
-                             std::max(style.rim_inset_dip, 0.0f), 0.0f},
+                             std::max(style.rim_inset_dip, 0.0f), 0.0f,},
         };
 
         if (fx.blur && style.blur_std_dev > 0.05f) {

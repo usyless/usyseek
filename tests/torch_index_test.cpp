@@ -2,9 +2,13 @@
 
 #include <usyseek/torch_index.hpp>
 
+#include <cstdio>
+
 using namespace usyseek;
 
-int main() {
+namespace {
+
+void run_torch_index_tests() {
     CHECK(torch_index_url("cuda", "cu126") == "https://download.pytorch.org/whl/cu126");
     CHECK(torch_index_url("cuda", "cu130") == "https://download.pytorch.org/whl/cu130");
     CHECK(torch_index_url("cuda", "cu134") == "https://download.pytorch.org/whl/cu134");
@@ -24,4 +28,16 @@ int main() {
     for (const std::string_view v : cuda_versions) {
         CHECK(normalize_cuda_version(v) == v);
     }
+}
+
+} // namespace
+
+int main() {
+    try {
+        run_torch_index_tests();
+    } catch (...) {
+        (void)std::fputs("torch_index_test: unexpected exception\n", stderr);
+        return 1;
+    }
+    return usyseek::test::failures != 0;
 }

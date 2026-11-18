@@ -3,6 +3,7 @@
 #include <usyseek/ui/dirty_rects.hpp>
 
 #include <array>
+#include <cstdio>
 #include <print>
 
 using usyseek::ui::FlipDirtyTracker;
@@ -27,7 +28,7 @@ void run_dirty_rects_tests() {
         {.left = 10, .top = 10, .right = 30, .bottom = 30},
         {.left = 50, .top = 50, .right = 70, .bottom = 70},
         {.left = 0, .top = 0, .right = 0, .bottom = 0},
-    }};
+    },};
     const std::array<PixelRect, 1> b = {{{.left = 25, .top = 25, .right = 55, .bottom = 55}}};
     const auto merged = merge_disjoint_rects(a, b);
     CHECK(merged.size() == 1);
@@ -37,7 +38,7 @@ void run_dirty_rects_tests() {
     const std::array<PixelRect, 2> adj = {{
         {.left = 0, .top = 0, .right = 10, .bottom = 10},
         {.left = 10, .top = 0, .right = 20, .bottom = 10},
-    }};
+    },};
     const auto adj_merged = merge_disjoint_rects(adj);
     CHECK(adj_merged.size() == 2);
 
@@ -107,10 +108,10 @@ void run_dirty_rects_tests() {
 int main() {
     try {
         run_dirty_rects_tests();
+        std::println("dirty_rects_test: {} failures", usyseek::test::failures);
     } catch (...) {
-        std::println(stderr, "dirty_rects_test: unexpected exception");
+        (void)std::fputs("dirty_rects_test: unexpected exception\n", stderr);
         return 1;
     }
-    std::println("dirty_rects_test: {} failures", usyseek::test::failures);
     return usyseek::test::failures == 0 ? 0 : 1;
 }

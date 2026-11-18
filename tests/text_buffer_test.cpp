@@ -2,6 +2,8 @@
 
 #include <usyseek/ui/text_buffer.hpp>
 
+#include <cstdio>
+
 using usyseek::ui::TextBuffer;
 
 namespace {
@@ -10,9 +12,7 @@ void type_str(TextBuffer& tb, std::wstring_view s) {
     for (const wchar_t c : s) CHECK(tb.on_char(c));
 }
 
-} // namespace
-
-int main() {
+void run_text_buffer_tests() {
     // Empty buffer
     {
         TextBuffer tb;
@@ -169,6 +169,16 @@ int main() {
         while (tb.undo()) ++steps;
         CHECK(steps == TextBuffer::MAX_UNDO);
     }
+}
 
+} // namespace
+
+int main() {
+    try {
+        run_text_buffer_tests();
+    } catch (...) {
+        (void)std::fputs("text_buffer_test: unexpected exception\n", stderr);
+        return 1;
+    }
     return usyseek::test::failures != 0;
 }
