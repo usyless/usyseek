@@ -228,7 +228,9 @@ private:
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         wil::com_ptr<IWICImagingFactory> wic;
         if (full_) {
-            CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
+            if (FAILED(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) {
+                wic.reset();
+            }
         }
         while (!st.stop_requested()) {
             Req r;

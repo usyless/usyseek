@@ -559,7 +559,9 @@ private:
         if (!db_want_event_) return;
         const std::scoped_lock lk{wait_mx_};
         if (wait_handle_) {
-            UnregisterWaitEx(wait_handle_, nullptr);
+            if (!UnregisterWaitEx(wait_handle_, nullptr)) {
+                // Non-blocking unregister returns FALSE with ERROR_IO_PENDING while a callback runs.
+            }
             wait_handle_ = nullptr;
         }
         RegisterWaitForSingleObject(&wait_handle_, db_want_event_.get(), &Engine::on_db_want, this, INFINITE, WT_EXECUTEONLYONCE);
@@ -568,7 +570,9 @@ private:
     void disarm_db_want_wait() noexcept {
         const std::scoped_lock lk{wait_mx_};
         if (wait_handle_) {
-            UnregisterWaitEx(wait_handle_, INVALID_HANDLE_VALUE);
+            if (!UnregisterWaitEx(wait_handle_, INVALID_HANDLE_VALUE)) {
+                // Best effort on shutdown.
+            }
             wait_handle_ = nullptr;
         }
     }

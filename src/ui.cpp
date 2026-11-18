@@ -8,6 +8,8 @@
 
 #include <shellapi.h>
 
+#include <memory>
+
 namespace {
 
 using namespace usyseek;
@@ -135,7 +137,7 @@ int run_automated_test(Shared& sh, Pill& pill, SettingsWindow& settings_win, con
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_APARTMENTTHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
     // OLE proper (not just COM) for dragging media out and putting it on the clipboard.
@@ -196,7 +198,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         }
     }
 
-    Shared sh;
+    const auto sh_owned = std::make_unique<Shared>();
+    Shared& sh = *sh_owned;
     sh.test_mode = test_dir.has_value();
     sh.theme_override = std::move(theme_arg);
     bool settings_corrupt = false;
@@ -215,9 +218,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         return 1;
     }
 
-    Pill pill{sh};
-    SettingsWindow settings_win{sh};
-    ThemeEditorWindow theme_editor_win{sh};
+    const auto pill_owned = std::make_unique<Pill>(sh);
+    const auto settings_win_owned = std::make_unique<SettingsWindow>(sh);
+    const auto theme_editor_win_owned = std::make_unique<ThemeEditorWindow>(sh);
+    Pill& pill = *pill_owned;
+    SettingsWindow& settings_win = *settings_win_owned;
+    ThemeEditorWindow& theme_editor_win = *theme_editor_win_owned;
     if (!pill.create(hInstance)) {
         MessageBoxW(nullptr, L"Failed to create the search window.", APP_NAME, MB_ICONERROR | MB_OK);
         return 1;

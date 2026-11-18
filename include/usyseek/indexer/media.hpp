@@ -55,7 +55,9 @@ struct Decoded {
 class Decoder {
 public:
     Decoder(uint32_t size, ResizeMode mode) noexcept : size_{size}, mode_{mode} {
-        CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_));
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_)))) {
+            wic_.reset();
+        }
     }
 
     std::optional<Decoded> image(const std::wstring& path, uint32_t frame_count = 1, std::wstring* reason = nullptr) {

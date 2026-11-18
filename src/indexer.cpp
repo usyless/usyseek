@@ -416,7 +416,9 @@ public:
             ~StopWaitGuard() { release(); }
             void release() noexcept {
                 if (handle) {
-                    UnregisterWaitEx(handle, INVALID_HANDLE_VALUE);
+                    if (!UnregisterWaitEx(handle, INVALID_HANDLE_VALUE)) {
+                        // Best effort when tearing down wait registration.
+                    }
                     handle = nullptr;
                 }
             }
@@ -982,12 +984,16 @@ struct PyVision {
 
 private:
     DWORD wait_ov(OVERLAPPED& ov, const char* crash_msg) {
-        std::array<HANDLE, 4> handles; // NOLINT(cppcoreguidelines-pro-type-member-init)
-        DWORD count = 0;
-        handles[count++] = ov_event.get();
-        handles[count++] = proc.hProcess;
-        if (cancel_event) handles[count++] = cancel_event.get();
-        if (const HANDLE stop = runtime().stop) handles[count++] = stop;
+        std::array<HANDLE, 4> handles{ov_event.get(), proc.hProcess, nullptr, nullptr};
+        DWORD count = 2;
+        if (cancel_event) {
+            handles[2] = cancel_event.get();
+            count = 3;
+        }
+        if (const HANDLE stop = runtime().stop) {
+            handles[count] = stop;
+            ++count;
+        }
         const DWORD w = WaitForMultipleObjects(count, handles.data(), FALSE, INFINITE);
         if (w != WAIT_OBJECT_0) {
             CancelIoEx(pipe.get(), &ov);
