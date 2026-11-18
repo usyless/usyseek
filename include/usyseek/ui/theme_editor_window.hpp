@@ -794,7 +794,7 @@ private:
             case SlSettingsAlpha: return {.min_v = 0.05f, .max_v = 1.0f, .step = 0.01f, .label = L"Settings & Editor Opacity", .unit = L"", .decimals = 2};
             case SlCardAlpha: return {.min_v = 0.05f, .max_v = 1.0f, .step = 0.01f, .label = L"Card Background Opacity", .unit = L"", .decimals = 2};
             case SlShadowScale: return {.min_v = 0.0f, .max_v = 2.0f, .step = 0.05f, .label = L"Shadow Intensity", .unit = L"\u00d7", .decimals = 2};
-            case SlPillRadius: return {.min_v = 0.0f, .max_v = 48.0f, .step = 1.0f, .label = L"Pill Corner Radius", .unit = L" px", .decimals = 0};
+            case SlPillRadius: return {.min_v = 0.0f, .max_v = 45.0f, .step = 1.0f, .label = L"Pill Corner Radius", .unit = L" px", .decimals = 0};
             case SlCardRadius: return {.min_v = 0.0f, .max_v = 32.0f, .step = 1.0f, .label = L"Card Corner Radius", .unit = L" px", .decimals = 0};
             case SlButtonRadius: return {.min_v = 0.0f, .max_v = 24.0f, .step = 1.0f, .label = L"Button & Input Radius", .unit = L" px", .decimals = 0};
             case SlThumbRadius: return {.min_v = 0.0f, .max_v = 24.0f, .step = 1.0f, .label = L"Thumbnail Radius", .unit = L" px", .decimals = 0};
