@@ -1881,7 +1881,9 @@ private:
     GlassStyle s;
     s.blur_std_dev = std::clamp(blur_std * (t.glass.blur / 1.4f), 0.0f, 8.0f);
     s.corner_radius = corner_radius;
-    s.roundness = std::clamp(t.glass.roundness - 0.1f, 2.0f, 8.0f);
+    // Overlay popups draw circular D2D shadows and borders (`cv.shadow` / `cv.stroke_round`),
+    // so the glass SDF must also use circular corners (`roundness = 2.0`) to stay aligned.
+    s.roundness = 2.0f;
     s.margin_dip = 0.5f;
     s.ref_thickness = 16.0f;
     s.ref_factor = t.glass.refraction;
