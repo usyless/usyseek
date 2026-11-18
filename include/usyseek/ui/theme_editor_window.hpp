@@ -145,6 +145,8 @@ public:
         KillTimer(hwnd_, TIMER_CARET);
         KillTimer(hwnd_, TIMER_DEVICE);
         KillTimer(hwnd_, TIMER_GLASS);
+        KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
+        live_apply_pending_ = false;
         cloak_window(hwnd_, true);
         ShowWindow(hwnd_, SW_HIDE);
         ValidateRect(hwnd_, nullptr);
@@ -235,7 +237,8 @@ private:
     static constexpr float PAD = 20.0f;
     static constexpr float CARD_GAP = 14.0f;
     static constexpr float DEFAULT_CUSTOM_PILL_RADIUS = 28.0f;
-    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_GLASS = 2, TIMER_DEVICE = 3;
+    static constexpr UINT_PTR TIMER_CARET = 1, TIMER_GLASS = 2, TIMER_DEVICE = 3, TIMER_LIVE_PREVIEW = 4;
+    static constexpr long long LIVE_PREVIEW_THROTTLE_MS = 50;
 
     enum Id : uint8_t {
         IdNone = 0,
@@ -258,7 +261,6 @@ private:
         IdTagField,
         IdResetTag,
         IdSaveApply,
-        IdApplyOnly,
         IdDeleteTheme,
         IdCancel,
         IdScrollbar,
@@ -402,12 +404,14 @@ private:
         scroll_ = target_scroll_ = 0.0f;
         show_advanced_colors_ = false;
         preview_applied_ = false;
+        live_apply_pending_ = false;
+        if (hwnd_) KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
         error_msg_.clear();
         if (active_field_) {
             active_field_->focused = false;
             active_field_ = nullptr;
         }
-        mark_preview_dirty();
+        mark_preview_dirty(false);
         load_draft_into_fields(true);
         sync_switch_targets(false);
     }
@@ -424,7 +428,10 @@ private:
         }
     }
 
-    void mark_preview_dirty() noexcept { preview_dirty_ = true; }
+    void mark_preview_dirty(bool live = true) noexcept {
+        preview_dirty_ = true;
+        if (live) schedule_live_preview();
+    }
 
     void ensure_preview_resolved() {
         if (!preview_dirty_) return;
@@ -506,11 +513,11 @@ private:
     }
 
     void load_draft_into_fields(bool normalize = false) {
-        mark_preview_dirty();
+        mark_preview_dirty(false);
         ensure_preview_resolved();
         if (normalize) {
             normalize_draft_against_base();
-            mark_preview_dirty();
+            mark_preview_dirty(false);
             ensure_preview_resolved();
         }
         name_field_.set(to_wide(draft_.name));
@@ -529,7 +536,7 @@ private:
             std::string trimmed = to_utf8(trim(name_field_.text));
             draft_.name = trimmed.empty() ? "Custom Theme" : std::move(trimmed);
             name_field_.set(to_wide(draft_.name));
-            mark_preview_dirty();
+            mark_preview_dirty(false);
             return;
         }
         for (size_t i = 0; i < color_fields_.size(); ++i) {
@@ -707,14 +714,36 @@ private:
     }
 
     void clear_unsaved_preview() {
+        live_apply_pending_ = false;
+        if (hwnd_) KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
         if (!preview_applied_) return;
         preview_applied_ = false;
         sh_.theme_spec_override.reset();
         sh_.refresh_theme(false, false);
     }
 
-    void apply_preview_only() {
-        commit_field(active_field_);
+    void schedule_live_preview() noexcept {
+        if (!hwnd_ || !visible() || sh_.test_mode) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_live_apply_).count();
+        if (elapsed_ms >= LIVE_PREVIEW_THROTTLE_MS) {
+            if (live_apply_pending_) {
+                KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
+                live_apply_pending_ = false;
+            }
+            apply_live_preview();
+            return;
+        }
+        if (!live_apply_pending_) {
+            live_apply_pending_ = true;
+            const UINT wait_ms = static_cast<UINT>(std::max<long long>(1, LIVE_PREVIEW_THROTTLE_MS - elapsed_ms));
+            SetTimer(hwnd_, TIMER_LIVE_PREVIEW, wait_ms, nullptr);
+        }
+    }
+
+    void apply_live_preview() {
+        live_apply_pending_ = false;
+        last_live_apply_ = std::chrono::steady_clock::now();
         preview_applied_ = true;
         sh_.theme_spec_override = draft_;
         sh_.refresh_theme(false, false);
@@ -722,6 +751,8 @@ private:
 
     void save_and_apply() {
         commit_field(active_field_);
+        live_apply_pending_ = false;
+        if (hwnd_) KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
         error_msg_.clear();
         const std::string clean_name = draft_.name.empty() ? "Custom Theme" : draft_.name;
         draft_.name = clean_name;
@@ -765,6 +796,8 @@ private:
         }
 
         const std::string deleted_id = ulp::str::concat_strings("custom:", to_utf8(target_path_.stem().wstring()));
+        live_apply_pending_ = false;
+        if (hwnd_) KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
         preview_applied_ = false;
         sh_.theme_spec_override.reset();
         if (sh_.settings.theme == deleted_id) {
@@ -911,9 +944,10 @@ private:
     void set_slider_value(int idx, float v) {
         const SliderSpec sp = slider_spec(idx);
         const float snapped = std::round(std::clamp(v, sp.min_v, sp.max_v) / sp.step) * sp.step;
+        const std::optional<float> prev_opt = raw_slider_opt(idx);
         if (idx == SlPillRadius) {
             draft_.pill_radius = snapped;
-            mark_preview_dirty();
+            if (draft_.pill_radius != prev_opt) mark_preview_dirty();
             return;
         }
         const bool at_base = std::abs(snapped - base_slider_value(idx)) < (sp.step * 0.25f);
@@ -939,7 +973,7 @@ private:
             default: break;
         }
         prune_empty_glass();
-        mark_preview_dirty();
+        if (raw_slider_opt(idx) != prev_opt) mark_preview_dirty();
     }
 
     void reset_slider(int idx) {
@@ -1177,13 +1211,10 @@ private:
             draw_button(cv, rect(PAD, by, del_w, bh), glyph::del, L"Delete", IdDeleteTheme, 0, 2);
         }
         const float save_w = button_width(cv, L"Save & Apply", true, 134.0f);
-        const float apply_w = button_width(cv, L"Apply", true, 90.0f);
         const float cancel_w = button_width(cv, L"Cancel", false, 84.0f);
 
         float rx = sz.width - PAD - save_w;
         draw_button(cv, rect(rx, by, save_w, bh), glyph::check, L"Save & Apply", IdSaveApply, 0, 1);
-        rx -= apply_w + 8.0f;
-        draw_button(cv, rect(rx, by, apply_w, bh), glyph::refresh, L"Apply", IdApplyOnly, 0, 0);
         rx -= cancel_w + 8.0f;
         draw_button(cv, rect(rx, by, cancel_w, bh), 0, L"Cancel", IdCancel, 0, 3);
     }
@@ -1732,9 +1763,6 @@ private:
             case IdSaveApply:
                 save_and_apply();
                 return;
-            case IdApplyOnly:
-                apply_preview_only();
-                return;
             case IdDeleteTheme:
                 delete_current_theme();
                 return;
@@ -1789,7 +1817,7 @@ private:
             if (active_field_->on_key(hwnd_, vk, handled)) {
                 if (active_field_ == &name_field_) {
                     draft_.name = to_utf8(name_field_.text);
-                    mark_preview_dirty();
+                    mark_preview_dirty(false);
                 } else {
                     for (size_t i = 0; i < color_fields_.size(); ++i) {
                         if (active_field_ == &color_fields_[i]) apply_hex_field_value(i, true);
@@ -1817,7 +1845,7 @@ private:
         if (active_field_->on_char(c)) {
             if (active_field_ == &name_field_) {
                 draft_.name = to_utf8(name_field_.text);
-                mark_preview_dirty();
+                mark_preview_dirty(false);
             } else {
                 for (size_t i = 0; i < color_fields_.size(); ++i) {
                     if (active_field_ == &color_fields_[i]) apply_hex_field_value(i, true);
@@ -2113,6 +2141,10 @@ private:
                             invalidate();
                         }
                         return 0;
+                    case TIMER_LIVE_PREVIEW:
+                        KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
+                        if (live_apply_pending_) apply_live_preview();
+                        return 0;
                     default:
                         break;
                 }
@@ -2178,6 +2210,8 @@ private:
     bool editing_existing_ = false;
     fs::path target_path_;
     bool preview_applied_ = false;
+    bool live_apply_pending_ = false;
+    std::chrono::steady_clock::time_point last_live_apply_{};
     bool show_advanced_colors_ = false;
     std::wstring error_msg_;
     std::wstring editing_subtitle_w_;

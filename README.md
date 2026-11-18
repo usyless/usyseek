@@ -129,7 +129,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 </p>
 
 - **Built-In Presets & Windows Sync**: Switch between **Follow Windows**, **Windows Accent** (dynamically derived from your Windows accent color), **Midnight Dark**, **Daylight**, **Nord**, **Catppuccin Mocha**, **Pure OLED**, and **Liquid Glass**.
-- **Built-In Theme Editor**: Create, duplicate, edit, or delete custom themes directly from **Settings → Appearance & Theme**, with **Apply** for instant live previewing and **Save & Apply** to persist to disk.
+- **Built-In Theme Editor**: Create, duplicate, edit, or delete custom themes directly from **Settings → Appearance & Theme**, with real-time live previewing and **Save & Apply** to persist to disk.
 - **JSON Schema & Live Reload**: Custom themes live in `data/themes/*.json` alongside an auto-synced `theme.schema.json` (for editor autocomplete/validation) and `example-sakura (copy but do not edit).json`, with **Open Folder** and **Reload** actions in Settings.
 - **Surfaces, Radii & Shadows**: Customize dark/light/system polarity, DWM backdrops (`Acrylic`, `Mica`, `Tabbed`, `Solid`) independently for the search pill and settings/editor windows, surface opacities, drop shadow scale, and custom **Corner Radii** for the search pill, cards, buttons, and thumbnails.
 - **Tunable Liquid Glass Material**: Enable the Direct2D/DXGI **Liquid Glass** shader on any custom theme and fine-tune blur, superellipse corner roundness, index of refraction, chromatic dispersion, glare scale, and glare angle—complete with multi-monitor, display rotation, and DPI scaling support.
