@@ -9,6 +9,7 @@
 #include <shellscalingapi.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cwctype>
 #include <map>
@@ -1219,7 +1220,17 @@ private:
         return glass_active() && (preview_ >= 0 || menu_open_ || drop_open_ || show_help());
     }
 
-    static void draw_pill_shadow(Canvas& cv, D2D1_RECT_F pr, float radius, bool focused) noexcept {
+    struct ShadowLayer {
+        float sigma; // Gaussian standard deviation (DIPs)
+        float dy;    // downward offset (DIPs)
+        float alpha; // peak opacity
+    };
+
+    /// Soft drop shadow for custom-radius pill frames, approximating the Windows 11 DWM window shadow: a wide key
+    /// shadow cast downwards plus a tight ambient contact shadow. Each layer is the analytic Gaussian falloff of the
+    /// rounded rect (0.5 * erfc(sdf / (sigma * sqrt2))), rasterised once into a small bitmap whose pill is shrunk to
+    /// just its corners, then drawn 9-slice (straight edges are uniform along their length) so resizing is free.
+    void draw_pill_shadow(Canvas& cv, D2D1_RECT_F pr, float radius, bool focused) {
         const float theme_s = cv.theme().shadow_alpha_scale;
         if (theme_s <= 0.002f) return;
         if (const auto dc_clip = cv.dirty_clip()) {
@@ -1228,35 +1239,96 @@ private:
                 return;
             }
         }
-        constexpr int steps = 14;
-        const float spread = focused ? 22.0f : 15.0f;
-        const float dy_max = focused ? 4.0f : 2.0f;
-        const float intensity = (focused ? 0.78f : 0.34f) * theme_s;
-        const float max_d = spread * 0.80f;
-        const D2D1_RECT_F bounds = D2D1::RectF(
-            pr.left - max_d - 1.0f,
-            pr.top - max_d - 1.0f,
-            pr.right + max_d + 1.0f,
-            pr.bottom + max_d + dy_max + 1.0f);
-        if (!cv.intersects_clip(bounds, 1.0f)) return;
+        const std::array<ShadowLayer, 2> layers = focused
+            ? std::array<ShadowLayer, 2>{{{.sigma = 8.0f, .dy = 6.0f, .alpha = 0.30f}, {.sigma = 2.0f, .dy = 1.0f, .alpha = 0.12f}}}
+            : std::array<ShadowLayer, 2>{{{.sigma = 5.0f, .dy = 3.0f, .alpha = 0.16f}, {.sigma = 1.5f, .dy = 0.5f, .alpha = 0.08f}}};
+        const float reach = (layers[0].sigma * 3.0f) + layers[0].dy + 2.0f;
+        if (!cv.intersects_clip(inset(pr, -reach, -reach), 1.0f)) return;
 
-        for (int i = steps; i >= 1; --i) {
-            const float t = static_cast<float>(i) / static_cast<float>(steps);
-            const float g = spread * t;
-            const float d = g * 0.80f;
-            const float dy = dy_max * t;
-            const float falloff = (1.0f - t) * (1.0f - t);
-            const float a = std::clamp(intensity * (0.045f + (0.085f * falloff)), 0.0f, 0.9f);
-            cv.fill_round(
-                D2D1::RectF(pr.left - d, pr.top - d + dy,
-                            pr.right + d, pr.bottom + d + dy),
-                radius > 0.0f ? (radius + d) : (g * 0.65f),
-                hex(0x000000, a));
-        }
-        cv.fill_round(inset(pr, -0.75f, -0.75f), radius > 0.0f ? (radius + 0.75f) : 0.75f,
-                      hex(0x000000, std::clamp(0.18f * (focused ? 1.0f : 0.55f) * theme_s, 0.0f, 0.6f)));
-        // Punch out the pill interior so translucent themes/glass never darken from the shadow fill underneath.
         ID2D1DeviceContext6* dc = cv.dc();
+        const float s = target_.scale();
+        const float r = std::clamp(radius, 0.0f, std::min(width(pr), height(pr)) * 0.5f);
+        const float max_dy = std::max(layers[0].dy, layers[1].dy);
+
+        // Pill edges in window pixels, and the bitmap layout: `e` px of shadow margin around a pill whose fractional
+        // pixel offsets match the real one, so every slice maps 1:1 onto the pixel grid.
+        const float e = std::ceil(reach * s);
+        const float pl = pr.left * s, pt = pr.top * s, prr = pr.right * s, pb = pr.bottom * s;
+        const float req = std::ceil(((2.0f * r) + (2.0f * max_dy)) * s) + 6.0f;
+        const auto span = [req](float lo, float hi) noexcept {
+            const float actual = hi - lo;
+            if (actual < req + 2.0f) return actual; // too small to shrink: rasterise at full size
+            return req + ((hi - std::floor(hi)) - (lo - std::floor(lo)));
+        };
+        const float bl = e + (pl - std::floor(pl));
+        const float bt = e + (pt - std::floor(pt));
+        const float br = bl + span(pl, prr);
+        const float bb = bt + span(pt, pb);
+        const auto bw = static_cast<UINT>(std::floor(br) + e + 1.0f);
+        const auto bh = static_cast<UINT>(std::floor(bb) + e + 1.0f);
+
+        const ShadowKey key{.gfx_epoch = sh_.gfx.epoch(), .target_epoch = target_.target_epoch(), .scale = s, .radius = r,
+                            .strength = theme_s, .focused = focused, .left = bl, .top = bt, .right = br, .bottom = bb};
+        if (!shadow_bmp_ || !(key == shadow_key_)) {
+            shadow_bmp_.reset();
+            shadow_px_.assign(static_cast<size_t>(bw) * bh * 4u, 0);
+            const float hx = (br - bl) * 0.5f / s;
+            const float hy = (bb - bt) * 0.5f / s;
+            const float cx = (bl + br) * 0.5f / s;
+            const float cy = (bt + bb) * 0.5f / s;
+            const float rr = std::min(r, std::min(hx, hy));
+            constexpr float inv_sqrt2 = 0.70710678f;
+            for (UINT y = 0; y < bh; ++y) {
+                const float py = (static_cast<float>(y) + 0.5f) / s;
+                for (UINT x = 0; x < bw; ++x) {
+                    const float qx = std::abs(((static_cast<float>(x) + 0.5f) / s) - cx) - (hx - rr);
+                    float keep = 1.0f;
+                    for (const ShadowLayer& l : layers) {
+                        const float qy = std::abs(py - (cy + l.dy)) - (hy - rr);
+                        const float ox = std::max(qx, 0.0f);
+                        const float oy = std::max(qy, 0.0f);
+                        const float sdf = std::sqrt((ox * ox) + (oy * oy)) + std::min(std::max(qx, qy), 0.0f) - rr;
+                        const float a = std::min(0.95f, l.alpha * theme_s) * 0.5f * std::erfc(sdf * inv_sqrt2 / l.sigma);
+                        keep *= 1.0f - a;
+                    }
+                    shadow_px_[((static_cast<size_t>(y) * bw) + x) * 4u + 3u] =
+                        static_cast<uint8_t>(std::lround(std::clamp(1.0f - keep, 0.0f, 1.0f) * 255.0f));
+                }
+            }
+            const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_NONE,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                target_.dpi(), target_.dpi());
+            if (FAILED(dc->CreateBitmap(D2D1::SizeU(bw, bh), shadow_px_.data(), bw * 4u, &props, &shadow_bmp_))) {
+                shadow_bmp_.reset();
+                return;
+            }
+            shadow_key_ = key;
+        }
+
+        // 9-slice: the 1px column/row through the bitmap's centre lies on the pill's straight edges, so stretching it
+        // reproduces the shadow of the full-size pill exactly.
+        const float ox = std::floor(pl) - e;
+        const float oxr = std::floor(prr) - std::floor(br);
+        const float oy = std::floor(pt) - e;
+        const float oyb = std::floor(pb) - std::floor(bb);
+        const float cx1 = std::floor((bl + br) * 0.5f);
+        const float cy1 = std::floor((bt + bb) * 0.5f);
+        const std::array<float, 4> sx{0.0f, cx1, cx1 + 1.0f, static_cast<float>(bw)};
+        const std::array<float, 4> dx{ox, ox + cx1, oxr + cx1 + 1.0f, oxr + static_cast<float>(bw)};
+        const std::array<float, 4> sy{0.0f, cy1, cy1 + 1.0f, static_cast<float>(bh)};
+        const std::array<float, 4> dy{oy, oy + cy1, oyb + cy1 + 1.0f, oyb + static_cast<float>(bh)};
+        for (size_t j = 0; j < 3; ++j) {
+            for (size_t i = 0; i < 3; ++i) {
+                if (i == 1 && j == 1) continue; // under the pill: punched out below anyway
+                if (dx[i + 1] <= dx[i] || dy[j + 1] <= dy[j]) continue;
+                const D2D1_RECT_F src = D2D1::RectF(sx[i] / s, sy[j] / s, sx[i + 1] / s, sy[j + 1] / s);
+                const D2D1_RECT_F dst = D2D1::RectF(dx[i] / s, dy[j] / s, dx[i + 1] / s, dy[j + 1] / s);
+                dc->DrawBitmap(shadow_bmp_.get(), &dst, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src, nullptr);
+            }
+        }
+
+        // Punch out the pill interior so translucent themes/glass never darken from the shadow fill underneath.
         dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
         cv.fill_round(inset(pr, 0.5f, 0.5f), std::max(0.0f, radius - 0.5f), D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
         dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
@@ -4372,6 +4444,22 @@ private:
     bool copy_decoding_ = false;
     wil::com_ptr<IDataObject> pending_clipboard_;
     int clipboard_attempts_ = 0;
+
+    /// Pill drop shadow, rasterised once per key into a small 9-slice bitmap (see `draw_pill_shadow`).
+    struct ShadowKey {
+        uint64_t gfx_epoch = 0;
+        uint64_t target_epoch = 0;
+        float scale = 0.0f;
+        float radius = 0.0f;
+        float strength = 0.0f;
+        bool focused = false;
+        float left = 0.0f, top = 0.0f, right = 0.0f, bottom = 0.0f; // pill rect inside the bitmap, in pixels
+        [[nodiscard]] bool operator==(const ShadowKey&) const noexcept = default;
+    };
+    ShadowKey shadow_key_{};
+    wil::com_ptr<ID2D1Bitmap1> shadow_bmp_;
+    std::vector<uint8_t> shadow_px_;
+
     std::map<uint64_t, std::jthread> copy_workers_; // last member: joined before the state they report to goes away
 };
 
