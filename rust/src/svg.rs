@@ -1,13 +1,13 @@
 //! SVG rasterisation through resvg, shared by the indexer (embedding input) and the UI (thumbnails).
 
 use std::io::Read;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use resvg::{tiny_skia, usvg};
 
-use crate::{err, write_bytes, write_out, UsyBuf, UsyStr};
+use crate::{UsyBuf, UsyStr, err, write_bytes, write_out};
 
 /// Larger documents are rejected rather than parsed (usvg keeps the whole tree in memory).
 const MAX_SVG_BYTES: u64 = 64 << 20;
@@ -37,18 +37,29 @@ fn fontdb() -> Arc<usvg::fontdb::Database> {
     .clone()
 }
 
-fn render(path: &str, box_w: u32, box_h: u32, fit: u32, background: u32) -> Result<(UsySvgInfo, Vec<u8>), String> {
+fn render(
+    path: &str,
+    box_w: u32,
+    box_h: u32,
+    fit: u32,
+    background: u32,
+) -> Result<(UsySvgInfo, Vec<u8>), String> {
     if box_w == 0 || box_h == 0 || box_w > MAX_SIDE || box_h > MAX_SIDE {
         return Err("invalid target size".into());
     }
     let path = Path::new(path);
-    let mut file = std::fs::File::open(path).map_err(err)?;
+    let file = std::fs::File::open(path).map_err(err)?;
     let file_len = file.metadata().map_err(err)?.len();
     if file_len > MAX_SVG_BYTES {
         return Err("SVG file too large".into());
     }
     let mut data = Vec::with_capacity(file_len as usize);
-    file.read_to_end(&mut data).map_err(err)?;
+    file.take(MAX_SVG_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(err)?;
+    if data.len() as u64 > MAX_SVG_BYTES {
+        return Err("SVG file too large".into());
+    }
 
     let opt = usvg::Options {
         resources_dir: path.parent().map(Path::to_path_buf),
@@ -63,17 +74,26 @@ fn render(path: &str, box_w: u32, box_h: u32, fit: u32, background: u32) -> Resu
 
     let (bw, bh) = (box_w as f32, box_h as f32);
     let (transform, out_w, out_h) = match fit {
-        FIT_STRETCH => (tiny_skia::Transform::from_scale(bw / sw, bh / sh), box_w, box_h),
+        FIT_STRETCH => (
+            tiny_skia::Transform::from_scale(bw / sw, bh / sh),
+            box_w,
+            box_h,
+        ),
         FIT_COVER => {
             let s = (bw / sw).max(bh / sh);
-            let t = tiny_skia::Transform::from_scale(s, s).post_translate((bw - sw * s) / 2.0, (bh - sh * s) / 2.0);
+            let t = tiny_skia::Transform::from_scale(s, s)
+                .post_translate((bw - sw * s) / 2.0, (bh - sh * s) / 2.0);
             (t, box_w, box_h)
         }
         _ => {
             let s = (bw / sw).min(bh / sh);
             let ow = ((sw * s).round() as u32).clamp(1, box_w);
             let oh = ((sh * s).round() as u32).clamp(1, box_h);
-            (tiny_skia::Transform::from_scale(ow as f32 / sw, oh as f32 / sh), ow, oh)
+            (
+                tiny_skia::Transform::from_scale(ow as f32 / sw, oh as f32 / sh),
+                ow,
+                oh,
+            )
         }
     };
 
@@ -117,8 +137,10 @@ pub unsafe extern "C" fn usy_svg_render(
 ) -> i32 {
     let path = path.as_str();
     // A malformed document must fail that one file, not take the whole indexer down with it
-    let result = catch_unwind(AssertUnwindSafe(|| render(path, box_w, box_h, fit, background)))
-        .unwrap_or_else(|_| Err("SVG renderer panicked".into()));
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        render(path, box_w, box_h, fit, background)
+    }))
+    .unwrap_or_else(|_| Err("SVG renderer panicked".into()));
     match result {
         Ok((i, pixels)) => {
             if !info.is_null() {

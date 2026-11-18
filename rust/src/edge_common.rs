@@ -72,15 +72,30 @@ pub fn create_edge_shard(dir: &Path, dim: usize) -> Result<EdgeShard, String> {
             .parse::<JsonPath>()
             .map_err(|_| format!("invalid json path '{field}'"))?;
         shard
-            .update(UpdateOperation::FieldIndexOperation(FieldIndexOperations::CreateIndex(
-                CreateIndex { field_name, field_schema: Some(schema) },
-            )))
+            .update(UpdateOperation::FieldIndexOperation(
+                FieldIndexOperations::CreateIndex(CreateIndex {
+                    field_name,
+                    field_schema: Some(schema),
+                }),
+            ))
             .map_err(|e| e.to_string())
     };
-    create_idx("t", PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword))?;
-    create_idx("a", PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword))?;
-    create_idx("k", PayloadFieldSchema::FieldType(PayloadSchemaType::Integer))?;
-    create_idx("m", PayloadFieldSchema::FieldType(PayloadSchemaType::Integer))?;
+    create_idx(
+        "t",
+        PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword),
+    )?;
+    create_idx(
+        "a",
+        PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword),
+    )?;
+    create_idx(
+        "k",
+        PayloadFieldSchema::FieldType(PayloadSchemaType::Integer),
+    )?;
+    create_idx(
+        "m",
+        PayloadFieldSchema::FieldType(PayloadSchemaType::Integer),
+    )?;
     create_idx(
         "n",
         PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(

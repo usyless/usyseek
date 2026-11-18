@@ -15,12 +15,12 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 
 use qdrant_edge::{
-    AnyVariants, Condition, CountRequestBuilder, Direction, EdgeShard, FacetRequestBuilder,
-    FacetValue, FieldCondition, Filter, JsonPath, Match, NamedQuery, OrderBy, OrderByInterface,
-    Payload, PayloadOps, PointId, PointInsertOperations, PointOperations, PointStruct,
-    PointStructPersisted, QueryEnum, QueryRequestBuilder, RetrieveRequestBuilder, ScoringQuery,
-    ScrollRequestBuilder, SearchParams, SetPayloadOp, UpdateOperation, ValueVariants,
-    VectorInternal, VectorStructInternal, WithPayloadInterface, WithVector, DEFAULT_VECTOR_NAME,
+    AnyVariants, Condition, CountRequestBuilder, DEFAULT_VECTOR_NAME, Direction, EdgeShard,
+    FacetRequestBuilder, FacetValue, FieldCondition, Filter, JsonPath, Match, NamedQuery, OrderBy,
+    OrderByInterface, Payload, PayloadOps, PointId, PointInsertOperations, PointOperations,
+    PointStruct, PointStructPersisted, QueryEnum, QueryRequestBuilder, RetrieveRequestBuilder,
+    ScoringQuery, ScrollRequestBuilder, SearchParams, SetPayloadOp, UpdateOperation, ValueVariants,
+    VectorInternal, VectorStructInternal, WithPayloadInterface, WithVector,
 };
 use serde_json::{Map as JsonMap, Value as Json};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
@@ -54,13 +54,21 @@ pub struct UsyBuf {
 
 impl UsyBuf {
     fn empty() -> Self {
-        Self { ptr: ptr::null_mut(), len: 0, cap: 0 }
+        Self {
+            ptr: ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        }
     }
     fn from_string(s: String) -> Self {
         Self::from_bytes(s.into_bytes())
     }
     fn from_bytes(mut v: Vec<u8>) -> Self {
-        let out = Self { ptr: v.as_mut_ptr(), len: v.len(), cap: v.capacity() };
+        let out = Self {
+            ptr: v.as_mut_ptr(),
+            len: v.len(),
+            cap: v.capacity(),
+        };
         std::mem::forget(v);
         out
     }
@@ -162,14 +170,23 @@ const F_KIND: &str = "k";
 const F_MTIME: &str = "m";
 
 impl UsyQdrant {
+    fn resolve_collection(&self, name: &str) -> Result<(String, PathBuf), String> {
+        let key = sanitize_collection_name(name)?.into_owned();
+        let dir = self.root.join(&key);
+        Ok((key, dir))
+    }
+
     fn collection_dir(&self, name: &str) -> Result<PathBuf, String> {
-        Ok(self.root.join(sanitize_collection_name(name)?.as_ref()))
+        Ok(self.resolve_collection(name)?.1)
     }
 
     fn get_or_load_shard(&self, name: &str) -> Result<Arc<EdgeShard>, String> {
-        let dir = self.collection_dir(name)?;
-        let mut shards = self.shards.lock().map_err(|_| "shard lock poisoned".to_string())?;
-        if let Some(shard) = shards.get(name) {
+        let (key, dir) = self.resolve_collection(name)?;
+        let mut shards = self
+            .shards
+            .lock()
+            .map_err(|_| "shard lock poisoned".to_string())?;
+        if let Some(shard) = shards.get(&key) {
             return Ok(Arc::clone(shard));
         }
         if !shard_exists_on_disk(&dir) {
@@ -178,20 +195,24 @@ impl UsyQdrant {
         // Keep at most the active model's shard mapped so switching models doesn't hold stale mmaps open.
         shards.clear();
         let shard = Arc::new(EdgeShard::load(&dir, None).map_err(err)?);
-        shards.insert(name.to_owned(), Arc::clone(&shard));
+        shards.insert(key, Arc::clone(&shard));
         Ok(shard)
     }
 
     fn flush_target(&self, name: &str) -> Result<(), String> {
-        let targets: Vec<Arc<EdgeShard>> = {
-            let shards = self.shards.lock().map_err(|_| "shard lock poisoned".to_string())?;
-            if name.is_empty() {
-                shards.values().cloned().collect()
-            } else if let Some(s) = shards.get(name) {
-                vec![Arc::clone(s)]
-            } else {
-                Vec::new()
-            }
+        let targets: Vec<Arc<EdgeShard>> = if name.is_empty() {
+            let shards = self
+                .shards
+                .lock()
+                .map_err(|_| "shard lock poisoned".to_string())?;
+            shards.values().cloned().collect()
+        } else {
+            let key = sanitize_collection_name(name)?;
+            let shards = self
+                .shards
+                .lock()
+                .map_err(|_| "shard lock poisoned".to_string())?;
+            shards.get(key.as_ref()).cloned().into_iter().collect()
         };
         for shard in targets {
             shard.flush().map_err(err)?;
@@ -201,7 +222,10 @@ impl UsyQdrant {
 
     fn close_all(&self) -> Result<(), String> {
         let drained: Vec<(String, Arc<EdgeShard>)> = {
-            let mut shards = self.shards.lock().map_err(|_| "shard lock poisoned".to_string())?;
+            let mut shards = self
+                .shards
+                .lock()
+                .map_err(|_| "shard lock poisoned".to_string())?;
             shards.drain().collect()
         };
         let mut first_err: Option<String> = None;
@@ -238,11 +262,15 @@ fn id_to_u64(id: PointId) -> u64 {
 }
 
 fn json_path(s: &str) -> Result<JsonPath, String> {
-    s.parse::<JsonPath>().map_err(|_| format!("invalid json path '{s}'"))
+    s.parse::<JsonPath>()
+        .map_err(|_| format!("invalid json path '{s}'"))
 }
 
 fn field_match(field: &str, m: Match) -> Result<Condition, String> {
-    Ok(Condition::Field(FieldCondition::new_match(json_path(field)?, m)))
+    Ok(Condition::Field(FieldCondition::new_match(
+        json_path(field)?,
+        m,
+    )))
 }
 
 /// Filter description:
@@ -253,11 +281,17 @@ fn build_filter(f: Option<&Json>) -> Result<Option<Filter>, String> {
     let mut must_not: Vec<Condition> = Vec::new();
 
     if let Some(k) = f.get("kind").and_then(|k| k.as_i64()) {
-        must.push(field_match(F_KIND, Match::new_value(ValueVariants::Integer(k)))?);
+        must.push(field_match(
+            F_KIND,
+            Match::new_value(ValueVariants::Integer(k)),
+        )?);
     }
     if let Some(arr) = f.get("tags_all").and_then(|x| x.as_array()) {
         for t in arr.iter().filter_map(|s| s.as_str()) {
-            must.push(field_match(F_TAGS, Match::new_value(ValueVariants::String(t.to_owned())))?);
+            must.push(field_match(
+                F_TAGS,
+                Match::new_value(ValueVariants::String(t.to_owned())),
+            )?);
         }
     }
     if let Some(arr) = f.get("tags_none").and_then(|x| x.as_array())
@@ -266,7 +300,9 @@ fn build_filter(f: Option<&Json>) -> Result<Option<Filter>, String> {
         must_not.push(field_match(
             F_TAGS,
             Match::new_any(AnyVariants::Strings(
-                arr.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect(),
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(str::to_owned))
+                    .collect(),
             )),
         )?);
     }
@@ -276,7 +312,9 @@ fn build_filter(f: Option<&Json>) -> Result<Option<Filter>, String> {
         must.push(field_match(
             F_ANCESTORS,
             Match::new_any(AnyVariants::Strings(
-                arr.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect(),
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(str::to_owned))
+                    .collect(),
             )),
         )?);
     }
@@ -406,22 +444,30 @@ pub unsafe extern "C" fn usy_qd_optimize(q: *mut UsyQdrant, name: UsyStr, out: *
 ///
 /// `q` must be null or valid; `name` (when non-empty) must point to valid readable bytes; `out` must be null or uniquely writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn usy_qd_ensure_collection(q: *mut UsyQdrant, name: UsyStr, dim: u64, out: *mut UsyBuf) -> i32 {
+pub unsafe extern "C" fn usy_qd_ensure_collection(
+    q: *mut UsyQdrant,
+    name: UsyStr,
+    dim: u64,
+    out: *mut UsyBuf,
+) -> i32 {
     let Ok(q) = (unsafe { qdrant_ref(q) }) else {
         unsafe { write_out(out, "null qdrant handle".into()) };
         return 1;
     };
     let name = name.as_str();
     let res: Result<String, (i32, String)> = (|| {
-        let dir = q.collection_dir(name).map_err(|e| (1, e))?;
-        let mut shards = q.shards.lock().map_err(|_| (1, "shard lock poisoned".to_owned()))?;
-        if shards.contains_key(name) {
+        let (key, dir) = q.resolve_collection(name).map_err(|e| (1, e))?;
+        let mut shards = q
+            .shards
+            .lock()
+            .map_err(|_| (1, "shard lock poisoned".to_owned()))?;
+        if shards.contains_key(&key) {
             return Ok("exists".to_owned());
         }
         if shard_exists_on_disk(&dir) {
             shards.clear();
             let shard = Arc::new(EdgeShard::load(&dir, None).map_err(|e| (1, err(e)))?);
-            shards.insert(name.to_owned(), shard);
+            shards.insert(key, shard);
             return Ok("exists".to_owned());
         }
         if dim == 0 {
@@ -431,7 +477,7 @@ pub unsafe extern "C" fn usy_qd_ensure_collection(q: *mut UsyQdrant, name: UsySt
         shards.clear();
         let shard = create_edge_shard(&dir, dim as usize).map_err(|e| (1, e))?;
 
-        shards.insert(name.to_owned(), Arc::new(shard));
+        shards.insert(key, Arc::new(shard));
         Ok("created".to_owned())
     })();
     match res {
@@ -452,7 +498,11 @@ pub unsafe extern "C" fn usy_qd_ensure_collection(q: *mut UsyQdrant, name: UsySt
 ///
 /// `q` must be null or valid; `name`/`out` must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn usy_qd_check_collection(q: *mut UsyQdrant, name: UsyStr, out: *mut UsyBuf) -> i32 {
+pub unsafe extern "C" fn usy_qd_check_collection(
+    q: *mut UsyQdrant,
+    name: UsyStr,
+    out: *mut UsyBuf,
+) -> i32 {
     let name = name.as_str();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
@@ -485,7 +535,9 @@ pub unsafe extern "C" fn usy_qd_upsert(
     let payloads = payloads.as_str();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let total_floats = count.checked_mul(dim).ok_or_else(|| "vector slice size overflow".to_string())?;
+        let total_floats = count
+            .checked_mul(dim)
+            .ok_or_else(|| "vector slice size overflow".to_string())?;
         let ids = unsafe { slice_from(ids, count) }?;
         let vectors = unsafe { slice_from(vectors, total_floats) }?;
         if count == 0 {
@@ -500,14 +552,18 @@ pub unsafe extern "C" fn usy_qd_upsert(
             .into_iter()
             .enumerate()
             .map(|(i, p)| {
-                let obj = if p.is_object() { p } else { Json::Object(JsonMap::new()) };
+                let obj = if p.is_object() {
+                    p
+                } else {
+                    Json::Object(JsonMap::new())
+                };
                 PointStruct::new(ids[i], vectors[i * dim..(i + 1) * dim].to_vec(), obj).into()
             })
             .collect();
         shard
-            .update(UpdateOperation::PointOperation(PointOperations::UpsertPoints(
-                PointInsertOperations::PointsList(points),
-            )))
+            .update(UpdateOperation::PointOperation(
+                PointOperations::UpsertPoints(PointInsertOperations::PointsList(points)),
+            ))
             .map_err(err)?;
         Ok("ok".to_owned())
     })
@@ -532,7 +588,7 @@ pub unsafe extern "C" fn usy_qd_query(
     let request = request.as_str();
     run_bytes(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let mut vector: Vec<f32> = if dim > 0 && !vector.is_null() {
+        let mut vector: Vec<f32> = if dim > 0 {
             unsafe { slice_from(vector, dim) }?.to_vec()
         } else {
             Vec::new()
@@ -552,10 +608,14 @@ pub unsafe extern "C" fn usy_qd_query(
                             .build(),
                     )
                     .map_err(err)?;
-                let rec = records.into_iter().next().ok_or_else(|| "query point not found".to_string())?;
+                let rec = records
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "query point not found".to_string())?;
                 vector = match rec.vector {
                     Some(VectorStructInternal::Single(v)) => v,
-                    Some(VectorStructInternal::Named(mut m)) => match m.remove(DEFAULT_VECTOR_NAME) {
+                    Some(VectorStructInternal::Named(mut m)) => match m.remove(DEFAULT_VECTOR_NAME)
+                    {
                         Some(VectorInternal::Dense(v)) => v,
                         _ => return Err("query point has no dense vector".into()),
                     },
@@ -568,10 +628,15 @@ pub unsafe extern "C" fn usy_qd_query(
 
         let mut b = QueryRequestBuilder::new(limit)
             .offset(offset)
-            .query(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery::default_dense(vector))))
+            .query(ScoringQuery::Vector(QueryEnum::Nearest(
+                NamedQuery::default_dense(vector),
+            )))
             .with_payload(payload_selector(req.get("fields"))?)
             .with_vector(WithVector::Bool(false))
-            .params(SearchParams { exact: true, ..Default::default() });
+            .params(SearchParams {
+                exact: true,
+                ..Default::default()
+            });
         if let Some(t) = req.get("threshold").and_then(|v| v.as_f64()) {
             b = b.score_threshold(t as f32);
         }
@@ -602,7 +667,12 @@ pub unsafe extern "C" fn usy_qd_query(
 ///
 /// `q` must be null or valid; `name`/`request`/`out` must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn usy_qd_scroll(q: *mut UsyQdrant, name: UsyStr, request: UsyStr, out: *mut UsyBuf) -> i32 {
+pub unsafe extern "C" fn usy_qd_scroll(
+    q: *mut UsyQdrant,
+    name: UsyStr,
+    request: UsyStr,
+    out: *mut UsyBuf,
+) -> i32 {
     let name = name.as_str();
     let request = request.as_str();
     run_bytes(out, || {
@@ -616,7 +686,11 @@ pub unsafe extern "C" fn usy_qd_scroll(q: *mut UsyQdrant, name: UsyStr, request:
         if let Some(f) = build_filter(req.get("filter"))? {
             b = b.filter(f);
         }
-        if req.get("order_mtime").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if req
+            .get("order_mtime")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             b = b.order_by(OrderByInterface::Struct(OrderBy {
                 key: json_path(F_MTIME)?,
                 direction: Some(Direction::Desc),
@@ -665,11 +739,18 @@ pub unsafe extern "C" fn usy_qd_retrieve(
     let request = request.as_str();
     run_bytes(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| PointId::NumId(i)).collect();
+        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?
+            .iter()
+            .map(|&i| PointId::NumId(i))
+            .collect();
         if ids.is_empty() {
             return Ok(br#"{"points":[]}"#.to_vec());
         }
-        let req: Json = serde_json::from_str(request).unwrap_or(Json::Null);
+        let req: Json = if request.is_empty() {
+            Json::Null
+        } else {
+            serde_json::from_str(request).map_err(err)?
+        };
         let shard = q.get_or_load_shard(name)?;
         let records = shard
             .retrieve(
@@ -712,7 +793,10 @@ pub unsafe extern "C" fn usy_qd_set_payload(
     let payload = payload.as_str();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| PointId::NumId(i)).collect();
+        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?
+            .iter()
+            .map(|&i| PointId::NumId(i))
+            .collect();
         if ids.is_empty() {
             return Ok("ok".to_owned());
         }
@@ -722,12 +806,14 @@ pub unsafe extern "C" fn usy_qd_set_payload(
         };
         let shard = q.get_or_load_shard(name)?;
         shard
-            .update(UpdateOperation::PayloadOperation(PayloadOps::SetPayload(SetPayloadOp {
-                payload: Payload(map.into_iter().collect()),
-                points: Some(ids),
-                filter: None,
-                key: None,
-            })))
+            .update(UpdateOperation::PayloadOperation(PayloadOps::SetPayload(
+                SetPayloadOp {
+                    payload: Payload(map.into_iter().collect()),
+                    points: Some(ids),
+                    filter: None,
+                    key: None,
+                },
+            )))
             .map_err(err)?;
         Ok("ok".to_owned())
     })
@@ -739,17 +825,28 @@ pub unsafe extern "C" fn usy_qd_set_payload(
 ///
 /// `q` must be null or valid; when `count > 0`, `ids` must point to `count` readable `u64`s; `name`/`out` must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn usy_qd_delete(q: *mut UsyQdrant, name: UsyStr, ids: *const u64, count: usize, out: *mut UsyBuf) -> i32 {
+pub unsafe extern "C" fn usy_qd_delete(
+    q: *mut UsyQdrant,
+    name: UsyStr,
+    ids: *const u64,
+    count: usize,
+    out: *mut UsyBuf,
+) -> i32 {
     let name = name.as_str();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?.iter().map(|&i| PointId::NumId(i)).collect();
+        let ids: Vec<PointId> = unsafe { slice_from(ids, count) }?
+            .iter()
+            .map(|&i| PointId::NumId(i))
+            .collect();
         if ids.is_empty() {
             return Ok("ok".to_owned());
         }
         let shard = q.get_or_load_shard(name)?;
         shard
-            .update(UpdateOperation::PointOperation(PointOperations::DeletePoints { ids }))
+            .update(UpdateOperation::PointOperation(
+                PointOperations::DeletePoints { ids },
+            ))
             .map_err(err)?;
         Ok("ok".to_owned())
     })
@@ -761,14 +858,21 @@ pub unsafe extern "C" fn usy_qd_delete(q: *mut UsyQdrant, name: UsyStr, ids: *co
 ///
 /// `q` must be null or valid; `name`/`out` must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn usy_qd_drop_collection(q: *mut UsyQdrant, name: UsyStr, out: *mut UsyBuf) -> i32 {
+pub unsafe extern "C" fn usy_qd_drop_collection(
+    q: *mut UsyQdrant,
+    name: UsyStr,
+    out: *mut UsyBuf,
+) -> i32 {
     let name = name.as_str();
     run(out, || {
         let q = unsafe { qdrant_ref(q) }?;
-        let dir = q.collection_dir(name)?;
+        let (key, dir) = q.resolve_collection(name)?;
         {
-            let mut shards = q.shards.lock().map_err(|_| "shard lock poisoned".to_string())?;
-            if let Some(shard) = shards.remove(name) {
+            let mut shards = q
+                .shards
+                .lock()
+                .map_err(|_| "shard lock poisoned".to_string())?;
+            if let Some(shard) = shards.remove(&key) {
                 drop(shard);
             }
             if dir.exists() {
@@ -846,16 +950,22 @@ pub unsafe extern "C" fn usy_qd_list_collections(q: *mut UsyQdrant, out: *mut Us
         buf.push(b'[');
         for (i, (name, path)) in entries.iter().enumerate() {
             let bytes = dir_bytes(path);
-            let loaded = {
-                let shards = q.shards.lock().map_err(|_| "shard lock poisoned".to_string())?;
-                shards.get(name).cloned()
-            };
-            let count = if let Some(shard) = loaded {
-                shard.count(CountRequestBuilder::new().exact(true).build()).ok()
-            } else if let Ok(shard) = EdgeShard::load(path, None) {
-                shard.count(CountRequestBuilder::new().exact(true).build()).ok()
-            } else {
-                None
+            let count = {
+                let shards = q
+                    .shards
+                    .lock()
+                    .map_err(|_| "shard lock poisoned".to_string())?;
+                if let Some(shard) = shards.get(name) {
+                    shard
+                        .count(CountRequestBuilder::new().exact(true).build())
+                        .ok()
+                } else if let Ok(shard) = EdgeShard::load(path, None) {
+                    shard
+                        .count(CountRequestBuilder::new().exact(true).build())
+                        .ok()
+                } else {
+                    None
+                }
             };
             if i > 0 {
                 buf.push(b',');
@@ -891,7 +1001,9 @@ pub unsafe extern "C" fn usy_qd_count(q: *mut UsyQdrant, name: UsyStr, out: *mut
             return Ok("0".to_owned());
         }
         let shard = q.get_or_load_shard(name)?;
-        let count = shard.count(CountRequestBuilder::new().exact(true).build()).map_err(err)?;
+        let count = shard
+            .count(CountRequestBuilder::new().exact(true).build())
+            .map_err(err)?;
         Ok(count.to_string())
     })
 }
@@ -902,7 +1014,12 @@ pub unsafe extern "C" fn usy_qd_count(q: *mut UsyQdrant, name: UsyStr, out: *mut
 ///
 /// `q` must be null or valid; `name`/`out` must be valid.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn usy_qd_facet_tags(q: *mut UsyQdrant, name: UsyStr, limit: u64, out: *mut UsyBuf) -> i32 {
+pub unsafe extern "C" fn usy_qd_facet_tags(
+    q: *mut UsyQdrant,
+    name: UsyStr,
+    limit: u64,
+    out: *mut UsyBuf,
+) -> i32 {
     let name = name.as_str();
     run_bytes(out, || {
         let q = unsafe { qdrant_ref(q) }?;
@@ -912,7 +1029,12 @@ pub unsafe extern "C" fn usy_qd_facet_tags(q: *mut UsyQdrant, name: UsyStr, limi
         }
         let shard = q.get_or_load_shard(name)?;
         let res = shard
-            .facet(FacetRequestBuilder::new(json_path(F_TAGS)?).limit(limit as usize).exact(true).build())
+            .facet(
+                FacetRequestBuilder::new(json_path(F_TAGS)?)
+                    .limit(limit as usize)
+                    .exact(true)
+                    .build(),
+            )
             .map_err(err)?;
         let mut buf = Vec::with_capacity(8 + res.hits.len() * 32);
         buf.push(b'[');
@@ -948,7 +1070,11 @@ pub struct UsyTokenizer {
 ///
 /// `path` (when non-empty) must point to readable bytes; `out` must be null or uniquely writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn usy_tok_load(path: UsyStr, context_length: usize, out: *mut UsyBuf) -> *mut UsyTokenizer {
+pub unsafe extern "C" fn usy_tok_load(
+    path: UsyStr,
+    context_length: usize,
+    out: *mut UsyBuf,
+) -> *mut UsyTokenizer {
     let mut tok = match Tokenizer::from_file(path.as_str()) {
         Ok(t) => t,
         Err(e) => {
@@ -956,7 +1082,10 @@ pub unsafe extern "C" fn usy_tok_load(path: UsyStr, context_length: usize, out: 
             return ptr::null_mut();
         }
     };
-    if let Err(e) = tok.with_truncation(Some(TruncationParams { max_length: context_length, ..Default::default() })) {
+    if let Err(e) = tok.with_truncation(Some(TruncationParams {
+        max_length: context_length,
+        ..Default::default()
+    })) {
         unsafe { write_out(out, e.to_string()) };
         return ptr::null_mut();
     }
@@ -965,7 +1094,10 @@ pub unsafe extern "C" fn usy_tok_load(path: UsyStr, context_length: usize, out: 
         pad_id: 0,
         ..Default::default()
     }));
-    Box::into_raw(Box::new(UsyTokenizer { tok, ctx: context_length }))
+    Box::into_raw(Box::new(UsyTokenizer {
+        tok,
+        ctx: context_length,
+    }))
 }
 
 /// Frees a `UsyTokenizer` handle returned by `usy_tok_load`.
@@ -986,15 +1118,21 @@ pub unsafe extern "C" fn usy_tok_free(t: *mut UsyTokenizer) {
 ///
 /// `t` must be null or valid; `text` must be valid; `ids` must be null or point to `context_length` writable `i64` elements.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn usy_tok_encode(t: *mut UsyTokenizer, text: UsyStr, ids: *mut i64) -> usize {
+pub unsafe extern "C" fn usy_tok_encode(
+    t: *mut UsyTokenizer,
+    text: UsyStr,
+    ids: *mut i64,
+) -> usize {
     if t.is_null() || ids.is_null() {
         return 0;
     }
     let t = unsafe { &*t };
-    let Ok(enc) = t.tok.encode(text.as_str(), true) else { return 0 };
     if t.ctx == 0 {
         return 0;
     }
+    let Ok(enc) = t.tok.encode(text.as_str(), true) else {
+        return 0;
+    };
     // Zero via raw pointer before creating `&mut [i64]` so uninitialized C++ stack buffers are sound.
     unsafe { ptr::write_bytes(ids, 0, t.ctx) };
     let out = unsafe { slice::from_raw_parts_mut(ids, t.ctx) };
@@ -1015,25 +1153,53 @@ mod tests {
 
     #[test]
     fn null_qdrant_and_empty_slices_fail_safely() {
-        let empty = || UsyStr { ptr: ptr::null(), len: 0 };
+        let empty = || UsyStr {
+            ptr: ptr::null(),
+            len: 0,
+        };
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_flush(ptr::null_mut(), empty(), &mut buf) }, 1);
+        assert_eq!(
+            unsafe { usy_qd_flush(ptr::null_mut(), empty(), &mut buf) },
+            1
+        );
         unsafe { usy_buf_free(buf) };
 
         let mut buf2 = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_retrieve(ptr::null_mut(), empty(), ptr::null(), 0, empty(), &mut buf2) }, 1);
+        assert_eq!(
+            unsafe {
+                usy_qd_retrieve(ptr::null_mut(), empty(), ptr::null(), 0, empty(), &mut buf2)
+            },
+            1
+        );
         unsafe { usy_buf_free(buf2) };
 
         let mut buf3 = usy_buf_empty();
         assert_eq!(
-            unsafe { usy_qd_upsert(ptr::null_mut(), empty(), ptr::null(), usize::MAX, ptr::null(), 4, empty(), &mut buf3) },
+            unsafe {
+                usy_qd_upsert(
+                    ptr::null_mut(),
+                    empty(),
+                    ptr::null(),
+                    usize::MAX,
+                    ptr::null(),
+                    4,
+                    empty(),
+                    &mut buf3,
+                )
+            },
             1
         );
         unsafe { usy_buf_free(buf3) };
 
-        assert_eq!(unsafe { slice_from::<u64>(ptr::null(), 0).unwrap().len() }, 0);
+        assert_eq!(
+            unsafe { slice_from::<u64>(ptr::null(), 0).unwrap().len() },
+            0
+        );
         assert!(unsafe { slice_from::<u64>(ptr::null(), 2) }.is_err());
-        assert_eq!(unsafe { usy_tok_encode(ptr::null_mut(), empty(), ptr::null_mut()) }, 0);
+        assert_eq!(
+            unsafe { usy_tok_encode(ptr::null_mut(), empty(), ptr::null_mut()) },
+            0
+        );
     }
 
     #[test]
@@ -1041,7 +1207,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("usyseek_edge_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let root_str = root.to_string_lossy().into_owned();
-        let ustr = |s: &str| UsyStr { ptr: s.as_ptr(), len: s.len() };
+        let ustr = |s: &str| UsyStr {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        };
 
         let mut buf = usy_buf_empty();
         let q = unsafe { usy_qd_open(ustr(&root_str), &mut buf) };
@@ -1049,27 +1218,54 @@ mod tests {
         assert!(!q.is_null());
 
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_ensure_collection(q, ustr("test_model"), 0, &mut buf) }, 2);
+        assert_eq!(
+            unsafe { usy_qd_ensure_collection(q, ustr("test_model"), 0, &mut buf) },
+            2
+        );
         unsafe { usy_buf_free(buf) };
 
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_ensure_collection(q, ustr("test_model"), 4, &mut buf) }, 0);
+        assert_eq!(
+            unsafe { usy_qd_ensure_collection(q, ustr("test_model"), 4, &mut buf) },
+            0
+        );
         unsafe { usy_buf_free(buf) };
 
         let ids = [10u64, 20u64];
         let vecs = [1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         let payloads = r#"[{"p":"C:/a.jpg","n":"alpha_cat.jpg","k":0,"m":100,"s":10,"w":1,"h":1,"d":0,"t":["fav"],"a":["C:"]},{"p":"C:/b.mp4","n":"beta_dog.mp4","k":1,"m":200,"s":20,"w":1,"h":1,"d":500,"t":["fav","clip"],"a":["C:"]}]"#;
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_upsert(q, ustr("test_model"), ids.as_ptr(), 2, vecs.as_ptr(), 4, ustr(payloads), &mut buf) }, 0);
+        assert_eq!(
+            unsafe {
+                usy_qd_upsert(
+                    q,
+                    ustr("test_model"),
+                    ids.as_ptr(),
+                    2,
+                    vecs.as_ptr(),
+                    4,
+                    ustr(payloads),
+                    &mut buf,
+                )
+            },
+            0
+        );
         unsafe { usy_buf_free(buf) };
 
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_optimize(q, ustr("test_model"), &mut buf) }, 0);
+        assert_eq!(
+            unsafe { usy_qd_optimize(q, ustr("test_model"), &mut buf) },
+            0
+        );
         unsafe { usy_buf_free(buf) };
 
         let mut buf = usy_buf_empty();
         assert_eq!(unsafe { usy_qd_count(q, ustr("test_model"), &mut buf) }, 0);
-        let cnt = unsafe { std::str::from_utf8(slice::from_raw_parts(buf.ptr, buf.len)).unwrap().to_owned() };
+        let cnt = unsafe {
+            std::str::from_utf8(slice::from_raw_parts(buf.ptr, buf.len))
+                .unwrap()
+                .to_owned()
+        };
         unsafe { usy_buf_free(buf) };
         assert_eq!(cnt, "2");
 
@@ -1077,8 +1273,21 @@ mod tests {
         let qvec = [0.9f32, 0.1, 0.0, 0.0];
         let qreq = r#"{"limit":10,"offset":0,"filter":{"names":["alpha"]},"fields":["p","n","t"]}"#;
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_query(q, ustr("test_model"), qvec.as_ptr(), 4, ustr(qreq), &mut buf) }, 0);
-        let qjson: Json = serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        assert_eq!(
+            unsafe {
+                usy_qd_query(
+                    q,
+                    ustr("test_model"),
+                    qvec.as_ptr(),
+                    4,
+                    ustr(qreq),
+                    &mut buf,
+                )
+            },
+            0
+        );
+        let qjson: Json =
+            serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
         unsafe { usy_buf_free(buf) };
         assert_eq!(qjson["points"].as_array().unwrap().len(), 1);
         assert_eq!(qjson["points"][0]["id"], 10);
@@ -1086,24 +1295,36 @@ mod tests {
         // Query by stored point ID
         let idreq = r#"{"limit":10,"offset":0,"id":20,"fields":["p"]}"#;
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_query(q, ustr("test_model"), ptr::null(), 0, ustr(idreq), &mut buf) }, 0);
-        let idjson: Json = serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        assert_eq!(
+            unsafe { usy_qd_query(q, ustr("test_model"), ptr::null(), 0, ustr(idreq), &mut buf) },
+            0
+        );
+        let idjson: Json =
+            serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
         unsafe { usy_buf_free(buf) };
         assert_eq!(idjson["points"][0]["id"], 20);
 
         // Scroll ordered by mtime desc
         let sreq = r#"{"limit":10,"order_mtime":true,"fields":["m"]}"#;
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_scroll(q, ustr("test_model"), ustr(sreq), &mut buf) }, 0);
-        let sjson: Json = serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        assert_eq!(
+            unsafe { usy_qd_scroll(q, ustr("test_model"), ustr(sreq), &mut buf) },
+            0
+        );
+        let sjson: Json =
+            serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
         unsafe { usy_buf_free(buf) };
         assert_eq!(sjson["points"][0]["id"], 20);
         assert_eq!(sjson["points"][1]["id"], 10);
 
         // Facet tags
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_facet_tags(q, ustr("test_model"), 100, &mut buf) }, 0);
-        let fjson: Json = serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        assert_eq!(
+            unsafe { usy_qd_facet_tags(q, ustr("test_model"), 100, &mut buf) },
+            0
+        );
+        let fjson: Json =
+            serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
         unsafe { usy_buf_free(buf) };
         assert_eq!(fjson.as_array().unwrap().len(), 2);
 
@@ -1120,18 +1341,26 @@ mod tests {
 
         let mut buf = usy_buf_empty();
         assert_eq!(unsafe { usy_qd_count(q2, ustr("test_model"), &mut buf) }, 0);
-        let cnt2 = unsafe { std::str::from_utf8(slice::from_raw_parts(buf.ptr, buf.len)).unwrap().to_owned() };
+        let cnt2 = unsafe {
+            std::str::from_utf8(slice::from_raw_parts(buf.ptr, buf.len))
+                .unwrap()
+                .to_owned()
+        };
         unsafe { usy_buf_free(buf) };
         assert_eq!(cnt2, "2");
 
         // Second collection for list_collections test
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_ensure_collection(q2, ustr("alpha_model"), 4, &mut buf) }, 0);
+        assert_eq!(
+            unsafe { usy_qd_ensure_collection(q2, ustr("alpha_model"), 4, &mut buf) },
+            0
+        );
         unsafe { usy_buf_free(buf) };
 
         let mut buf = usy_buf_empty();
         assert_eq!(unsafe { usy_qd_list_collections(q2, &mut buf) }, 0);
-        let cols: Json = serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        let cols: Json =
+            serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
         unsafe { usy_buf_free(buf) };
         let arr = cols.as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -1143,13 +1372,115 @@ mod tests {
         assert!(arr[1]["bytes"].as_u64().unwrap() > 0);
 
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_drop_collection(q2, ustr("alpha_model"), &mut buf) }, 0);
+        assert_eq!(
+            unsafe { usy_qd_drop_collection(q2, ustr("alpha_model"), &mut buf) },
+            0
+        );
         unsafe { usy_buf_free(buf) };
 
         let mut buf = usy_buf_empty();
-        assert_eq!(unsafe { usy_qd_drop_collection(q2, ustr("test_model"), &mut buf) }, 0);
+        assert_eq!(
+            unsafe { usy_qd_drop_collection(q2, ustr("test_model"), &mut buf) },
+            0
+        );
         unsafe { usy_buf_free(buf) };
         unsafe { usy_qd_free(q2) };
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sanitized_collection_name_and_invalid_inputs() {
+        let root =
+            std::env::temp_dir().join(format!("usyseek_sanitized_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let root_str = root.to_string_lossy().into_owned();
+        let ustr = |s: &str| UsyStr {
+            ptr: s.as_ptr(),
+            len: s.len(),
+        };
+
+        let mut buf = usy_buf_empty();
+        let q = unsafe { usy_qd_open(ustr(&root_str), &mut buf) };
+        unsafe { usy_buf_free(buf) };
+        assert!(!q.is_null());
+
+        let coll = "org/model:v1";
+        let mut buf = usy_buf_empty();
+        assert_eq!(
+            unsafe { usy_qd_ensure_collection(q, ustr(coll), 4, &mut buf) },
+            0
+        );
+        unsafe { usy_buf_free(buf) };
+
+        let ids = [1u64];
+        let vecs = [1.0f32, 0.0, 0.0, 0.0];
+        let payloads = r#"[{"p":"C:/a.jpg"}]"#;
+        let mut buf = usy_buf_empty();
+        assert_eq!(
+            unsafe {
+                usy_qd_upsert(
+                    q,
+                    ustr(coll),
+                    ids.as_ptr(),
+                    1,
+                    vecs.as_ptr(),
+                    4,
+                    ustr(payloads),
+                    &mut buf,
+                )
+            },
+            0
+        );
+        unsafe { usy_buf_free(buf) };
+
+        // Query with non-zero dim and null pointer should return error
+        let mut buf = usy_buf_empty();
+        assert_eq!(
+            unsafe {
+                usy_qd_query(
+                    q,
+                    ustr(coll),
+                    ptr::null(),
+                    4,
+                    ustr(r#"{"limit":1}"#),
+                    &mut buf,
+                )
+            },
+            1
+        );
+        unsafe { usy_buf_free(buf) };
+
+        // Retrieve with malformed non-empty JSON should return error
+        let mut buf = usy_buf_empty();
+        assert_eq!(
+            unsafe { usy_qd_retrieve(q, ustr(coll), ids.as_ptr(), 1, ustr("{bad"), &mut buf) },
+            1
+        );
+        unsafe { usy_buf_free(buf) };
+
+        // list_collections should resolve the cached open shard via its sanitized name
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_list_collections(q, &mut buf) }, 0);
+        let cols: Json =
+            serde_json::from_slice(unsafe { slice::from_raw_parts(buf.ptr, buf.len) }).unwrap();
+        unsafe { usy_buf_free(buf) };
+        let arr = cols.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "org_model_v1");
+        assert_eq!(arr[0]["count"], 1);
+
+        let mut buf = usy_buf_empty();
+        assert_eq!(unsafe { usy_qd_flush(q, ustr(coll), &mut buf) }, 0);
+        unsafe { usy_buf_free(buf) };
+
+        let mut buf = usy_buf_empty();
+        assert_eq!(
+            unsafe { usy_qd_drop_collection(q, ustr(coll), &mut buf) },
+            0
+        );
+        unsafe { usy_buf_free(buf) };
+
+        unsafe { usy_qd_free(q) };
         let _ = fs::remove_dir_all(&root);
     }
 }
