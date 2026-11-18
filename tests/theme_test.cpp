@@ -67,6 +67,16 @@ int main() {
         CHECK(acc.id == "accent");
         CHECK(acc.follows_system_mode);
         CHECK(acc.follows_windows_accent);
+
+        const Theme lgr = resolve_builtin_theme("liquid-glass-rounder");
+        CHECK(lgr.id == "liquid-glass-rounder");
+        CHECK(lgr.name == "Liquid Glass Rounder");
+        CHECK(lgr.is_liquid_glass);
+        CHECK(lgr.follows_system_mode);
+        CHECK(lgr.pill_radius.has_value() && approx(*lgr.pill_radius, 28.0f, 0.001f));
+        CHECK(approx(lgr.card_radius, 24.0f, 0.001f));
+        CHECK(approx(lgr.button_radius, 24.0f, 0.001f));
+        CHECK(approx(lgr.thumb_radius, 19.0f, 0.001f));
     }
 
     // 4. Windows accent theme derivation across dark & light modes
@@ -185,6 +195,26 @@ int main() {
         CHECK(approx(t.card_radius, 14.0f, 0.001f));
         CHECK(approx(t.button_radius, 10.0f, 0.001f));
         CHECK(approx(t.thumb_radius, 10.0f, 0.001f));
+    }
+
+    // 9b. Custom theme based on liquid-glass-rounder inherits rounder radii & light/dark mode
+    {
+        ThemeSpec spec;
+        spec.name = "Light Rounder";
+        spec.base = "liquid-glass-rounder";
+        spec.mode = "light";
+        spec.liquid_glass = true;
+
+        const Theme lg_light = theme_liquid_glass(false);
+        const Theme t = apply_theme_spec(spec, "custom:light-rounder", "light-rounder");
+        CHECK(t.is_liquid_glass);
+        CHECK(!t.dark_mode);
+        CHECK(!t.follows_system_mode);
+        CHECK(approx(t.bg.r, lg_light.bg.r, 0.005f));
+        CHECK(t.pill_radius.has_value() && approx(*t.pill_radius, 28.0f, 0.001f));
+        CHECK(approx(t.card_radius, 24.0f, 0.001f));
+        CHECK(approx(t.button_radius, 24.0f, 0.001f));
+        CHECK(approx(t.thumb_radius, 19.0f, 0.001f));
     }
 
     // 10. Corner radius overrides & clamping + offset_radius helper

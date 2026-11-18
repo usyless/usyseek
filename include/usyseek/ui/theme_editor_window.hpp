@@ -328,7 +328,7 @@ private:
         std::wstring_view label;
     };
 
-    static constexpr std::array<NamedOption, 8> kBaseOptions{{
+    static constexpr std::array<NamedOption, 9> kBaseOptions{{
         {.value = "dark", .label = L"Dark"},
         {.value = "light", .label = L"Light"},
         {.value = "system", .label = L"System"},
@@ -337,6 +337,7 @@ private:
         {.value = "mocha", .label = L"Mocha"},
         {.value = "oled", .label = L"OLED"},
         {.value = "liquid-glass", .label = L"Liquid Glass"},
+        {.value = "liquid-glass-rounder", .label = L"Liquid Glass Rounder"},
     },};
 
     static constexpr std::array<NamedOption, 4> kModeOptions{{
@@ -704,7 +705,7 @@ private:
         const Theme& t = resolved_preview();
         sw_glass_.set(t.is_liquid_glass ? 1.0f : 0.0f, animate);
         sw_round_.set(t.round_corners ? 1.0f : 0.0f, animate);
-        sw_pill_rad_.set(draft_.pill_radius.has_value() ? 1.0f : 0.0f, animate);
+        sw_pill_rad_.set(t.pill_radius.has_value() ? 1.0f : 0.0f, animate);
         sw_adv_.set(show_advanced_colors_ ? 1.0f : 0.0f, animate);
         if (animate && !sh_.test_mode) start_anim();
     }
@@ -992,7 +993,13 @@ private:
             case SlSettingsAlpha: draft_.settings_bg_alpha.reset(); break;
             case SlCardAlpha: draft_.card_alpha.reset(); break;
             case SlShadowScale: draft_.shadow_alpha_scale.reset(); break;
-            case SlPillRadius: draft_.pill_radius = default_pill_radius(); break;
+            case SlPillRadius:
+                if (base_theme().pill_radius.has_value()) {
+                    draft_.pill_radius.reset();
+                } else {
+                    draft_.pill_radius = default_pill_radius();
+                }
+                break;
             case SlCardRadius: draft_.card_radius.reset(); break;
             case SlButtonRadius: draft_.button_radius.reset(); break;
             case SlThumbRadius: draft_.thumb_radius.reset(); break;
@@ -1418,7 +1425,7 @@ private:
                 cur_y += warn_h + 10.0f;
             }
             const float pr_y = cur_y;
-            if (draft_.pill_radius.has_value()) cur_y += sim_slider_h(SlPillRadius, L"Overrides OS DWM rounding with custom radius + outer shadow");
+            if (prev.pill_radius.has_value()) cur_y += sim_slider_h(SlPillRadius, L"Overrides OS DWM rounding with custom radius + outer shadow");
             const float cr_y = cur_y;
             cur_y += sim_slider_h(SlCardRadius, L"");
             cur_y += sim_slider_h(SlButtonRadius, L"Also scales input wells and choice chips");
@@ -1434,17 +1441,17 @@ private:
             if (!prev.is_liquid_glass) {
                 const D2D1_RECT_F wr = rect(lx, warn_y, rw, warn_h);
                 const float wr_rad = std::min(cv.theme().button_radius, 8.0f);
-                const D2D1_COLOR_F accent = draft_.pill_radius.has_value() ? cv.theme().amber : cv.theme().outline_variant;
-                cv.fill_round(wr, wr_rad, with_alpha(accent, draft_.pill_radius.has_value() ? (cv.theme().dark_mode ? 0.14f : 0.18f) : 0.12f));
+                const D2D1_COLOR_F accent = prev.pill_radius.has_value() ? cv.theme().amber : cv.theme().outline_variant;
+                cv.fill_round(wr, wr_rad, with_alpha(accent, prev.pill_radius.has_value() ? (cv.theme().dark_mode ? 0.14f : 0.18f) : 0.12f));
                 cv.stroke_round(wr, wr_rad, with_alpha(accent, 0.45f));
                 cv.icon(glyph::warning, rect(lx + 10.0f, warn_y, 18.0f, warn_h),
-                        draft_.pill_radius.has_value() ? cv.theme().amber : cv.theme().on_surface_variant, Font::IconSmall);
+                        prev.pill_radius.has_value() ? cv.theme().amber : cv.theme().on_surface_variant, Font::IconSmall);
                 cv.text_wrap(kCornerDwmWarn, rect(lx + 32.0f, warn_y + 7.0f, rw - 38.0f, warn_h - 14.0f),
-                             Font::Caption, draft_.pill_radius.has_value() ? cv.theme().on_surface : cv.theme().on_surface_variant);
+                             Font::Caption, prev.pill_radius.has_value() ? cv.theme().on_surface : cv.theme().on_surface_variant);
             }
 
             float sy = pr_y;
-            if (draft_.pill_radius.has_value()) {
+            if (prev.pill_radius.has_value()) {
                 sy = draw_slider_row(cv, lx, sy, rw, SlPillRadius, L"Overrides OS DWM rounding with custom radius + outer shadow");
             }
             sy = draw_slider_row(cv, lx, cr_y, rw, SlCardRadius, L"");
@@ -1723,7 +1730,7 @@ private:
             case IdBaseChip:
                 if (idx >= 0 && static_cast<size_t>(idx) < kBaseOptions.size()) {
                     draft_.base = std::string{kBaseOptions[static_cast<size_t>(idx)].value};
-                    if (draft_.base == "liquid-glass") {
+                    if (draft_.base == "liquid-glass" || draft_.base == "liquid-glass-rounder") {
                         draft_.liquid_glass = true;
                     } else {
                         draft_.liquid_glass.reset();
@@ -1765,7 +1772,7 @@ private:
                 }
                 break;
             case IdTogglePillRadius:
-                if (draft_.pill_radius.has_value()) {
+                if (base_theme().pill_radius.has_value() || draft_.pill_radius.has_value()) {
                     draft_.pill_radius.reset();
                 } else {
                     draft_.pill_radius = default_pill_radius();

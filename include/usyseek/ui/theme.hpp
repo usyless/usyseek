@@ -606,6 +606,21 @@ inline void apply_liquid_glass_material(Theme& t) noexcept {
     return theme_liquid_glass(windows_uses_dark_mode());
 }
 
+[[nodiscard]] inline Theme theme_liquid_glass_rounder(bool dark) {
+    Theme t = theme_liquid_glass(dark);
+    t.id = "liquid-glass-rounder";
+    t.name = "Liquid Glass Rounder";
+    t.pill_radius = 28.0f;
+    t.card_radius = 24.0f;
+    t.button_radius = 24.0f;
+    t.thumb_radius = 19.0f;
+    return t;
+}
+
+[[nodiscard]] inline Theme theme_liquid_glass_rounder() {
+    return theme_liquid_glass_rounder(windows_uses_dark_mode());
+}
+
 [[nodiscard]] inline Theme resolve_builtin_theme(std::string_view id) {
     if (id == "system") return theme_system();
     if (id == "accent") return theme_accent();
@@ -614,6 +629,7 @@ inline void apply_liquid_glass_material(Theme& t) noexcept {
     if (id == "mocha") return theme_mocha();
     if (id == "oled") return theme_oled();
     if (id == "liquid-glass") return theme_liquid_glass();
+    if (id == "liquid-glass-rounder") return theme_liquid_glass_rounder();
     return theme_dark();
 }
 
@@ -630,7 +646,7 @@ struct LiquidGlassSpec {
 /// String-based theme override specification (deserialized from JSON or constructed directly in tests).
 struct ThemeSpec {
     std::string name;
-    std::string base;                     // optional: dark | light | system | accent | nord | mocha | oled | liquid-glass
+    std::string base;                     // optional: dark | light | system | accent | nord | mocha | oled | liquid-glass | liquid-glass-rounder
     std::string mode;                     // optional: dark | light | system
     std::string pill_backdrop;            // optional: acrylic | mica | tabbed | none
     std::string settings_backdrop;        // optional: acrylic | mica | tabbed | none
@@ -703,7 +719,9 @@ struct ThemeSpec {
     };
     Theme t = (base_id == "liquid-glass")
         ? theme_liquid_glass(mode_is_dark())
-        : resolve_builtin_theme(base_id);
+        : (base_id == "liquid-glass-rounder")
+            ? theme_liquid_glass_rounder(mode_is_dark())
+            : resolve_builtin_theme(base_id);
     t.id = std::move(id);
     t.name = !spec.name.empty() ? spec.name : std::string{fallback_name};
 
@@ -718,7 +736,7 @@ struct ThemeSpec {
         t.follows_system_mode = true;
     }
 
-    if (enable_glass && base_id != "liquid-glass") {
+    if (enable_glass && base_id != "liquid-glass" && base_id != "liquid-glass-rounder") {
         apply_liquid_glass_material(t);
     }
     if (spec.liquid_glass.has_value()) t.is_liquid_glass = *spec.liquid_glass;

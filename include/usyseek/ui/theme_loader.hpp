@@ -40,7 +40,7 @@ inline std::string_view theme_schema_json() noexcept {
     "name": { "type": "string", "description": "Display name shown in Settings." },
     "base": {
       "type": "string",
-      "enum": ["dark", "light", "system", "accent", "nord", "mocha", "oled", "liquid-glass"],
+      "enum": ["dark", "light", "system", "accent", "nord", "mocha", "oled", "liquid-glass", "liquid-glass-rounder"],
       "description": "Built-in preset to inherit unspecified tokens from."
     },
     "mode": {
@@ -268,7 +268,7 @@ struct ThemeEntry {
         out = *src.spec;
     } else {
         out.base = src.id.empty() ? "dark" : src.id;
-        if (out.base == "liquid-glass") out.liquid_glass = true;
+        if (out.base == "liquid-glass" || out.base == "liquid-glass-rounder") out.liquid_glass = true;
     }
     out.name = std::move(new_name);
     return out;
@@ -398,8 +398,8 @@ class ThemeCatalog {
 public:
     void reload(std::vector<std::string>* errors = nullptr) {
         entries_.clear();
-        static constexpr std::array<std::string_view, 8> builtin_ids = {
-            "system", "accent", "dark", "light", "nord", "mocha", "oled", "liquid-glass",};
+        static constexpr std::array<std::string_view, 9> builtin_ids = {
+            "system", "accent", "dark", "light", "nord", "mocha", "oled", "liquid-glass", "liquid-glass-rounder",};
         for (const std::string_view id : builtin_ids) {
             Theme t = resolve_builtin_theme(id);
             std::wstring nw = to_wide(t.name);
@@ -455,7 +455,7 @@ public:
 
     void refresh_dynamic_swatches() {
         for (ThemeEntry& e : entries_) {
-            if (!e.custom && (e.id == "system" || e.id == "accent" || e.id == "liquid-glass")) {
+            if (!e.custom && (e.id == "system" || e.id == "accent" || e.id == "liquid-glass" || e.id == "liquid-glass-rounder")) {
                 e.swatch = resolve_builtin_theme(e.id).primary;
             } else if (e.custom && e.spec) {
                 e.swatch = apply_theme_spec(*e.spec, e.id, e.name).primary;
@@ -466,7 +466,8 @@ public:
     [[nodiscard]] Theme resolve(std::string_view id_or_name) const {
         if (id_or_name.empty() || id_or_name == "system" || id_or_name == "accent" ||
             id_or_name == "dark" || id_or_name == "light" || id_or_name == "nord" ||
-            id_or_name == "mocha" || id_or_name == "oled" || id_or_name == "liquid-glass") {
+            id_or_name == "mocha" || id_or_name == "oled" || id_or_name == "liquid-glass" ||
+            id_or_name == "liquid-glass-rounder") {
             return resolve_builtin_theme(id_or_name.empty() ? "system" : id_or_name);
         }
         for (const ThemeEntry& e : entries_) {

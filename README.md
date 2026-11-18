@@ -90,7 +90,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 - **Find Similar (Visual Cosine Search)**: Click the "Similar" button on any image or video card to search your library for visually and semantically related items.
 - **Interactive Media Previews**: Supports video and animated GIF playback directly in previews with seek controls, volume adjustment, and image/preview zooming.
 - **Search History & Default Open Mode**: Navigate previous queries with text box history, and choose whether the app opens in Pill or Fullscreen mode by default.
-- **Themes & Liquid Glass**: Customize the interface with 8 built-in themes (including **Liquid Glass** with multi-monitor & DPI-aware live desktop refraction) or build your own in the **Theme Editor**.
+- **Themes & Liquid Glass**: Customize the interface with 9 built-in themes (including **Liquid Glass** and **Liquid Glass Rounder** with multi-monitor & DPI-aware live desktop refraction) or build your own in the **Theme Editor**.
 - **Directory Path Scoping**: Filter searches to specific folders or parent directories using `dir:...` or path autocompletion.
 - **Media Kind Filters**: Filter seamlessly between All, Images, or Videos.
 
@@ -128,7 +128,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
   <img src="assets/theme-editor.png" alt="Custom Theme Editor" />
 </p>
 
-- **Built-In Presets & Windows Sync**: Switch between **Follow Windows**, **Windows Accent** (dynamically derived from your Windows accent color), **Midnight Dark**, **Daylight**, **Nord**, **Catppuccin Mocha**, **Pure OLED**, and **Liquid Glass**.
+- **Built-In Presets & Windows Sync**: Switch between **Follow Windows**, **Windows Accent** (dynamically derived from your Windows accent color), **Midnight Dark**, **Daylight**, **Nord**, **Catppuccin Mocha**, **Pure OLED**, **Liquid Glass**, and **Liquid Glass Rounder**.
 - **Built-In Theme Editor**: Create, duplicate, edit, or delete custom themes directly from **Settings → Appearance & Theme**, with real-time live previewing and **Save & Apply** to persist to disk.
 - **JSON Schema & Live Reload**: Custom themes live in `data/themes/*.json` alongside an auto-synced `theme.schema.json` (for editor autocomplete/validation) and `example-sakura (copy but do not edit).json`, with **Open Folder** and **Reload** actions in Settings.
 - **Surfaces, Radii & Shadows**: Customize dark/light/system polarity, DWM backdrops (`Acrylic`, `Mica`, `Tabbed`, `Solid`) independently for the search pill and settings/editor windows, surface opacities, drop shadow scale, and custom **Corner Radii** for the search pill, cards, buttons, and thumbnails.

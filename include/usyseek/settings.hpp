@@ -29,7 +29,7 @@ struct Settings {
     int32_t pill_h = 0;
     std::string thumb_fit = "crop"; // crop | contain
     std::string thumb_dblclick = "open"; // open | preview
-    std::string theme = "system"; // system | accent | dark | light | nord | mocha | oled | custom:<name>
+    std::string theme = "system"; // system | accent | dark | light | nord | mocha | oled | liquid-glass | liquid-glass-rounder | custom:<name>
     double grid_zoom = 1.0; // >= 1.0
     double video_volume = 1.0;
     bool video_muted = false;
