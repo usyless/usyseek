@@ -85,6 +85,7 @@ struct Shared {
     std::function<void()> theme_changed;    // re-apply DWM attributes and repaint windows
     std::function<void()> tags_refreshed;
     std::function<void()> redraw_all;
+    std::function<void(HWND)> on_drag_paced;
 
     /// Runs `fn` on the UI thread (safe from any thread).
     void call(std::function<void()> fn) {

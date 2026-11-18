@@ -318,6 +318,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
         settings_win.invalidate();
         theme_editor_win.invalidate();
     };
+    bool in_drag_paced = false;
+    sh.on_drag_paced = [&](HWND source) {
+        if (in_drag_paced) return;
+        in_drag_paced = true;
+        const auto reset_guard = wil::scope_exit([&] { in_drag_paced = false; });
+        if (source != pill.hwnd()) pill.pump_during_other_drag();
+        if (source != settings_win.hwnd()) settings_win.pump_during_other_drag();
+        if (source != theme_editor_win.hwnd()) theme_editor_win.pump_during_other_drag();
+    };
     sh.theme_changed = [&] {
         pill.apply_theme();
         settings_win.apply_theme();

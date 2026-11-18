@@ -163,7 +163,20 @@ public:
         if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
-    void render() {
+    /// Advances pending repaints, animations, and glass backdrop updates when another window's paced drag starves WM_TIMER/WM_PAINT.
+    void pump_during_other_drag() {
+        if (!visible() || in_sizemove_ || rendering_ || sh_.test_mode) return;
+        if (glass_active() && !full_dirty_ && !dirty_ && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
+            full_dirty_ = true;
+            dirty_ = true;
+        }
+        if (dirty_ || anim_active_) {
+            render(true);
+            if (visible() && !anim_active_ && !dirty_) ValidateRect(hwnd_, nullptr);
+        }
+    }
+
+    void render(bool from_drag_pump = false) {
         if (rendering_ || (!visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         rendering_ = true;
@@ -216,7 +229,8 @@ public:
         }
 
         const bool request_full = std::exchange(full_dirty_, false);
-        const bool ok = target_.render_frame(request_full, dirty_dips_scratch_, !in_sizemove_,
+        bool did_pace = false;
+        const bool ok = target_.render_frame(request_full, dirty_dips_scratch_, target_.present_mode_for(in_sizemove_, from_drag_pump),
                                              [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
             if (full_frame) {
                 hits_.clear();
@@ -227,11 +241,12 @@ public:
                 Canvas cv{target_, sh_.fonts, scratch_hits_, sh_.theme, clip};
                 draw(cv);
             }
-        });
+        }, &did_pace);
         glass_.end_frame();
         if (!ok) recover();
         rendering_ = false;
         anim_active_ = visible() && anim;
+        if (did_pace && !from_drag_pump && sh_.on_drag_paced) sh_.on_drag_paced(hwnd_);
     }
 
 private:

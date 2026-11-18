@@ -251,8 +251,35 @@ public:
         if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
+    /// Advances preview media, animations, and glass backdrop when another window's paced drag starves WM_TIMER/WM_PAINT.
+    void pump_during_other_drag() {
+        if (!visible() || in_sizemove_ || rendering_ || sh_.test_mode) return;
+        if (fading_out_ || std::abs(target_fade_ - fade_) >= 0.005f) {
+            on_fade_timer();
+            if (!visible()) return;
+        }
+        if (preview_valid()) {
+            const Item& it = items_[preview_];
+            if (it.pt.p.k == 1) {
+                if (video_.active() && !video_.failed() && video_.needs_timer()) {
+                    on_video_timer();
+                }
+            } else if (step_gif_playback()) {
+                invalidate_preview_media();
+            }
+        }
+        if (glass_active() && !full_dirty_ && !dirty_ && glass_.poll_desktop(sh_.desktop_dupl, sh_.gfx, hwnd_)) {
+            full_dirty_ = true;
+            dirty_ = true;
+        }
+        if (dirty_ || anim_active_) {
+            render(true);
+            if (visible() && !anim_active_ && !dirty_) ValidateRect(hwnd_, nullptr);
+        }
+    }
+
     /// Draws a frame right now. Prefer `invalidate()`: presenting waits for the display's refresh.
-    void render() {
+    void render(bool from_drag_pump = false) {
         if (rendering_ || (!visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         if (!prepare_preview_media()) return;
@@ -311,7 +338,9 @@ public:
         const bool request_full = std::exchange(full_dirty_, false);
         partial_hits_.clear();
         bool drew_full = false;
-        const bool ok = target_.render_frame(request_full, dirty_dips_scratch_, !in_sizemove_, [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
+        bool did_pace = false;
+        const bool ok = target_.render_frame(request_full, dirty_dips_scratch_, target_.present_mode_for(in_sizemove_, from_drag_pump),
+                                             [&](std::optional<D2D1_RECT_F> clip, bool full_frame) {
             if (full_frame) {
                 drew_full = true;
                 hits_.clear();
@@ -321,13 +350,14 @@ public:
                 Canvas cv{target_, sh_.fonts, partial_hits_, sh_.theme, clip};
                 draw(cv);
             }
-        });
+        }, &did_pace);
         glass_.end_frame();
         if (!ok) recover();
         if (!drew_full && !partial_hits_.empty()) sync_card_overlay_hits(hits_, partial_hits_);
         last_tooltip_dirty_ = curr_tip_dirty;
         rendering_ = false;
         anim_active_ = visible() && (anim || searching_ || loading_more_);
+        if (did_pace && !from_drag_pump && sh_.on_drag_paced) sh_.on_drag_paced(hwnd_);
     }
 
     /// Test hook: puts the pill into a given state without going through input.
@@ -2489,30 +2519,47 @@ private:
             if (video_.active() && !video_.failed()) {
                 const uint32_t nw = video_.native_width();
                 const uint32_t nh = video_.native_height();
+                bool resized = false;
                 if (nw > 0 && nh > 0) {
                     const D2D1_RECT_F area = preview_media_area(pill_bounds(target_.size()), preview_has_controls());
                     const D2D1_RECT_F dest = preview_dest_dims(nw, nh, nw, nh, area);
                     const auto px_w = static_cast<uint32_t>(std::max(1.0f, std::round(width(dest) * target_.scale())));
                     const auto px_h = static_cast<uint32_t>(std::max(1.0f, std::round(height(dest) * target_.scale())));
+                    resized = video_.set_output_size(px_w, px_h);
+                }
+                if (resized || video_.is_seeking() || (in_sizemove_ && video_.needs_timer())) {
                     const bool had_frame = video_.has_frame();
-                    const bool resized = video_.set_output_size(px_w, px_h);
-                    if (resized || video_.is_seeking()) {
-                        const MediaTickStatus st = video_.tick(sh_.gfx.d3d(), target_.dc());
-                        if (st == MediaTickStatus::DeviceLost) {
-                            recover();
-                            return false;
-                        }
-                        if (st == MediaTickStatus::FrameReady) {
-                            last_scrubber_redraw_ = std::chrono::steady_clock::now();
-                            if (!had_frame || !queue_preview_media_dirty()) full_dirty_ = true;
-                            sync_preview_timers();
+                    const MediaTickStatus st = video_.tick(sh_.gfx.d3d(), target_.dc());
+                    if (st == MediaTickStatus::DeviceLost) {
+                        recover();
+                        return false;
+                    }
+                    if (st == MediaTickStatus::FrameReady) {
+                        last_scrubber_redraw_ = std::chrono::steady_clock::now();
+                        if (!had_frame || !queue_preview_media_dirty()) full_dirty_ = true;
+                        sync_preview_timers();
+                    } else if (in_sizemove_ && video_.is_playing()) {
+                        const auto now = std::chrono::steady_clock::now();
+                        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_scrubber_redraw_).count() >= 200) {
+                            last_scrubber_redraw_ = now;
+                            if (pv_ctrl_rect_.right > pv_ctrl_rect_.left && pv_ctrl_rect_.bottom > pv_ctrl_rect_.top) {
+                                pending_dirty_.push_back(D2D1::RectF(pv_ctrl_rect_.left - 4.0f, pv_ctrl_rect_.top - 4.0f,
+                                                                     pv_ctrl_rect_.right + 4.0f, pv_ctrl_rect_.bottom + 4.0f));
+                            } else {
+                                full_dirty_ = true;
+                            }
                         }
                     }
                 }
             }
-        } else if (gif_.active() && gif_.has_frame() && gif_.sync_bitmap(target_.dc()) == MediaTickStatus::DeviceLost) {
-            recover();
-            return false;
+        } else if (gif_.active()) {
+            if (in_sizemove_ && step_gif_playback() && !queue_preview_media_dirty()) {
+                full_dirty_ = true;
+            }
+            if (gif_.has_frame() && gif_.sync_bitmap(target_.dc()) == MediaTickStatus::DeviceLost) {
+                recover();
+                return false;
+            }
         }
         return true;
     }
@@ -2610,12 +2657,18 @@ private:
         }
     }
 
-    void on_gif_timer() {
-        KillTimer(hwnd_, TIMER_GIF);
-        if (!visible() || !preview_valid() || items_[preview_].pt.p.k == 1 || !gif_.has_animation() || !gif_.playing()) return;
+    bool step_gif_playback() {
+        if (!visible() || !preview_valid() || items_[preview_].pt.p.k == 1 || !gif_.has_animation() || !gif_.playing()) {
+            return false;
+        }
         const auto [advanced, wait_ms] = gif_.tick(std::chrono::steady_clock::now());
         if (wait_ms > 0) SetTimer(hwnd_, TIMER_GIF, wait_ms, nullptr);
-        if (advanced) invalidate_preview_media();
+        return advanced;
+    }
+
+    void on_gif_timer() {
+        KillTimer(hwnd_, TIMER_GIF);
+        if (step_gif_playback()) invalidate_preview_media();
     }
 
     void on_video_event() {

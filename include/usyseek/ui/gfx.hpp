@@ -346,17 +346,27 @@ public:
         return create_target();
     }
 
+    enum class PresentMode : uint8_t { Vsync, Immediate, PacedDrag };
+
+    [[nodiscard]] PresentMode present_mode_for(bool in_sizemove, bool from_drag_pump) const noexcept {
+        if (in_sizemove) return liquid_glass_ ? PresentMode::PacedDrag : PresentMode::Immediate;
+        return from_drag_pump ? PresentMode::Immediate : PresentMode::Vsync;
+    }
+
     /// Draws and presents a frame. When `full_redraw` is false and both swap-chain buffers are synced,
     /// only the union of previous and current dirty regions is cleared, drawn clipped, and passed to `Present1`.
     /// Returns false if the device must be recovered.
     template <typename DrawFn>
-    bool render_frame(bool full_redraw, std::span<const D2D1_RECT_F> dirty_dips, bool vsync, DrawFn&& draw_fn) {
+    bool render_frame(bool full_redraw, std::span<const D2D1_RECT_F> dirty_dips, PresentMode present_mode, DrawFn&& draw_fn,
+                      bool* did_pace_out = nullptr) {
+        if (did_pace_out) *did_pace_out = false;
         if (!ready()) return false;
         const float s = scale();
         if (capture_) full_redraw = true;
         // Liquid Glass drag frames are paced against DWM below so the swapchain flip and the HWND move
         // land in the same composition pass.
-        const bool paced = liquid_glass_ && !vsync;
+        const bool paced = liquid_glass_ && (present_mode == PresentMode::PacedDrag);
+        const UINT sync_interval = (present_mode == PresentMode::Vsync) ? 1u : 0u;
 
         curr_px_.clear();
         if (!full_redraw) {
@@ -398,6 +408,7 @@ public:
             capture_ok_ = write_png(*capture_);
             capture_.reset();
         }
+        bool did_pace = false;
         if (SUCCEEDED(hr)) {
             if (paced) {
                 // 1. Finish all GPU work so the flip is ready the instant it is queued.
@@ -406,21 +417,24 @@ public:
                 //    before DWM latches again, so the Present below and the move DefWindowProc applies right
                 //    after WM_WINDOWPOSCHANGING returns reach the same composition (no one-frame lead).
                 (void)DwmFlush();
+                did_pace = true;
             }
             DXGI_PRESENT_PARAMETERS params{};
             if (!p.full) {
                 params.DirtyRectsCount = static_cast<UINT>(present_rects_.size());
                 params.pDirtyRects = present_rects_.data();
             }
-            hr = swap_->Present1(vsync ? 1 : 0, 0, &params);
+            hr = swap_->Present1(sync_interval, 0, &params);
         }
         if (hr == DXGI_STATUS_OCCLUDED) {
             dirty_tracker_.reset();
+            if (did_pace_out) *did_pace_out = did_pace;
             return true;
         }
         if (FAILED(hr)) return false;
 
         dirty_tracker_.commit(full_redraw, p);
+        if (did_pace_out) *did_pace_out = did_pace;
         return true;
     }
 
