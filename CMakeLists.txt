@@ -24,7 +24,6 @@ include(FetchContent)
 ##### Options
 option(USYSEEK_USE_MIMALLOC "Replace default allocator with mimalloc" ON)
 option(USYSEEK_USE_INTERPROCEDURAL_OPTIMIZATION "Enable FLTO/LTCG" ON)
-option(USYSEEK_BUILD_MIGRATE "Build temporary Qdrant-to-Edge migration tool (usyseek-migrate.exe)" OFF)
 cmake_dependent_option(USYSEEK_USE_STATIC_MSVCRT
     "Use the static release/debug MSVCRT - or set the flag yourself before including the project" ON
     "MSVC" OFF
@@ -104,34 +103,37 @@ usyseek_fetch_archive(everything-${USYSEEK_EVERYTHING_VERSION}
 file(GLOB EVERYTHING_EXE "${EVERYTHING_DIR}/Everything*.exe")
 list(GET EVERYTHING_EXE 0 EVERYTHING_EXE)
 
-##### Rust staticlib (qdrant-edge + tokenizers + resvg)
+##### Rust cdylib (qdrant-edge + tokenizers + resvg)
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
 set(RUST_DIR "${PROJECT_SOURCE_DIR}/rust")
 set(RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/rust_target")
-set(RUST_STATIC_LIB "${RUST_TARGET_DIR}/release/usyseek_rust.lib")
-set(RUST_OUTPUTS "${RUST_STATIC_LIB}")
-set(RUST_DEPENDS "${RUST_DIR}/Cargo.toml" "${RUST_DIR}/Cargo.lock" "${RUST_DIR}/src/lib.rs" "${RUST_DIR}/src/edge_common.rs" "${RUST_DIR}/src/svg.rs")
-set(RUST_CARGO_TARGETS --lib)
-set(RUST_BUILD_COMMENT "Building usyseek_rust staticlib (qdrant-edge + tokenizers + resvg)...")
-if(USYSEEK_BUILD_MIGRATE)
-    set(RUST_MIGRATE_EXE "${RUST_TARGET_DIR}/release/usyseek-migrate.exe")
-    list(APPEND RUST_OUTPUTS "${RUST_MIGRATE_EXE}")
-    list(APPEND RUST_DEPENDS "${RUST_DIR}/src/bin/usyseek-migrate.rs")
-    list(APPEND RUST_CARGO_TARGETS --bin usyseek-migrate)
-    set(RUST_BUILD_COMMENT "Building usyseek_rust staticlib and usyseek-migrate (qdrant-edge + tokenizers + resvg)...")
-endif()
+set(RUST_DLL "${RUST_TARGET_DIR}/release/usyseek_rust.dll")
+set(RUST_IMPLIB "${RUST_TARGET_DIR}/release/usyseek_rust.dll.lib")
+set(RUST_RUNTIME_DLL "${USYSEEK_BIN_DIR}/usyseek_rust.dll")
+set(RUST_DEPENDS
+    "${RUST_DIR}/Cargo.toml"
+    "${RUST_DIR}/Cargo.lock"
+    "${RUST_DIR}/.cargo/config.toml"
+    "${RUST_DIR}/src/lib.rs"
+    "${RUST_DIR}/src/edge_common.rs"
+    "${RUST_DIR}/src/svg.rs"
+)
 add_custom_command(
-    OUTPUT ${RUST_OUTPUTS}
-    COMMAND "${CARGO_EXECUTABLE}" build --release ${RUST_CARGO_TARGETS} --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
+    OUTPUT "${RUST_DLL}" "${RUST_IMPLIB}" "${RUST_RUNTIME_DLL}"
+    COMMAND "${CARGO_EXECUTABLE}" build --release --lib --manifest-path "${RUST_DIR}/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${USYSEEK_BIN_DIR}"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${RUST_DLL}" "${RUST_RUNTIME_DLL}"
     DEPENDS ${RUST_DEPENDS}
     WORKING_DIRECTORY "${RUST_DIR}"
-    COMMENT "${RUST_BUILD_COMMENT}"
+    COMMENT "Building usyseek_rust.dll (qdrant-edge + tokenizers + resvg)..."
     VERBATIM
 )
-add_custom_target(usyseek_rust_build DEPENDS ${RUST_OUTPUTS})
-add_library(usyseek_rust STATIC IMPORTED GLOBAL)
-set_target_properties(usyseek_rust PROPERTIES IMPORTED_LOCATION "${RUST_STATIC_LIB}")
-target_link_libraries(usyseek_rust INTERFACE ws2_32 userenv ntdll bcrypt advapi32 synchronization crypt32 secur32 ncrypt)
+add_custom_target(usyseek_rust_build DEPENDS "${RUST_DLL}" "${RUST_IMPLIB}" "${RUST_RUNTIME_DLL}")
+add_library(usyseek_rust SHARED IMPORTED GLOBAL)
+set_target_properties(usyseek_rust PROPERTIES
+    IMPORTED_LOCATION "${RUST_DLL}"
+    IMPORTED_IMPLIB "${RUST_IMPLIB}"
+)
 add_dependencies(usyseek_rust usyseek_rust_build)
 
 ##### FetchContent dependencies
@@ -280,7 +282,7 @@ target_link_libraries(usyseek-ui PRIVATE
     usyseek_sqlite3
     "${ORT_ROOT}/lib/onnxruntime.lib"
     d2d1 dwrite d3d11 d3dcompiler dxgi dxguid dcomp dwmapi windowscodecs mfplat mfuuid
-    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys winhttp version comdlg32
+    shell32 shlwapi shcore ole32 oleaut32 user32 gdi32 imm32 uxtheme propsys winhttp version comdlg32 bcrypt
 )
 add_custom_command(TARGET usyseek-ui POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${ORT_ROOT}/lib/onnxruntime.dll" "$<TARGET_FILE_DIR:usyseek-ui>/onnxruntime.dll"
@@ -304,14 +306,9 @@ target_link_libraries(usyseek-indexer PRIVATE
 )
 
 ##### Runtime layout next to the executables
-set(USYSEEK_MIGRATE_COPY_CMD "")
-if(USYSEEK_BUILD_MIGRATE)
-    set(USYSEEK_MIGRATE_COPY_CMD COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${RUST_MIGRATE_EXE}" "${USYSEEK_BIN_DIR}/usyseek-migrate.exe")
-endif()
 add_custom_target(usyseek_runtime ALL
     DEPENDS usyseek_rust_build
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${USYSEEK_BIN_DIR}/python"
-    ${USYSEEK_MIGRATE_COPY_CMD}
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/python/usyseek_vision.py" "${USYSEEK_BIN_DIR}/python/usyseek_vision.py"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${PROJECT_SOURCE_DIR}/python/requirements.txt" "${USYSEEK_BIN_DIR}/python/requirements.txt"
     VERBATIM

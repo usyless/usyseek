@@ -11,7 +11,7 @@ struct UsySvgInfo {
     uint32_t src_height;
 };
 
-int32_t usy_svg_render(UsyStr path, uint32_t box_w, uint32_t box_h, uint32_t fit, uint32_t background, UsySvgInfo* info, UsyBuf* out);
+USY_RUST_API int32_t usy_svg_render(UsyStr path, uint32_t box_w, uint32_t box_h, uint32_t fit, uint32_t background, UsySvgInfo* info, UsyBuf* out);
 }
 
 namespace usyseek::svg {

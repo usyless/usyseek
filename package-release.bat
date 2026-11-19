@@ -11,7 +11,7 @@ set "BIN=build\bin"
 set "DIST=dist"
 set "STAGE=%DIST%\stage"
 
-for %%F in (usyseek.exe usyseek-ui.exe usyseek-indexer.exe onnxruntime.dll python\usyseek_vision.py python\requirements.txt) do (
+for %%F in (usyseek.exe usyseek-ui.exe usyseek-indexer.exe usyseek_rust.dll onnxruntime.dll python\usyseek_vision.py python\requirements.txt) do (
     if not exist "%BIN%\%%F" (
         echo [package-release] Missing %BIN%\%%F. Run build.bat first or pass --build.
         goto :fail
@@ -32,6 +32,7 @@ mkdir "%STAGE%\python"
 copy /y "%BIN%\usyseek.exe" "%STAGE%\usyseek.exe" >nul || goto :fail
 copy /y "%BIN%\usyseek-ui.exe" "%STAGE%\usyseek-ui.exe" >nul || goto :fail
 copy /y "%BIN%\usyseek-indexer.exe" "%STAGE%\usyseek-indexer.exe" >nul || goto :fail
+copy /y "%BIN%\usyseek_rust.dll" "%STAGE%\usyseek_rust.dll" >nul || goto :fail
 copy /y "%BIN%\onnxruntime.dll" "%STAGE%\onnxruntime.dll" >nul || goto :fail
 copy /y "%BIN%\python\usyseek_vision.py" "%STAGE%\python\usyseek_vision.py" >nul || goto :fail
 copy /y "%BIN%\python\requirements.txt" "%STAGE%\python\requirements.txt" >nul || goto :fail

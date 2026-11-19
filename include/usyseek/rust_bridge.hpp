@@ -5,7 +5,13 @@
 #include <string_view>
 #include <utility>
 
-// Buffer types shared by every function exported from the usyseek_rust staticlib.
+#ifdef _WIN32
+#define USY_RUST_API __declspec(dllimport)
+#else
+#define USY_RUST_API
+#endif
+
+// Buffer types shared by every function exported from usyseek_rust.dll.
 extern "C" {
 struct UsyStr {
     const char* ptr;
@@ -17,7 +23,7 @@ struct UsyBuf {
     size_t cap;
 };
 
-void usy_buf_free(UsyBuf b);
+USY_RUST_API void usy_buf_free(UsyBuf b);
 }
 
 namespace usyseek {

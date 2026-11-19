@@ -16,27 +16,27 @@ extern "C" {
 struct UsyQdrant;
 struct UsyTokenizer;
 
-UsyQdrant* usy_qd_open(UsyStr dir, UsyBuf* out);
-int32_t usy_qd_close_all(UsyQdrant* q, UsyBuf* out);
-void usy_qd_free(UsyQdrant* q);
-int32_t usy_qd_flush(UsyQdrant* q, UsyStr name, UsyBuf* out);
-int32_t usy_qd_optimize(UsyQdrant* q, UsyStr name, UsyBuf* out);
-int32_t usy_qd_ensure_collection(UsyQdrant* q, UsyStr name, uint64_t dim, UsyBuf* out);
-int32_t usy_qd_check_collection(UsyQdrant* q, UsyStr name, UsyBuf* out);
-int32_t usy_qd_upsert(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, const float* vectors, size_t dim, UsyStr payloads, UsyBuf* out);
-int32_t usy_qd_query(UsyQdrant* q, UsyStr name, const float* vector, size_t dim, UsyStr request, UsyBuf* out);
-int32_t usy_qd_scroll(UsyQdrant* q, UsyStr name, UsyStr request, UsyBuf* out);
-int32_t usy_qd_retrieve(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, UsyStr request, UsyBuf* out);
-int32_t usy_qd_set_payload(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, UsyStr payload, UsyBuf* out);
-int32_t usy_qd_delete(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, UsyBuf* out);
-int32_t usy_qd_drop_collection(UsyQdrant* q, UsyStr name, UsyBuf* out);
-int32_t usy_qd_count(UsyQdrant* q, UsyStr name, UsyBuf* out);
-int32_t usy_qd_list_collections(UsyQdrant* q, UsyBuf* out);
-int32_t usy_qd_facet_tags(UsyQdrant* q, UsyStr name, uint64_t limit, UsyBuf* out);
+USY_RUST_API UsyQdrant* usy_qd_open(UsyStr dir, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_close_all(UsyQdrant* q, UsyBuf* out);
+USY_RUST_API void usy_qd_free(UsyQdrant* q);
+USY_RUST_API int32_t usy_qd_flush(UsyQdrant* q, UsyStr name, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_optimize(UsyQdrant* q, UsyStr name, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_ensure_collection(UsyQdrant* q, UsyStr name, uint64_t dim, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_check_collection(UsyQdrant* q, UsyStr name, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_upsert(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, const float* vectors, size_t dim, UsyStr payloads, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_query(UsyQdrant* q, UsyStr name, const float* vector, size_t dim, UsyStr request, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_scroll(UsyQdrant* q, UsyStr name, UsyStr request, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_retrieve(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, UsyStr request, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_set_payload(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, UsyStr payload, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_delete(UsyQdrant* q, UsyStr name, const uint64_t* ids, size_t count, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_drop_collection(UsyQdrant* q, UsyStr name, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_count(UsyQdrant* q, UsyStr name, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_list_collections(UsyQdrant* q, UsyBuf* out);
+USY_RUST_API int32_t usy_qd_facet_tags(UsyQdrant* q, UsyStr name, uint64_t limit, UsyBuf* out);
 
-UsyTokenizer* usy_tok_load(UsyStr path, size_t context_length, UsyBuf* out);
-void usy_tok_free(UsyTokenizer* t);
-size_t usy_tok_encode(UsyTokenizer* t, UsyStr text, int64_t* ids);
+USY_RUST_API UsyTokenizer* usy_tok_load(UsyStr path, size_t context_length, UsyBuf* out);
+USY_RUST_API void usy_tok_free(UsyTokenizer* t);
+USY_RUST_API size_t usy_tok_encode(UsyTokenizer* t, UsyStr text, int64_t* ids);
 }
 
 namespace usyseek {

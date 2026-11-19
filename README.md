@@ -70,7 +70,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
    - Reports live progress, throughput, and status through shared memory (`Local\usyseek.indexer.status`).
 
 4. **Embedded Vector Engine (`qdrant-edge`)**:
-   - Powered by **`qdrant-edge`** embedded directly inside the `usyseek_rust` static library—no external `qdrant.exe` server or gRPC overhead.
+   - Powered by **`qdrant-edge`** in a shared `usyseek_rust.dll` library used by both `usyseek-ui.exe` and `usyseek-indexer.exe`—no external `qdrant.exe` server or gRPC overhead.
    - Stores vector embeddings, payloads, and a centralized tags database locally on disk.
 
 ---
@@ -166,7 +166,7 @@ To avoid the massive idle resource consumption common to AI and Electron-based d
 - **C++ Compiler**: MSVC from Visual Studio 2022 (v143+) supporting C++23 (`/std:c++latest`)
 - **CMake**: `3.31+`
 - **Build System**: [Ninja](https://github.com/ninja-build/ninja)
-- **Rust Toolchain**: `cargo` / `rustc` 1.85+ (used to compile the `usyseek_rust` static library)
+- **Rust Toolchain**: `cargo` / `rustc` 1.85+ (used to compile `usyseek_rust.dll`)
 - **Python**: **Not required!** System-wide Python is no longer a dependency. The application can automatically download and manage a portable Python runtime directly from the Settings UI (or you can optionally point it to an existing virtualenv / local install).
 - **GPU (Optional but recommended for indexing)**:
   - **AMD**: ROCm for Windows (default target: `gfx1030` / RDNA2+)
@@ -202,8 +202,9 @@ All built executables, dependencies, and runtime assets are automatically assemb
 ```
 build/bin/
 ├── usyseek.exe              # Launcher and tray supervisor
-├── usyseek-ui.exe           # Search pill & settings UI (with embedded qdrant-edge)
-├── usyseek-indexer.exe      # Indexing and embedding engine (with embedded qdrant-edge)
+├── usyseek-ui.exe           # Search pill & settings UI
+├── usyseek-indexer.exe      # Indexing and embedding engine
+├── usyseek_rust.dll         # Shared Rust bridge (qdrant-edge, tokenizers, resvg)
 ├── onnxruntime.dll          # ONNX Runtime (CPU)
 └── python/
     ├── usyseek_vision.py    # PyTorch vision tower worker
@@ -219,7 +220,6 @@ build/bin/
 | `USYSEEK_USE_MIMALLOC` | `ON` | Replace the default allocator with Microsoft `mimalloc` |
 | `USYSEEK_USE_INTERPROCEDURAL_OPTIMIZATION` | `ON` | Enable Link-Time Optimization (LTO/LTCG) |
 | `USYSEEK_USE_STATIC_MSVCRT` | `ON` | Link against static MSVC runtime (`/MT`) |
-| `USYSEEK_BUILD_MIGRATE` | `OFF` | Build temporary Qdrant-to-Edge migration tool (`usyseek-migrate.exe`) |
 | `USYSEEK_USYLIBPP_VERSION` | `main` | Git branch/tag for `usylibpp` |
 | `USYSEEK_GLAZE_VERSION` | `v9.1.0` | Git tag for `glaze` (high-performance JSON) |
 | `USYSEEK_MIMALLOC_VERSION` | `v3.5.3` | Git tag for `mimalloc` |

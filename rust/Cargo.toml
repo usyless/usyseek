@@ -6,11 +6,7 @@ publish = false
 
 [lib]
 name = "usyseek_rust"
-crate-type = ["staticlib"]
-
-[[bin]]
-name = "usyseek-migrate"
-path = "src/bin/usyseek-migrate.rs"
+crate-type = ["cdylib"]
 
 [dependencies]
 qdrant-edge = "0.9.0"
