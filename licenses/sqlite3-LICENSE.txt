@@ -1,0 +1,2 @@
+Public domain
+https://www.sqlite.org/copyright.html
