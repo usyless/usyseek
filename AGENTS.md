@@ -22,4 +22,7 @@ Guidelines for working in the `usyseek` repository (C++23 + Rust).
 - Match the style, idioms, and conventions of the surrounding codebase.
 - Write code with performance and allocation efficiency in mind:
   - Minimize heap allocations where practical (e.g., reuse buffers, use fixed-size stack arrays when sizes are bounded).
+  - Prefer the stack-allocated string helpers in `include/usyseek/string_helpers.hpp` over allocating standard utilities — e.g., `usyseek::to_fixed_str` / `usyseek::to_fixed_wstr` instead of `std::to_string` / `std::to_wstring`, and `FixedString` / `FixedWString` for bounded stack strings.
+  - Avoid `std::string + std::string` concatenation. Use `usylibpp::strings::concat_strings` when constructing a new string from multiple parts, and `usyseek::append_to` (or pre-reserved in-place appending) when appending to an existing string.
+  - Continue this pattern when adding new utilities or code paths: prefer non-allocating or single-allocation helpers over chained temporaries.
 - Never trade away correctness for micro-optimizations: keep **thread safety** and **avoiding undefined behavior** strictly in mind when reusing buffers, skipping initialization, or manipulating low-level memory.
