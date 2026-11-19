@@ -2024,6 +2024,14 @@ private:
                 append_to(fetch_note, L"  ", format_size(fetch_view.done), L" / ", format_size(fetch_view.total));
             }
             const float fetch_note_h = fetch_note.empty() ? 0.0f : text_height(cv, fetch_note, Font::Caption, rw, 18.0f);
+            const std::string custom_repo = to_utf8(trim(repo_field_.text));
+            const std::string typed_model = to_utf8(trim(model_field_.text));
+            const bool model_warn = sh_.settings.model_name != "PE-Core-L-14-336" ||
+                (!typed_model.empty() && typed_model != "PE-Core-L-14-336") ||
+                (!custom_repo.empty() && custom_repo != "timm/PE-Core-L-14-336");
+            const std::wstring_view model_warn_text =
+                L"Only the default model (PE-Core-L-14-336) is fully tested. Other open_clip models or Hugging Face repos may have incompatible file layouts, tokenizers, or ONNX export issues.";
+            const float model_warn_h = model_warn ? error_row_height(cv, model_warn_text, rw) : 0.0f;
 
             // Device & VRAM Batch size
             const bool is_cpu = sh_.settings.device == "cpu";
@@ -2109,7 +2117,8 @@ private:
             const float enc_error_y = files_y + files.height(rw) + 6.0f;
             const float fetch_y = enc_error_y + (enc_error.empty() ? 0.0f : enc_error_h + 6.0f) + 2.0f;
             const float fetch_note_y = fetch_y + (show_fetch ? fetch.height(rw) + 6.0f : 0.0f);
-            const float compute_y = fetch_note_y + (fetch_note.empty() ? 0.0f : fetch_note_h + 6.0f) + 6.0f;
+            const float model_warn_y = fetch_note_y + (fetch_note.empty() ? 0.0f : fetch_note_h + 6.0f);
+            const float compute_y = model_warn_y + (model_warn ? model_warn_h + 6.0f : 0.0f) + 6.0f;
             const float note_y = compute_y + compute.height(rw) + 6.0f;
             const float script_y = note_y + note_h + 8.0f;
             const float h = script_y + script.height(rw) + 16.0f - y;
@@ -2123,6 +2132,10 @@ private:
             if (show_fetch) fetch.draw(lx, fetch_y, rw);
             if (!fetch_note.empty()) {
                 cv.text_wrap(fetch_note, rect(lx, fetch_note_y, rw, fetch_note_h), Font::Caption, fetch_view.failed ? cv.theme().error : cv.theme().outline);
+            }
+            if (model_warn) {
+                cv.icon(glyph::warning, rect(lx, model_warn_y, 18.0f, 20.0f), cv.theme().amber, Font::IconSmall);
+                cv.text_wrap(model_warn_text, rect(lx + 22.0f, model_warn_y, rw - 22.0f, model_warn_h), Font::Caption, cv.theme().amber);
             }
             compute.draw(lx, compute_y, rw);
             if (batch_warn) {
