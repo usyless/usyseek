@@ -1,0 +1,23 @@
+# Configuration for cargo-about (third-party Rust license generation).
+# Run from the rust/ directory:
+#   cargo about generate about.hbs -o ../licenses/rust-licenses.txt
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "0BSD",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+targets = ["x86_64-pc-windows-msvc"]

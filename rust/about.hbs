@@ -1,0 +1,16 @@
+Third-Party Rust Dependencies for usyseek (usyseek_rust.dll)
+============================================================
+
+This file lists the licenses for the Rust crates compiled into usyseek_rust.dll.
+
+{{#each licenses}}
+================================================================================
+License: {{name}} ({{id}})
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+--------------------------------------------------------------------------------
+{{{text}}}
+
+{{/each}}
