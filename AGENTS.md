@@ -1,0 +1,25 @@
+# AGENTS.md
+
+Guidelines for working in the `usyseek` repository (C++23 + Rust).
+
+## Versioning
+
+- **usyseek version**: Bump `VERSION` in `project(usyseek VERSION ...)` in `CMakeLists.txt` — nowhere else.
+- **Rust crate version**: Bump `version` in `rust/Cargo.toml` — nowhere else.
+  - Only bump the Rust version when making changes to the Rust codebase (`rust/`).
+  - Check published releases (GitHub tags) before bumping: do not bump if the current version has not yet been in a published release.
+
+## Static Analysis (`clang-tidy`)
+
+- After making C/C++ edits, verify that your changes do not introduce any `clang-tidy` warnings (rules are defined in `.clang-tidy`).
+- Keep warnings to a minimum. Acceptable exceptions are:
+  - False positives on Windows API structs.
+  - Intentional, verified-safe performance choices (e.g., skipping zero-initialization of an array).
+- When suppressing a verified-valid warning, scope it to the specific check (e.g., `// NOLINT(cppcoreguidelines-pro-type-member-init)`). Use `NOLINT` sparingly — do not scatter blanket suppressions across the codebase.
+
+## Code Style & Performance
+
+- Match the style, idioms, and conventions of the surrounding codebase.
+- Write code with performance and allocation efficiency in mind:
+  - Minimize heap allocations where practical (e.g., reuse buffers, use fixed-size stack arrays when sizes are bounded).
+- Never trade away correctness for micro-optimizations: keep **thread safety** and **avoiding undefined behavior** strictly in mind when reusing buffers, skipping initialization, or manipulating low-level memory.
