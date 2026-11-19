@@ -115,7 +115,6 @@ set(RUST_DEPENDS
     "${RUST_DIR}/Cargo.lock"
     "${RUST_DIR}/.cargo/config.toml"
     "${RUST_DIR}/src/lib.rs"
-    "${RUST_DIR}/src/edge_common.rs"
     "${RUST_DIR}/src/svg.rs"
 )
 add_custom_command(
