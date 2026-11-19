@@ -354,6 +354,15 @@ def benchmark_batch(limit=128):
         _torch.cuda.empty_cache()
 
 
+def _build_text_meta_buffer(torch, parent, attr, buf):
+    if attr == "attn_mask":
+        if hasattr(parent, "build_causal_mask"):
+            return parent.build_causal_mask().to(device="cpu", dtype=buf.dtype)
+        if buf.ndim == 2 and buf.shape[0] == buf.shape[1] and buf.is_floating_point():
+            return torch.full(buf.shape, float("-inf"), dtype=buf.dtype, device="cpu").triu_(1)
+    return torch.zeros(buf.shape, dtype=buf.dtype, device="cpu")
+
+
 def export_text(model_dir, model_name):
     """One-time export of the text tower to ONNX so the search UI never needs torch."""
     weights, onnx_path = _model_paths(model_dir, model_name)
@@ -383,10 +392,7 @@ def export_text(model_dir, model_name):
         if buf.is_meta:
             parent_name, _, attr = name.rpartition(".")
             parent = m.get_submodule(parent_name) if parent_name else m
-            if attr == "attn_mask" and hasattr(parent, "build_causal_mask"):
-                setattr(parent, attr, parent.build_causal_mask().to("cpu"))
-            else:
-                setattr(parent, attr, torch.zeros(buf.shape, dtype=buf.dtype, device="cpu"))
+            setattr(parent, attr, _build_text_meta_buffer(torch, parent, attr, buf))
     for mod in m.modules():
         if hasattr(mod, "init_non_persistent_buffers"):
             mod.init_non_persistent_buffers()

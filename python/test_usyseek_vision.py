@@ -11,6 +11,11 @@ try:
 except ImportError:
     np = None
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 import usyseek_vision as v
 
 
@@ -303,6 +308,22 @@ class ExportTextEdgeCasesTest(unittest.TestCase):
             onnx_file = Path(td) / "demo-text.onnx"
             onnx_file.write_bytes(b"existing")
             self.assertEqual(v.export_text(td, "demo"), str(onnx_file))
+
+    @unittest.skipUnless(torch is not None, "torch required")
+    def test_classic_clip_causal_attn_mask_fallback(self):
+        buf = torch.empty((4, 4), dtype=torch.float32, device="meta")
+        mask = v._build_text_meta_buffer(torch, object(), "attn_mask", buf)
+        self.assertEqual(mask.device.type, "cpu")
+        self.assertEqual(mask.shape, (4, 4))
+        expected = torch.full((4, 4), float("-inf"), dtype=torch.float32).triu_(1)
+        self.assertTrue(torch.equal(mask, expected))
+
+        class _WithBuilder:
+            def build_causal_mask(self):
+                return torch.ones((4, 4), dtype=torch.float32)
+
+        built = v._build_text_meta_buffer(torch, _WithBuilder(), "attn_mask", buf)
+        self.assertTrue(torch.equal(built, torch.ones((4, 4), dtype=torch.float32)))
 
 
 class _FakePipe:
