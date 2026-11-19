@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <shlobj.h>
+#include <wil/resource.h>
 
 #include <algorithm>
 #include <array>
@@ -37,11 +38,14 @@ inline constexpr const wchar_t* APP_VERSION = USYSEEK_VERSION_WSTR;
 
 inline constexpr const wchar_t* LAUNCHER_CLASS = L"usyseek.launcher";
 inline constexpr const wchar_t* LAUNCHER_MUTEX = L"Local\\usyseek.launcher";
+inline constexpr const wchar_t* UI_MUTEX = L"Local\\usyseek.ui";
 inline constexpr const wchar_t* PILL_CLASS = L"usyseek.pill";
 inline constexpr const wchar_t* SETTINGS_CLASS = L"usyseek.settings";
 inline constexpr const wchar_t* THEME_EDITOR_CLASS = L"usyseek.theme_editor";
 inline constexpr const wchar_t* STATUS_SHM = L"Local\\usyseek.indexer.status";
 inline constexpr const wchar_t* INDEXER_MUTEX = L"Local\\usyseek.indexer";
+inline constexpr const wchar_t* INDEXER_DB_MUTEX = L"Local\\usyseek.db.indexer";
+inline constexpr const wchar_t* LAUNCHER_DB_WANT_MUTEX = L"Local\\usyseek.db.launcher_want";
 inline constexpr const wchar_t* INDEXER_STOP_EVENT = L"Local\\usyseek.indexer.stop";
 inline constexpr const wchar_t* INDEXER_DB_WANT_EVENT = L"Local\\usyseek.db.want";
 inline constexpr const wchar_t* NOTIFICATIONS_MUTEX = L"Local\\usyseek.notifications";
@@ -494,31 +498,68 @@ inline const fs::path& tags_db_path() {
     return p;
 }
 
-/// True while an indexer process holds the indexer mutex or is being launched.
-inline bool is_indexer_db_wanted() noexcept {
-    if (HANDLE mx = OpenMutexW(SYNCHRONIZE, FALSE, INDEXER_MUTEX)) {
-        const DWORD w = WaitForSingleObject(mx, 0);
+/// RAII owner of a cross-process named Win32 mutex acquired via WaitForSingleObject (handles WAIT_ABANDONED
+/// and avoids ERROR_ALREADY_EXISTS false positives when another process momentarily probes the mutex).
+struct NamedMutexLock {
+    wil::unique_mutex_nothrow handle;
+    bool owned = false;
+
+    NamedMutexLock() = default;
+    NamedMutexLock(const NamedMutexLock&) = delete;
+    NamedMutexLock& operator=(const NamedMutexLock&) = delete;
+    NamedMutexLock(NamedMutexLock&& o) noexcept
+        : handle{std::move(o.handle)}, owned{std::exchange(o.owned, false)} {}
+    NamedMutexLock& operator=(NamedMutexLock&& o) noexcept {
+        if (this != &o) {
+            release();
+            handle = std::move(o.handle);
+            owned = std::exchange(o.owned, false);
+        }
+        return *this;
+    }
+    ~NamedMutexLock() { release(); }
+
+    bool try_lock(const wchar_t* name, DWORD timeout_ms = 0) noexcept {
+        release();
+        handle.reset(CreateMutexW(nullptr, FALSE, name));
+        if (!handle) return false;
+        const DWORD w = WaitForSingleObject(handle.get(), timeout_ms);
         if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) {
-            ReleaseMutex(mx);
-            if (w == WAIT_ABANDONED) {
-                // Previous standalone indexer exited abnormally without resetting the event.
-                if (HANDLE ev = OpenEventW(EVENT_MODIFY_STATE, FALSE, INDEXER_DB_WANT_EVENT)) {
-                    ResetEvent(ev);
-                    CloseHandle(ev);
-                }
-            }
-        } else if (w == WAIT_TIMEOUT) {
-            CloseHandle(mx);
+            owned = true;
             return true;
         }
-        CloseHandle(mx);
+        handle.reset();
+        return false;
     }
-    if (HANDLE ev = OpenEventW(SYNCHRONIZE, FALSE, INDEXER_DB_WANT_EVENT)) {
-        const bool signaled = WaitForSingleObject(ev, 0) == WAIT_OBJECT_0;
-        CloseHandle(ev);
-        if (signaled) return true;
+
+    void release() noexcept {
+        if (handle && owned) {
+            ReleaseMutex(handle.get());
+            owned = false;
+        }
+        handle.reset();
     }
-    return false;
+
+    [[nodiscard]] explicit operator bool() const noexcept { return owned; }
+};
+
+/// True while another thread or process currently owns the named mutex `name`.
+inline bool is_named_mutex_held(const wchar_t* name) noexcept {
+    const wil::unique_mutex_nothrow mx{OpenMutexW(SYNCHRONIZE, FALSE, name)};
+    if (!mx) return false;
+    const DWORD w = WaitForSingleObject(mx.get(), 0);
+    if (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED) {
+        ReleaseMutex(mx.get());
+        return false;
+    }
+    return w == WAIT_TIMEOUT;
+}
+
+/// True while an indexer process owns the Qdrant Edge handoff mutex or the launcher is launching one.
+/// Because mutex ownership is automatically abandoned by Windows if the owning process crashes,
+/// this can never stay wedged after an abnormal exit.
+inline bool is_indexer_db_wanted() noexcept {
+    return is_named_mutex_held(INDEXER_DB_MUTEX) || is_named_mutex_held(LAUNCHER_DB_WANT_MUTEX);
 }
 
 /// Looks for a relative path walking up from the executable directory.

@@ -58,6 +58,7 @@ public:
         if (!hwnd_) return false;
         // Allow the (possibly elevated-aware) children to reach us
         ChangeWindowMessageFilterEx(hwnd_, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
+        ChangeWindowMessageFilterEx(hwnd_, msg_toggle_search(), MSGFLT_ALLOW, nullptr);
 
         add_tray();
         register_hotkey();
@@ -87,16 +88,19 @@ public:
     }
 
     void open_about() { open_settings(3); }
+    void start_index_from_cli() { start_index(); }
 
     void shutdown() {
         remove_tray();
         if (indexer_.hProcess) {
             SetEvent(stop_event_.get());
-            if (WaitForSingleObject(indexer_.hProcess, 3000) != WAIT_OBJECT_0) TerminateProcess(indexer_.hProcess, 1);
+            if (WaitForSingleObject(indexer_.hProcess, 8000) != WAIT_OBJECT_0) TerminateProcess(indexer_.hProcess, 1);
             close_everything_instance();
         }
-        if (db_want_event_) ResetEvent(db_want_event_.get());
-        if (ui_.hProcess) TerminateProcess(ui_.hProcess, 0);
+        if (stop_event_) ResetEvent(stop_event_.get());
+        db_want_lock_.release();
+        if (db_want_event_ && !is_indexer_db_wanted()) ResetEvent(db_want_event_.get());
+        close_ui(3000);
     }
 
 private:
@@ -163,7 +167,7 @@ private:
                         TerminateProcess(indexer_.hProcess, 1);
                         push_notification_to_disk(
                             "warning", "Indexer", "Indexer had to be force-stopped",
-                            "usyseek-indexer.exe did not exit within 6 seconds after requesting stop and was terminated.",
+                            "usyseek-indexer.exe did not exit within 15 seconds after requesting stop and was terminated.",
                             "indexer-force-stop", true);
                     }
                 } else if (wp == TIMER_TRAY_PROGRESS) {
@@ -281,14 +285,27 @@ private:
         ui_ = spawn(exe_dir() / L"usyseek-ui.exe", arg, false);
     }
 
+    HWND active_ui_hwnd() const noexcept {
+        if (ui_hwnd_ && IsWindow(ui_hwnd_)) return ui_hwnd_;
+        return FindWindowW(PILL_CLASS, nullptr);
+    }
+
+    DWORD ui_pid_for(HWND h) const noexcept {
+        if (ui_.hProcess && ui_.dwProcessId != 0) return ui_.dwProcessId;
+        DWORD pid = 0;
+        if (h) GetWindowThreadProcessId(h, &pid);
+        return pid;
+    }
+
     bool is_pill_visible() const noexcept {
-        return ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_) && IsWindowVisible(ui_hwnd_);
+        const HWND h = active_ui_hwnd();
+        return h != nullptr && IsWindowVisible(h) != FALSE;
     }
 
     void toggle_search() {
-        if (ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_)) {
-            AllowSetForegroundWindow(ui_.dwProcessId);
-            PostMessageW(ui_hwnd_, msg_toggle_search(), static_cast<WPARAM>(ToggleMode::Toggle), 0);
+        if (HWND h = active_ui_hwnd()) {
+            if (const DWORD pid = ui_pid_for(h)) AllowSetForegroundWindow(pid);
+            PostMessageW(h, msg_toggle_search(), static_cast<WPARAM>(ToggleMode::Toggle), 0);
         } else if (!ui_.hProcess) {
             spawn_ui(L"--show");
         }
@@ -296,25 +313,25 @@ private:
 
     void on_tray_select() {
         const bool hide_only = std::exchange(tray_hide_on_select_, false);
-        if (ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_)) {
+        if (HWND h = active_ui_hwnd()) {
             if (hide_only) {
-                PostMessageW(ui_hwnd_, msg_toggle_search(), static_cast<WPARAM>(ToggleMode::Hide), 0);
+                PostMessageW(h, msg_toggle_search(), static_cast<WPARAM>(ToggleMode::Hide), 0);
                 return;
             }
-            AllowSetForegroundWindow(ui_.dwProcessId);
+            if (const DWORD pid = ui_pid_for(h)) AllowSetForegroundWindow(pid);
             POINT pt{};
             GetCursorPos(&pt);
-            PostMessageW(ui_hwnd_, msg_toggle_search(), static_cast<WPARAM>(ToggleMode::TraySelect), MAKELPARAM(pt.x, pt.y));
+            PostMessageW(h, msg_toggle_search(), static_cast<WPARAM>(ToggleMode::TraySelect), MAKELPARAM(pt.x, pt.y));
         } else if (!ui_.hProcess && !hide_only) {
             spawn_ui(L"--show");
         }
     }
 
     void open_settings(int tab = -1) {
-        if (ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_)) {
-            AllowSetForegroundWindow(ui_.dwProcessId);
-            SetForegroundWindow(ui_hwnd_);
-            PostMessageW(ui_hwnd_, msg_open_settings(), tab >= 0 ? static_cast<WPARAM>(tab + 1) : 0, 0);
+        if (HWND h = active_ui_hwnd()) {
+            if (const DWORD pid = ui_pid_for(h)) AllowSetForegroundWindow(pid);
+            SetForegroundWindow(h);
+            PostMessageW(h, msg_open_settings(), tab >= 0 ? static_cast<WPARAM>(tab + 1) : 0, 0);
         } else if (!ui_.hProcess) {
             if (tab >= 0) {
                 FixedWString<32> arg{L"--settings-tab "};
@@ -327,10 +344,10 @@ private:
     }
 
     void open_notifications() {
-        if (ui_.hProcess && ui_hwnd_ && IsWindow(ui_hwnd_)) {
-            AllowSetForegroundWindow(ui_.dwProcessId);
-            SetForegroundWindow(ui_hwnd_);
-            PostMessageW(ui_hwnd_, msg_open_notifications(), 0, 0);
+        if (HWND h = active_ui_hwnd()) {
+            if (const DWORD pid = ui_pid_for(h)) AllowSetForegroundWindow(pid);
+            SetForegroundWindow(h);
+            PostMessageW(h, msg_open_notifications(), 0, 0);
         } else if (!ui_.hProcess) {
             spawn_ui(L"--notifications");
         }
@@ -338,19 +355,18 @@ private:
 
     bool is_ui_running() const noexcept {
         if (ui_.hProcess && WaitForSingleObject(ui_.hProcess, 0) == WAIT_TIMEOUT) return true;
-        if (ui_hwnd_ && IsWindow(ui_hwnd_)) return true;
-        return FindWindowW(PILL_CLASS, nullptr) != nullptr;
+        return active_ui_hwnd() != nullptr;
     }
 
-    void close_ui() {
-        HWND h = (ui_hwnd_ && IsWindow(ui_hwnd_)) ? ui_hwnd_ : FindWindowW(PILL_CLASS, nullptr);
+    void close_ui(DWORD timeout_ms = 3000) {
+        HWND h = active_ui_hwnd();
         DWORD ext_pid = 0;
         if (h) {
             GetWindowThreadProcessId(h, &ext_pid);
             PostMessageW(h, msg_quit_ui(), 0, 0);
         }
         if (ui_.hProcess) {
-            if (WaitForSingleObject(ui_.hProcess, 400) != WAIT_OBJECT_0) {
+            if (WaitForSingleObject(ui_.hProcess, timeout_ms) != WAIT_OBJECT_0) {
                 TerminateProcess(ui_.hProcess, 0);
                 WaitForSingleObject(ui_.hProcess, 1000);
             }
@@ -358,7 +374,7 @@ private:
         } else if (ext_pid != 0 && ext_pid != GetCurrentProcessId()) {
             const wil::unique_handle proc{OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, ext_pid)};
             if (proc) {
-                if (WaitForSingleObject(proc.get(), 400) != WAIT_OBJECT_0) {
+                if (WaitForSingleObject(proc.get(), timeout_ms) != WAIT_OBJECT_0) {
                     TerminateProcess(proc.get(), 0);
                 }
             }
@@ -367,8 +383,9 @@ private:
     }
 
     void start_index() {
-        if (indexer_.hProcess) return;
+        if (indexer_.hProcess || is_named_mutex_held(INDEXER_MUTEX)) return;
         settings_ = load_settings();
+        (void)db_want_lock_.try_lock(LAUNCHER_DB_WANT_MUTEX, 50);
         if (db_want_event_) SetEvent(db_want_event_.get());
         notify_ui(true);
         ResetEvent(stop_event_.get());
@@ -384,8 +401,9 @@ private:
         indexer_status_.reset();
         if (indexer_.hProcess) {
             SetTimer(hwnd_, TIMER_TRAY_PROGRESS, 1000, nullptr);
-        } else if (db_want_event_) {
-            ResetEvent(db_want_event_.get());
+        } else {
+            db_want_lock_.release();
+            if (db_want_event_ && !is_indexer_db_wanted()) ResetEvent(db_want_event_.get());
         }
         notify_ui();
         update_tip();
@@ -395,7 +413,7 @@ private:
         if (!indexer_.hProcess) return;
         stopping_index_ = true;
         SetEvent(stop_event_.get());
-        SetTimer(hwnd_, TIMER_STOP_INDEX, 6000, nullptr);
+        SetTimer(hwnd_, TIMER_STOP_INDEX, 15000, nullptr);
         notify_ui();
         update_tip();
     }
@@ -417,8 +435,14 @@ private:
         if (h == ui_.hProcess) {
             DWORD code = 0;
             GetExitCodeProcess(ui_.hProcess, &code);
+            const DWORD exited_pid = ui_.dwProcessId;
             ui_.reset();
-            ui_hwnd_ = nullptr;
+            if (ui_hwnd_) {
+                DWORD hwnd_pid = 0;
+                if (!IsWindow(ui_hwnd_) || (GetWindowThreadProcessId(ui_hwnd_, &hwnd_pid) != 0 && hwnd_pid == exited_pid)) {
+                    ui_hwnd_ = nullptr;
+                }
+            }
             tray_hide_on_select_ = false;
             if (code != 0) {
                 push_notification_to_disk(
@@ -432,16 +456,17 @@ private:
             KillTimer(hwnd_, TIMER_STOP_INDEX);
             KillTimer(hwnd_, TIMER_TRAY_PROGRESS);
             indexer_.reset();
-            if (db_want_event_) ResetEvent(db_want_event_.get());
+            db_want_lock_.release();
+            if (db_want_event_ && !is_indexer_db_wanted()) ResetEvent(db_want_event_.get());
+            if (stop_event_) ResetEvent(stop_event_.get());
             const bool was_stopping = stopping_index_;
             stopping_index_ = false;
             std::wstring status_msg;
             if (auto b = indexer_status_ ? std::move(indexer_status_) : StatusBlock::open()) {
-                const StatusData d = b->read();
-                if (d.message[0]) status_msg = d.message.data();
+                if (const auto d = b->try_read(); d && d->message[0]) status_msg = d->message.data();
             }
             indexer_status_.reset();
-            close_everything_instance();
+            if (code != 3) close_everything_instance();
             if (code != 0 && code != 2 && code != 3) {
                 if (status_msg.empty()) status_msg = to_wide(read_indexer_log_error());
                 const std::wstring msg = status_msg.empty()
@@ -464,8 +489,8 @@ private:
     }
 
     void notify_ui(std::optional<bool> force_active = std::nullopt) noexcept {
-        const bool active = force_active.value_or(indexer_.hProcess != nullptr);
-        if (ui_hwnd_ && IsWindow(ui_hwnd_)) PostMessageW(ui_hwnd_, msg_indexer_changed(), active ? 1 : 0, 0);
+        const bool active = force_active.value_or(indexer_.hProcess != nullptr || is_indexer_db_wanted());
+        if (HWND h = active_ui_hwnd()) PostMessageW(h, msg_indexer_changed(), active ? 1 : 0, 0);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -618,7 +643,9 @@ private:
         if (!indexer_.hProcess) return {};
         if (!indexer_status_) indexer_status_ = StatusBlock::open();
         if (indexer_status_) {
-            const StatusData d = indexer_status_->read();
+            const auto snap = indexer_status_->try_read();
+            if (!snap) return stopping_index_ ? L"Stopping indexer…" : L"Indexing…";
+            const StatusData& d = *snap;
             if (stopping_index_) {
                 if (d.found > 0) {
                     const double pct = std::clamp(100.0 * static_cast<double>(d.embedded) / static_cast<double>(d.found), 0.0, 100.0);
@@ -735,6 +762,7 @@ private:
     wil::unique_handle job_;
     wil::unique_event_nothrow stop_event_;
     wil::unique_event_nothrow db_want_event_;
+    NamedMutexLock db_want_lock_;
     wil::unique_process_information ui_;
     wil::unique_process_information indexer_;
     wil::unique_hicon tray_icon_;
@@ -874,9 +902,14 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
         cleanup_update_artifacts(cleanup_dir, exe_dir());
     }
 
-    const wil::unique_mutex_nothrow single{CreateMutexW(nullptr, TRUE, LAUNCHER_MUTEX)};
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (HWND existing = FindWindowW(LAUNCHER_CLASS, nullptr)) {
+    NamedMutexLock single;
+    if (!single.try_lock(LAUNCHER_MUTEX, 0)) {
+        HWND existing = FindWindowW(LAUNCHER_CLASS, nullptr);
+        for (int i = 0; i < 20 && !existing; ++i) {
+            Sleep(25);
+            existing = FindWindowW(LAUNCHER_CLASS, nullptr);
+        }
+        if (existing) {
             if (start_index) {
                 send_cmd(existing, Cmd::StartIndex);
             } else {
@@ -894,6 +927,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
         return 1;
     }
     if (open_about) launcher.open_about();
+    if (start_index) launcher.start_index_from_cli();
     const int code = launcher.run();
     launcher.shutdown();
     return code;

@@ -647,7 +647,7 @@ struct FailureCache {
                       to_utf8(f.path), "\t",
                       to_utf8(f.reason.empty() ? L"Decode failed" : f.reason), "\n");
         }
-        if (!ulp::fs::write(path, std::string_view{out})) {
+        if (!write_file_atomic(path, std::string_view{out})) {
             push_notification_to_disk(
                 "error", "Indexer", "Failed to save failed-files log",
                 ulp::str::concat_strings("Could not write ", to_utf8(path.wstring()), " (", win32_error_utf8(GetLastError()), ")."),
@@ -866,12 +866,15 @@ struct PyVision {
         pipe.reset(CreateNamedPipeW(
             pipe_name.c_str(),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1, 65536, 65536, 0, nullptr));
         if (!pipe) {
             throw std::runtime_error("Could not create vision IPC pipe");
         }
         ov_event.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+        if (!ov_event) {
+            throw std::runtime_error("Could not create vision IPC event");
+        }
         wil::unique_handle new_job = make_kill_on_close_job();
 
         std::wstring cmd = ulp::str::concat_strings(
@@ -953,9 +956,10 @@ struct PyVision {
         const size_t out_bytes = frames * dim * sizeof(float);
         const auto needed = std::max<size_t>({65536, in_bytes, out_bytes});
         if (needed > shm_bytes || !shm_view) {
+            const size_t prev_bytes = shm_bytes;
             unmap_shm();
             const size_t min_alloc = static_cast<size_t>(std::max<size_t>(frames, 128)) * size * size * 3;
-            const size_t alloc = std::max({needed, min_alloc, shm_bytes * 2});
+            const size_t alloc = std::max({needed, min_alloc, prev_bytes * 2});
             shm_name = ulp::str::concat_strings("Local\\usyseek.vision.shm.", to_fixed_str(GetCurrentProcessId()), ".", to_fixed_str(++shm_gen));
             shm.reset(CreateFileMappingA(
                 INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
@@ -1098,14 +1102,16 @@ int run_indexer(Settings& settings) {
 
     // --- Database (indexer takes priority over the UI's embedded Qdrant Edge handle)
     pr.phase(Phase::Starting, L"Opening database");
+    NamedMutexLock db_lock;
+    (void)db_lock.try_lock(INDEXER_DB_MUTEX, 1000);
     wil::unique_event_nothrow db_want{CreateEventW(nullptr, TRUE, FALSE, INDEXER_DB_WANT_EVENT)};
     if (db_want) SetEvent(db_want.get());
     if (HWND ui = FindWindowW(PILL_CLASS, nullptr)) PostMessageW(ui, msg_indexer_changed(), 1, 0);
 
     Db db;
     bool db_modified = false;
-    const auto finish_db = [&] {
-        if (db_modified) {
+    const auto finish_db = [&](bool run_optimize) {
+        if (db_modified && run_optimize && !stopping()) {
             pr.phase(Phase::Cleaning, L"Optimizing database");
             std::string opt_err;
             if (!db.optimize(coll, &opt_err)) {
@@ -1127,7 +1133,8 @@ int run_indexer(Settings& settings) {
         if (!db.close(&close_err) && !close_err.empty()) {
             std::println("database close warning: {}", close_err);
         }
-        if (db_want) ResetEvent(db_want.get());
+        db_lock.release();
+        if (db_want && !is_named_mutex_held(LAUNCHER_DB_WANT_MUTEX)) ResetEvent(db_want.get());
         if (HWND ui = FindWindowW(PILL_CLASS, nullptr)) PostMessageW(ui, msg_indexer_changed(), 0, 0);
     });
 
@@ -1206,15 +1213,31 @@ int run_indexer(Settings& settings) {
 
     // Check collection existence without dims; wait briefly if the UI is releasing its EdgeShard lock.
     Db::CollectionStatus coll_status = Db::CollectionStatus::Error;
-    const auto lock_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    const auto start_wait = std::chrono::steady_clock::now();
+    const auto lock_deadline = start_wait + std::chrono::seconds(15);
+    const auto corrupt_deadline = start_wait + std::chrono::seconds(2);
     for (;;) {
         err.clear();
         coll_status = db.ensure_collection_status(coll, 0, &err);
-        if (coll_status != Db::CollectionStatus::Error || stopping() || std::chrono::steady_clock::now() >= lock_deadline) break;
+        if (coll_status != Db::CollectionStatus::Error || stopping()) break;
+        const auto now = std::chrono::steady_clock::now();
+        const auto deadline = is_db_lock_error(err) ? lock_deadline : corrupt_deadline;
+        if (now >= deadline) break;
         Sleep(50);
+    }
+    if (stopping()) {
+        loader.cancel_and_join();
+        pr.phase(Phase::Stopped);
+        return 2;
     }
     bool collection_exists = (coll_status == Db::CollectionStatus::Ready);
     if (coll_status == Db::CollectionStatus::Error) {
+        // Never wipe the user's collection when another process still holds the file lock.
+        if (is_db_lock_error(err)) {
+            loader.cancel_and_join();
+            pr.phase(Phase::Error, to_wide(ulp::str::concat_strings("Database is in use by another process: ", err)));
+            return 1;
+        }
         std::string drop_err;
         if (db.drop_collection(coll, &drop_err)) {
             push_notification_to_disk(
@@ -1458,7 +1481,7 @@ int run_indexer(Settings& settings) {
             loader.cancel_and_join();
         }
         failures.save();
-        finish_db();
+        finish_db(!stopping());
         auto st = load_json_file<IndexState>(state_path());
         st.last_index_unix = unix_now();
         st.last_index_found = files.size();
@@ -1550,6 +1573,8 @@ int run_indexer(Settings& settings) {
     std::atomic<uint32_t> alive{workers};
     std::vector<std::jthread> pool;
     pool.reserve(workers);
+    // Declared after `pool` so stack unwinding always closes `queue` before `pool`'s jthreads join.
+    const auto close_queue = wil::scope_exit([&] { queue.close(); });
     for (uint32_t w = 0; w < workers; ++w) {
         pool.emplace_back([&] {
             const ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
@@ -1734,7 +1759,7 @@ int run_indexer(Settings& settings) {
     flush(true);
     if (upsert_any.load(std::memory_order_relaxed)) db_modified = true;
     failures.save();
-    finish_db();
+    finish_db(!was_stopped);
 
     if (failed_this_run > 0) {
         push_notification_to_disk("warning", "Indexer",
@@ -1795,9 +1820,9 @@ int wmain(int argc, wchar_t* const* argv) {
     const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED)};
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
 
-    // Only one indexer at a time
-    const wil::unique_mutex_nothrow single{CreateMutexW(nullptr, TRUE, INDEXER_MUTEX)};
-    if (GetLastError() == ERROR_ALREADY_EXISTS) return 3;
+    // Only one indexer at a time (acquire via WaitForSingleObject so concurrent probes cannot cause false ERROR_ALREADY_EXISTS).
+    NamedMutexLock single;
+    if (!single.try_lock(INDEXER_MUTEX, 100)) return 3;
 
     rt.progress.block = StatusBlock::create();
     if (!rt.progress.block) {
@@ -1828,8 +1853,8 @@ int wmain(int argc, wchar_t* const* argv) {
                 win32_error_utf8(), "indexer-save-state");
         }
     }
-    // Keep the final status readable for a moment so the UI can pick it up
-    Sleep(1500);
+    // Keep the final status readable briefly on normal completion/error; exit immediately when stopped.
+    if (!stopping() && code != 2) Sleep(400);
     MFShutdown();
     return code;
 }

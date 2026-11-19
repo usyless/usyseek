@@ -2215,6 +2215,14 @@ private:
 
     void set_tag(const std::string& tag, bool on) {
         if (tag.empty()) return;
+        if (!sh_.engine.db_ready()) {
+            const char* title = sh_.engine.db_paused_for_indexing() ? "Database unavailable while indexing" : "Database unavailable";
+            const char* detail = sh_.engine.db_paused_for_indexing()
+                ? "Tag updates are paused while indexing is in progress."
+                : "Tag updates cannot be saved while the database is closed.";
+            sh_.notify("error", "Tags", title, detail, "db-job-dropped");
+            return;
+        }
         struct Change {
             uint64_t id;
             std::string path;

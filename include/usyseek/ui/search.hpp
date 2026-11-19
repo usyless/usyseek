@@ -219,11 +219,22 @@ public:
 
     /// Blocks until a pending load has finished, then runs the model. The lock is only held around the
     /// bookkeeping, never around inference, so `state()` / `error()` stay responsive while a query is encoded.
-    std::optional<std::vector<float>> encode(const std::wstring& text, std::wstring* err = nullptr) {
+    std::optional<std::vector<float>> encode(const std::wstring& text, std::wstring* err = nullptr,
+                                             const std::function<bool()>& should_abort = {}) {
         std::shared_ptr<const Model> model;
         {
             std::unique_lock lk{m_};
-            cv_.wait(lk, [&] { return !busy_; });
+            while (busy_ && !stopping_.load(std::memory_order_acquire)) {
+                if (should_abort && should_abort()) {
+                    if (err) *err = L"Database unavailable while indexing";
+                    return std::nullopt;
+                }
+                cv_.wait_for(lk, std::chrono::milliseconds(50));
+            }
+            if (stopping_.load(std::memory_order_acquire)) {
+                if (err) *err = L"Model loading cancelled";
+                return std::nullopt;
+            }
             if (state_ != State::Ready || !model_) {
                 if (err) *err = error_.empty() ? L"Text model not loaded" : error_;
                 return std::nullopt;
@@ -324,6 +335,13 @@ private:
     }
 
     void load_loop() {
+        const auto finish_busy = wil::scope_exit([this] {
+            {
+                const std::scoped_lock lk{m_};
+                busy_ = false;
+            }
+            cv_.notify_all();
+        });
         for (;;) {
             if (stopping_.load(std::memory_order_acquire)) break;
             fs::path dir;
@@ -475,6 +493,13 @@ inline constexpr uint64_t PAGE = 90;
 /// thread never blocks. Searches are coalesced: only the newest pending request runs.
 class Engine {
 public:
+    Engine() = default;
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
+    Engine(Engine&&) = delete;
+    Engine& operator=(Engine&&) = delete;
+    ~Engine() { stop(); }
+
     std::function<void(std::unique_ptr<SearchResult>)> on_result;
     std::function<void(std::function<void()>)> post_ui; // marshal a callback to the UI thread
     std::function<void(bool ready, std::string error)> on_db_state;
@@ -482,29 +507,37 @@ public:
     std::function<void(std::string title, std::string detail)> on_job_dropped;
 
     void start(const Settings& s) {
-        settings_ = s;
+        stopping_atomic_.store(false, std::memory_order_release);
+        {
+            const std::scoped_lock lk{m_};
+            stopping_ = false;
+            settings_ = s;
+        }
         db_want_event_.reset(CreateEventW(nullptr, TRUE, FALSE, INDEXER_DB_WANT_EVENT));
-        arm_db_want_wait();
         thread_ = std::jthread([this] { run(); });
     }
 
     void stop() noexcept {
-        disarm_db_want_wait();
+        stopping_atomic_.store(true, std::memory_order_release);
         {
             const std::scoped_lock lk{m_};
             stopping_ = true;
         }
         cv_.notify_all();
-        thread_ = {};
         encoder_.stop();
+        thread_ = {};
+        disarm_db_want_wait();
     }
 
-    void set_indexing_active(bool active) noexcept {
+    void notify_indexer_changed() noexcept {
         {
             const std::scoped_lock lk{m_};
-            indexing_active_hint_ = active;
         }
         cv_.notify_one();
+    }
+
+    void set_indexing_active(bool /*active*/) noexcept {
+        notify_indexer_changed();
     }
 
     void search(SearchRequest r) noexcept {
@@ -552,16 +585,15 @@ public:
 
 private:
     static void CALLBACK on_db_want(PVOID ctx, BOOLEAN /*timed_out*/) noexcept {
-        static_cast<Engine*>(ctx)->set_indexing_active(true);
+        static_cast<Engine*>(ctx)->notify_indexer_changed();
     }
 
     void arm_db_want_wait() noexcept {
-        if (!db_want_event_) return;
+        if (!db_want_event_ || stopping_atomic_.load(std::memory_order_acquire)) return;
         const std::scoped_lock lk{wait_mx_};
+        if (stopping_atomic_.load(std::memory_order_acquire)) return;
         if (wait_handle_) {
-            if (!UnregisterWaitEx(wait_handle_, nullptr)) {
-                // Non-blocking unregister returns FALSE with ERROR_IO_PENDING while a callback runs.
-            }
+            (void)UnregisterWaitEx(wait_handle_, INVALID_HANDLE_VALUE);
             wait_handle_ = nullptr;
         }
         RegisterWaitForSingleObject(&wait_handle_, db_want_event_.get(), &Engine::on_db_want, this, INFINITE, WT_EXECUTEONLYONCE);
@@ -570,49 +602,83 @@ private:
     void disarm_db_want_wait() noexcept {
         const std::scoped_lock lk{wait_mx_};
         if (wait_handle_) {
-            if (!UnregisterWaitEx(wait_handle_, INVALID_HANDLE_VALUE)) {
-                // Best effort on shutdown.
-            }
+            (void)UnregisterWaitEx(wait_handle_, INVALID_HANDLE_VALUE);
             wait_handle_ = nullptr;
         }
     }
 
     void run() {
         const ulp::win::COMWrapper<false> com{COINIT_MULTITHREADED};
+        const auto close_on_exit = wil::scope_exit([this] { (void)db_.close(); });
         Settings s;
         {
             const std::scoped_lock lk{m_};
             s = settings_;
         }
 
-        auto ensure_collection_healthy = [&](const std::string& coll) {
+        enum class Health : uint8_t { Ok, PausedForIndexing, Failed };
+        auto ensure_collection_healthy = [&](const std::string& coll, std::string& out_err) -> Health {
+            out_err.clear();
+            if (is_indexer_db_wanted()) return Health::PausedForIndexing;
             std::string load_err;
-            if (!db_.check_collection(coll, &load_err)) {
-                (void)db_.drop_collection(coll);
-                if (on_db_cleared) on_db_cleared(coll, load_err);
+            for (int attempt = 0; attempt < 6; ++attempt) {
+                load_err.clear();
+                if (db_.check_collection(coll, &load_err)) return Health::Ok;
+                if (stopping_atomic_.load(std::memory_order_acquire)) return Health::Failed;
+                if (is_indexer_db_wanted()) return Health::PausedForIndexing;
+                if (attempt < 5) Sleep(50);
             }
+            if (is_indexer_db_wanted()) return Health::PausedForIndexing;
+            // Never delete a collection when the error indicates file-lock / sharing contention.
+            if (is_db_lock_error(load_err)) {
+                out_err = std::move(load_err);
+                return Health::Failed;
+            }
+            (void)db_.drop_collection(coll);
+            if (on_db_cleared) on_db_cleared(coll, load_err);
+            return Health::Ok;
         };
 
-        const auto open_db = [&] {
-            db_state_.store(DbState::Loading, std::memory_order_release);
-            if (on_db_state) on_db_state(false, {});
-            std::string err;
-            if (db_.open(edge_data_dir(), &err)) {
-                ensure_collection_healthy(s.model_name);
-                db_state_.store(DbState::Ready, std::memory_order_release);
-                arm_db_want_wait();
-                if (on_db_state) on_db_state(true, {});
-            } else {
-                db_state_.store(DbState::Failed, std::memory_order_release);
-                if (on_db_state) on_db_state(false, err);
-            }
-        };
         const auto pause_db = [&] {
             const bool already_paused = db_paused_for_indexing() && !db_.opened();
             std::string err;
             (void)db_.close(&err);
             db_state_.store(DbState::PausedForIndexing, std::memory_order_release);
             if (!already_paused && on_db_state) on_db_state(false, {});
+        };
+        const auto open_db = [&] {
+            if (is_indexer_db_wanted()) {
+                pause_db();
+                return;
+            }
+            if (db_want_event_) ResetEvent(db_want_event_.get());
+            arm_db_want_wait();
+            if (is_indexer_db_wanted()) {
+                pause_db();
+                return;
+            }
+            db_state_.store(DbState::Loading, std::memory_order_release);
+            if (on_db_state) on_db_state(false, {});
+            std::string err;
+            if (!db_.open(edge_data_dir(), &err)) {
+                db_state_.store(DbState::Failed, std::memory_order_release);
+                if (on_db_state) on_db_state(false, err);
+                return;
+            }
+            std::string health_err;
+            const Health h = ensure_collection_healthy(s.model_name, health_err);
+            if (h == Health::PausedForIndexing || is_indexer_db_wanted()) {
+                pause_db();
+                return;
+            }
+            if (h == Health::Failed) {
+                (void)db_.close();
+                db_state_.store(DbState::Failed, std::memory_order_release);
+                if (on_db_state) on_db_state(false, health_err);
+                return;
+            }
+            db_state_.store(DbState::Ready, std::memory_order_release);
+            if (on_db_state) on_db_state(true, {});
         };
 
         if (is_indexer_db_wanted()) {
@@ -630,7 +696,7 @@ private:
                 std::unique_lock lk{m_};
                 const auto wake = [&] {
                     if (stopping_) return true;
-                    const bool want = indexing_active_hint_ || is_indexer_db_wanted();
+                    const bool want = is_indexer_db_wanted();
                     const bool paused = db_paused_for_indexing();
                     if (want && !paused) return true;
                     if (!want && paused) return true;
@@ -644,11 +710,10 @@ private:
                 }
                 if (stopping_) return;
 
-                const bool want = indexing_active_hint_ || is_indexer_db_wanted();
+                const bool want = is_indexer_db_wanted();
                 if (want) {
                     if (!db_paused_for_indexing() || db_.opened()) need_pause = true;
                 } else if (db_paused_for_indexing()) {
-                    indexing_active_hint_ = false;
                     need_resume = true;
                 }
 
@@ -690,7 +755,20 @@ private:
                 continue;
             }
             if (req && on_result) {
-                if (db_ready()) ensure_collection_healthy(s.model_name);
+                if (db_ready()) {
+                    std::string health_err;
+                    const Health h = ensure_collection_healthy(s.model_name, health_err);
+                    if (h == Health::PausedForIndexing) {
+                        pause_db();
+                    } else if (h == Health::Failed) {
+                        auto res = std::make_unique<SearchResult>();
+                        res->seq = req->seq;
+                        res->append = req->offset > 0;
+                        res->error = to_wide(health_err);
+                        on_result(std::move(res));
+                        continue;
+                    }
+                }
                 on_result(execute(*req, s));
             }
         }
@@ -750,7 +828,9 @@ private:
                 pts = db_.query(coll, {}, qr, &err);
             } else {
                 std::wstring enc_err;
-                auto v = encoder_.encode(q.text, &enc_err);
+                auto v = encoder_.encode(q.text, &enc_err, [this] noexcept {
+                    return stopping_atomic_.load(std::memory_order_acquire) || is_indexer_db_wanted();
+                });
                 if (!v) {
                     res->error = enc_err;
                     return res;
@@ -799,7 +879,7 @@ private:
     std::deque<PostedJob> jobs_;
     std::deque<std::function<void(Db&)>> deferred_jobs_;
     bool stopping_ = false;
-    bool indexing_active_hint_ = false;
+    std::atomic<bool> stopping_atomic_{false};
     Settings settings_;
     Db db_;
     std::atomic<DbState> db_state_{DbState::Loading};

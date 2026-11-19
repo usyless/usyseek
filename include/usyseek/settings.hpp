@@ -89,20 +89,30 @@ inline T load_json_file(const fs::path& p, bool* parse_ok = nullptr) {
     return value;
 }
 
+/// Atomically writes `data` to `p` via a per-thread temp file + MoveFileExW, retrying brief Windows sharing violations.
+inline bool write_file_atomic(const fs::path& p, std::string_view data) {
+    const fs::path tmp = ulp::str::concat_strings(p.wstring(), L".tmp.", to_fixed_wstr(GetCurrentProcessId()), L".", to_fixed_wstr(GetCurrentThreadId()));
+    if (!ulp::fs::write(tmp, data)) return false;
+    DWORD err = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) return true;
+        err = GetLastError();
+        if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION && err != ERROR_ACCESS_DENIED) break;
+        Sleep(15);
+    }
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    SetLastError(err);
+    return false;
+}
+
 template <typename T>
 inline bool save_json_file(const fs::path& p, const T& value) {
     thread_local std::string out;
     thread_local glz::context ctx{};
     out.clear();
     if (glz::write<JSON_WRITE>(value, out, ctx)) return false;
-    const fs::path tmp = ulp::str::concat_strings(p.wstring(), L".tmp.", to_fixed_wstr(GetCurrentProcessId()), L".", to_fixed_wstr(GetCurrentThreadId()));
-    if (!ulp::fs::write(tmp, std::string_view{out})) return false;
-    if (MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) return true;
-    const DWORD err = GetLastError();
-    std::error_code ec;
-    fs::remove(tmp, ec);
-    SetLastError(err);
-    return false;
+    return write_file_atomic(p, std::string_view{out});
 }
 
 /// Exclusions that can never be removed (shown with a lock in settings).

@@ -143,8 +143,10 @@ struct Shared {
         const Phase prev_phase = indexer.phase;
 
         if (auto b = StatusBlock::open()) {
-            indexer = b->read();
-            indexer_running = indexer.pid != 0 && indexer.phase != Phase::Done && indexer.phase != Phase::Stopped && indexer.phase != Phase::Error;
+            if (const auto snap = b->try_read()) {
+                indexer = *snap;
+                indexer_running = indexer.pid != 0 && indexer.phase != Phase::Done && indexer.phase != Phase::Stopped && indexer.phase != Phase::Error;
+            }
         } else {
             indexer_running = false;
         }
@@ -161,7 +163,7 @@ struct Shared {
         }
 
         const bool finished = was_running && !indexer_running;
-        if (indexer_running != was_running) engine.set_indexing_active(indexer_running);
+        if (indexer_running != was_running) engine.notify_indexer_changed();
         if (finished) engine.encoder().retry(); // the indexer exports the text model when it was missing
         const bool failed_changed = indexer_running && indexer.failed != prev_failed;
         if (force || finished || failed_changed || !polled_once_) {

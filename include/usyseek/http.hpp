@@ -283,10 +283,17 @@ inline std::wstring status_text(DWORD status) {
 } // namespace detail
 
 /// Small GET into memory (API responses). Fails on anything but HTTP 200 or when the body exceeds `max_bytes`.
-inline std::optional<std::string> get(const std::wstring& url, size_t max_bytes = 16ull << 20u) {
+inline std::optional<std::string> get(const std::wstring& url, size_t max_bytes = 16ull << 20u, const std::stop_token& stop = {}) {
+    wil::unique_event_nothrow cancel_ev;
+    if (stop.stop_possible()) {
+        cancel_ev.reset(CreateEventW(nullptr, TRUE, stop.stop_requested() ? TRUE : FALSE, nullptr));
+    }
+    const std::stop_callback abort{stop, [&cancel_ev] {
+        if (cancel_ev) SetEvent(cancel_ev.get());
+    }};
     detail::Response r;
     std::wstring error;
-    if (!detail::open(url, 0, r, error) || r.status != 200) return std::nullopt;
+    if (!detail::open(url, 0, r, error, cancel_ev.get()) || r.status != 200) return std::nullopt;
     std::string out;
     if (r.content_length > 0 && r.content_length <= max_bytes) {
         out.reserve(static_cast<size_t>(r.content_length));
@@ -295,7 +302,7 @@ inline std::optional<std::string> get(const std::wstring& url, size_t max_bytes 
     const auto buf = std::make_unique_for_overwrite<char[]>(CHUNK_CAP); // NOLINT(modernize-avoid-c-arrays)
     for (;;) {
         DWORD got = 0;
-        if (!detail::read_chunk(r, buf.get(), CHUNK_CAP, got, error)) return std::nullopt;
+        if (!detail::read_chunk(r, buf.get(), CHUNK_CAP, got, error, cancel_ev.get())) return std::nullopt;
         if (got == 0) break;
         out.append(buf.get(), got);
         if (out.size() > max_bytes) return std::nullopt;

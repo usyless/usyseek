@@ -32,12 +32,16 @@ inline std::string win32_error_utf8(DWORD err = GetLastError()) {
 
 namespace detail {
 
+inline std::mutex& notifications_in_proc_mutex() noexcept {
+    static std::mutex mu;
+    return mu;
+}
+
 template <typename Fn>
 inline auto with_notifications_lock(Fn&& fn) {
-    static std::mutex in_proc_mu;
-    const std::scoped_lock in_proc_lk{in_proc_mu};
+    const std::scoped_lock in_proc_lk{notifications_in_proc_mutex()};
     const wil::unique_mutex_nothrow mu{CreateMutexW(nullptr, FALSE, NOTIFICATIONS_MUTEX)};
-    bool owned = !mu;
+    bool owned = false;
     if (mu) {
         const DWORD wait = WaitForSingleObject(mu.get(), 5000);
         owned = (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED);

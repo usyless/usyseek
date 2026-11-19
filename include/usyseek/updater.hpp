@@ -53,11 +53,12 @@ inline bool save_update_state(const UpdateState& st) {
 }
 
 /// Checks GitHub's latest release endpoint, always recording `last_check_unix` regardless of success or failure.
-inline bool check_latest_release(UpdateState& st, bool& is_newer) {
+inline bool check_latest_release(UpdateState& st, bool& is_newer, const std::stop_token& stop = {}) {
     is_newer = false;
     st.last_check_unix = unix_now();
 
-    const auto body = http::get(std::wstring{GITHUB_LATEST_RELEASE_URL});
+    const auto body = http::get(std::wstring{GITHUB_LATEST_RELEASE_URL}, 16ull << 20u, stop);
+    if (stop.stop_requested()) return false;
     if (!body) {
         st.last_error = "Could not reach GitHub releases (network error or API rate limit).";
         save_update_state(st);

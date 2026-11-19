@@ -101,6 +101,33 @@ struct FieldsRequest {
 
 inline constexpr auto JSON_SKIP_NULL = glz::opts{.skip_null_members = true};
 
+/// True when a Qdrant Edge error indicates file-lock / sharing contention rather than on-disk corruption.
+[[nodiscard]] inline bool is_db_lock_error(std::string_view err) noexcept {
+    if (err.empty()) return false;
+    const auto contains_ci = [&](std::string_view needle) noexcept {
+        if (needle.size() > err.size()) return false;
+        const auto eq = [](char a, char b) noexcept {
+            const auto la = (a >= 'A' && a <= 'Z') ? static_cast<char>(a + ('a' - 'A')) : a;
+            const auto lb = (b >= 'A' && b <= 'Z') ? static_cast<char>(b + ('a' - 'A')) : b;
+            return la == lb;
+        };
+        return !std::ranges::search(err, needle, eq).empty();
+    };
+    return contains_ci("being used by another process") ||
+           contains_ci("locked a portion of the file") ||
+           contains_ci("sharing violation") ||
+           contains_ci("lock violation") ||
+           contains_ci("access is denied") ||
+           contains_ci("permission denied") ||
+           contains_ci("resource temporarily unavailable") ||
+           contains_ci("wouldblock") ||
+           contains_ci("os error 32") ||
+           contains_ci("os error 33") ||
+           contains_ci("os error 5") ||
+           contains_ci("lock") ||
+           contains_ci("busy");
+}
+
 /// Thread-safe handle to an embedded Qdrant Edge storage root.
 class Db {
 public:
@@ -295,7 +322,7 @@ public:
     }
 
     bool drop_collection(std::string_view coll, std::string* error = nullptr) {
-        const std::shared_lock lk{mx_};
+        const std::unique_lock lk{mx_};
         if (!q_) {
             if (error) *error = "database is closed";
             return false;

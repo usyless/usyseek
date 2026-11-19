@@ -2535,9 +2535,10 @@ private:
         sh_.update_state.last_check_unix = st.last_check_unix;
         invalidate();
 
-        update_check_thread_ = std::jthread([this, st = std::move(st), manual] mutable {
+        update_check_thread_ = std::jthread([this, st = std::move(st), manual](const std::stop_token& stop) mutable {
             bool is_newer = false;
-            const bool ok = check_latest_release(st, is_newer);
+            const bool ok = check_latest_release(st, is_newer, stop);
+            if (stop.stop_requested()) return;
             sh_.call([this, st = std::move(st), ok, is_newer, manual] mutable {
                 sh_.update_checking = false;
                 --sh_.background_jobs;
@@ -3321,14 +3322,14 @@ private:
                     if (confirmed) {
                         if (sh_.indexer_running) send_launcher_or_notify(Cmd::StopIndex, "stop indexing");
                         std::string coll = sh_.settings.model_name;
-                        std::error_code ec;
-                        fs::remove(failed_path(coll), ec);
-                        fs::remove(state_path(), ec);
                         sh_.index_state = {};
                         sh_.failed_files.clear();
                         sh_.db_count = 0;
                         sh_.tags.clear();
                         sh_.engine.post_when_ready([this, coll = std::move(coll)](Db& db) mutable {
+                            std::error_code ec;
+                            fs::remove(failed_path(coll), ec);
+                            fs::remove(state_path(), ec);
                             std::string drop_err;
                             const bool ok = db.drop_collection(coll, &drop_err);
                             if (ok) {

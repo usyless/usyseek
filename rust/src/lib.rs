@@ -295,7 +295,10 @@ impl UsyQdrant {
             return Err(format!("collection '{name}' does not exist"));
         }
         // Keep at most the active model's shard mapped so switching models doesn't hold stale mmaps open.
-        shards.clear();
+        for (_, old) in shards.drain() {
+            let _ = old.flush();
+            drop(old);
+        }
         let shard = Arc::new(EdgeShard::load(&dir, None).map_err(err)?);
         shards.insert(key, Arc::clone(&shard));
         Ok(shard)
@@ -567,7 +570,10 @@ pub unsafe extern "C" fn usy_qd_ensure_collection(
             return Ok("exists".to_owned());
         }
         if shard_exists_on_disk(&dir) {
-            shards.clear();
+            for (_, old) in shards.drain() {
+                let _ = old.flush();
+                drop(old);
+            }
             let shard = Arc::new(EdgeShard::load(&dir, None).map_err(|e| (1, err(e)))?);
             shards.insert(key, shard);
             return Ok("exists".to_owned());
@@ -576,7 +582,10 @@ pub unsafe extern "C" fn usy_qd_ensure_collection(
             return Err((2, "collection does not exist and requires dims".to_owned()));
         }
 
-        shards.clear();
+        for (_, old) in shards.drain() {
+            let _ = old.flush();
+            drop(old);
+        }
         let shard = create_edge_shard(&dir, dim as usize).map_err(|e| (1, e))?;
 
         shards.insert(key, Arc::new(shard));

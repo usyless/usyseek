@@ -187,13 +187,21 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
     }
     if (argv) LocalFree(static_cast<HLOCAL>(argv));
 
-    // If an instance is already running, forward the request and exit
+    // Only one UI process at a time (prevents two instances from racing on Qdrant Edge locks).
+    NamedMutexLock single_ui;
     if (!test_dir) {
-        if (HWND existing = FindWindowW(PILL_CLASS, nullptr)) {
-            AllowSetForegroundWindow( ASFW_ANY );
-            const UINT msg = show_notifications ? msg_open_notifications() : (show_settings ? msg_open_settings() : msg_toggle_search());
-            const WPARAM wp = show_settings ? static_cast<WPARAM>(settings_tab + 1) : 0;
-            PostMessageW(existing, msg, wp, 0);
+        if (!single_ui.try_lock(UI_MUTEX, 0)) {
+            HWND existing = FindWindowW(PILL_CLASS, nullptr);
+            for (int i = 0; i < 40 && !existing; ++i) {
+                Sleep(25);
+                existing = FindWindowW(PILL_CLASS, nullptr);
+            }
+            if (existing) {
+                AllowSetForegroundWindow(ASFW_ANY);
+                const UINT msg = show_notifications ? msg_open_notifications() : (show_settings ? msg_open_settings() : msg_toggle_search());
+                const WPARAM wp = show_settings ? static_cast<WPARAM>(settings_tab + 1) : 0;
+                PostMessageW(existing, msg, wp, 0);
+            }
             return 0;
         }
     }
@@ -367,6 +375,9 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
     const UINT m_idx = msg_indexer_changed();
     const UINT m_notifs = msg_notifications_changed();
     const UINT m_quit = msg_quit_ui();
+    for (const UINT m : {m_toggle, m_settings, m_open_notifs, m_idx, m_notifs, m_quit}) {
+        if (m) ChangeWindowMessageFilterEx(pill.hwnd(), m, MSGFLT_ALLOW, nullptr);
+    }
 
     pill.extra_handler = [&](UINT msg, WPARAM wp, LPARAM lp, bool& done) -> LRESULT {
         if (msg == m_quit && m_quit) {
@@ -402,7 +413,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
         }
         if (msg == m_idx && m_idx) {
             done = true;
-            sh.engine.set_indexing_active(wp != 0);
+            sh.engine.notify_indexer_changed();
             pill.on_indexer_changed();
             settings_win.invalidate();
             return 0;

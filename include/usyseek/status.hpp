@@ -61,6 +61,7 @@ public:
         std::atomic<uint32_t> seq;
         StatusData data;
     };
+    static_assert(std::atomic<uint32_t>::is_always_lock_free);
 
     static std::optional<StatusBlock> create() noexcept {
         StatusBlock b;
@@ -80,28 +81,38 @@ public:
 
     void write(const StatusData& d) noexcept {
         auto* s = shared();
-        const uint32_t v = s->seq.load(std::memory_order_relaxed);
-        s->seq.store(v + 1, std::memory_order_release);
+        // Force the base sequence to even so a previous writer killed mid-write can never wedge future reads.
+        const uint32_t v = s->seq.load(std::memory_order_relaxed) & ~1u;
+        s->seq.store(v + 1u, std::memory_order_release);
         std::atomic_thread_fence(std::memory_order_release);
         std::memcpy(&s->data, &d, sizeof(StatusData));
         std::atomic_thread_fence(std::memory_order_release);
-        s->seq.store(v + 2, std::memory_order_release);
+        s->seq.store(v + 2u, std::memory_order_release);
     }
 
-    [[nodiscard]] StatusData read() const noexcept {
+    [[nodiscard]] std::optional<StatusData> try_read() const noexcept {
         const auto* s = shared();
-        for (int i = 0; i < 64; ++i) {
+        for (int i = 0; i < 128; ++i) {
             const uint32_t a = s->seq.load(std::memory_order_acquire);
             if ((a & 1u) != 0) {
-                YieldProcessor();
+                if (i < 16) {
+                    YieldProcessor();
+                } else {
+                    SwitchToThread();
+                }
                 continue;
             }
             StatusData candidate;
             std::memcpy(&candidate, &s->data, sizeof(StatusData));
             std::atomic_thread_fence(std::memory_order_acquire);
             if (s->seq.load(std::memory_order_acquire) == a) return candidate;
+            if (i >= 16) SwitchToThread();
         }
-        return {};
+        return std::nullopt;
+    }
+
+    [[nodiscard]] StatusData read() const noexcept {
+        return try_read().value_or(StatusData{});
     }
 
 private:
