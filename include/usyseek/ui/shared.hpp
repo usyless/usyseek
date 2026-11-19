@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <dwmapi.h>
+#include <limits>
 #include <shellapi.h>
 #include <shldisp.h>
 #include <windowsx.h>
@@ -646,34 +647,50 @@ struct ClipboardPayload {
     std::vector<uint8_t> png; // the file's own bytes as "PNG" so alpha survives
 };
 
-/// Any thread: copies `image` (unpremultiplied BGRA) into a DIB and reads `png_file`.
-inline ClipboardPayload build_clipboard_payload(std::vector<std::wstring> paths, const Raster* image, const std::wstring* png_file) {
-    ClipboardPayload payload{.paths = std::move(paths)};
+/// Any thread: fills `payload.dib` from `image` (unpremultiplied BGRA) and reads `png_file` into `payload.png`.
+inline void populate_clipboard_payload(ClipboardPayload& payload, const Raster* image, const std::wstring* png_file) {
     if (image && image->w && image->h) {
-        const size_t stride = static_cast<size_t>(image->w) * 4;
-        payload.dib.resize(sizeof(BITMAPINFOHEADER) + (stride * image->h));
-        auto* bih = reinterpret_cast<BITMAPINFOHEADER*>(payload.dib.data());
-        bih->biSize = sizeof(BITMAPINFOHEADER);
-        bih->biWidth = static_cast<LONG>(image->w);
-        bih->biHeight = static_cast<LONG>(image->h); // bottom-up: the form every consumer reads correctly
-        bih->biPlanes = 1;
-        bih->biBitCount = 32;
-        bih->biCompression = BI_RGB;
-        bih->biSizeImage = static_cast<DWORD>(stride * image->h);
-        for (UINT y = 0; y < image->h; ++y) {
-            std::memcpy(payload.dib.data() + sizeof(BITMAPINFOHEADER) + (stride * (image->h - 1 - y)), image->pixels.data() + (stride * y), stride);
+        constexpr uint64_t MAX_DIB_PIXELS = 1ull << 29u; // 2 GiB at 4 bytes/pixel
+        const uint64_t total_pixels = static_cast<uint64_t>(image->w) * image->h;
+        if (total_pixels <= MAX_DIB_PIXELS && image->w <= MAX_DIB_PIXELS &&
+            image->h <= static_cast<UINT>(std::numeric_limits<LONG>::max())) {
+            const size_t stride = static_cast<size_t>(image->w) * 4;
+            const size_t byte_size = static_cast<size_t>(total_pixels) * 4;
+            if (image->pixels.size() >= byte_size) {
+                payload.dib.resize(sizeof(BITMAPINFOHEADER) + byte_size);
+                BITMAPINFOHEADER bih{};
+                bih.biSize = sizeof(BITMAPINFOHEADER);
+                bih.biWidth = static_cast<LONG>(image->w);
+                bih.biHeight = static_cast<LONG>(image->h); // bottom-up: the form every consumer reads correctly
+                bih.biPlanes = 1;
+                bih.biBitCount = 32;
+                bih.biCompression = BI_RGB;
+                bih.biSizeImage = static_cast<DWORD>(byte_size);
+                std::memcpy(payload.dib.data(), &bih, sizeof(bih));
+                for (UINT y = 0; y < image->h; ++y) {
+                    std::memcpy(payload.dib.data() + sizeof(BITMAPINFOHEADER) + (stride * (image->h - 1 - y)), image->pixels.data() + (stride * y), stride);
+                }
+            }
         }
     }
     if (png_file) {
-        const wil::unique_hfile f{CreateFileW(png_file->c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr)};
+        const wil::unique_hfile f{CreateFileW(png_file->c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr)};
         LARGE_INTEGER size{};
         if (f && GetFileSizeEx(f.get(), &size) && size.QuadPart > 0 && std::cmp_less(size.QuadPart, 256ull << 20u)) {
-            payload.png.resize(static_cast<size_t>(size.QuadPart));
-            DWORD read = 0;
-            if (!ReadFile(f.get(), payload.png.data(), static_cast<DWORD>(payload.png.size()), &read, nullptr) || read != payload.png.size()) payload.png.clear();
+            const auto expected = static_cast<size_t>(size.QuadPart);
+            payload.png.resize(expected);
+            size_t total_read = 0;
+            while (total_read < expected) {
+                DWORD read = 0;
+                const auto chunk = static_cast<DWORD>(expected - total_read);
+                if (!ReadFile(f.get(), payload.png.data() + total_read, chunk, &read, nullptr) || read == 0) {
+                    payload.png.clear();
+                    break;
+                }
+                total_read += read;
+            }
         }
     }
-    return payload;
 }
 
 /// UI thread: the data object to hand to OleSetClipboard.

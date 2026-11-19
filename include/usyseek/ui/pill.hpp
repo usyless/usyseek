@@ -245,7 +245,13 @@ public:
     /// COM objects this window still holds; released before OLE is uninitialised.
     void release_com_objects() noexcept {
         async_drops_.clear();
-        pending_clipboard_.reset();
+        if (pending_clipboard_) {
+            if (clipboard_flushing_ && OleIsCurrentClipboard(pending_clipboard_.get()) == S_OK) {
+                (void)OleFlushClipboard();
+            }
+            clipboard_flushing_ = false;
+            pending_clipboard_.reset();
+        }
         gif_.shutdown();
         video_.shutdown();
     }
@@ -2454,6 +2460,7 @@ private:
 
         if (pending_clipboard_) {
             KillTimer(hwnd_, TIMER_COPY);
+            clipboard_flushing_ = false;
             pending_clipboard_.reset();
             end_copy();
         }
@@ -2461,56 +2468,102 @@ private:
         const uint64_t id = ++copy_generation_;
         copy_decoding_ = decode;
         ++sh_.background_jobs;
-        copy_workers_[id] = std::jthread([this, id, decode, paths = std::move(paths)](const std::stop_token& stop) mutable {
-            const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
-            const auto payload = std::make_shared<ClipboardPayload>();
-            if (!stop.stop_requested()) {
-                std::optional<Raster> image;
-                std::optional<std::wstring> png;
-                if (decode) {
-                    image = decode_image(paths[0], 0, false);
-                    if (image && static_cast<uint64_t>(image->w) * image->h > COPY_MAX_PIXELS) {
-                        image.reset();
-                    } else if (!image) {
-                        std::string p_utf8 = to_utf8(paths[0]);
-                        sh_.call([this, p_utf8 = std::move(p_utf8)] {
-                            sh_.notify("warning", "Clipboard", "Copied file link only (image decode failed)",
-                                ulp::str::concat_strings(p_utf8, " exceeded pixel limits or could not be decoded for bitmap paste."), "clipboard-decode");
-                        });
+        try {
+            copy_workers_.emplace(id, std::jthread([this, id, decode, paths = std::move(paths)](const std::stop_token& stop) mutable {
+                const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
+                const auto payload = std::make_shared<ClipboardPayload>();
+                payload->paths = std::move(paths);
+                bool decode_failed = false;
+                if (!stop.stop_requested()) {
+                    try {
+                        std::optional<Raster> image;
+                        std::optional<std::wstring> png;
+                        if (decode && !payload->paths.empty()) {
+                            image = decode_image(payload->paths[0], 0, false, nullptr, COPY_MAX_PIXELS);
+                            if (stop.stop_requested()) {
+                                image.reset();
+                            } else if (!image) {
+                                decode_failed = true;
+                            } else if (lower(fs::path{payload->paths[0]}.extension().wstring()) == L".png") {
+                                png = payload->paths[0];
+                            }
+                        }
+                        if (!stop.stop_requested()) {
+                            populate_clipboard_payload(*payload, image ? &*image : nullptr, png ? &*png : nullptr);
+                        }
+                    } catch (...) {
+                        // Fall back to file-only copy on OOM or filesystem errors so the worker never terminates the process.
+                        payload->dib.clear();
+                        payload->png.clear();
+                        if (decode && !stop.stop_requested()) decode_failed = true;
                     }
-                    if (lower(fs::path{paths[0]}.extension().wstring()) == L".png") png = paths[0];
                 }
-                *payload = build_clipboard_payload(std::move(paths), image ? &*image : nullptr, png ? &*png : nullptr);
-            }
-            sh_.call([this, id, payload] {
-                copy_workers_.erase(id);
-                if (id != copy_generation_) {
-                    end_copy();
-                    return;
-                }
-                copy_decoding_ = false;
-                pending_clipboard_ = clipboard_data_object(*payload);
-                clipboard_attempts_ = 0;
-                set_clipboard();
-            });
-        });
+                sh_.call([this, id, payload, decode_failed] {
+                    copy_workers_.erase(id);
+                    if (id != copy_generation_) {
+                        end_copy();
+                        return;
+                    }
+                    copy_decoding_ = false;
+                    if (decode_failed && !payload->paths.empty()) {
+                        sh_.notify("warning", "Clipboard", "Copied file link only (image decode failed)",
+                            ulp::str::concat_strings(to_utf8(payload->paths[0]), " exceeded pixel limits or could not be decoded for bitmap paste."), "clipboard-decode");
+                    }
+                    pending_clipboard_ = clipboard_data_object(*payload);
+                    clipboard_attempts_ = 0;
+                    clipboard_flushing_ = false;
+                    set_clipboard();
+                });
+            }));
+        } catch (...) {
+            copy_workers_.erase(id);
+            copy_decoding_ = false;
+            end_copy();
+            sh_.notify("error", "Clipboard", "Failed to copy media to clipboard", "Could not start clipboard worker thread.", "clipboard");
+        }
     }
 
     /// The clipboard can be held open by another process for a moment: try again shortly instead of waiting here.
     void set_clipboard() {
         KillTimer(hwnd_, TIMER_COPY);
-        const HRESULT hr = pending_clipboard_ ? OleSetClipboard(pending_clipboard_.get()) : E_FAIL;
-        if (hr == CLIPBRD_E_CANT_OPEN && ++clipboard_attempts_ < CLIPBOARD_ATTEMPTS) {
-            SetTimer(hwnd_, TIMER_COPY, 30, nullptr);
+        if (!pending_clipboard_) {
+            clipboard_flushing_ = false;
+            sh_.notify("error", "Clipboard", "Failed to copy media to clipboard",
+                "None of the selected files could be found on disk.", "clipboard");
+            end_copy();
             return;
         }
-        // Render now: this process exits when idle and the clipboard must outlive it
-        if (SUCCEEDED(hr)) {
-            OleFlushClipboard();
-        } else {
-            sh_.notify("error", "Clipboard", "Failed to copy media to clipboard",
-                win32_error_utf8(static_cast<DWORD>(hr)), "clipboard");
+        HRESULT hr = S_OK;
+        if (!clipboard_flushing_) {
+            hr = OleSetClipboard(pending_clipboard_.get());
+            if (hr == CLIPBRD_E_CANT_OPEN && ++clipboard_attempts_ < CLIPBOARD_ATTEMPTS) {
+                SetTimer(hwnd_, TIMER_COPY, 30, nullptr);
+                return;
+            }
+            if (FAILED(hr)) {
+                sh_.notify("error", "Clipboard", "Failed to copy media to clipboard",
+                    win32_error_utf8(static_cast<DWORD>(hr)), "clipboard");
+                pending_clipboard_.reset();
+                end_copy();
+                return;
+            }
+            clipboard_flushing_ = true;
+            clipboard_attempts_ = 0;
         }
+        // Render now: this process exits when idle and the clipboard must outlive it.
+        // Skip flushing if another app has already replaced the clipboard since OleSetClipboard succeeded.
+        if (OleIsCurrentClipboard(pending_clipboard_.get()) == S_OK) {
+            hr = OleFlushClipboard();
+            if (hr == CLIPBRD_E_CANT_OPEN && ++clipboard_attempts_ < CLIPBOARD_ATTEMPTS) {
+                SetTimer(hwnd_, TIMER_COPY, 30, nullptr);
+                return;
+            }
+            if (FAILED(hr)) {
+                sh_.notify("warning", "Clipboard", "Copied media may not persist after closing",
+                    win32_error_utf8(static_cast<DWORD>(hr)), "clipboard");
+            }
+        }
+        clipboard_flushing_ = false;
         pending_clipboard_.reset();
         end_copy();
     }
@@ -4671,6 +4724,7 @@ private:
     bool copy_decoding_ = false;
     wil::com_ptr<IDataObject> pending_clipboard_;
     int clipboard_attempts_ = 0;
+    bool clipboard_flushing_ = false;
 
     /// Pill drop shadow, rasterised once per key into a small 9-slice bitmap (see `draw_pill_shadow`).
     struct ShadowKey {

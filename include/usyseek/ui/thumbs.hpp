@@ -23,8 +23,12 @@ struct Raster {
 };
 
 /// Decodes the first frame of an image with WIC, upright (EXIF orientation applied) and scaled down to fit
-/// `max_px` on its longer side (0 = native size). Any thread with COM initialised.
-inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px, bool premultiplied, IWICImagingFactory* shared_wic = nullptr) {
+/// `max_px` on its longer side (0 = native size). `max_pixels` caps total output pixels (0 = 512M / 2 GiB).
+/// Any thread with COM initialised.
+inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px, bool premultiplied,
+                                          IWICImagingFactory* shared_wic = nullptr, uint64_t max_pixels = 0) {
+    constexpr uint64_t MAX_DECODE_PIXELS = 1ull << 29u; // 2 GiB at 4 bytes/pixel
+    const uint64_t pixel_limit = (max_pixels > 0 && max_pixels < MAX_DECODE_PIXELS) ? max_pixels : MAX_DECODE_PIXELS;
     wil::com_ptr<IWICImagingFactory> owned_wic;
     IWICImagingFactory* wic = shared_wic;
     if (!wic) {
@@ -38,6 +42,7 @@ inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px,
     UINT w = 0;
     UINT h = 0;
     if (FAILED(frame->GetSize(&w, &h)) || !w || !h) return std::nullopt;
+    if (max_px == 0 && static_cast<uint64_t>(w) * h > pixel_limit) return std::nullopt;
 
     USHORT orientation = 1;
     wil::com_ptr<IWICMetadataQueryReader> meta;
@@ -82,10 +87,12 @@ inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px,
     if (FAILED(conv->Initialize(src.get(), fmt, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) return std::nullopt;
     Raster r;
     if (FAILED(conv->GetSize(&r.w, &r.h)) || !r.w || !r.h) return std::nullopt;
+    const uint64_t total_pixels = static_cast<uint64_t>(r.w) * r.h;
+    if (total_pixels > pixel_limit || r.w > MAX_DECODE_PIXELS) return std::nullopt;
     const size_t stride = static_cast<size_t>(r.w) * 4;
-    if (stride * r.h > (1ull << 31u)) return std::nullopt;
-    r.pixels.resize(stride * r.h);
-    if (FAILED(conv->CopyPixels(nullptr, static_cast<UINT>(stride), static_cast<UINT>(r.pixels.size()), r.pixels.data()))) return std::nullopt;
+    const size_t byte_size = static_cast<size_t>(total_pixels) * 4;
+    r.pixels.resize(byte_size);
+    if (FAILED(conv->CopyPixels(nullptr, static_cast<UINT>(stride), static_cast<UINT>(byte_size), r.pixels.data()))) return std::nullopt;
     return r;
 }
 
