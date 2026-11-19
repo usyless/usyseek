@@ -273,9 +273,9 @@ struct ThemeEntry {
     const std::string base = sanitize_theme_stem(name);
     const fs::path& dir = themes_dir();
     std::error_code ec;
-    fs::path p = dir / to_wide(ulp::str::concat_strings(base, ".json"));
+    fs::path p = dir / concat_wide(base, L".json");
     for (int n = 2; fs::exists(p, ec); ++n) {
-        p = dir / to_wide(ulp::str::concat_strings(base, "-", to_fixed_str(n), ".json"));
+        p = dir / concat_wide(base, L"-", to_fixed_str(n), L".json");
     }
     return p;
 }
@@ -445,13 +445,13 @@ public:
         for (const fs::path& p : files) {
             const auto bytes = ulp::fs::read_as_bytes(p);
             if (!bytes) {
-                if (errors) errors->push_back(ulp::str::concat_strings("Could not read theme file: ", to_utf8(p.filename().native())));
+                if (errors) errors->push_back(concat_utf8("Could not read theme file: ", p.filename()));
                 continue;
             }
             ThemeSpec spec;
             const auto err = glz::read<JSON_READ>(spec, *bytes);
             if (err) {
-                if (errors) errors->push_back(ulp::str::concat_strings("Invalid JSON in theme file: ", to_utf8(p.filename().native())));
+                if (errors) errors->push_back(concat_utf8("Invalid JSON in theme file: ", p.filename()));
                 continue;
             }
             const std::string stem = to_utf8(p.stem().native());

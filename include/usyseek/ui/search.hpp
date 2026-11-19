@@ -393,7 +393,7 @@ private:
         const fs::path& tok = !fs::exists(paths.tokenizer, ec) && fs::exists(paths.shared_tokenizer, ec) ? paths.shared_tokenizer : paths.tokenizer;
         if (!fs::exists(paths.onnx, ec)) {
             if (!fs::exists(paths.weights, ec)) {
-                throw std::runtime_error(ulp::str::concat_strings("Model weights missing (", to_utf8(paths.weights.filename().wstring()), ") - download the model in Settings"));
+                throw std::runtime_error(concat_utf8("Model weights missing (", paths.weights.filename(), ") - download the model in Settings"));
             }
             state_ = State::Exporting;
             notify();
@@ -422,7 +422,7 @@ private:
             }
         }
         if (!fs::exists(tok, ec)) {
-            throw std::runtime_error(ulp::str::concat_strings("Tokenizer missing (", to_utf8(tok.filename().wstring()), ") - download the model in Settings"));
+            throw std::runtime_error(concat_utf8("Tokenizer missing (", tok.filename(), ") - download the model in Settings"));
         }
 
         if (!env_) env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_ERROR, "usyseek");

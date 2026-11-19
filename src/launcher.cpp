@@ -272,7 +272,7 @@ private:
             push_notification_to_disk(
                 "error", "Launcher", ulp::str::concat_strings("Failed to start ", name),
                 win32_error_utf8(err), ulp::str::concat_strings("spawn-", name), true);
-            show_balloon(APP_NAME, ulp::str::concat_strings(L"Failed to start ", exe.filename().wstring(), L": ", to_wide(win32_error_utf8(err))), NIIF_ERROR, BalloonTarget::Notifications);
+            show_balloon(APP_NAME, concat_wide(L"Failed to start ", exe.filename(), L": ", win32_error_utf8(err)), NIIF_ERROR, BalloonTarget::Notifications);
             return {};
         }
         AssignProcessToJobObject(job_.get(), pi.hProcess);
@@ -475,7 +475,7 @@ private:
                 if (!was_stopping) {
                     push_notification_to_disk(
                         "error", "Indexer", "Indexing ended with errors",
-                        ulp::str::concat_strings(to_utf8(msg), " (exit code ", to_fixed_str(code), ", log: data\\indexer.log)"),
+                        concat_utf8(msg, " (exit code ", to_fixed_str(code), ", log: data\\indexer.log)"),
                         "indexer-exit", true);
                 }
                 if (!is_ui_running()) {
@@ -529,7 +529,7 @@ private:
         failed_vk_ = settings_.hotkey_vk;
         push_notification_to_disk(
             "warning", "Hotkeys", "Global shortcut is already in use",
-            ulp::str::concat_strings(to_utf8(hotkey_text(settings_)), " could not be registered because another application already owns it. Pick a different shortcut in Settings."),
+            concat_utf8(hotkey_text(settings_), " could not be registered because another application already owns it. Pick a different shortcut in Settings."),
             "hotkey-unavailable", true);
         if (!already_reported) {
             show_balloon(APP_NAME, L"The search shortcut is already used by another app. Pick a different one in Settings.", NIIF_WARNING, BalloonTarget::Settings);
@@ -804,7 +804,7 @@ int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::pat
 
     for (const auto& entry : fs::recursive_directory_iterator(staging_root, ec)) {
         if (ec) {
-            MessageBoxW(nullptr, ulp::str::concat_strings(L"Failed to read update staging directory: ", to_wide(ec.message())).c_str(),
+            MessageBoxW(nullptr, concat_wide(L"Failed to read update staging directory: ", ec.message()).c_str(),
                         APP_NAME, MB_ICONERROR | MB_OK);
             return 1;
         }
@@ -817,15 +817,15 @@ int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::pat
         if (entry.is_directory(ec)) {
             fs::create_directories(dst, ec);
             if (ec) {
-                MessageBoxW(nullptr, ulp::str::concat_strings(L"Could not create directory ", dst.wstring()).c_str(), APP_NAME, MB_ICONERROR | MB_OK);
+                MessageBoxW(nullptr, concat_wide(L"Could not create directory ", dst).c_str(), APP_NAME, MB_ICONERROR | MB_OK);
                 return 1;
             }
         } else if (entry.is_regular_file(ec)) {
             fs::create_directories(dst.parent_path(), ec);
             if (!copy_one(entry.path(), dst)) {
-                const std::wstring msg = ulp::str::concat_strings(
-                    L"Could not update ", dst.filename().wstring(),
-                    L" (", to_wide(win32_error_utf8(GetLastError())), L").");
+                const std::wstring msg = concat_wide(
+                    L"Could not update ", dst.filename(),
+                    L" (", win32_error_utf8(GetLastError()), L").");
                 MessageBoxW(nullptr, msg.c_str(), APP_NAME, MB_ICONERROR | MB_OK);
                 return 1;
             }
@@ -834,14 +834,14 @@ int run_apply_update(DWORD wait_pid, const fs::path& staging_root, const fs::pat
 
     const fs::path next_exe = target_dir / L"usyseek.exe";
     const fs::path update_dir = target_dir / L"data" / L"update";
-    std::wstring cmd = ulp::str::concat_strings(
-        L"\"", next_exe.wstring(), L"\" --cleanup-update \"", update_dir.wstring(), L"\"",
+    std::wstring cmd = concat_wide(
+        L"\"", next_exe, L"\" --cleanup-update \"", update_dir, L"\"",
         open_about ? L" --open-about" : L"");
     STARTUPINFOW si{.cb = sizeof(STARTUPINFOW)};
     wil::unique_process_information pi;
     if (!CreateProcessW(next_exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
                         CREATE_UNICODE_ENVIRONMENT, nullptr, target_dir.c_str(), &si, &pi)) {
-        MessageBoxW(nullptr, ulp::str::concat_strings(L"Update was installed, but usyseek.exe could not restart: ", to_wide(win32_error_utf8(GetLastError()))).c_str(),
+        MessageBoxW(nullptr, concat_wide(L"Update was installed, but usyseek.exe could not restart: ", win32_error_utf8(GetLastError())).c_str(),
                     APP_NAME, MB_ICONWARNING | MB_OK);
         return 1;
     }

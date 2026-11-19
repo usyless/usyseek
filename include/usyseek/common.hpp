@@ -106,32 +106,8 @@ inline UINT msg_open_notifications() noexcept {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Strings
+// Strings (to_utf8 / to_wide / append_to / overwrite_to / concat_* live in string_helpers.hpp)
 // ---------------------------------------------------------------------------------------------
-
-inline std::string to_utf8(std::wstring_view w) {
-    if (w.empty()) return {};
-    const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
-    if (n <= 0) return {};
-    std::string out;
-    out.resize_and_overwrite(static_cast<size_t>(n), [&](char* buf, size_t) noexcept {
-        const int written = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), buf, n, nullptr, nullptr);
-        return written > 0 ? static_cast<size_t>(written) : 0u;
-    });
-    return out;
-}
-
-inline std::wstring to_wide(std::string_view s) {
-    if (s.empty()) return {};
-    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
-    if (n <= 0) return {};
-    std::wstring out;
-    out.resize_and_overwrite(static_cast<size_t>(n), [&](wchar_t* buf, size_t) noexcept {
-        const int written = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), buf, n);
-        return written > 0 ? static_cast<size_t>(written) : 0u;
-    });
-    return out;
-}
 
 inline std::wstring lower(std::wstring_view s) {
     std::wstring out{s};

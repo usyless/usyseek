@@ -453,13 +453,13 @@ private:
 
     void refresh_cached_labels() {
         if (editing_existing_ && !target_path_.empty()) {
-            const std::wstring fname = target_path_.filename().wstring();
-            editing_subtitle_w_ = ulp::str::concat_strings(L"Editing ", fname);
-            file_note_w_ = ulp::str::concat_strings(L"File: ", fname);
+            const fs::path fname = target_path_.filename();
+            overwrite_to(editing_subtitle_w_, L"Editing ", fname);
+            overwrite_to(file_note_w_, L"File: ", fname);
         } else {
             editing_subtitle_w_.clear();
             const std::string stem = sanitize_theme_stem(draft_.name.empty() ? "Custom Theme" : draft_.name);
-            file_note_w_ = to_wide(ulp::str::concat_strings("File: ", stem, ".json"));
+            overwrite_to(file_note_w_, L"File: ", stem, L".json");
         }
     }
 
@@ -813,7 +813,7 @@ private:
         preview_applied_ = false;
         sh_.theme_spec_override.reset();
         sh_.theme_override.reset();
-        sh_.settings.theme = ulp::str::concat_strings("custom:", to_utf8(dest.stem().wstring()));
+        overwrite_to(sh_.settings.theme, "custom:", dest.stem());
         sh_.refresh_theme(true, true);
         sh_.save();
         hide(false);
@@ -821,8 +821,8 @@ private:
 
     void delete_current_theme() {
         if (!editing_existing_ || target_path_.empty() || in_modal_) return;
-        const std::wstring msg = ulp::str::concat_strings(
-            L"Delete custom theme \"", to_wide(draft_.name), L"\"?\n\nFile: ", target_path_.wstring());
+        const std::wstring msg = concat_wide(
+            L"Delete custom theme \"", draft_.name, L"\"?\n\nFile: ", target_path_);
         in_modal_ = true;
         const bool confirmed = confirm_box(hwnd_, L"Delete Custom Theme", msg);
         in_modal_ = false;
@@ -831,12 +831,12 @@ private:
         std::error_code ec;
         fs::remove(target_path_, ec);
         if (ec) {
-            error_msg_ = ulp::str::concat_strings(L"Failed to delete theme file: ", to_wide(ec.message()));
+            overwrite_to(error_msg_, L"Failed to delete theme file: ", ec.message());
             invalidate();
             return;
         }
 
-        const std::string deleted_id = ulp::str::concat_strings("custom:", to_utf8(target_path_.stem().wstring()));
+        const std::string deleted_id = concat_utf8("custom:", target_path_.stem());
         live_apply_pending_ = false;
         if (hwnd_) KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
         preview_applied_ = false;

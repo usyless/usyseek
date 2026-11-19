@@ -2304,14 +2304,14 @@ private:
     void open_item_file(const std::wstring& path) {
         std::string err;
         if (!open_file(path, &err)) {
-            sh_.notify("error", "Open File", "Failed to open file", ulp::str::concat_strings(err, ": ", to_utf8(path)), "open-file");
+            sh_.notify("error", "Open File", "Failed to open file", concat_utf8(err, ": ", path), "open-file");
         }
     }
 
     void reveal_item_file(const std::wstring& path) {
         std::string err;
         if (!reveal_in_explorer(path, &err)) {
-            sh_.notify("error", "Explorer", "Failed to reveal file in Explorer", ulp::str::concat_strings(err, ": ", to_utf8(path)), "reveal-file");
+            sh_.notify("error", "Explorer", "Failed to reveal file in Explorer", concat_utf8(err, ": ", path), "reveal-file");
         }
     }
 
@@ -2508,7 +2508,7 @@ private:
                     copy_decoding_ = false;
                     if (decode_failed && !payload->paths.empty()) {
                         sh_.notify("warning", "Clipboard", "Copied file link only (image decode failed)",
-                            ulp::str::concat_strings(to_utf8(payload->paths[0]), " exceeded pixel limits or could not be decoded for bitmap paste."), "clipboard-decode");
+                            concat_utf8(payload->paths[0], " exceeded pixel limits or could not be decoded for bitmap paste."), "clipboard-decode");
                     }
                     pending_clipboard_ = clipboard_data_object(*payload);
                     clipboard_attempts_ = 0;
@@ -2745,8 +2745,8 @@ private:
         if (gif_.process_worker_signal()) {
             if (!had_static_err && gif_.static_fallback_error()) {
                 sh_.notify("warning", "Preview", "Animated GIF playback unavailable",
-                    ulp::str::concat_strings("Could not decode animated GIF frames; displaying static thumbnail instead (",
-                        to_utf8(item_path(items_[preview_])), ")."),
+                    concat_utf8("Could not decode animated GIF frames; displaying static thumbnail instead (",
+                        items_[preview_].pt.p.p, ")."),
                     "preview-gif");
             }
             sync_preview_timers();
@@ -2778,7 +2778,7 @@ private:
         const bool changed = video_.process_events();
         if (!had_failed && video_.failed() && preview_valid() && items_[preview_].pt.p.k == 1) {
             sh_.notify("warning", "Preview", "Inline video playback failed",
-                ulp::str::concat_strings("Could not play video inline (", to_utf8(item_path(items_[preview_])),
+                concat_utf8("Could not play video inline (", items_[preview_].pt.p.p,
                     "). Click Play to open in your default media player."),
                 "preview-video");
         }

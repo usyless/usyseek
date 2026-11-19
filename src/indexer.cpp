@@ -799,13 +799,13 @@ struct FailureCache {
                       to_fixed_str(id), "\t",
                       to_fixed_str(f.mtime), "\t",
                       to_fixed_str(f.size), "\t",
-                      to_utf8(f.path), "\t",
-                      to_utf8(f.reason.empty() ? L"Decode failed" : f.reason), "\n");
+                      f.path, "\t",
+                      f.reason.empty() ? std::wstring_view{L"Decode failed"} : std::wstring_view{f.reason}, "\n");
         }
         if (!write_file_atomic(path, std::string_view{out})) {
             push_notification_to_disk(
                 "error", "Indexer", "Failed to save failed-files log",
-                ulp::str::concat_strings("Could not write ", to_utf8(path.wstring()), " (", win32_error_utf8(GetLastError()), ")."),
+                concat_utf8("Could not write ", path, " (", win32_error_utf8(GetLastError()), ")."),
                 "save-failed-log", true);
         }
     }
@@ -1032,10 +1032,10 @@ struct PyVision {
         }
         wil::unique_handle new_job = make_kill_on_close_job();
 
-        std::wstring cmd = ulp::str::concat_strings(
-            L"\"", venv.python_exe, L"\" -u \"", worker_script.wstring(), L"\" --worker \"", pipe_name, L"\"");
+        std::wstring cmd = concat_wide(
+            L"\"", venv.python_exe, L"\" -u \"", worker_script, L"\" --worker \"", pipe_name, L"\"");
         if (!settings.vision_script.empty()) {
-            append_to(cmd, L" \"", to_wide(settings.vision_script), L"\"");
+            append_to(cmd, L" \"", settings.vision_script, L"\"");
         }
 
         STARTUPINFOW si{.cb = sizeof(si)};
@@ -1085,7 +1085,7 @@ struct PyVision {
         size = r.info.size;
         dim = r.info.dim;
         mode = media::parse_resize_mode(r.info.resize_mode);
-        device = to_wide(ulp::str::concat_strings(r.info.device, " \xc2\xb7 ", r.info.backend));
+        overwrite_to(device, r.info.device, L" · ", r.info.backend);
         if (r.info.fallback_cpu) {
             push_notification_to_disk(
                 "warning", "Compute", "GPU unavailable — indexing on CPU",
@@ -1231,9 +1231,9 @@ int export_text_only(const Settings& settings) {
     const fs::path script = settings.vision_script.empty() ? exe_dir() / L"python" / L"usyseek_vision.py" : fs::path{to_wide(settings.vision_script)};
     if (!fs::exists(script, ec)) return 1;
 
-    std::wstring cmd = ulp::str::concat_strings(
-        L"\"", venv.python_exe, L"\" -u \"", script.wstring(),
-        L"\" --export-text \"", to_wide(settings.model_dir), L"\" \"", to_wide(settings.model_name), L"\"");
+    std::wstring cmd = concat_wide(
+        L"\"", venv.python_exe, L"\" -u \"", script,
+        L"\" --export-text \"", settings.model_dir, L"\" \"", settings.model_name, L"\"");
     const wil::unique_handle job = make_kill_on_close_job();
     STARTUPINFOW si{.cb = sizeof(si)};
     si.dwFlags |= STARTF_USESHOWWINDOW;
@@ -1325,7 +1325,7 @@ int run_indexer(Settings& settings) {
         wlog(L"Everything unavailable ({}), walking included folders\n", scan_error);
         if (!runtime().no_everything) {
             push_notification_to_disk("warning", "Scanner", "Using slower directory walk",
-                ulp::str::concat_strings("Everything index was not used (", to_utf8(scan_error), "). Walking included folders directly."),
+                concat_utf8("Everything index was not used (", scan_error, "). Walking included folders directly."),
                 "indexer-scan-fallback");
         }
         scan_error.clear();
@@ -1390,7 +1390,7 @@ int run_indexer(Settings& settings) {
         // Never wipe the user's collection when another process still holds the file lock.
         if (is_db_lock_error(err)) {
             loader.cancel_and_join();
-            pr.phase(Phase::Error, to_wide(ulp::str::concat_strings("Database is in use by another process: ", err)));
+            pr.phase(Phase::Error, concat_wide(L"Database is in use by another process: ", err));
             return 1;
         }
         std::string drop_err;
@@ -1609,7 +1609,7 @@ int run_indexer(Settings& settings) {
     });
     pr.d.todo = todo.size();
 
-    const fs::path onnx = fs::path{to_wide(settings.model_dir)} / ulp::str::concat_strings(to_wide(settings.model_name), L"-text.onnx");
+    const fs::path onnx = fs::path{to_wide(settings.model_dir)} / concat_wide(settings.model_name, L"-text.onnx");
     std::error_code onnx_ec;
     if (todo.empty() || stopping()) {
         std::string export_err;
@@ -1693,7 +1693,7 @@ int run_indexer(Settings& settings) {
     // --- Batch size
     uint32_t batch = settings.batch_size;
     const bool auto_batch = batch == 0;
-    const std::string auto_batch_key = ulp::str::concat_strings(settings.model_name, "|", to_utf8(vision.device), "|", to_fixed_str(vision.size));
+    const std::string auto_batch_key = concat_utf8(settings.model_name, "|", vision.device, "|", to_fixed_str(vision.size));
     if (auto_batch) {
         auto cached = load_json_file<IndexState>(state_path());
         if (cached.auto_batch > 0 && cached.auto_batch_key == auto_batch_key) {

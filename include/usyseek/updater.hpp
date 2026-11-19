@@ -212,14 +212,18 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
     std::error_code ec;
     fs::create_directories(work_dir, ec);
     if (ec) {
-        err = ulp::str::concat_strings(L"Could not create update folder: ", to_wide(ec.message()));
+        overwrite_to(err, L"Could not create update folder: ", ec.message());
         return false;
     }
 
-    if (status_cb) status_cb(ulp::str::concat_strings(L"Downloading ", to_wide(st.asset_name), L"…"));
+    if (status_cb) status_cb(concat_wide(L"Downloading ", st.asset_name, L"…"));
     const http::Result dl = http::download(to_wide(st.asset_url), archive, progress, stop);
     if (!dl.ok) {
-        err = dl.cancelled ? std::wstring{L"Download cancelled — it can resume next time."} : ulp::str::concat_strings(L"Download failed: ", dl.error);
+        if (dl.cancelled) {
+            err = L"Download cancelled — it can resume next time.";
+        } else {
+            overwrite_to(err, L"Download failed: ", dl.error);
+        }
         return false;
     }
 
@@ -233,7 +237,7 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
         }
         if (got != st.asset_sha256) {
             fs::remove(archive, ec);
-            err = ulp::str::concat_strings(L"Downloaded file checksum mismatch (expected ", to_wide(st.asset_sha256), L").");
+            overwrite_to(err, L"Downloaded file checksum mismatch (expected ", st.asset_sha256, L").");
             return false;
         }
     }
@@ -242,12 +246,12 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
     fs::remove_all(staging, ec);
     fs::create_directories(staging, ec);
     if (ec) {
-        err = ulp::str::concat_strings(L"Could not prepare staging directory: ", to_wide(ec.message()));
+        overwrite_to(err, L"Could not prepare staging directory: ", ec.message());
         return false;
     }
 
     const fs::path& tar = system_tar_path();
-    const std::wstring tar_cmd = ulp::str::concat_strings(L"\"", tar.wstring(), L"\" -xf \"", archive.wstring(), L"\" -C \"", staging.wstring(), L"\"");
+    const std::wstring tar_cmd = concat_wide(L"\"", tar, L"\" -xf \"", archive, L"\" -C \"", staging, L"\"");
     const auto res = ulp::win::proc::run_process<{.allow_visible_windows = false, .capture_stdout = false}>(
         ulp::win::proc::process_settings{
             .commandline = tar_cmd,
@@ -258,9 +262,10 @@ inline bool download_and_stage_update(const UpdateState& st, fs::path& out_stagi
         while (!tar_err.empty() && (tar_err.back() == '\r' || tar_err.back() == '\n' || tar_err.back() == ' ' || tar_err.back() == '\t')) {
             tar_err.remove_suffix(1);
         }
-        err = ulp::str::concat_strings(
+        overwrite_to(
+            err,
             L"Extraction failed (tar exited with code ", to_fixed_wstr(res.status), L")",
-            tar_err.empty() ? L"." : L": ", tar_err.empty() ? std::wstring{} : to_wide(tar_err));
+            tar_err.empty() ? L"." : L": ", tar_err);
         return false;
     }
 

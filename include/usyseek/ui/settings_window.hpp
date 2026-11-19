@@ -888,7 +888,7 @@ private:
             const D2D1_COLOR_F col = is_err ? cv.theme().error : (is_info ? cv.theme().primary : cv.theme().amber);
             const wchar_t* sev = is_err ? L"Error" : (is_info ? L"Info" : L"Warning");
             std::wstring meta = sev;
-            if (!n.source.empty()) append_to(meta, L"  •  ", to_wide(n.source));
+            if (!n.source.empty()) append_to(meta, L"  •  ", n.source);
             if (n.unix_ts > 0) append_to(meta, L"  •  ", format_ago(n.unix_ts));
             if (n.count > 1) append_to(meta, L"  •  ×", format_count(n.count));
 
@@ -1011,18 +1011,20 @@ private:
             if (sh_.update_checking) {
                 caption = L"Checking GitHub Releases…";
             } else if (update_avail) {
-                const std::wstring ver = sh_.update_state.latest_tag.empty()
-                    ? ulp::str::concat_strings(L"v", to_wide(sh_.update_state.latest_version))
-                    : to_wide(sh_.update_state.latest_tag);
-                caption = ulp::str::concat_strings(L"New version ", ver, L" is available (current: v", APP_VERSION, L").");
+                overwrite_to(
+                    caption,
+                    L"New version ",
+                    sh_.update_state.latest_tag.empty() ? "v" : "",
+                    sh_.update_state.latest_tag.empty() ? sh_.update_state.latest_version : sh_.update_state.latest_tag,
+                    L" is available (current: v", APP_VERSION, L").");
                 title_col = cv.theme().primary;
             } else if (!sh_.update_state.last_error.empty()) {
-                caption = ulp::str::concat_strings(L"Last check failed: ", to_wide(sh_.update_state.last_error));
+                overwrite_to(caption, L"Last check failed: ", sh_.update_state.last_error);
                 if (sh_.update_state.last_check_unix > 0) {
                     append_to(caption, L"  •  Checked ", format_ago(sh_.update_state.last_check_unix));
                 }
             } else if (sh_.update_state.last_check_unix > 0) {
-                caption = ulp::str::concat_strings(L"Up to date  •  Last checked ", format_ago(sh_.update_state.last_check_unix));
+                overwrite_to(caption, L"Up to date  •  Last checked ", format_ago(sh_.update_state.last_check_unix));
             } else {
                 caption = L"Checks github.com/usyless/usyseek/releases once every 24 hours when opened.";
             }
@@ -1043,10 +1045,11 @@ private:
                     ? ulp::str::concat_strings(L"Cancel  •  ", to_fixed_wstr(upd_view.done * 100 / upd_view.total), L"%")
                     : L"Cancel";
             } else if (update_avail) {
-                const std::wstring ver = sh_.update_state.latest_tag.empty()
-                    ? ulp::str::concat_strings(L"v", to_wide(sh_.update_state.latest_version))
-                    : to_wide(sh_.update_state.latest_tag);
-                install_lbl = ulp::str::concat_strings(L"Download & Install ", ver);
+                overwrite_to(
+                    install_lbl,
+                    L"Download & Install ",
+                    sh_.update_state.latest_tag.empty() ? "v" : "",
+                    sh_.update_state.latest_tag.empty() ? sh_.update_state.latest_version : sh_.update_state.latest_tag);
             }
 
             Flow actions{8.0f, 8.0f};
@@ -1073,7 +1076,7 @@ private:
 
             std::wstring pkg_note;
             if (update_avail && !sh_.update_state.asset_name.empty()) {
-                append_to(pkg_note, L"Selected package: ", to_wide(sh_.update_state.asset_name));
+                append_to(pkg_note, L"Selected package: ", sh_.update_state.asset_name);
                 if (sh_.update_state.asset_size > 0) {
                     append_to(pkg_note, L" (", format_size(sh_.update_state.asset_size), L")");
                 }
@@ -1313,8 +1316,8 @@ private:
             const bool db_paused = sh_.engine.db_paused_for_indexing();
             const bool db_loading = sh_.engine.db_loading() && !sh_.test_mode;
             const bool db_disconnected = !sh_.engine.db_ready() && !sh_.test_mode;
-            const std::wstring db_info = ulp::str::concat_strings(
-                L"Qdrant Edge collection: ", to_wide(sh_.settings.model_name),
+            const std::wstring db_info = concat_wide(
+                L"Qdrant Edge collection: ", sh_.settings.model_name,
                 db_paused ? L"  •  Unavailable while indexing"
                           : (db_loading ? L"  •  Loading…"
                                         : (db_disconnected ? L"  •  Disconnected" : L"")));
@@ -2611,9 +2614,9 @@ private:
                     if (!launch_staged_updater(*staged_root, exe_dir(), wait_pid, true, uac_cancelled, err)) {
                         if (uac_cancelled) {
                             sh_.notify("warning", "Updates", "Update requires administrator permission",
-                                       ulp::str::concat_strings(
+                                       concat_utf8(
                                            "Administrator permission (UAC) was cancelled, so the update could not be applied to ",
-                                           to_utf8(exe_dir().wstring()), ". Accept the UAC prompt to finish installing the update."),
+                                           exe_dir(), ". Accept the UAC prompt to finish installing the update."),
                                        "app-update-uac");
                         } else {
                             sh_.notify("error", "Updates", "Failed to apply update", to_utf8(err), "app-update-apply");
@@ -2657,16 +2660,14 @@ private:
         std::error_code ec;
         fs::create_directories(dir, ec);
         if (ec) {
-            const std::wstring msg = ulp::str::concat_strings(L"Cannot create model folder: ", to_wide(ec.message()));
+            const std::wstring msg = concat_wide(L"Cannot create model folder: ", ec.message());
             report(model_job_, msg, true);
             notify_async("error", "Model", "Model download failed", to_utf8(msg), "model-download");
             return;
         }
-        const std::wstring wrepo = to_wide(repo);
-        const std::wstring base = ulp::str::concat_strings(L"https://huggingface.co/", wrepo, L"/resolve/main/");
-        const std::wstring wname = to_wide(name);
-        const std::wstring tok_name = ulp::str::concat_strings(wname, L"-tokenizer.json");
-        const std::wstring weights_name = ulp::str::concat_strings(wname, L".safetensors");
+        const std::wstring base = concat_wide(L"https://huggingface.co/", repo, L"/resolve/main/");
+        const std::wstring tok_name = concat_wide(name, L"-tokenizer.json");
+        const std::wstring weights_name = concat_wide(name, L".safetensors");
         struct Item {
             std::wstring remote;
             fs::path local;
@@ -2679,7 +2680,7 @@ private:
         },};
         for (const Item& item : items) {
             if (item.present) continue;
-            report(model_job_, ulp::str::concat_strings(L"Downloading ", item.remote, L" from ", wrepo, L"…"));
+            report(model_job_, concat_wide(L"Downloading ", item.remote, L" from ", repo, L"…"));
             const http::Result r = http::download(ulp::str::concat_strings(base, item.remote), item.local,
                                                   [this](uint64_t done, uint64_t total) { report_progress(model_job_, done, total); }, stop);
             report_progress(model_job_, 0, 0);
@@ -2688,13 +2689,13 @@ private:
                 return;
             }
             if (!r.ok) {
-                const std::wstring msg = ulp::str::concat_strings(item.remote, L" from ", wrepo, L": ", r.error);
+                const std::wstring msg = concat_wide(item.remote, L" from ", repo, L": ", r.error);
                 report(model_job_, msg, true);
                 notify_async("error", "Model", "Model download failed", to_utf8(msg), "model-download");
                 return;
             }
         }
-        report(model_job_, ulp::str::concat_strings(L"Saved as ", wname, L".safetensors and ", wname, L"-tokenizer.json in ", dir.wstring()));
+        report(model_job_, concat_wide(L"Saved as ", name, L".safetensors and ", name, L"-tokenizer.json in ", dir));
     }
 
     void start_model_download() {
@@ -2858,14 +2859,14 @@ private:
             append_venv_log(L"Extracting…");
             fs::remove_all(root, ec);
             if (ec) {
-                const std::wstring msg = ulp::str::concat_strings(L"Failed to clear old Python folder: ", to_wide(ec.message()));
+                const std::wstring msg = concat_wide(L"Failed to clear old Python folder: ", ec.message());
                 report(venv_job_, msg, true);
                 notify_async("error", "Venv", "Portable Python extraction failed", to_utf8(msg), "venv-setup");
                 return;
             }
             fs::create_directories(root, ec);
             if (ec) {
-                const std::wstring msg = ulp::str::concat_strings(L"Failed to create Python folder: ", to_wide(ec.message()));
+                const std::wstring msg = concat_wide(L"Failed to create Python folder: ", ec.message());
                 report(venv_job_, msg, true);
                 notify_async("error", "Venv", "Portable Python extraction failed", to_utf8(msg), "venv-setup");
                 return;
@@ -3102,19 +3103,17 @@ private:
         if (next_model.empty() || next_model == sh_.settings.model_name) return true;
         if (in_modal_) return false;
         in_modal_ = true;
-        const std::wstring cur_model_w = to_wide(sh_.settings.model_name);
-        const std::wstring next_model_w = to_wide(next_model);
-        std::wstring msg = ulp::str::concat_strings(
-            L"Switch embedding model from '", cur_model_w, L"' to '", next_model_w, L"'?\n\n");
+        std::wstring msg = concat_wide(
+            L"Switch embedding model from '", sh_.settings.model_name, L"' to '", next_model, L"'?\n\n");
         if (sh_.indexer_running) {
             append_to(msg,
-                      L"Indexing is currently active in '", cur_model_w,
-                      L"'. Switching does not stop it, and new searches/indexing for '", next_model_w,
+                      L"Indexing is currently active in '", sh_.settings.model_name,
+                      L"'. Switching does not stop it, and new searches/indexing for '", next_model,
                       L"' will use a separate collection.\n\n");
         }
         append_to(msg,
                   L"Each model uses its own Qdrant collection, so you will need to download (if missing) and index files for '",
-                  next_model_w, L"' before searching with it.");
+                  next_model, L"' before searching with it.");
         const bool ok = confirm_box(hwnd_, L"Change Embedding Model", msg);
         in_modal_ = false;
         if (!ok) {
@@ -3175,7 +3174,7 @@ private:
                 const long v = std::stol(bs_txt);
                 if (v <= 0) {
                     new_bs = sh_.settings.batch_size;
-                    sh_.notify("warning", "Settings", ulp::str::concat_strings("Invalid batch size '", to_utf8(bs_txt), "'"),
+                    sh_.notify("warning", "Settings", concat_utf8("Invalid batch size '", bs_txt, "'"),
                         "Batch size must be a positive number (1..4096) or blank/auto.", "settings-batch");
                 } else {
                     new_bs = static_cast<uint32_t>(std::clamp(v, 1L, 4096L));
@@ -3186,7 +3185,7 @@ private:
                 }
             } catch (...) {
                 new_bs = sh_.settings.batch_size;
-                sh_.notify("warning", "Settings", ulp::str::concat_strings("Invalid batch size '", to_utf8(bs_txt), "'"),
+                sh_.notify("warning", "Settings", concat_utf8("Invalid batch size '", bs_txt, "'"),
                     "Could not parse batch size; reverted to previous value.", "settings-batch");
             }
         }
@@ -3313,9 +3312,9 @@ private:
                 sh_.poll_indexer();
                 break;
             case IdClearDatabase: {
-                const std::wstring msg = ulp::str::concat_strings(
+                const std::wstring msg = concat_wide(
                     L"Clear all indexed embeddings and tags in collection '",
-                    to_wide(sh_.settings.model_name), L"'?\n\nYour media files on disk will not be touched.");
+                    sh_.settings.model_name, L"'?\n\nYour media files on disk will not be touched.");
                 if (!in_modal_) {
                     in_modal_ = true;
                     const bool confirmed = confirm_box(hwnd_, L"Clear Database", msg);
@@ -3365,8 +3364,8 @@ private:
                 const std::wstring count_line = col.count
                     ? ulp::str::concat_strings(format_count(*col.count), *col.count == 1 ? L" indexed file" : L" indexed files")
                     : L"unknown file count";
-                const std::wstring msg = ulp::str::concat_strings(
-                    L"Delete Qdrant Edge database '", to_wide(col.name), L"' (",
+                const std::wstring msg = concat_wide(
+                    L"Delete Qdrant Edge database '", col.name, L"' (",
                     count_line, L", ", format_size(col.bytes),
                     L")?\n\nThis removes all indexed embeddings and tags in that collection. Your media files and downloaded models will not be touched.");
                 if (!in_modal_) {
@@ -3738,8 +3737,8 @@ private:
                 const ModelStorageInfo m = downloaded_models_[idx];
                 const bool is_active = m.name == sh_.settings.model_name;
                 if (is_active && sh_.indexer_running) break;
-                const std::wstring msg = ulp::str::concat_strings(
-                    L"Delete downloaded model files for '", to_wide(m.name), L"' (",
+                const std::wstring msg = concat_wide(
+                    L"Delete downloaded model files for '", m.name, L"' (",
                     format_size(m.bytes),
                     L")?\n\nYour indexed Qdrant database collections and tags will not be touched.");
                 if (!in_modal_) {
@@ -3840,8 +3839,8 @@ private:
                 return;
             case IdRecreateVenv: {
                 if (in_modal_) break;
-                std::wstring msg = ulp::str::concat_strings(
-                    L"Recreate Python environment at:\n", to_wide(sh_.settings.venv_dir),
+                std::wstring msg = concat_wide(
+                    L"Recreate Python environment at:\n", sh_.settings.venv_dir,
                     L"\n\nExisting files and packages in this folder will be deleted and reinstalled.");
                 if (sh_.indexer_running) {
                     msg += L"\n\nWarning: Indexing is currently running and may fail or abort if its Python environment is replaced.";
@@ -3856,7 +3855,7 @@ private:
                         std::error_code ec;
                         fs::remove_all(to_wide(in.venv_dir), ec);
                         if (ec) {
-                            const std::wstring err = ulp::str::concat_strings(L"Failed to remove existing environment: ", to_wide(ec.message()));
+                            const std::wstring err = concat_wide(L"Failed to remove existing environment: ", ec.message());
                             report(venv_job_, err, true);
                             notify_async("error", "Venv", "Failed to remove Python environment", to_utf8(err), "venv-setup");
                             return;
@@ -3872,7 +3871,7 @@ private:
                         append_venv_log(L"Removing old environment…");
                         fs::remove_all(vdir, ec);
                         if (ec) {
-                            const std::wstring err = ulp::str::concat_strings(L"Failed to remove existing environment: ", to_wide(ec.message()));
+                            const std::wstring err = concat_wide(L"Failed to remove existing environment: ", ec.message());
                             report(venv_job_, err, true);
                             notify_async("error", "Venv", "Failed to remove Python environment", to_utf8(err), "venv-setup");
                             return;
@@ -3890,8 +3889,8 @@ private:
             }
             case IdDeleteVenv: {
                 if (in_modal_) break;
-                std::wstring msg = ulp::str::concat_strings(
-                    L"Delete Python environment at:\n", to_wide(sh_.settings.venv_dir),
+                std::wstring msg = concat_wide(
+                    L"Delete Python environment at:\n", sh_.settings.venv_dir,
                     L"\n\nYou will need to recreate it before indexing or exporting text models.");
                 if (sh_.indexer_running) {
                     msg += L"\n\nWarning: Indexing is currently running and uses this environment.";
@@ -3905,7 +3904,7 @@ private:
                     std::error_code ec;
                     fs::remove_all(vdir, ec);
                     if (ec) {
-                        const std::wstring err = ulp::str::concat_strings(L"Failed to delete environment: ", to_wide(ec.message()));
+                        const std::wstring err = concat_wide(L"Failed to delete environment: ", ec.message());
                         report(venv_job_, err, true);
                         notify_async("error", "Venv", "Failed to delete Python environment", to_utf8(err), "venv-setup");
                         return;

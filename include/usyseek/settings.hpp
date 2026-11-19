@@ -225,7 +225,7 @@ struct FailedFile {
 };
 
 inline fs::path failed_path(std::string_view coll) {
-    return data_dir() / ulp::str::concat_strings(L"failed-", to_wide(coll), L".txt");
+    return data_dir() / concat_wide(L"failed-", coll, L".txt");
 }
 
 inline std::vector<FailedFile> load_failed_files(std::string_view coll) {
