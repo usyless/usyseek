@@ -8,6 +8,9 @@
 
 using usyseek::indexer::EVERYTHING_LEAN_CONFIG;
 using usyseek::indexer::build_everything_args;
+using usyseek::indexer::is_usn_journal_filesystem;
+using usyseek::indexer::join_sentinel_path;
+using usyseek::indexer::make_usn_sentinel_name;
 
 namespace {
 
@@ -54,6 +57,9 @@ void run_everything_config_tests() {
     CHECK(has_line(EVERYTHING_LEAN_CONFIG, "monitor_pause=0"));
     CHECK(has_line(EVERYTHING_LEAN_CONFIG, "monitor_stop=0"));
     CHECK(has_line(EVERYTHING_LEAN_CONFIG, "monitor_notify_results_changed_delay=50"));
+    CHECK(has_line(EVERYTHING_LEAN_CONFIG, "monitor_thread_mode_background=0"));
+    CHECK(has_line(EVERYTHING_LEAN_CONFIG, "ntfs_update_thread_mode_background=0"));
+    CHECK(has_line(EVERYTHING_LEAN_CONFIG, "exclude_hidden_files_and_folders=0"));
 
     // Unneeded features for headless SDK3 queries should be disabled.
     CHECK(has_line(EVERYTHING_LEAN_CONFIG, "show_tray_icon=0"));
@@ -74,6 +80,26 @@ void run_everything_config_tests() {
           L" -add-config \"C:\\Program Files\\usyseek\\data\\Everything\\everything-lean.ini\"");
     CHECK(build_everything_args(L"C:", L"") ==
           L"-safe-mode -no-auto-index -volumes \"C:\" -exclude-folders \"\"");
+
+    // USN journal filesystem detection.
+    CHECK(is_usn_journal_filesystem(L"NTFS"));
+    CHECK(is_usn_journal_filesystem(L"ntfs"));
+    CHECK(is_usn_journal_filesystem(L"ReFS"));
+    CHECK(is_usn_journal_filesystem(L"refs"));
+    CHECK(!is_usn_journal_filesystem(L"FAT32"));
+    CHECK(!is_usn_journal_filesystem(L"exFAT"));
+    CHECK(!is_usn_journal_filesystem(L""));
+
+    // Sentinel naming and path joining.
+    CHECK(make_usn_sentinel_name(1234, 56789) == L".usyseek-sync-1234-56789.tmp");
+    CHECK(join_sentinel_path(L"D:\\", L".usyseek-sync-1-2.tmp") == L"D:\\.usyseek-sync-1-2.tmp");
+    CHECK(join_sentinel_path(L"D:", L".usyseek-sync-1-2.tmp") == L"D:\\.usyseek-sync-1-2.tmp");
+    CHECK(join_sentinel_path(L"C:\\Users\\usy\\AppData\\Roaming\\", L".usyseek-sync-1-2.tmp") ==
+          L"C:\\Users\\usy\\AppData\\Roaming\\.usyseek-sync-1-2.tmp");
+    CHECK(join_sentinel_path(L"C:\\Users\\usy\\AppData\\Roaming", L".usyseek-sync-1-2.tmp") ==
+          L"C:\\Users\\usy\\AppData\\Roaming\\.usyseek-sync-1-2.tmp");
+    CHECK(join_sentinel_path(L"", L".usyseek-sync-1-2.tmp").empty());
+    CHECK(join_sentinel_path(L"C:\\", L"").empty());
 }
 
 } // namespace

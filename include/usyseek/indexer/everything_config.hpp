@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 
@@ -24,6 +26,9 @@ inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
     "monitor_pause=0\r\n"
     "monitor_stop=0\r\n"
     "monitor_notify_results_changed_delay=50\r\n"
+    "monitor_thread_mode_background=0\r\n"
+    "ntfs_update_thread_mode_background=0\r\n"
+    "exclude_hidden_files_and_folders=0\r\n"
     "allow_plugins=0\r\n"
     "plugins=0\r\n"
     "show_tray_icon=0\r\n"
@@ -90,6 +95,44 @@ inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
         args += L'"';
     }
     return args;
+}
+
+/// Returns true if the filesystem name supports a Windows USN Change Journal monitored by Everything.
+[[nodiscard]] constexpr bool is_usn_journal_filesystem(std::wstring_view fs_name) noexcept {
+    constexpr auto ascii_ieq = [](std::wstring_view a, std::wstring_view b) constexpr noexcept {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            const wchar_t ca = (a[i] >= L'A' && a[i] <= L'Z') ? static_cast<wchar_t>(a[i] + (L'a' - L'A')) : a[i];
+            const wchar_t cb = (b[i] >= L'A' && b[i] <= L'Z') ? static_cast<wchar_t>(b[i] + (L'a' - L'A')) : b[i];
+            if (ca != cb) return false;
+        }
+        return true;
+    };
+    return ascii_ieq(fs_name, L"NTFS") || ascii_ieq(fs_name, L"ReFS");
+}
+
+/// Builds a unique non-media temporary sentinel filename used to fence Everything's USN journal catch-up.
+[[nodiscard]] inline std::wstring make_usn_sentinel_name(std::uint32_t pid, std::uint64_t nonce) {
+    std::wstring name = L".usyseek-sync-";
+    name += std::to_wstring(pid);
+    name.push_back(L'-');
+    name += std::to_wstring(nonce);
+    name += L".tmp";
+    return name;
+}
+
+/// Joins a directory path and sentinel filename with a single backslash (safe for both `D:\` and `C:\dir`).
+[[nodiscard]] inline std::wstring join_sentinel_path(std::wstring_view dir, std::wstring_view filename) {
+    while (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/')) {
+        dir.remove_suffix(1);
+    }
+    if (dir.empty() || filename.empty()) return {};
+    std::wstring out;
+    out.reserve(dir.size() + 1 + filename.size());
+    out.append(dir);
+    out.push_back(L'\\');
+    out.append(filename);
+    return out;
 }
 
 } // namespace usyseek::indexer

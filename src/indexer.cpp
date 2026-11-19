@@ -444,6 +444,13 @@ public:
             return out;
         }
 
+        const bool usn_synced = wait_for_usn_fence(client, scope, std::chrono::seconds(60));
+        if (stopping()) {
+            stop_guard.release();
+            error = L"Stopped";
+            return out;
+        }
+
         ulp::everything3::ResultList results = client.search(state);
         if (!results) {
             stop_guard.release();
@@ -451,31 +458,34 @@ public:
             return out;
         }
 
-        // Everything 1.5 can finish loading its persisted .db before background USN updates settle.
-        // Wait briefly for DB busy / monitor result changes to settle and re-fetch updated results.
-        constexpr auto settle_quiet = std::chrono::milliseconds(350);
-        constexpr auto settle_max = std::chrono::seconds(10);
-        const auto max_deadline = std::chrono::steady_clock::now() + settle_max;
-        auto quiet_deadline = std::chrono::steady_clock::now() + settle_quiet;
+        // Fallback when any volume could not be fenced via the NTFS/ReFS USN journal
+        // (e.g. non-USN filesystem, read-only volume, or fence timeout): wait briefly for
+        // DB busy / monitor result changes to settle and re-fetch updated results.
+        if (!usn_synced) {
+            constexpr auto settle_quiet = std::chrono::milliseconds(350);
+            constexpr auto settle_max = std::chrono::seconds(10);
+            const auto max_deadline = std::chrono::steady_clock::now() + settle_max;
+            auto quiet_deadline = std::chrono::steady_clock::now() + settle_quiet;
 
-        while (!stopping() && std::chrono::steady_clock::now() < max_deadline) {
-            const bool busy = owned_->is_ipc_db_busy();
-            const bool changed = client.is_result_list_change();
-            if (busy || changed) {
-                if (busy) {
-                    const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::max(std::chrono::steady_clock::duration::zero(), max_deadline - std::chrono::steady_clock::now()));
-                    wait_for_db_idle(rem);
+            while (!stopping() && std::chrono::steady_clock::now() < max_deadline) {
+                const bool busy = owned_->is_ipc_db_busy();
+                const bool changed = client.is_result_list_change();
+                if (busy || changed) {
+                    if (busy) {
+                        const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::max(std::chrono::steady_clock::duration::zero(), max_deadline - std::chrono::steady_clock::now()));
+                        wait_for_db_idle(rem);
+                    }
+                    if (stopping()) break;
+                    if (auto updated = client.get_results(state)) {
+                        results = std::move(updated);
+                    }
+                    quiet_deadline = std::chrono::steady_clock::now() + settle_quiet;
+                    continue;
                 }
-                if (stopping()) break;
-                if (auto updated = client.get_results(state)) {
-                    results = std::move(updated);
-                }
-                quiet_deadline = std::chrono::steady_clock::now() + settle_quiet;
-                continue;
+                if (std::chrono::steady_clock::now() >= quiet_deadline) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
             }
-            if (std::chrono::steady_clock::now() >= quiet_deadline) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
         stop_guard.release();
         if (stopping()) {
@@ -536,6 +546,150 @@ public:
     }
 
 private:
+    /// Drops a unique hidden temp sentinel file on each indexed NTFS/ReFS volume and waits until
+    /// Everything's RAM index observes all of them. Because each volume's USN Journal is strictly
+    /// ordered, seeing the sentinel guarantees Everything has processed every prior USN record on
+    /// that volume. Returns true only when every drive in `scope.drives()` was fenced and observed.
+    static bool wait_for_usn_fence(
+        const ulp::everything3::Client& client,
+        const Scope& scope,
+        std::chrono::milliseconds timeout
+    ) {
+        struct UsnFence {
+            std::vector<std::wstring> paths;
+            UsnFence() = default;
+            UsnFence(const UsnFence&) = delete;
+            UsnFence& operator=(const UsnFence&) = delete;
+            UsnFence(UsnFence&&) = delete;
+            UsnFence& operator=(UsnFence&&) = delete;
+            ~UsnFence() { cleanup(); }
+            void cleanup() noexcept {
+                for (const auto& p : paths) {
+                    DeleteFileW(p.c_str());
+                }
+                paths.clear();
+            }
+        } fence;
+
+        const auto drives = scope.drives();
+        if (drives.empty()) return true;
+
+        static constexpr std::array<const KNOWNFOLDERID*, 7> known_ids = {
+            &FOLDERID_RoamingAppData,
+            &FOLDERID_Public,
+            &FOLDERID_Profile,
+            &FOLDERID_Pictures,
+            &FOLDERID_Documents,
+            &FOLDERID_Downloads,
+            &FOLDERID_Desktop,
+        };
+        std::vector<std::wstring> known_dirs;
+        known_dirs.reserve(known_ids.size());
+        for (const KNOWNFOLDERID* id : known_ids) {
+            std::wstring p = known_folder(*id);
+            if (!p.empty()) known_dirs.push_back(std::move(p));
+        }
+
+        const std::uint32_t pid = GetCurrentProcessId();
+        const auto base_nonce = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        std::uint64_t seq = 0;
+
+        bool all_fenced = true;
+        fence.paths.reserve(drives.size());
+
+        for (const wchar_t drive : drives) {
+            const std::array<wchar_t, 4> root = {drive, L':', L'\\', L'\0'};
+            std::array<wchar_t, 32> fs_name{};
+            if (!GetVolumeInformationW(
+                    root.data(), nullptr, 0, nullptr, nullptr, nullptr,
+                    fs_name.data(), static_cast<DWORD>(fs_name.size())) ||
+                !usyseek::indexer::is_usn_journal_filesystem(fs_name.data())) {
+                all_fenced = false;
+                continue;
+            }
+
+            const std::wstring sentinel_name = usyseek::indexer::make_usn_sentinel_name(pid, base_nonce + seq++);
+            const auto try_dir = [&](std::wstring_view dir) -> bool {
+                if (dir.size() < 2 || dir[1] != L':' || static_cast<wchar_t>(towupper(dir[0])) != drive) {
+                    return false;
+                }
+                std::wstring probe = usyseek::indexer::join_sentinel_path(dir, sentinel_name);
+                if (probe.empty() || scope.excluded(probe)) return false;
+
+                wil::unique_hfile h{CreateFileW(
+                    probe.c_str(),
+                    GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr,
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY,
+                    nullptr)};
+                if (!h) return false;
+                // Close immediately so Windows emits USN_REASON_FILE_CREATE | USN_REASON_CLOSE.
+                h.reset();
+                fence.paths.push_back(std::move(probe));
+                return true;
+            };
+
+            bool placed = false;
+            if (!scope.whole_pc) {
+                for (const auto& inc : scope.includes) {
+                    if (try_dir(inc)) {
+                        placed = true;
+                        break;
+                    }
+                }
+            }
+            if (!placed) {
+                for (const auto& kd : known_dirs) {
+                    if (try_dir(kd)) {
+                        placed = true;
+                        break;
+                    }
+                }
+            }
+            if (!placed) {
+                placed = try_dir(std::wstring_view{root.data(), 3});
+            }
+            if (!placed) {
+                all_fenced = false;
+            }
+        }
+
+        if (fence.paths.empty()) return false;
+
+        std::vector<std::size_t> pending;
+        pending.reserve(fence.paths.size());
+        for (std::size_t i = 0; i < fence.paths.size(); ++i) {
+            pending.push_back(i);
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        bool ipc_error = false;
+        while (!pending.empty() && !stopping()) {
+            std::erase_if(pending, [&](std::size_t idx) {
+                if (client.get_file_attributes(fence.paths[idx]).has_value()) {
+                    return true;
+                }
+                if (Everything3_GetLastError() != EVERYTHING3_OK) {
+                    ipc_error = true;
+                }
+                return false;
+            });
+            if (pending.empty() || ipc_error || stopping()) break;
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        fence.cleanup();
+        if (!pending.empty() && !stopping()) {
+            wlog(L"Everything USN fence did not observe {} volume(s) before timeout; using fallback settle\n",
+                 pending.size());
+        }
+        return all_fenced && pending.empty() && !ipc_error && !stopping();
+    }
+
     bool wait_for_db_idle(std::chrono::milliseconds timeout = std::chrono::minutes(2)) const {
         if (!owned_) return true;
         const auto deadline = std::chrono::steady_clock::now() + timeout;
