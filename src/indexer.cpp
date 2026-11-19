@@ -257,13 +257,14 @@ bool write_everything_exe(const fs::path& target) {
 }
 
 bool write_everything_lean_config(const fs::path& target) {
+    const std::string cfg = usyseek::indexer::build_everything_lean_config();
     if (const auto existing = ulp::fs::read_as_bytes(target);
-        existing && *existing == usyseek::indexer::EVERYTHING_LEAN_CONFIG) {
+        existing && *existing == cfg) {
         return true;
     }
     std::error_code ec;
     fs::create_directories(target.parent_path(), ec);
-    return ulp::fs::write(target, usyseek::indexer::EVERYTHING_LEAN_CONFIG);
+    return ulp::fs::write(target, std::string_view{cfg});
 }
 
 [[nodiscard]] int kind_of_lower(std::wstring_view lower_path, bool allow_images, bool allow_videos) noexcept {
@@ -609,7 +610,7 @@ private:
                 continue;
             }
 
-            const std::wstring sentinel_name = usyseek::indexer::make_usn_sentinel_name(pid, base_nonce + seq++);
+            const auto sentinel_name = usyseek::indexer::make_usn_sentinel_name(pid, base_nonce + seq++);
             const auto try_dir = [&](std::wstring_view dir) -> bool {
                 if (dir.size() < 2 || dir[1] != L':' || static_cast<wchar_t>(towupper(dir[0])) != drive) {
                     return false;

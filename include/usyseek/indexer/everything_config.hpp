@@ -1,5 +1,8 @@
 #pragma once
 
+#include <usyseek/indexer/media_exts.hpp>
+#include <usyseek/string_helpers.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -7,7 +10,11 @@
 
 namespace usyseek::indexer {
 
-/// Headless, IPC-only overrides applied via Everything 1.5 `-add-config`.
+/// Extension used for temporary per-volume USN journal fence files (kept in `include_only_files`).
+inline constexpr std::string_view USN_SENTINEL_EXT_ASCII = "usyseek-sync";
+inline constexpr std::wstring_view USN_SENTINEL_EXT = L"usyseek-sync";
+
+/// Static headless, IPC-only overrides applied via Everything 1.5 `-add-config`.
 inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
     "[Everything]\r\n"
     "app_data=0\r\n"
@@ -28,6 +35,7 @@ inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
     "monitor_notify_results_changed_delay=50\r\n"
     "monitor_thread_mode_background=0\r\n"
     "ntfs_update_thread_mode_background=0\r\n"
+    "exclude_list_enabled=1\r\n"
     "exclude_hidden_files_and_folders=0\r\n"
     "allow_plugins=0\r\n"
     "plugins=0\r\n"
@@ -78,21 +86,75 @@ inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
     "regenerate_user_environment=0\r\n"
     "notify_win_event=0\r\n";
 
+/// Builds the static `include_only_files` pattern list covering all supported image/video extensions
+/// plus the USN fence sentinel extension. Always includes both images and videos so toggling settings
+/// does not invalidate Everything's persisted `.db`.
+[[nodiscard]] inline std::string build_everything_include_only_files() {
+    std::size_t total = 0;
+    const auto measure = [&](auto&& list) noexcept {
+        for (const std::wstring_view ext : list) {
+            if (total > 0) ++total; // ';'
+            total += 2 + ext.size(); // "*." + ext
+        }
+    };
+    measure(media::IMAGE_EXTS);
+    measure(media::VIDEO_EXTS);
+    if (total > 0) ++total;
+    total += 2 + USN_SENTINEL_EXT_ASCII.size();
+
+    std::string out;
+    out.resize_and_overwrite(total, [&](char* dst, std::size_t) noexcept {
+        char* cur = dst;
+        bool first = true;
+        const auto emit_wide = [&](auto&& list) noexcept {
+            for (const std::wstring_view ext : list) {
+                if (!first) *cur++ = ';';
+                first = false;
+                *cur++ = '*';
+                *cur++ = '.';
+                for (const wchar_t c : ext) *cur++ = static_cast<char>(c);
+            }
+        };
+        emit_wide(media::IMAGE_EXTS);
+        emit_wide(media::VIDEO_EXTS);
+        if (!first) *cur++ = ';';
+        *cur++ = '*';
+        *cur++ = '.';
+        std::char_traits<char>::copy(cur, USN_SENTINEL_EXT_ASCII.data(), USN_SENTINEL_EXT_ASCII.size());
+        cur += USN_SENTINEL_EXT_ASCII.size();
+        return static_cast<std::size_t>(cur - dst);
+    });
+    return out;
+}
+
+/// Builds the complete Everything 1.5 `-add-config` INI contents including `include_only_files`.
+[[nodiscard]] inline std::string build_everything_lean_config() {
+    const std::string include_only = build_everything_include_only_files();
+    std::string out;
+    append_to(out, EVERYTHING_LEAN_CONFIG, "include_only_files=", include_only, "\r\n");
+    return out;
+}
+
 /// Builds the Everything 1.5 extra launch arguments appended by `ulp::Everything3::try_load`.
 [[nodiscard]] inline std::wstring build_everything_args(
     std::wstring_view volumes,
     std::wstring_view exclude_folders,
     std::wstring_view add_config_path = {}
 ) {
-    std::wstring args = L"-safe-mode -no-auto-index -volumes \"";
-    args += volumes;
-    args += L"\" -exclude-folders \"";
-    args += exclude_folders;
-    args += L'"';
+    std::wstring args;
     if (!add_config_path.empty()) {
-        args += L" -add-config \"";
-        args += add_config_path;
-        args += L'"';
+        append_to(
+            args,
+            L"-safe-mode -no-auto-index -volumes \"", volumes,
+            L"\" -exclude-folders \"", exclude_folders,
+            L"\" -add-config \"", add_config_path, L"\""
+        );
+    } else {
+        append_to(
+            args,
+            L"-safe-mode -no-auto-index -volumes \"", volumes,
+            L"\" -exclude-folders \"", exclude_folders, L"\""
+        );
     }
     return args;
 }
@@ -112,12 +174,13 @@ inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
 }
 
 /// Builds a unique non-media temporary sentinel filename used to fence Everything's USN journal catch-up.
-[[nodiscard]] inline std::wstring make_usn_sentinel_name(std::uint32_t pid, std::uint64_t nonce) {
-    std::wstring name = L".usyseek-sync-";
-    name += std::to_wstring(pid);
+[[nodiscard]] inline FixedWString<64> make_usn_sentinel_name(std::uint32_t pid, std::uint64_t nonce) noexcept {
+    FixedWString<64> name{L".usyseek-sync-"};
+    name.append(to_fixed_wstr(pid));
     name.push_back(L'-');
-    name += std::to_wstring(nonce);
-    name += L".tmp";
+    name.append(to_fixed_wstr(nonce));
+    name.push_back(L'.');
+    name.append(USN_SENTINEL_EXT);
     return name;
 }
 
@@ -128,10 +191,7 @@ inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
     }
     if (dir.empty() || filename.empty()) return {};
     std::wstring out;
-    out.reserve(dir.size() + 1 + filename.size());
-    out.append(dir);
-    out.push_back(L'\\');
-    out.append(filename);
+    append_to(out, dir, L"\\", filename);
     return out;
 }
 
