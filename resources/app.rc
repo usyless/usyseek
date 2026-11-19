@@ -6,14 +6,22 @@
 #define USYSEEK_RC_DESCRIPTION       "usyseek UI"
 #define USYSEEK_RC_INTERNAL_NAME     "usyseek-ui"
 #define USYSEEK_RC_ORIGINAL_FILENAME "usyseek-ui.exe"
+#define USYSEEK_RC_FILETYPE          VFT_APP
 #elif defined(USYSEEK_TARGET_INDEXER)
 #define USYSEEK_RC_DESCRIPTION       "usyseek Indexer"
 #define USYSEEK_RC_INTERNAL_NAME     "usyseek-indexer"
 #define USYSEEK_RC_ORIGINAL_FILENAME "usyseek-indexer.exe"
+#define USYSEEK_RC_FILETYPE          VFT_APP
+#elif defined(USYSEEK_TARGET_RUST)
+#define USYSEEK_RC_DESCRIPTION       "usyseek Rust Runtime"
+#define USYSEEK_RC_INTERNAL_NAME     "usyseek_rust"
+#define USYSEEK_RC_ORIGINAL_FILENAME "usyseek_rust.dll"
+#define USYSEEK_RC_FILETYPE          VFT_DLL
 #else
 #define USYSEEK_RC_DESCRIPTION       "usyseek"
 #define USYSEEK_RC_INTERNAL_NAME     "usyseek"
 #define USYSEEK_RC_ORIGINAL_FILENAME "usyseek.exe"
+#define USYSEEK_RC_FILETYPE          VFT_APP
 #endif
 
 #ifndef USYSEEK_RC_SKIP_ICON
@@ -30,7 +38,7 @@ FILEFLAGS       VS_FF_DEBUG
 FILEFLAGS       0x0L
 #endif
 FILEOS          VOS_NT_WINDOWS32
-FILETYPE        VFT_APP
+FILETYPE        USYSEEK_RC_FILETYPE
 FILESUBTYPE     VFT2_UNKNOWN
 BEGIN
     BLOCK "StringFileInfo"

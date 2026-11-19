@@ -114,8 +114,11 @@ set(RUST_DEPENDS
     "${RUST_DIR}/Cargo.toml"
     "${RUST_DIR}/Cargo.lock"
     "${RUST_DIR}/.cargo/config.toml"
+    "${RUST_DIR}/build.rs"
     "${RUST_DIR}/src/lib.rs"
     "${RUST_DIR}/src/svg.rs"
+    "${PROJECT_SOURCE_DIR}/resources/app.rc"
+    "${PROJECT_SOURCE_DIR}/resources/resource.h"
 )
 add_custom_command(
     OUTPUT "${RUST_DLL}" "${RUST_IMPLIB}" "${RUST_RUNTIME_DLL}"
