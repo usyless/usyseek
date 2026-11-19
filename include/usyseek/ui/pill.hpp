@@ -3506,6 +3506,7 @@ private:
     // ------------------------------------------------------------------------------------------
 
     void begin_drag_detect(int index) noexcept {
+        if (dragging_out_) return;
         drag_pending_ = true;
         drag_index_ = index;
         GetCursorPos(&drag_origin_);
@@ -3524,6 +3525,7 @@ private:
     }
 
     void start_drag() {
+        if (dragging_out_) return;
         drag_pending_ = false;
         deferred_select_.reset();
         release_capture_if_owned();
@@ -3537,12 +3539,15 @@ private:
         clear_hover();
         clear_tooltip_now();
         render();
-        dragging_out_ = true;
-        // Not topmost while the target works, so its dialogs (e.g. file conflict prompts) are not hidden behind this window
-        SetWindowPos(hwnd_, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         std::string drag_err;
-        auto async_drop = drag_media(hwnd_, paths, &drag_err);
-        dragging_out_ = false;
+        wil::com_ptr<AsyncDataObject> async_drop;
+        {
+            dragging_out_ = true;
+            const auto clear_dragging = wil::scope_exit([&] { dragging_out_ = false; });
+            // Not topmost while the target works, so its dialogs (e.g. file conflict prompts) are not hidden behind this window
+            SetWindowPos(hwnd_, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            async_drop = drag_media(hwnd_, paths, &drag_err);
+        }
         if (!drag_err.empty()) {
             sh_.notify("error", "Drag & Drop", "Failed to start file drag operation", drag_err, "drag-drop");
         }
@@ -3550,7 +3555,7 @@ private:
             async_drops_.push_back(std::move(async_drop));
             ++sh_.background_jobs;
             SetTimer(hwnd_, TIMER_DROP, 250, nullptr);
-        } else {
+        } else if (async_drops_.empty()) {
             SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
         if (sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && GetForegroundWindow() != hwnd_) hide();
@@ -4464,13 +4469,14 @@ private:
                     case TIMER_DROP: {
                         const size_t before = async_drops_.size();
                         std::erase_if(async_drops_, [](const auto& drop) {
-                            BOOL in_operation = FALSE;
-                            return FAILED(drop->InOperation(&in_operation)) || !in_operation;
+                            return !drop || !drop->is_operation_active();
                         });
                         sh_.background_jobs -= static_cast<int>(before - async_drops_.size());
                         if (async_drops_.empty()) {
                             KillTimer(hwnd_, TIMER_DROP);
-                            SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            if (!dragging_out_) {
+                                SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            }
                             if (sh_.visibility_changed) sh_.visibility_changed();
                         }
                         return 0;
@@ -4659,7 +4665,7 @@ private:
     int drag_index_ = -1;
     POINT drag_origin_{};
     std::optional<uint64_t> deferred_select_;
-    std::vector<wil::com_ptr<IDataObjectAsyncCapability>> async_drops_; // drops the target is still completing
+    std::vector<wil::com_ptr<AsyncDataObject>> async_drops_; // drops the target is still completing
 
     uint64_t copy_generation_ = 0;
     bool copy_decoding_ = false;

@@ -416,12 +416,16 @@ inline bool reveal_in_explorer(const std::wstring& path, std::string* error = nu
 
 /// Hands `n` bytes to `obj` as an HGLOBAL of format `cf` (the data object takes ownership).
 inline bool set_data_bytes(IDataObject* obj, CLIPFORMAT cf, const void* data, size_t n) noexcept {
+    if (!obj || !data || n == 0) return false;
     HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, n);
     if (!h) return false;
-    if (void* p = GlobalLock(h)) {
-        std::memcpy(p, data, n);
-        GlobalUnlock(h);
+    void* p = GlobalLock(h);
+    if (!p) {
+        GlobalFree(h);
+        return false;
     }
+    std::memcpy(p, data, n);
+    GlobalUnlock(h);
     FORMATETC fe{.cfFormat = cf, .ptd = nullptr, .dwAspect = DVASPECT_CONTENT, .lindex = -1, .tymed = TYMED_HGLOBAL};
     STGMEDIUM sm{};
     sm.tymed = TYMED_HGLOBAL;
@@ -479,9 +483,10 @@ inline wil::com_ptr<IDataObject> media_data_object(std::span<const std::wstring>
         buf.insert(buf.end(), b, b + ((p.size() + 1) * sizeof(wchar_t)));
     }
     buf.insert(buf.end(), sizeof(wchar_t), 0);
-    auto* df = reinterpret_cast<DROPFILES*>(buf.data());
-    df->pFiles = sizeof(DROPFILES);
-    df->fWide = TRUE;
+    DROPFILES df{};
+    df.pFiles = sizeof(DROPFILES);
+    df.fWide = TRUE;
+    std::memcpy(buf.data(), &df, sizeof(df));
     set_data_bytes(obj.get(), CF_HDROP, buf.data(), buf.size());
 
     const DWORD effect = DROPEFFECT_COPY;
@@ -500,7 +505,6 @@ public:
     AsyncDataObject& operator=(const AsyncDataObject&) = delete;
     AsyncDataObject(AsyncDataObject&&) = delete;
     AsyncDataObject& operator=(AsyncDataObject&&) = delete;
-    virtual ~AsyncDataObject() = default;
 
     // IUnknown
     IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) noexcept override {
@@ -515,7 +519,7 @@ public:
             AddRef();
             return S_OK;
         }
-        return inner_ ? inner_->QueryInterface(riid, ppv) : E_NOINTERFACE;
+        return E_NOINTERFACE;
     }
 
     IFACEMETHODIMP_(ULONG) AddRef() noexcept override {
@@ -530,7 +534,7 @@ public:
 
     // IDataObjectAsyncCapability
     IFACEMETHODIMP SetAsyncMode(BOOL fDoOpAsync) noexcept override {
-        async_mode_ = fDoOpAsync;
+        async_mode_ = fDoOpAsync ? VARIANT_TRUE : VARIANT_FALSE;
         return S_OK;
     }
 
@@ -541,7 +545,7 @@ public:
     }
 
     IFACEMETHODIMP StartOperation(IBindCtx* /*pbcReserved*/) noexcept override {
-        in_operation_ = TRUE;
+        in_operation_ = VARIANT_TRUE;
         return S_OK;
     }
 
@@ -552,8 +556,16 @@ public:
     }
 
     IFACEMETHODIMP EndOperation(HRESULT /*hResult*/, IBindCtx* /*pbcReserved*/, DWORD /*dwEffects*/) noexcept override {
-        in_operation_ = FALSE;
+        in_operation_ = VARIANT_FALSE;
         return S_OK;
+    }
+
+    /// True while the target is still running the async drop and holds at least one external COM reference.
+    /// If the target crashes or releases its proxy without calling EndOperation, ref_count_ drops to 1
+    /// (only our own tracking handle remains), preventing leaked objects and stuck UI state.
+    [[nodiscard]] bool is_operation_active() const noexcept {
+        return in_operation_.load(std::memory_order_acquire) != VARIANT_FALSE &&
+               ref_count_.load(std::memory_order_acquire) > 1;
     }
 
     // IDataObject
@@ -594,41 +606,36 @@ public:
     }
 
 private:
+    ~AsyncDataObject() = default;
+
     wil::com_ptr<IDataObject> inner_;
     std::atomic<ULONG> ref_count_{1};
     std::atomic<BOOL> async_mode_{VARIANT_TRUE};
-    std::atomic<BOOL> in_operation_{FALSE};
+    std::atomic<BOOL> in_operation_{VARIANT_FALSE};
 };
 
 /// Drags files out to other applications (copy or link only: a drop never moves the user's files away).
 /// The target is asked to finish the drop on its own thread, so its dialogs (such as "file already exists")
-/// never block this one inside the drag loop. Returns the data object's async state when the target is still
-/// working on the drop afterwards, null otherwise.
-inline wil::com_ptr<IDataObjectAsyncCapability> drag_media(HWND hwnd, std::span<const std::wstring> paths, std::string* error = nullptr) {
+/// never block this one inside the drag loop. Returns the data object when the target is still working on
+/// the drop afterwards, null otherwise.
+inline wil::com_ptr<AsyncDataObject> drag_media(HWND hwnd, std::span<const std::wstring> paths, std::string* error = nullptr) {
     auto inner = media_data_object(paths);
     if (!inner) {
         if (error) *error = "None of the selected files could be found on disk for drag-and-drop.";
         return nullptr;
     }
-    auto* wrapper = new (std::nothrow) AsyncDataObject(std::move(inner));
-    if (!wrapper) {
+    wil::com_ptr<AsyncDataObject> obj;
+    obj.attach(new (std::nothrow) AsyncDataObject(std::move(inner)));
+    if (!obj) {
         if (error) *error = "Out of memory starting drag operation.";
         return nullptr;
     }
-    wil::com_ptr<IDataObject> obj;
-    obj.attach(static_cast<IDataObject*>(wrapper));
-    auto async = obj.try_query<IDataObjectAsyncCapability>();
-    if (!async) {
-        if (error) *error = "Could not initialize drag data object.";
-        return nullptr;
-    }
     DWORD effect = DROPEFFECT_NONE;
-    const HRESULT hr = SHDoDragDrop(hwnd, obj.get(), nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
+    const HRESULT hr = SHDoDragDrop(hwnd, static_cast<IDataObject*>(obj.get()), nullptr, DROPEFFECT_COPY | DROPEFFECT_LINK, &effect);
     if (FAILED(hr) && error) {
         *error = ulp::str::concat_strings("Drag-and-drop failed (", win32_error_utf8(static_cast<DWORD>(hr)), ").");
     }
-    BOOL in_operation = FALSE;
-    if (SUCCEEDED(async->InOperation(&in_operation)) && in_operation) return async;
+    if (obj->is_operation_active()) return obj;
     return nullptr;
 }
 
