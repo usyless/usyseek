@@ -408,6 +408,28 @@ inline D2D1_RECT_L expand_rect_safe(const D2D1_RECT_L& r, LONG pad) noexcept {
         clamp_add(r.bottom, pad));
 }
 
+/// True when the calling thread's desktop is the active input desktop (false during UAC Secure Desktop or lock screen).
+[[nodiscard]] inline bool is_input_desktop_accessible() noexcept {
+    HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (!input) return false;
+    const auto close_input = wil::scope_exit([&] { CloseDesktop(input); });
+    HDESK cur = GetThreadDesktop(GetCurrentThreadId());
+    if (!cur) return true;
+    std::array<wchar_t, 64> input_name{};
+    std::array<wchar_t, 64> cur_name{};
+    DWORD n1 = 0;
+    DWORD n2 = 0;
+    if (!GetUserObjectInformationW(input, UOI_NAME, input_name.data(),
+                                   static_cast<DWORD>(input_name.size() * sizeof(wchar_t)), &n1) ||
+        !GetUserObjectInformationW(cur, UOI_NAME, cur_name.data(),
+                                   static_cast<DWORD>(cur_name.size() * sizeof(wchar_t)), &n2)) {
+        return true;
+    }
+    input_name.back() = L'\0';
+    cur_name.back() = L'\0';
+    return _wcsicmp(input_name.data(), cur_name.data()) == 0;
+}
+
 } // namespace detail
 
 /// Native Direct2D custom effect implementation running the Liquid Glass pixel shader.
@@ -610,6 +632,7 @@ public:
         wil::com_ptr<ID2D1Bitmap1> native_bmp;
         wil::com_ptr<ID2D1Bitmap1> desktop_target_bmp;
         bool has_frame = false;
+        bool needs_full_copy = true;
         uint64_t frame_seq = 0;
         ULONGLONG retry_after_tick = 0;
 
@@ -790,8 +813,8 @@ private:
             if (hr == DXGI_ERROR_WAIT_TIMEOUT) break;
             if (FAILED(hr)) {
                 if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL) {
-                    reset_output(*st);
-                    st->retry_after_tick = now_tick + 400;
+                    drop_duplication(*st);
+                    st->retry_after_tick = now_tick + 100;
                 }
                 return st->has_frame ? st : nullptr;
             }
@@ -806,7 +829,7 @@ private:
             FrameDelta& delta = scratch_delta_;
             delta.seq = 0;
             const bool have_meta = collect_frame_rects(*st, info.TotalMetadataBufferSize, delta);
-            delta.dirty_all = !st->has_frame || !have_meta;
+            delta.dirty_all = !st->has_frame || st->needs_full_copy || !have_meta;
 
             const bool rotated = st->rotation != DesktopRotation::Identity;
             ID3D11Texture2D* dst = rotated ? st->native_tex.get() : st->desktop_tex.get();
@@ -829,10 +852,12 @@ private:
             }
             if (rotated && !rotate_into_desktop(*st, full ? nullptr : &delta.dirty_rects)) {
                 st->has_frame = false; // desktop_tex is now out of step with native_tex: force a full copy next time
+                st->needs_full_copy = true;
                 break;
             }
 
             st->has_frame = true;
+            st->needs_full_copy = false;
             ++st->frame_seq;
             delta.seq = st->frame_seq;
             st->push_history(delta);
@@ -932,49 +957,56 @@ private:
         return SUCCEEDED(hr);
     }
 
-    static void reset_output(OutputState& st) noexcept {
-        st.native_bmp.reset();
-        st.desktop_target_bmp.reset();
-        st.native_tex.reset();
+    /// Releases a lost duplication session while retaining `desktop_tex` (if any) so glass windows keep their
+    /// last valid backdrop across transient desktop switches (e.g. UAC Secure Desktop) instead of flashing.
+    static void drop_duplication(OutputState& st) noexcept {
         st.dupl.reset();
-        st.desktop_tex.reset();
-        st.tex_id = 0;
-        st.mon_rect = {};
-        st.rotation = DesktopRotation::Identity;
-        st.tex_w = st.tex_h = 0;
-        st.has_frame = false;
+        st.needs_full_copy = true;
         st.clear_history();
     }
 
     static bool ensure_duplication(Gfx& gfx, OutputState& st, ULONGLONG now_tick) noexcept {
         if (st.dupl) return true;
         if (now_tick < st.retry_after_tick) return false;
-
-        reset_output(st);
-        wil::com_ptr<IDXGIAdapter> adapter;
-        if (FAILED(gfx.dxgi_device()->GetAdapter(&adapter)) || !adapter) {
-            st.retry_after_tick = now_tick + 1000;
+        if (!detail::is_input_desktop_accessible()) {
+            st.retry_after_tick = now_tick + 100;
             return false;
         }
-        for (UINT i = 0;; ++i) {
-            wil::com_ptr<IDXGIOutput> out;
-            if (adapter->EnumOutputs(i, &out) == DXGI_ERROR_NOT_FOUND) break;
-            DXGI_OUTPUT_DESC desc{};
-            if (SUCCEEDED(out->GetDesc(&desc)) && desc.Monitor == st.mon) {
-                if (const auto out1 = out.try_query<IDXGIOutput1>()) {
-                    if (SUCCEEDED(out1->DuplicateOutput(gfx.d3d(), &st.dupl))) {
-                        DXGI_OUTDUPL_DESC dd{};
-                        st.dupl->GetDesc(&dd);
-                        st.mon_rect = desc.DesktopCoordinates;
-                        st.rotation = to_rotation(dd.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED ? dd.Rotation : desc.Rotation);
-                        st.has_frame = false;
-                        return true;
+
+        const auto try_adapter = [&](IDXGIAdapter* adapter) noexcept -> bool {
+            if (!adapter) return false;
+            for (UINT i = 0;; ++i) {
+                wil::com_ptr<IDXGIOutput> out;
+                if (adapter->EnumOutputs(i, &out) == DXGI_ERROR_NOT_FOUND) break;
+                DXGI_OUTPUT_DESC desc{};
+                if (SUCCEEDED(out->GetDesc(&desc)) && desc.Monitor == st.mon) {
+                    if (const auto out1 = out.try_query<IDXGIOutput1>()) {
+                        wil::com_ptr<IDXGIOutputDuplication> dupl;
+                        if (SUCCEEDED(out1->DuplicateOutput(gfx.d3d(), &dupl)) && dupl) {
+                            DXGI_OUTDUPL_DESC dd{};
+                            dupl->GetDesc(&dd);
+                            st.dupl = std::move(dupl);
+                            st.mon_rect = desc.DesktopCoordinates;
+                            st.rotation = to_rotation(dd.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED ? dd.Rotation : desc.Rotation);
+                            st.needs_full_copy = true;
+                            st.clear_history();
+                            return true;
+                        }
                     }
+                    break;
                 }
-                break;
             }
+            return false;
+        };
+
+        if (const auto fresh_adapter = gfx.current_adapter()) {
+            if (try_adapter(fresh_adapter.get())) return true;
         }
-        st.retry_after_tick = now_tick + 1000;
+        wil::com_ptr<IDXGIAdapter> adapter;
+        if (SUCCEEDED(gfx.dxgi_device()->GetAdapter(&adapter)) && try_adapter(adapter.get())) {
+            return true;
+        }
+        st.retry_after_tick = now_tick + 250;
         return false;
     }
 
@@ -1144,14 +1176,26 @@ public:
         GlassStyle s = style;
         s.force_opaque = true;
 
-        ID2D1Bitmap1* gdi_bmp = nullptr;
-        if (!use_dupl) {
-            gdi_bmp = capture_gdi_backdrop(target, origin, pw, ph);
-            if (!gdi_bmp) return false;
-        }
-
         const D2D1_SIZE_F sz = target.size();
         const D2D1_RECT_F full_dest = D2D1::RectF(0.0f, 0.0f, sz.width, sz.height);
+
+        ID2D1Bitmap1* gdi_bmp = nullptr;
+        if (!use_dupl) {
+            if (detail::is_input_desktop_accessible()) {
+                gdi_bmp = capture_gdi_backdrop(target, origin, pw, ph);
+            }
+            if (!gdi_bmp) {
+                if (cached_glass_valid_ && cached_glass_bmp_ &&
+                    cached_key_.pw == pw && cached_key_.ph == ph &&
+                    cached_key_.dpi == target.dpi() && cached_key_.epoch == target.target_epoch()) {
+                    cv.dc()->DrawBitmap(cached_glass_bmp_.get(), &full_dest, 1.0f,
+                                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &full_dest, nullptr);
+                    return true;
+                }
+                return false;
+            }
+        }
+
         const GlassCacheKey key = make_cache_key(pw, ph, target.dpi(), target.target_epoch(), origin, panel_rect, s, use_dupl, backdrop_ver_);
         if (cached_glass_valid_ && cached_glass_bmp_ && cached_key_ == key) {
             cv.dc()->DrawBitmap(cached_glass_bmp_.get(), &full_dest, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &full_dest, nullptr);
@@ -1500,6 +1544,7 @@ private:
 
         if (!ensure_win_bmp(target, pw, ph)) return nullptr;
         win_bmp_idx_ ^= 1u;
+        seeded_gdi_ = false;
         ID2D1Bitmap1* dst_bmp = win_bmp_[win_bmp_idx_].get();
 
         // Parts of the window off every monitor would otherwise keep whatever this buffer held two frames ago.
@@ -1695,8 +1740,9 @@ private:
     ID2D1Bitmap1* capture_gdi_backdrop(WindowTarget& target, POINT origin, UINT pw, UINT ph) noexcept {
         if (!ensure_win_bmp(target, pw, ph)) return nullptr;
         if (!seeded_gdi_ || origin.x != gdi_origin_.x || origin.y != gdi_origin_.y || pw > gdi_pw_ || ph > gdi_ph_) {
-            win_bmp_idx_ ^= 1u;
-            if (seed_from_screen_dc(win_bmp_[win_bmp_idx_].get(), origin, pw, ph)) {
+            const uint32_t next_idx = win_bmp_idx_ ^ 1u;
+            if (seed_from_screen_dc(win_bmp_[next_idx].get(), origin, pw, ph)) {
+                win_bmp_idx_ = next_idx;
                 seeded_gdi_ = true;
                 gdi_origin_ = origin;
                 gdi_pw_ = pw;

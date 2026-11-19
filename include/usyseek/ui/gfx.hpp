@@ -57,21 +57,53 @@ public:
     }
 
     [[nodiscard]] bool is_warp() const noexcept { return warp_; }
+    [[nodiscard]] LUID adapter_luid() const noexcept { return luid_; }
 
-    /// True when the DXGI adapter list changed or `hwnd` now sits on another GPU's monitor.
-    [[nodiscard]] bool adapter_stale(HWND hwnd) const noexcept {
-        if (!dxgi_factory_ || !dxgi_factory_->IsCurrent()) return true;
+    /// Refreshes `dxgi_factory_` in place when DXGI reports topology/session staleness (`IsCurrent() == FALSE`)
+    /// without tearing down a healthy D3D11/D2D device.
+    bool refresh_dxgi_factory() noexcept {
+        if (dxgi_factory_ && dxgi_factory_->IsCurrent()) return true;
+        wil::com_ptr<IDXGIFactory2> fresh;
+        if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&fresh))) || !fresh) return false;
+        dxgi_factory_ = std::move(fresh);
+        return true;
+    }
+
+    /// Returns the adapter matching the active D3D11 device's LUID from the current DXGI factory.
+    [[nodiscard]] wil::com_ptr<IDXGIAdapter1> current_adapter() noexcept {
+        if (!refresh_dxgi_factory() || !dxgi_factory_) return nullptr;
+        return find_adapter(dxgi_factory_.get(), luid_);
+    }
+
+    /// True when the D3D device was lost, its adapter disappeared, or `hwnd` now sits on another GPU's monitor.
+    /// Refreshes a stale `IDXGIFactory2` (e.g. after a UAC Secure Desktop switch) in place rather than
+    /// triggering a full device rebuild when the GPU itself has not changed.
+    [[nodiscard]] bool adapter_stale(HWND hwnd) noexcept {
+        if (device_lost()) return true;
+        if (!refresh_dxgi_factory()) return true;
         if (warp_) return false;
         if (const auto a = window_adapter(dxgi_factory_.get(), hwnd)) {
             DXGI_ADAPTER_DESC1 d{};
             if (SUCCEEDED(a->GetDesc1(&d))) return d.AdapterLuid.LowPart != luid_.LowPart || d.AdapterLuid.HighPart != luid_.HighPart;
         }
-        return false;
+        return !find_adapter(dxgi_factory_.get(), luid_);
     }
 
     std::function<void()> on_device_changed;
 
 private:
+    static wil::com_ptr<IDXGIAdapter1> find_adapter(IDXGIFactory2* f, LUID luid) noexcept {
+        if (!f) return nullptr;
+        for (UINT i = 0;; ++i) {
+            wil::com_ptr<IDXGIAdapter1> a;
+            if (f->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_ADAPTER_DESC1 d{};
+            if (SUCCEEDED(a->GetDesc1(&d)) && d.AdapterLuid.LowPart == luid.LowPart && d.AdapterLuid.HighPart == luid.HighPart) {
+                return a;
+            }
+        }
+        return nullptr;
+    }
     static wil::com_ptr<IDXGIAdapter1> window_adapter(IDXGIFactory2* f, HWND hwnd) noexcept {
         if (!f || !hwnd) return nullptr;
         HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
@@ -224,6 +256,10 @@ public:
         desc.Scaling = DXGI_SCALING_STRETCH;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+        if (!gfx_->refresh_dxgi_factory()) {
+            release();
+            return false;
+        }
         if (FAILED(gfx_->dxgi_factory()->CreateSwapChainForComposition(gfx_->d3d(), &desc, nullptr, &swap_))) {
             release();
             return false;
@@ -237,10 +273,12 @@ public:
                 return false;
             }
         }
-        if (FAILED(visual_->SetContent(swap_.get())) || FAILED(dcomp_->Commit())) {
+        if (FAILED(visual_->SetContent(swap_.get()))) {
             release();
             return false;
         }
+        // Defer `dcomp_->Commit()` until the first frame is presented so DWM never composes an unpresented swapchain.
+        dcomp_commit_pending_ = true;
 
         dpi_ = static_cast<float>(GetDpiForWindow(hwnd_));
         if (dpi_ <= 0) dpi_ = 96.0f;
@@ -254,9 +292,7 @@ public:
 
     void release() noexcept {
         release_swap_and_dc();
-        if (visual_) visual_->SetContent(nullptr);
-        if (dcomp_target_) dcomp_target_->SetRoot(nullptr);
-        if (dcomp_) dcomp_->Commit();
+        dcomp_commit_pending_ = false;
         visual_.reset();
         dcomp_target_.reset();
         dcomp_.reset();
@@ -433,6 +469,11 @@ public:
         }
         if (FAILED(hr)) return false;
 
+        if (dcomp_commit_pending_ && dcomp_) {
+            if (FAILED(dcomp_->Commit())) return false;
+            dcomp_commit_pending_ = false;
+        }
+
         dirty_tracker_.commit(full_redraw, p);
         if (did_pace_out) *did_pace_out = did_pace;
         return true;
@@ -541,6 +582,7 @@ private:
     std::optional<fs::path> capture_;
     bool capture_ok_ = false;
     bool liquid_glass_ = false;
+    bool dcomp_commit_pending_ = false;
 };
 
 } // namespace usyseek::ui

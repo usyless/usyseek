@@ -523,15 +523,16 @@ private:
             SetTimer(hwnd_, TIMER_DEVICE, 250, nullptr);
             return false;
         }
+        KillTimer(hwnd_, TIMER_DEVICE);
         return true;
     }
 
     void recover() {
-        sh_.gfx.recover(hwnd_);
-        sh_.thumbs.reset_gpu();
         glass_.release();
         sh_.desktop_dupl.reset();
         target_.release();
+        sh_.gfx.recover(hwnd_);
+        sh_.thumbs.reset_gpu();
         full_dirty_ = true;
         pending_dirty_.clear();
         last_tooltip_dirty_.reset();

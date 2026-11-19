@@ -872,6 +872,7 @@ private:
             SetTimer(hwnd_, TIMER_DEVICE, 250, nullptr);
             return false;
         }
+        KillTimer(hwnd_, TIMER_DEVICE);
         gfx_epoch_ = sh_.gfx.epoch();
         if (deferred_thumbs_) {
             deferred_thumbs_ = false;
