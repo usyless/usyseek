@@ -24,6 +24,26 @@ if errorlevel 1 (
     goto :fail
 )
 
+where cargo >nul 2>nul
+if errorlevel 1 (
+    echo [package-release] cargo not found in PATH. Unable to generate Rust third-party licenses.
+    goto :fail
+)
+cargo about --version >nul 2>nul
+if errorlevel 1 (
+    echo [package-release] cargo-about not found. Installing cargo-about...
+    cargo install --locked --features cli cargo-about
+    if errorlevel 1 goto :fail
+)
+echo [package-release] Generating licenses\rust-licenses.txt...
+pushd rust
+cargo about generate about.hbs -o ..\licenses\rust-licenses.txt
+if errorlevel 1 (
+    popd
+    goto :fail
+)
+popd
+
 if exist "%STAGE%" rmdir /s /q "%STAGE%"
 if not exist "%DIST%" mkdir "%DIST%"
 mkdir "%STAGE%"
