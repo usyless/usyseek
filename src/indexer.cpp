@@ -1973,7 +1973,18 @@ int wmain(int argc, wchar_t* const* argv) {
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
     const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED)};
-    MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    struct MfScope {
+        HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+        MfScope() = default;
+        MfScope(const MfScope&) = delete;
+        MfScope& operator=(const MfScope&) = delete;
+        MfScope(MfScope&&) = delete;
+        MfScope& operator=(MfScope&&) = delete;
+        ~MfScope() {
+            if (SUCCEEDED(hr)) MFShutdown();
+        }
+    };
+    const MfScope mf;
 
     // Only one indexer at a time (acquire via WaitForSingleObject so concurrent probes cannot cause false ERROR_ALREADY_EXISTS).
     NamedMutexLock single;
@@ -2010,6 +2021,5 @@ int wmain(int argc, wchar_t* const* argv) {
     }
     // Keep the final status readable briefly on normal completion/error; exit immediately when stopped.
     if (!stopping() && code != 2) Sleep(400);
-    MFShutdown();
     return code;
 }

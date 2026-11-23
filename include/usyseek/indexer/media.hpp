@@ -12,6 +12,8 @@
 #include <wil/com.h>
 
 #include <cmath>
+#include <cstdint>
+#include <limits>
 
 namespace usyseek::media {
 
@@ -123,16 +125,38 @@ public:
         }
 
         wil::com_ptr<IMFMediaType> type;
-        MFCreateMediaType(&type);
+        if (FAILED(MFCreateMediaType(&type)) || !type) return fail(L"Failed to create video media type");
         type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
         if (FAILED(reader->SetCurrentMediaType(stream, nullptr, type.get()))) return fail(L"Unsupported video codec (missing decoder)");
 
-        wil::com_ptr<IMFMediaType> current;
-        if (FAILED(reader->GetCurrentMediaType(stream, &current))) return fail(L"Could not query video stream format");
+        constexpr UINT32 MAX_VIDEO_DIM = 16384u;
+        constexpr uint64_t MAX_VIDEO_FRAME_BYTES = 512ull << 20u;
+        const auto query_video_format = [&](UINT32& out_w, UINT32& out_h, LONG& out_stride) noexcept -> bool {
+            wil::com_ptr<IMFMediaType> cur;
+            if (FAILED(reader->GetCurrentMediaType(stream, &cur)) || !cur) return false;
+            UINT32 nw = 0;
+            UINT32 nh = 0;
+            if (FAILED(MFGetAttributeSize(cur.get(), MF_MT_FRAME_SIZE, &nw, &nh)) ||
+                nw == 0 || nh == 0 || nw > MAX_VIDEO_DIM || nh > MAX_VIDEO_DIM ||
+                static_cast<uint64_t>(nw) * nh * 4u > MAX_VIDEO_FRAME_BYTES) {
+                return false;
+            }
+            UINT32 raw_stride = 0;
+            LONG stride = static_cast<LONG>(nw) * 4;
+            if (SUCCEEDED(cur->GetUINT32(MF_MT_DEFAULT_STRIDE, &raw_stride))) {
+                stride = static_cast<LONG>(raw_stride);
+            }
+            out_w = nw;
+            out_h = nh;
+            out_stride = stride;
+            return true;
+        };
+
         UINT32 w = 0;
         UINT32 h = 0;
-        if (FAILED(MFGetAttributeSize(current.get(), MF_MT_FRAME_SIZE, &w, &h)) || w == 0 || h == 0) {
+        LONG default_stride = 0;
+        if (!query_video_format(w, h, default_stride)) {
             return fail(L"Invalid video frame dimensions");
         }
 
@@ -140,7 +164,11 @@ public:
         PropVariantInit(&dur);
         uint64_t duration = 0;
         if (SUCCEEDED(reader->GetPresentationAttribute(static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE), MF_PD_DURATION, &dur))) {
-            duration = dur.uhVal.QuadPart;
+            if (dur.vt == VT_UI8) {
+                duration = dur.uhVal.QuadPart;
+            } else if (dur.vt == VT_I8 && dur.hVal.QuadPart > 0) {
+                duration = static_cast<uint64_t>(dur.hVal.QuadPart);
+            }
         }
         PropVariantClear(&dur);
 
@@ -165,8 +193,13 @@ public:
         bool seek_failed = false;
         for (uint32_t k = 0; k < n; ++k) {
             if (duration > 0) {
+                const uint64_t num = (2ull * k) + 1ull;
+                const uint64_t den = 2ull * n;
+                const uint64_t pos_u = ((duration / den) * num) + (((duration % den) * num) / den);
+                const LONGLONG pos_ll = static_cast<LONGLONG>(
+                    std::min<uint64_t>(pos_u, static_cast<uint64_t>(std::numeric_limits<LONGLONG>::max())));
                 PROPVARIANT pos;
-                InitPropVariantFromInt64(static_cast<LONGLONG>(duration * ((2ull * k) + 1) / (2ull * n)), &pos);
+                InitPropVariantFromInt64(pos_ll, &pos);
                 const HRESULT hr = reader->SetCurrentPosition(GUID_NULL, pos);
                 PropVariantClear(&pos);
                 if (FAILED(hr)) {
@@ -175,13 +208,25 @@ public:
                 }
             }
             wil::com_ptr<IMFSample> sample;
+            bool format_invalid = false;
             for (int tries = 0; tries < 16 && !sample; ++tries) {
                 DWORD flags = 0;
                 LONGLONG ts = 0;
                 if (FAILED(reader->ReadSample(stream, 0, nullptr, &flags, &ts, &sample))) break;
+                if ((flags & static_cast<DWORD>(MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED)) != 0) {
+                    if (!query_video_format(w, h, default_stride)) {
+                        format_invalid = true;
+                        sample.reset();
+                        break;
+                    }
+                    out.width = swapped ? h : w;
+                    out.height = swapped ? w : h;
+                    bgrx_buf_.resize(static_cast<size_t>(w) * h * 4);
+                }
                 if ((flags & static_cast<DWORD>(MF_SOURCE_READERF_ENDOFSTREAM)) != 0) break;
             }
-            if (!sample || !copy_sample(sample.get(), w, h, bgrx_buf_)) continue;
+            if (format_invalid) break;
+            if (!sample || !copy_sample(sample.get(), w, h, default_stride, bgrx_buf_)) continue;
 
             wil::com_ptr<IWICBitmap> bmp;
             if (FAILED(wic_->CreateBitmapFromMemory(w, h, GUID_WICPixelFormat32bppBGR, w * 4, static_cast<UINT>(bgrx_buf_.size()), bgrx_buf_.data(), &bmp))) continue;
@@ -224,7 +269,10 @@ private:
             wil::com_ptr<IWICBitmapFrameDecode> f0;
             if (FAILED(dec->GetFrame(0, &f0)) || FAILED(f0->GetSize(&cw, &ch))) return std::nullopt;
         }
-        if (cw < 32 || ch < 32 || static_cast<uint64_t>(cw) * ch * 4 > (512ull << 20u)) return std::nullopt;
+        if (cw < 32 || ch < 32 || cw > 16384u || ch > 16384u ||
+            static_cast<uint64_t>(cw) * ch * 4 > (512ull << 20u)) {
+            return std::nullopt;
+        }
 
         const UINT n = std::min<UINT>(total, std::max(1u, frame_count));
         std::vector<UINT> targets;
@@ -252,7 +300,7 @@ private:
             if (FAILED(dec->GetFrame(i, &frame))) continue;
             UINT fw = 0;
             UINT fh = 0;
-            if (FAILED(frame->GetSize(&fw, &fh)) || fw == 0 || fh == 0) continue;
+            if (FAILED(frame->GetSize(&fw, &fh)) || fw == 0 || fh == 0 || fw > 16384u || fh > 16384u) continue;
 
             UINT left = 0;
             UINT top = 0;
@@ -266,8 +314,6 @@ private:
                 }
             }
 
-            if (disposal == 3) gif_prev_canvas_ = gif_canvas_;
-
             wil::com_ptr<IWICFormatConverter> conv;
             if (FAILED(wic_->CreateFormatConverter(&conv))) continue;
             if (FAILED(conv->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) continue;
@@ -275,6 +321,8 @@ private:
             if (static_cast<uint64_t>(fstride) * fh > (512ull << 20u)) continue;
             frame_buf_.resize(fstride * fh);
             if (FAILED(conv->CopyPixels(nullptr, static_cast<UINT>(fstride), static_cast<UINT>(frame_buf_.size()), frame_buf_.data()))) continue;
+
+            if (disposal == 3) gif_prev_canvas_ = gif_canvas_;
 
             const UINT copy_w = left < cw ? std::min(fw, cw - left) : 0;
             const UINT copy_h = top < ch ? std::min(fh, ch - top) : 0;
@@ -363,25 +411,88 @@ private:
         return out;
     }
 
-    static bool copy_sample(IMFSample* sample, UINT32 w, UINT32 h, std::vector<uint8_t>& dst) noexcept {
+    static bool copy_sample(IMFSample* sample, UINT32 w, UINT32 h, LONG default_stride, std::vector<uint8_t>& dst) noexcept {
+        if (!sample || w == 0 || h == 0) return false;
+        const size_t row = static_cast<size_t>(w) * 4u;
+        const size_t expected_bytes = row * h;
+        if (dst.size() < expected_bytes) return false;
+
         wil::com_ptr<IMFMediaBuffer> buf;
-        if (FAILED(sample->ConvertToContiguousBuffer(&buf))) return false;
-        const size_t row = static_cast<size_t>(w) * 4;
+        if (FAILED(sample->ConvertToContiguousBuffer(&buf)) || !buf) return false;
+
+        if (const auto b2d2 = buf.try_query<IMF2DBuffer2>()) {
+            BYTE* scan0 = nullptr;
+            LONG pitch = 0;
+            BYTE* buf_start = nullptr;
+            DWORD buf_len = 0;
+            if (SUCCEEDED(b2d2->Lock2DSize(MF2DBuffer_LockFlags_Read, &scan0, &pitch, &buf_start, &buf_len))) {
+                bool ok = false;
+                if (scan0 && buf_start && pitch != std::numeric_limits<LONG>::min()) {
+                    const size_t abs_pitch = pitch < 0 ? static_cast<size_t>(-pitch) : static_cast<size_t>(pitch);
+                    if (abs_pitch >= row) {
+                        const auto start_addr = reinterpret_cast<uintptr_t>(buf_start);
+                        const auto end_addr = start_addr + buf_len;
+                        const auto s0 = reinterpret_cast<uintptr_t>(scan0);
+                        const size_t span_rows = static_cast<size_t>(h - 1u) * abs_pitch;
+                        if (end_addr >= start_addr && s0 >= start_addr && s0 <= end_addr) {
+                            const bool in_bounds = pitch >= 0
+                                ? (span_rows <= (end_addr - s0) && row <= ((end_addr - s0) - span_rows))
+                                : (row <= (end_addr - s0) && span_rows <= (s0 - start_addr));
+                            if (in_bounds) {
+                                for (UINT32 y = 0; y < h; ++y) {
+                                    std::memcpy(dst.data() + (static_cast<size_t>(y) * row),
+                                                scan0 + (static_cast<ptrdiff_t>(y) * pitch), row);
+                                }
+                                ok = true;
+                            }
+                        }
+                    }
+                }
+                b2d2->Unlock2D();
+                return ok;
+            }
+        }
+
         if (const auto b2d = buf.try_query<IMF2DBuffer>()) {
+            DWORD cur_len = 0;
+            const bool have_len = SUCCEEDED(buf->GetCurrentLength(&cur_len));
             BYTE* scan0 = nullptr;
             LONG pitch = 0;
             if (SUCCEEDED(b2d->Lock2D(&scan0, &pitch))) {
-                for (UINT32 y = 0; y < h; ++y) std::memcpy(dst.data() + (y * row), scan0 + (static_cast<ptrdiff_t>(y) * pitch), row);
+                bool ok = false;
+                if (scan0 && pitch != std::numeric_limits<LONG>::min()) {
+                    const size_t abs_pitch = pitch < 0 ? static_cast<size_t>(-pitch) : static_cast<size_t>(pitch);
+                    const size_t min_bytes = (static_cast<size_t>(h - 1u) * abs_pitch) + row;
+                    if (abs_pitch >= row && (!have_len || cur_len >= min_bytes)) {
+                        for (UINT32 y = 0; y < h; ++y) {
+                            std::memcpy(dst.data() + (static_cast<size_t>(y) * row),
+                                        scan0 + (static_cast<ptrdiff_t>(y) * pitch), row);
+                        }
+                        ok = true;
+                    }
+                }
                 b2d->Unlock2D();
-                return true;
+                return ok;
             }
         }
+
         BYTE* data = nullptr;
         DWORD len = 0;
         if (FAILED(buf->Lock(&data, nullptr, &len))) return false;
-        const bool ok = len >= row * h;
-        if (ok) {
-            for (UINT32 y = 0; y < h; ++y) std::memcpy(dst.data() + (y * row), data + (y * row), row);
+        bool ok = false;
+        if (data) {
+            const LONG eff_stride = (default_stride != 0 && default_stride != std::numeric_limits<LONG>::min())
+                ? default_stride
+                : static_cast<LONG>(row);
+            const size_t abs_stride = eff_stride < 0 ? static_cast<size_t>(-eff_stride) : static_cast<size_t>(eff_stride);
+            const size_t req_len = (static_cast<size_t>(h - 1u) * abs_stride) + row;
+            if (abs_stride >= row && len >= req_len) {
+                for (UINT32 y = 0; y < h; ++y) {
+                    const size_t src_y = eff_stride < 0 ? static_cast<size_t>(h - 1u - y) : static_cast<size_t>(y);
+                    std::memcpy(dst.data() + (static_cast<size_t>(y) * row), data + (src_y * abs_stride), row);
+                }
+                ok = true;
+            }
         }
         buf->Unlock();
         return ok;

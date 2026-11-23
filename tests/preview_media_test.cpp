@@ -17,6 +17,7 @@ using usyseek::ui::SeekState;
 using usyseek::ui::compute_preview_box;
 using usyseek::ui::fit_scaled_size;
 using usyseek::ui::is_gif_path;
+using usyseek::ui::make_mf_extension_hint_url;
 using usyseek::ui::normalize_gif_delay_ms;
 using usyseek::ui::normalize_mf_source_path;
 using usyseek::ui::parse_netscape_loop_count;
@@ -43,6 +44,11 @@ void test_path_and_timing_helpers() {
     CHECK(normalize_mf_source_path(LR"(\\?\C:\Videos\clip.mp4)") == LR"(C:\Videos\clip.mp4)");
     CHECK(normalize_mf_source_path(LR"(\\?\UNC\nas\share\clip.mp4)") == LR"(\\nas\share\clip.mp4)");
     CHECK(normalize_mf_source_path(LR"(C:\Videos\clip.mp4)") == LR"(C:\Videos\clip.mp4)");
+
+    CHECK(make_mf_extension_hint_url(LR"(C:\Videos\clip #1?%20.MP4)") == L"file:///media.mp4");
+    CHECK(make_mf_extension_hint_url(LR"(\\?\C:\dir.with.dots\movie.mkv)") == L"file:///media.mkv");
+    CHECK(make_mf_extension_hint_url(LR"(C:\dir.with.dots\noext)") == L"file:///media");
+    CHECK(make_mf_extension_hint_url(LR"(C:\Videos\bad.m#4)") == L"file:///media");
 
     CHECK(normalize_gif_delay_ms(0) == 100u);
     CHECK(normalize_gif_delay_ms(1) == 100u);
@@ -138,6 +144,14 @@ void test_gif_compositor() {
     for (const uint8_t b : comp.canvas()) {
         CHECK(b == 0);
     }
+
+    // advance_frame updates internal canvas identically to apply_frame without needing an output copy.
+    CHECK(comp.advance_frame(0, 0, 1, 1, red, GifDisposal::Keep));
+    CHECK(comp.canvas()[2] == 255 && comp.canvas()[3] == 255);
+    CHECK(comp.advance_frame(0, 0, 1, 1, green, GifDisposal::RestorePrev));
+    CHECK(comp.canvas()[1] == 0 && comp.canvas()[2] == 255 && comp.canvas()[3] == 255);
+    CHECK(comp.advance_frame(0, 0, 1, 1, blue, GifDisposal::RestoreBg));
+    CHECK(comp.canvas()[0] == 0 && comp.canvas()[2] == 0 && comp.canvas()[3] == 0);
 }
 
 void test_seek_state() {

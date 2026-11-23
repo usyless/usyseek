@@ -30,6 +30,8 @@ public:
     Pill& operator=(Pill&&) = delete;
     ~Pill() {
         stop_workers();
+        gif_.shutdown();
+        video_.shutdown();
         glass_.release();
         target_.release();
         if (hwnd_) DestroyWindow(hwnd_);
@@ -878,7 +880,7 @@ private:
             deferred_thumbs_ = false;
             (void)sh_.thumbs.process(target_.dc());
             const bool previews = sh_.previews.process(target_.dc());
-            if (preview_ < 0 && previews) sh_.previews.clear();
+            if (!should_keep_preview_decode(visible(), fading_out_, preview_) && previews) sh_.previews.clear();
         }
         if (std::exchange(preview_gpu_reset_, false) && preview_valid() && items_[preview_].pt.p.k != 1) {
             request_preview();
@@ -2630,7 +2632,7 @@ private:
                 }
                 if (resized || video_.is_seeking() || (in_sizemove_ && video_.needs_timer())) {
                     const bool had_frame = video_.has_frame();
-                    const MediaTickStatus st = video_.tick(sh_.gfx.d3d(), target_.dc());
+                    const MediaTickStatus st = video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc());
                     if (st == MediaTickStatus::DeviceLost) {
                         recover();
                         return false;
@@ -2787,7 +2789,7 @@ private:
             return;
         }
         if (target_.ready()) {
-            const MediaTickStatus st = video_.tick(sh_.gfx.d3d(), target_.dc());
+            const MediaTickStatus st = video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc());
             if (st == MediaTickStatus::DeviceLost) {
                 recover();
                 return;
@@ -2811,7 +2813,7 @@ private:
             return;
         }
         const bool had_frame = video_.has_frame();
-        const MediaTickStatus st = target_.ready() ? video_.tick(sh_.gfx.d3d(), target_.dc()) : MediaTickStatus::NoChange;
+        const MediaTickStatus st = target_.ready() ? video_.tick(sh_.gfx.d3d(), sh_.gfx.epoch(), target_.dc()) : MediaTickStatus::NoChange;
         if (st == MediaTickStatus::DeviceLost) {
             recover();
             return;
@@ -2929,7 +2931,12 @@ private:
         if (it.pt.p.k == 1) {
             gif_.close();
             apply_video_audio(false);
-            video_.open(path, sh_.gfx.d3d(), sh_.gfx.epoch());
+            if (!video_.open(path, sh_.gfx.d3d(), sh_.gfx.epoch()) && video_.failed()) {
+                sh_.notify("warning", "Preview", "Inline video playback failed",
+                    concat_utf8("Could not play video inline (", it.pt.p.p,
+                        "). Click Play to open in your default media player."),
+                    "preview-video");
+            }
         } else if (is_gif_path(it.name)) {
             video_.close();
             gif_.open(it.pt.id, path, px);
@@ -4587,6 +4594,8 @@ private:
                 if (should_allow_close(false, dragging_out_)) hide();
                 return 0;
             case WM_DESTROY:
+                gif_.set_notify(nullptr, 0);
+                video_.set_notify(nullptr, 0);
                 KillTimer(hwnd_, TIMER_CARET);
                 KillTimer(hwnd_, TIMER_DEBOUNCE);
                 KillTimer(hwnd_, TIMER_STATUS);

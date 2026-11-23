@@ -7,6 +7,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfmediaengine.h>
+#include <shlwapi.h>
 
 #include <algorithm>
 #include <array>
@@ -90,14 +91,22 @@ public:
         {
             const std::scoped_lock lk{mtx_};
             if (!hwnd_ || !msg_) return S_OK;
-            if (event_count_ < events_.size()) events_[event_count_++] = event;
+            if (event_count_ < events_.size()) {
+                events_[event_count_++] = event;
+            } else {
+                // Keep the latest significant event (e.g. ERROR / SEEKED / ENDED) if the queue saturates.
+                events_.back() = event;
+            }
             if (!posted_) {
                 posted_ = true;
                 hwnd = hwnd_;
                 msg = msg_;
             }
         }
-        if (hwnd && msg) PostMessageW(hwnd, msg, 0, 0);
+        if (hwnd && msg && !PostMessageW(hwnd, msg, 0, 0)) {
+            const std::scoped_lock lk{mtx_};
+            posted_ = false;
+        }
         return S_OK;
     }
 
@@ -198,14 +207,23 @@ public:
             return true;
         }
 
+        if (!d3d) {
+            close_source_only();
+            gpu_recovery_.active = true;
+            gpu_recovery_.path = path;
+            gpu_recovery_.pos_s = start_pos_s.value_or(0.0);
+            gpu_recovery_.want_play = autoplay;
+            return false;
+        }
+
         gpu_recovery_ = {};
-        if (!bind_device(d3d, gfx_epoch)) {
+        close_source_only();
+
+        if (!bind_device(d3d, gfx_epoch) || !create_engine_instance()) {
             current_path_ = path;
             phase_ = LoadPhase::Failed;
             return false;
         }
-
-        close_source_only();
 
         current_path_ = path;
         phase_ = LoadPhase::WaitingLoadStart;
@@ -219,21 +237,47 @@ public:
         engine_->SetVolume(volume_);
         engine_->SetMuted(muted_ ? TRUE : FALSE);
 
-        const std::wstring mf_url = normalize_mf_source_path(path);
-        const auto bstr = wil::make_bstr_nothrow(mf_url.c_str());
-        if (!bstr) {
-            phase_ = LoadPhase::Failed;
-            return false;
+        HRESULT hr_src = E_FAIL;
+        if (const auto engine_ex = engine_.try_query<IMFMediaEngineEx>()) {
+            wil::com_ptr<IStream> file_stream;
+            if (SUCCEEDED(SHCreateStreamOnFileEx(
+                    path.c_str(),
+                    static_cast<DWORD>(STGM_READ) | static_cast<DWORD>(STGM_SHARE_DENY_NONE),
+                    FILE_ATTRIBUTE_NORMAL,
+                    FALSE,
+                    nullptr,
+                    &file_stream)) &&
+                file_stream) {
+                wil::com_ptr<IMFByteStream> byte_stream;
+                if (SUCCEEDED(MFCreateMFByteStreamOnStream(file_stream.get(), &byte_stream)) && byte_stream) {
+                    const std::wstring hint_url = make_mf_extension_hint_url(path);
+                    const auto hint_bstr = wil::make_bstr_nothrow(hint_url.c_str());
+                    if (hint_bstr) {
+                        hr_src = engine_ex->SetSourceFromByteStream(byte_stream.get(), hint_bstr.get());
+                    }
+                }
+            }
         }
 
-        opening_sync_ = true;
-        const HRESULT hr_src = engine_->SetSource(bstr.get());
-        const HRESULT hr_load = SUCCEEDED(hr_src) ? engine_->Load() : hr_src;
-        (void)process_events();
-        opening_sync_ = false;
+        if (FAILED(hr_src)) {
+            const std::wstring mf_url = make_file_url(path);
+            const auto bstr = wil::make_bstr_nothrow(mf_url.c_str());
+            if (!bstr) {
+                shutdown_instance_only();
+                phase_ = LoadPhase::Failed;
+                return false;
+            }
+            hr_src = engine_->SetSource(bstr.get());
+        }
 
-        if (FAILED(hr_src) || FAILED(hr_load)) {
+        (void)process_events();
+
+        if (FAILED(hr_src) || phase_ == LoadPhase::Failed) {
+            shutdown_instance_only();
             phase_ = LoadPhase::Failed;
+            want_play_ = false;
+            scrubbing_ = false;
+            has_frame_ = false;
             return false;
         }
         return true;
@@ -261,6 +305,7 @@ public:
 
         bool changed = false;
         for (size_t i = 0; i < n; ++i) {
+            if (phase_ == LoadPhase::Failed || !engine_) break;
             const DWORD ev = events[i];
             switch (ev) {
                 case MF_MEDIA_ENGINE_EVENT_LOADSTART:
@@ -274,15 +319,14 @@ public:
                 case MF_MEDIA_ENGINE_EVENT_CANPLAY:
                 case MF_MEDIA_ENGINE_EVENT_CANPLAYTHROUGH:
                 case MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY: {
-                    if (phase_ == LoadPhase::WaitingLoadStart) break;
                     phase_ = LoadPhase::Ready;
                     if (!engine_->HasVideo() && engine_->HasAudio()) {
                         audio_only_ = true;
                     }
-                    if (deferred_resume_seek_) {
+                    if (deferred_resume_seek_ && duration() > 0.0) {
                         const double target = *deferred_resume_seek_;
                         deferred_resume_seek_.reset();
-                        if (duration() > 0.0) seek(target);
+                        seek(target);
                     }
                     if (!autoplay_handled_) {
                         autoplay_handled_ = true;
@@ -306,11 +350,6 @@ public:
                     break;
                 }
                 case MF_MEDIA_ENGINE_EVENT_ERROR: {
-                    wil::com_ptr<IMFMediaError> err;
-                    const bool has_err = SUCCEEDED(engine_->GetError(&err)) && err != nullptr;
-                    if ((phase_ == LoadPhase::WaitingLoadStart && !opening_sync_ && !has_err) || phase_ == LoadPhase::Failed) {
-                        break;
-                    }
                     phase_ = LoadPhase::Failed;
                     want_play_ = false;
                     scrubbing_ = false;
@@ -342,10 +381,13 @@ public:
     }
 
     /// Transfers a newly decoded video frame (or re-scales on resize/seek) into `video_bmp_`.
-    [[nodiscard]] MediaTickStatus tick(ID3D11Device* d3d, ID2D1DeviceContext* dc) noexcept {
+    [[nodiscard]] MediaTickStatus tick(ID3D11Device* d3d, uint64_t gfx_epoch, ID2D1DeviceContext* dc) noexcept {
         if (!engine_ || !d3d || !dc || current_path_.empty() ||
             phase_ == LoadPhase::Idle || phase_ == LoadPhase::Failed) {
             return MediaTickStatus::NoChange;
+        }
+        if (bound_epoch_ == 0 || gfx_epoch != bound_epoch_) {
+            return MediaTickStatus::DeviceLost;
         }
 
         // Recover if Media Foundation finished seeking without delivering SEEKED.
@@ -413,7 +455,7 @@ public:
 
             const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_NONE,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
                 96.0f, 96.0f);
             hr = dc->CreateBitmapFromDxgiSurface(surface.get(), &props, &video_bmp_);
             if (is_device_lost_hr(hr)) {
@@ -571,6 +613,22 @@ private:
                hr == MF_E_DXGI_DEVICE_NOT_INITIALIZED;
     }
 
+    [[nodiscard]] static std::wstring make_file_url(std::wstring_view path) {
+        std::wstring normalized = normalize_mf_source_path(path);
+        auto url_len = static_cast<DWORD>(normalized.size() + 64u);
+        std::wstring url(url_len, L'\0');
+        HRESULT hr = UrlCreateFromPathW(normalized.c_str(), url.data(), &url_len, 0);
+        if (hr == E_POINTER && url_len > 0) {
+            url.resize(url_len);
+            hr = UrlCreateFromPathW(normalized.c_str(), url.data(), &url_len, 0);
+        }
+        if (SUCCEEDED(hr) && url_len > 0) {
+            url.resize(url_len);
+            return url;
+        }
+        return normalized;
+    }
+
     bool ensure_mf() noexcept {
         if (mf_started_) return true;
         if (FAILED(MFStartup(MF_VERSION))) return false;
@@ -605,40 +663,52 @@ private:
             }
             bound_epoch_ = gfx_epoch;
         }
+        return true;
+    }
 
-        if (!engine_) {
-            wil::com_ptr<IMFMediaEngineClassFactory> factory;
-            if (FAILED(CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) ||
-                !factory) {
-                return false;
-            }
+    bool create_engine_instance() noexcept {
+        shutdown_instance_only();
+        if (!dxgi_manager_) return false;
 
-            wil::com_ptr<IMFAttributes> attrs;
-            if (FAILED(MFCreateAttributes(&attrs, 3)) || !attrs) return false;
+        wil::com_ptr<IMFMediaEngineClassFactory> factory;
+        if (FAILED(CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) ||
+            !factory) {
+            return false;
+        }
 
-            auto* notify_raw = new (std::nothrow) MediaEngineNotify(notify_hwnd_, notify_msg_);
-            if (!notify_raw) return false;
-            notify_cb_.attach(notify_raw);
-            attrs->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, notify_cb_.get());
-            attrs->SetUnknown(MF_MEDIA_ENGINE_DXGI_MANAGER, dxgi_manager_.get());
-            attrs->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM);
+        wil::com_ptr<IMFAttributes> attrs;
+        if (FAILED(MFCreateAttributes(&attrs, 3)) || !attrs) return false;
 
-            if (FAILED(factory->CreateInstance(0, attrs.get(), &engine_)) || !engine_) {
-                notify_cb_->detach();
-                notify_cb_.reset();
-                engine_.reset();
-                return false;
-            }
+        auto* notify_raw = new (std::nothrow) MediaEngineNotify(notify_hwnd_, notify_msg_);
+        if (!notify_raw) return false;
+        notify_cb_.attach(notify_raw);
+        attrs->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, notify_cb_.get());
+        attrs->SetUnknown(MF_MEDIA_ENGINE_DXGI_MANAGER, dxgi_manager_.get());
+        attrs->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM);
+
+        if (FAILED(factory->CreateInstance(0, attrs.get(), &engine_)) || !engine_) {
+            notify_cb_->detach();
+            notify_cb_.reset();
+            engine_.reset();
+            return false;
         }
         return true;
     }
 
-    void close_source_only() noexcept {
+    void shutdown_instance_only() noexcept {
+        if (notify_cb_) {
+            notify_cb_->detach();
+            notify_cb_.reset();
+        }
         if (engine_) {
             engine_->Pause();
-            engine_->SetSource(nullptr);
+            engine_->Shutdown();
+            engine_.reset();
         }
-        if (notify_cb_) notify_cb_->clear();
+    }
+
+    void close_source_only() noexcept {
+        shutdown_instance_only();
         reset_source_state();
     }
 
@@ -662,7 +732,6 @@ private:
         scrubbing_ = false;
         autoplay_handled_ = false;
         audio_only_ = false;
-        opening_sync_ = false;
         deferred_resume_seek_.reset();
         reset_frame_state();
     }
@@ -679,16 +748,7 @@ private:
     }
 
     void shutdown_engine() noexcept {
-        if (notify_cb_) {
-            notify_cb_->detach();
-            notify_cb_.reset();
-        }
-        if (engine_) {
-            engine_->Pause();
-            engine_->SetSource(nullptr);
-            engine_->Shutdown();
-            engine_.reset();
-        }
+        shutdown_instance_only();
         video_bmp_.reset();
         video_tex_.reset();
         dxgi_manager_.reset();
@@ -705,7 +765,6 @@ private:
     bool scrubbing_ = false;
     bool autoplay_handled_ = false;
     bool audio_only_ = false;
-    bool opening_sync_ = false;
     LoadPhase phase_ = LoadPhase::Idle;
     std::wstring current_path_;
     std::optional<double> deferred_resume_seek_;

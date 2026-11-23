@@ -74,6 +74,7 @@ struct Shared {
     wil::unique_event_nothrow stop_event_;
 
     std::atomic<HWND> call_hwnd{nullptr}; // window that runs marshalled callbacks
+    DWORD ui_thread_id = GetCurrentThreadId();
     bool test_mode = false;
     HotkeyState hotkey_state = HotkeyState::Unknown;
     int background_jobs = 0;         // downloads / installs in flight: the process must not idle-exit under them
@@ -199,7 +200,7 @@ struct Shared {
             }
             if (redraw_all) redraw_all();
         };
-        if (call_hwnd && GetWindowThreadProcessId(call_hwnd, nullptr) != GetCurrentThreadId()) {
+        if (GetCurrentThreadId() != ui_thread_id) {
             call(std::move(apply));
         } else {
             apply();

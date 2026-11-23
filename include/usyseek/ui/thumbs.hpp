@@ -8,6 +8,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <limits>
 #include <list>
 #include <mutex>
 #include <thread>
@@ -59,7 +60,16 @@ inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px,
         const UINT sw = std::max(1u, static_cast<UINT>(std::lround(w * s)));
         const UINT shh = std::max(1u, static_cast<UINT>(std::lround(h * s)));
         wil::com_ptr<IWICBitmapScaler> scaler;
-        if (FAILED(wic->CreateBitmapScaler(&scaler)) || FAILED(scaler->Initialize(src.get(), sw, shh, WICBitmapInterpolationModeHighQualityCubic))) return std::nullopt;
+        if (FAILED(wic->CreateBitmapScaler(&scaler))) return std::nullopt;
+        if (FAILED(scaler->Initialize(src.get(), sw, shh, WICBitmapInterpolationModeHighQualityCubic))) {
+            // Some pixel formats (CMYK, indexed, HDR, etc.) cannot be scaled directly without converting first.
+            wil::com_ptr<IWICFormatConverter> pre;
+            if (FAILED(wic->CreateFormatConverter(&pre)) ||
+                FAILED(pre->Initialize(src.get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) ||
+                FAILED(scaler->Initialize(pre.get(), sw, shh, WICBitmapInterpolationModeHighQualityCubic))) {
+                return std::nullopt;
+            }
+        }
         src = scaler;
     }
     // EXIF orientation as a rotation followed by an optional horizontal mirror
@@ -88,7 +98,10 @@ inline std::optional<Raster> decode_image(const std::wstring& path, UINT max_px,
     Raster r;
     if (FAILED(conv->GetSize(&r.w, &r.h)) || !r.w || !r.h) return std::nullopt;
     const uint64_t total_pixels = static_cast<uint64_t>(r.w) * r.h;
-    if (total_pixels > pixel_limit || r.w > MAX_DECODE_PIXELS) return std::nullopt;
+    if (total_pixels > pixel_limit || r.w > (std::numeric_limits<UINT>::max() / 4u) ||
+        total_pixels > (std::numeric_limits<UINT>::max() / 4u)) {
+        return std::nullopt;
+    }
     const size_t stride = static_cast<size_t>(r.w) * 4;
     const size_t byte_size = static_cast<size_t>(total_pixels) * 4;
     r.pixels.resize(byte_size);
@@ -109,8 +122,13 @@ public:
     ~Thumbs() { stop(); }
 
     void start(HWND notify, UINT msg, unsigned threads = 3) {
-        notify_ = notify;
-        msg_ = msg;
+        if (!workers_.empty()) stop();
+        {
+            const std::scoped_lock lk{m_};
+            notify_ = notify;
+            msg_ = msg;
+            stopping_ = false;
+        }
         for (unsigned i = 0; i < threads; ++i) workers_.emplace_back([this](const std::stop_token& st) { worker(st); });
     }
 
@@ -118,6 +136,7 @@ public:
         {
             const std::scoped_lock lk{m_};
             stopping_ = true;
+            notify_ = nullptr;
         }
         cv_.notify_all();
         workers_.clear();
@@ -125,10 +144,12 @@ public:
 
     /// Newest requests are served first; the queue is bounded so scrolled-past cards are dropped.
     void request(uint64_t id, const std::wstring& path, UINT px) {
+        if (px == 0) return;
         if (failed_.contains(id)) return;
         if (const auto it = bitmaps_.find(id); it != bitmaps_.end() && it->second.px >= px) return;
         {
             const std::scoped_lock lk{m_};
+            if (stopping_) return;
             if (!pending_.insert(id).second) return;
             queue_.push_front({.id = id, .path = path, .px = px, .gen = clear_gen_});
             while (queue_.size() > (full_ ? 6u : 64u)) {
@@ -151,19 +172,21 @@ public:
 
     /// UI thread: turn finished decodes into device bitmaps.
     bool process(ID2D1DeviceContext* dc) {
+        if (!dc) return false;
         done_scratch_.clear();
         {
             const std::scoped_lock lk{m_};
             done_scratch_.swap(done_);
         }
         for (auto& d : done_scratch_) {
-            if (d.pixels.empty()) {
+            if (d.pixels.empty() || d.w == 0 || d.h == 0 || d.w > 16384u || d.h > 16384u ||
+                d.pixels.size() < static_cast<size_t>(d.w) * d.h * 4u) {
                 failed_.insert(d.id);
                 continue;
             }
             wil::com_ptr<ID2D1Bitmap1> bmp;
             const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-            const HRESULT hr = dc->CreateBitmap(D2D1::SizeU(d.w, d.h), d.pixels.data(), d.w * 4, &props, &bmp);
+            const HRESULT hr = dc->CreateBitmap(D2D1::SizeU(d.w, d.h), d.pixels.data(), d.w * 4u, &props, &bmp);
             if (FAILED(hr)) {
                 if (hr != D2DERR_RECREATE_TARGET && hr != DXGI_ERROR_DEVICE_REMOVED && hr != DXGI_ERROR_DEVICE_RESET) {
                     failed_.insert(d.id);
@@ -233,7 +256,10 @@ private:
     };
 
     void worker(const std::stop_token& st) {
-        const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_MULTITHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
+        // IShellItemImageFactory thumbnail providers expect an STA apartment; WIC/resvg full decode works in MTA.
+        const DWORD com_flags = (full_ ? static_cast<DWORD>(COINIT_MULTITHREADED) : static_cast<DWORD>(COINIT_APARTMENTTHREADED)) |
+                                static_cast<DWORD>(COINIT_DISABLE_OLE1DDE);
+        const ulp::win::COMWrapper<false> com{com_flags};
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         wil::com_ptr<IWICImagingFactory> wic;
         if (full_) {
@@ -245,8 +271,8 @@ private:
             Req r;
             {
                 std::unique_lock lk{m_};
-                cv_.wait(lk, [&] { return stopping_ || !queue_.empty(); });
-                if (stopping_) return;
+                cv_.wait(lk, [&] { return stopping_ || st.stop_requested() || !queue_.empty(); });
+                if (stopping_ || st.stop_requested()) return;
                 r = std::move(queue_.front());
                 queue_.pop_front();
             }
@@ -261,16 +287,18 @@ private:
             } else {
                 load(r, d);
             }
-            bool should_notify = false;
+            HWND notify_hwnd = nullptr;
+            UINT notify_msg = 0;
             {
                 const std::scoped_lock lk{m_};
-                if (r.gen == clear_gen_) {
+                if (!stopping_ && r.gen == clear_gen_) {
                     pending_.erase(r.id);
                     done_.push_back(std::move(d));
-                    should_notify = true;
+                    notify_hwnd = notify_;
+                    notify_msg = msg_;
                 }
             }
-            if (should_notify && notify_) PostMessageW(notify_, msg_, 0, 0);
+            if (notify_hwnd && notify_msg) PostMessageW(notify_hwnd, notify_msg, 0, 0);
         }
     }
 
@@ -314,9 +342,13 @@ private:
         const wil::unique_hbitmap bmp{raw};
 
         BITMAP info{};
-        if (!GetObjectW(bmp.get(), sizeof(info), &info) || info.bmWidth <= 0 || info.bmHeight == 0) return;
+        if (!GetObjectW(bmp.get(), sizeof(info), &info) ||
+            info.bmWidth <= 0 || info.bmHeight == 0 || info.bmHeight == std::numeric_limits<LONG>::min()) {
+            return;
+        }
         const UINT w = static_cast<UINT>(info.bmWidth);
-        const UINT h = static_cast<UINT>(std::abs(info.bmHeight));
+        const UINT h = info.bmHeight < 0 ? static_cast<UINT>(-info.bmHeight) : static_cast<UINT>(info.bmHeight);
+        if (w > 16384u || h > 16384u || static_cast<uint64_t>(w) * h > (64ull << 20u)) return;
         BITMAPINFO bi{};
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bi.bmiHeader.biWidth = static_cast<LONG>(w);
@@ -324,8 +356,9 @@ private:
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
         bi.bmiHeader.biCompression = BI_RGB;
-        d.pixels.resize(static_cast<size_t>(w) * h * 4);
         const wil::unique_hdc_window screen{GetDC(nullptr)};
+        if (!screen) return;
+        d.pixels.resize(static_cast<size_t>(w) * h * 4);
         if (GetDIBits(screen.get(), bmp.get(), 0, h, d.pixels.data(), &bi, DIB_RGB_COLORS) != static_cast<int>(h)) {
             d.pixels.clear();
             return;

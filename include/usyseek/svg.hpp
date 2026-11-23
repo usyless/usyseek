@@ -58,7 +58,10 @@ inline std::optional<Raster> render(std::wstring_view path, uint32_t box_w, uint
         if (error) *error = r.pixels.str();
         return std::nullopt;
     }
-    if (r.pixels.b.len != static_cast<size_t>(info.width) * info.height * 4) return std::nullopt;
+    if (info.width == 0 || info.height == 0 ||
+        r.pixels.b.len != static_cast<size_t>(info.width) * info.height * 4) {
+        return std::nullopt;
+    }
     r.width = info.width;
     r.height = info.height;
     r.src_width = info.src_width;

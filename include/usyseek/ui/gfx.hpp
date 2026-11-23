@@ -150,6 +150,10 @@ private:
         }
         if (FAILED(hr)) return false;
 
+        if (const auto mt = d3d_.try_query<ID3D10Multithread>()) {
+            mt->SetMultithreadProtected(TRUE);
+        }
+
         if (FAILED(d3d_->QueryInterface(IID_PPV_ARGS(&dxgi_device_)))) return false;
         if (const auto d1 = dxgi_device_.try_query<IDXGIDevice1>()) d1->SetMaximumFrameLatency(1);
 

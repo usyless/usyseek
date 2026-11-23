@@ -50,6 +50,34 @@ struct FitBox {
     return std::wstring{path};
 }
 
+/// Builds a safe synthetic `file:///media.<ext>` URL hint for `IMFMediaEngineEx::SetSourceFromByteStream`
+/// so Media Foundation can sniff container format without parsing `#`, `?`, `%`, or >2084-char local paths.
+[[nodiscard]] inline std::wstring make_mf_extension_hint_url(std::wstring_view path) {
+    std::wstring out = L"file:///media";
+    const size_t slash = path.find_last_of(L"\\/");
+    const size_t dot = path.find_last_of(L'.');
+    if (dot != std::wstring_view::npos && (slash == std::wstring_view::npos || dot > slash)) {
+        const std::wstring_view ext = path.substr(dot + 1);
+        if (!ext.empty() && ext.size() <= 16u) {
+            bool ascii_alnum = true;
+            for (const wchar_t c : ext) {
+                const bool ok = (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9');
+                if (!ok) {
+                    ascii_alnum = false;
+                    break;
+                }
+            }
+            if (ascii_alnum) {
+                out.push_back(L'.');
+                for (const wchar_t c : ext) {
+                    out.push_back((c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c + (L'a' - L'A')) : c);
+                }
+            }
+        }
+    }
+    return out;
+}
+
 /// Normalizes a raw GIF delay in 10ms centiseconds per browser convention (`<= 1cs` -> `100ms`), clamped to `60s`.
 [[nodiscard]] inline uint32_t normalize_gif_delay_ms(uint32_t delay_cs) noexcept {
     if (delay_cs < 2u) return 100u;
@@ -119,6 +147,20 @@ public:
     bool apply_frame(
         uint32_t left, uint32_t top, uint32_t fw, uint32_t fh,
         std::span<const uint8_t> frame_pbgra, GifDisposal disposal, std::vector<uint8_t>& out_pbgra) {
+        return apply_frame_impl(left, top, fw, fh, frame_pbgra, disposal, &out_pbgra);
+    }
+
+    /// Advances the internal canvas state by one frame without copying out the full canvas (used during seek fast-forward).
+    bool advance_frame(
+        uint32_t left, uint32_t top, uint32_t fw, uint32_t fh,
+        std::span<const uint8_t> frame_pbgra, GifDisposal disposal) {
+        return apply_frame_impl(left, top, fw, fh, frame_pbgra, disposal, nullptr);
+    }
+
+private:
+    bool apply_frame_impl(
+        uint32_t left, uint32_t top, uint32_t fw, uint32_t fh,
+        std::span<const uint8_t> frame_pbgra, GifDisposal disposal, std::vector<uint8_t>* out_pbgra) {
         if (cw_ == 0 || ch_ == 0 || fw == 0 || fh == 0) return false;
         const size_t frame_stride = static_cast<size_t>(fw) * 4u;
         if (frame_pbgra.size() < frame_stride * fh) return false;
@@ -148,7 +190,9 @@ public:
             }
         }
 
-        out_pbgra = canvas_;
+        if (out_pbgra) {
+            *out_pbgra = canvas_;
+        }
 
         if (copy_w > 0 && copy_h > 0) {
             if (disposal == GifDisposal::RestoreBg) {
@@ -162,8 +206,6 @@ public:
         }
         return true;
     }
-
-private:
     void save_patch(uint32_t left, uint32_t top, uint32_t copy_w, uint32_t copy_h) {
         const size_t patch_row = static_cast<size_t>(copy_w) * 4u;
         const size_t canvas_stride = static_cast<size_t>(cw_) * 4u;

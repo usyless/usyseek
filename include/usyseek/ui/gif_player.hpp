@@ -124,6 +124,8 @@ public:
             ui_settled_static_ = true;
             ui_static_fallback_error_ = session_.static_fallback_error;
             ui_total_frames_ = 0;
+            ui_current_pixels_.reset();
+            reset_gpu();
             changed = true;
             return changed;
         }
@@ -308,7 +310,8 @@ public:
         } else {
             session_.stream_queue_.clear();
             session_.seek_target = target;
-            ++session_.seek_seq;
+            const uint64_t next_seek = ++session_.seek_seq;
+            seek_seq_.store(next_seek, std::memory_order_release);
             ui_waiting_stream_frame_ = true;
             ui_current_index_ = target;
             cv_.notify_one();
@@ -377,6 +380,7 @@ private:
         session_.stream_queue_.clear();
         session_.seek_seq = 0;
         session_.seek_target = 0;
+        seek_seq_.store(0, std::memory_order_release);
     }
 
     void ui_reset_state() noexcept {
@@ -422,6 +426,10 @@ private:
 
     void ensure_worker_started() {
         if (!worker_.joinable()) {
+            {
+                const std::scoped_lock lk{mtx_};
+                stopping_.store(false, std::memory_order_release);
+            }
             worker_ = std::jthread([this](const std::stop_token& st) { worker_loop(st); });
         }
     }
@@ -438,7 +446,6 @@ private:
 
     struct OpenedDecoder {
         wil::com_ptr<IWICBitmapDecoder> decoder;
-        std::vector<uint8_t> mem_file;
         wil::com_ptr<IStream> mem_stream;
     };
 
@@ -456,18 +463,19 @@ private:
 
         const auto bytes = static_cast<uint64_t>(fsize.QuadPart);
         if (bytes <= MAX_FILE_MEM_BYTES) {
-            res.mem_file.resize(static_cast<size_t>(bytes));
+            std::vector<uint8_t> mem_file(static_cast<size_t>(bytes));
             size_t total_read = 0;
-            while (total_read < res.mem_file.size()) {
-                const DWORD chunk = static_cast<DWORD>(std::min<uint64_t>(res.mem_file.size() - total_read, 16ull << 20u));
+            while (total_read < mem_file.size()) {
+                const DWORD chunk = static_cast<DWORD>(std::min<uint64_t>(mem_file.size() - total_read, 16ull << 20u));
                 DWORD got = 0;
-                if (!ReadFile(fh.get(), res.mem_file.data() + total_read, chunk, &got, nullptr) || got == 0) {
+                if (!ReadFile(fh.get(), mem_file.data() + total_read, chunk, &got, nullptr) || got == 0) {
                     return std::nullopt;
                 }
                 total_read += got;
             }
             fh.reset(); // Release OS file lock immediately
-            IStream* raw_stream = SHCreateMemStream(res.mem_file.data(), static_cast<UINT>(res.mem_file.size()));
+            // SHCreateMemStream copies the source buffer internally; `mem_file` is freed on return.
+            IStream* raw_stream = SHCreateMemStream(mem_file.data(), static_cast<UINT>(mem_file.size()));
             if (!raw_stream) return std::nullopt;
             res.mem_stream.attach(raw_stream);
             if (FAILED(wic->CreateDecoderFromStream(res.mem_stream.get(), nullptr, WICDecodeMetadataCacheOnDemand, &res.decoder))) {
@@ -525,7 +533,7 @@ private:
 
         wil::com_ptr<IWICImagingFactory> wic;
         if (FAILED(CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) {
-            return;
+            wic.reset();
         }
 
         while (!st.stop_requested()) {
@@ -537,13 +545,18 @@ private:
                 job = std::move(pending_job_);
                 has_pending_job_ = false;
             }
+            if (!wic) {
+                mark_static(job.gen, true);
+                continue;
+            }
             run_job(st, wic.get(), job);
         }
     }
 
     void run_job(const std::stop_token& st, IWICImagingFactory* wic, const Job& job) {
         const auto aborted = [&] noexcept {
-            return st.stop_requested() || stopping_ || generation_.load(std::memory_order_relaxed) != job.gen;
+            return st.stop_requested() || stopping_.load(std::memory_order_acquire) ||
+                   generation_.load(std::memory_order_acquire) != job.gen;
         };
         if (aborted()) return;
 
@@ -590,7 +603,8 @@ private:
         }
 
         const uint64_t frame_bytes = static_cast<uint64_t>(out_w) * out_h * 4u;
-        const bool streaming = (frame_bytes * total) > MAX_RAM_BYTES;
+        const uint64_t per_frame_ram = frame_bytes + sizeof(Frame) + 64u;
+        const bool streaming = total > (MAX_RAM_BYTES / std::max<uint64_t>(1u, per_frame_ram));
         const size_t stream_window = streaming
             ? std::clamp<size_t>(static_cast<size_t>(MAX_RAM_BYTES / std::max<uint64_t>(1u, frame_bytes)), 4u, 12u)
             : 0u;
@@ -605,7 +619,7 @@ private:
             session_.out_h = out_h;
             session_.total_frames = total;
             session_.streaming = streaming;
-            if (!streaming) session_.cached_frames.reserve(total);
+            if (!streaming) session_.cached_frames.reserve(std::min<size_t>(total, 4096u));
         }
 
         GifCompositor comp{cw, ch};
@@ -649,17 +663,18 @@ private:
                 return false;
             }
 
+            if (!produce_output) {
+                return comp.advance_frame(left, top, fw, fh, raw_frame, disposal);
+            }
             if (!comp.apply_frame(left, top, fw, fh, raw_frame, disposal, composed)) {
                 return false;
             }
 
-            if (produce_output) {
-                auto scaled = scale_canvas_if_needed(wic, cw, ch, out_w, out_h, composed);
-                if (!scaled) return false;
-                out_frame.pbgra = std::move(scaled);
-                out_frame.delay_ms = normalize_gif_delay_ms(delay_cs);
-                out_frame.index = idx;
-            }
+            auto scaled = scale_canvas_if_needed(wic, cw, ch, out_w, out_h, composed);
+            if (!scaled) return false;
+            out_frame.pbgra = std::move(scaled);
+            out_frame.delay_ms = normalize_gif_delay_ms(delay_cs);
+            out_frame.index = idx;
             return true;
         };
 
@@ -696,6 +711,7 @@ private:
         // Streaming loop for giant multi-hundred-MB GIFs
         UINT next_idx = 0;
         uint64_t seen_seek_seq = 0;
+        uint32_t consecutive_failures = 0;
         bool any_stream_frame = false;
         while (!aborted()) {
             std::optional<size_t> seek_to;
@@ -715,11 +731,17 @@ private:
             if (seek_to) {
                 comp.reset();
                 const UINT target = static_cast<UINT>(std::min<size_t>(*seek_to, total - 1));
+                bool superseded = false;
                 for (UINT i = 0; i < target; ++i) {
                     if (aborted()) return;
+                    if (seek_seq_.load(std::memory_order_acquire) != seen_seek_seq) {
+                        superseded = true;
+                        break;
+                    }
                     Frame dummy;
                     (void)decode_one(i, false, dummy);
                 }
+                if (superseded) continue;
                 next_idx = target;
             }
 
@@ -731,12 +753,13 @@ private:
             const bool ok = decode_one(next_idx, true, f);
             next_idx = (next_idx + 1) % total;
             if (!ok) {
-                if (next_idx == 0) {
+                if (++consecutive_failures >= total) {
                     if (!any_stream_frame && !aborted()) mark_static(job.gen, true);
                     return;
                 }
                 continue;
             }
+            consecutive_failures = 0;
 
             bool notify = false;
             {
@@ -759,6 +782,7 @@ private:
     std::mutex mtx_;
     std::condition_variable cv_;
     std::atomic<uint64_t> generation_{0};
+    std::atomic<uint64_t> seek_seq_{0};
     std::atomic<bool> stopping_{false};
     bool has_pending_job_ = false;
     Job pending_job_;
