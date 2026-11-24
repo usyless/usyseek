@@ -233,6 +233,7 @@ public:
         if (rendering_ || (!live_visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         rendering_ = true;
+        const auto clear_rendering = wil::scope_exit([&] { rendering_ = false; });
         dirty_ = false;
 
         const float prev_scroll = scroll_;
@@ -712,7 +713,7 @@ private:
         const TabLayout tlayout = tab_layout(sz.width);
         const float strip_h = tlayout.height + 16.0f;
         const bool need_scene = glass && (!cv.dirty_clip() || cv.dirty_clip()->top < strip_h + 24.0f || tooltip_visible());
-        const bool has_scene = need_scene && glass_.begin_scene(target_, sh_.gfx);
+        const bool has_scene = need_scene && glass_.begin_scene(cv, target_);
         if (glass) {
             if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, D2D1::RectF(0.0f, 0.0f, sz.width, sz.height),
                                            make_desktop_glass_style(cv.theme(), 0.0f, true))) {
@@ -758,8 +759,10 @@ private:
 
         if (has_scene) glass_.end_scene(target_);
         if (need_scene) {
-            glass_.draw_scene_glass(cv, target_, sh_.gfx, D2D1::RectF(0.0f, 0.0f, sz.width, strip_h),
-                                    make_overlay_glass_style(cv.theme(), 0.0f, 1.8f));
+            const D2D1_RECT_F strip_r = D2D1::RectF(0.0f, 0.0f, sz.width, strip_h);
+            if (!has_scene || !glass_.draw_scene_glass(cv, target_, sh_.gfx, strip_r, make_overlay_glass_style(cv.theme(), 0.0f, 1.8f))) {
+                cv.fill(strip_r, with_alpha(cv.theme().surface_high, cv.theme().dark_mode ? 0.56f : 0.72f));
+            }
             draw_tabs(cv, sz, strip_h, tlayout);
         }
         draw_tooltip(cv, glass_, target_, sh_.gfx, sz, tooltip_.anchor, tooltip_.title, tooltip_.subtitle, tooltip_.alpha.value);
@@ -4103,12 +4106,13 @@ private:
                                 .x = wpos->x + (cur_origin.x - win_rc.left),
                                 .y = wpos->y + (cur_origin.y - win_rc.top),
                             };
-                            if (next_origin.x != glass_.last_rendered_origin().x ||
-                                next_origin.y != glass_.last_rendered_origin().y) {
+                            if (!rendering_ &&
+                                (next_origin.x != glass_.last_rendered_origin().x ||
+                                 next_origin.y != glass_.last_rendered_origin().y)) {
                                 glass_.set_origin_override(next_origin);
+                                const auto clear_override = wil::scope_exit([&] { glass_.set_origin_override(std::nullopt); });
                                 full_dirty_ = true;
                                 render();
-                                glass_.set_origin_override(std::nullopt);
                                 if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
                             }
                         }
@@ -4171,6 +4175,8 @@ private:
                 }
                 return 0;
             case WM_DISPLAYCHANGE:
+                sh_.desktop_dupl.reset();
+                glass_.invalidate_backdrop();
                 if (visible()) {
                     if (sh_.gfx.adapter_stale(hwnd_)) recover();
                     invalidate();

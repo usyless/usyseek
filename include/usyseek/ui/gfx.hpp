@@ -96,7 +96,7 @@ private:
         if (!f) return nullptr;
         for (UINT i = 0;; ++i) {
             wil::com_ptr<IDXGIAdapter1> a;
-            if (f->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(f->EnumAdapters1(i, &a)) || !a) break;
             DXGI_ADAPTER_DESC1 d{};
             if (SUCCEEDED(a->GetDesc1(&d)) && d.AdapterLuid.LowPart == luid.LowPart && d.AdapterLuid.HighPart == luid.HighPart) {
                 return a;
@@ -109,10 +109,10 @@ private:
         HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         for (UINT i = 0;; ++i) {
             wil::com_ptr<IDXGIAdapter1> a;
-            if (f->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+            if (FAILED(f->EnumAdapters1(i, &a)) || !a) break;
             for (UINT j = 0;; ++j) {
                 wil::com_ptr<IDXGIOutput> o;
-                if (a->EnumOutputs(j, &o) == DXGI_ERROR_NOT_FOUND) break;
+                if (FAILED(a->EnumOutputs(j, &o)) || !o) break;
                 DXGI_OUTPUT_DESC od{};
                 if (SUCCEEDED(o->GetDesc(&od)) && od.Monitor == mon) return a;
             }
@@ -166,18 +166,25 @@ private:
 
         if (FAILED(d2d_factory_->CreateDevice(dxgi_device_.get(), &d2d_device_))) return false;
         // Keep the D2D glyph/bitmap caches small outside Liquid Glass.
-        d2d_device_->SetMaximumTextureMemory(32ull << 20u);
+        apply_glass_texture_budget();
         ++epoch_;
         if (on_device_changed) on_device_changed();
         return true;
     }
 
 public:
-    void set_glass_texture_budget(bool glass) noexcept {
-        if (d2d_device_) {
-            d2d_device_->SetMaximumTextureMemory((glass ? 128ull : 32ull) << 20u);
-        }
+    void add_glass_target() noexcept {
+        ++glass_target_count_;
+        apply_glass_texture_budget();
     }
+
+    void remove_glass_target() noexcept {
+        if (glass_target_count_ > 0) --glass_target_count_;
+        apply_glass_texture_budget();
+    }
+
+    [[nodiscard]] bool liquid_glass_registered() const noexcept { return liquid_glass_registered_; }
+    void mark_liquid_glass_registered() noexcept { liquid_glass_registered_ = true; }
 
     void wait_gpu() noexcept {
         if (!d3d_ || !d3d_ctx_) return;
@@ -188,12 +195,24 @@ public:
         d3d_ctx_->End(frame_query_.get());
         d3d_ctx_->Flush();
         BOOL done = FALSE;
-        while (d3d_ctx_->GetData(frame_query_.get(), &done, sizeof(done), 0) == S_FALSE) {
-            YieldProcessor();
+        const ULONGLONG deadline = GetTickCount64() + 100u;
+        for (uint32_t spins = 0; d3d_ctx_->GetData(frame_query_.get(), &done, sizeof(done), 0) == S_FALSE; ++spins) {
+            if (spins < 64u) {
+                YieldProcessor();
+            } else {
+                if (GetTickCount64() >= deadline || device_lost()) break;
+                SwitchToThread();
+            }
         }
     }
 
 private:
+    void apply_glass_texture_budget() noexcept {
+        if (d2d_device_) {
+            d2d_device_->SetMaximumTextureMemory((glass_target_count_ > 0 ? 128ull : 32ull) << 20u);
+        }
+    }
+
     wil::com_ptr<ID2D1Factory7> d2d_factory_;
     wil::com_ptr<IDWriteFactory3> dwrite_;
     wil::com_ptr<IWICImagingFactory> wic_;
@@ -205,23 +224,39 @@ private:
     wil::com_ptr<ID2D1Device6> d2d_device_;
     LUID luid_{};
     bool warp_ = false;
+    bool liquid_glass_registered_ = false;
+    int glass_target_count_ = 0;
     uint64_t epoch_ = 0;
 };
 
 /// Per-window swapchain composed through DirectComposition (premultiplied alpha so DWM backdrops show through).
 class WindowTarget {
 public:
+    WindowTarget() = default;
+    WindowTarget(const WindowTarget&) = delete;
+    WindowTarget& operator=(const WindowTarget&) = delete;
+    WindowTarget(WindowTarget&&) = delete;
+    WindowTarget& operator=(WindowTarget&&) = delete;
+    ~WindowTarget() {
+        sync_glass_budget(false);
+        release();
+    }
+
     bool attach(Gfx& gfx, HWND hwnd, bool liquid_glass = false) noexcept {
-        gfx_ = &gfx;
+        if (gfx_ != &gfx) {
+            sync_glass_budget(false);
+            gfx_ = &gfx;
+        }
         hwnd_ = hwnd;
         liquid_glass_ = liquid_glass;
+        sync_glass_budget(liquid_glass_);
         return rebuild();
     }
 
     void set_liquid_glass(bool on) noexcept {
         if (liquid_glass_ == on) return;
         liquid_glass_ = on;
-        if (gfx_) gfx_->set_glass_texture_budget(on);
+        sync_glass_budget(on);
         dirty_tracker_.reset();
     }
 
@@ -232,7 +267,7 @@ public:
             release();
             return false;
         }
-        gfx_->set_glass_texture_budget(liquid_glass_);
+        sync_glass_budget(liquid_glass_);
         // Keep the HWND's DirectComposition target alive across swap-effect rebuilds on theme switches.
         const bool keep_dcomp = (dcomp_ && dcomp_target_ && visual_ && epoch_ == gfx_->epoch());
         if (keep_dcomp) {
@@ -561,6 +596,16 @@ private:
         return SUCCEEDED(frame->Commit()) && SUCCEEDED(enc->Commit());
     }
 
+    void sync_glass_budget(bool want) noexcept {
+        if (want == counted_glass_ || !gfx_) return;
+        counted_glass_ = want;
+        if (want) {
+            gfx_->add_glass_target();
+        } else {
+            gfx_->remove_glass_target();
+        }
+    }
+
     Gfx* gfx_ = nullptr;
     HWND hwnd_ = nullptr;
     wil::com_ptr<ID2D1DeviceContext6> dc_;
@@ -586,6 +631,7 @@ private:
     std::optional<fs::path> capture_;
     bool capture_ok_ = false;
     bool liquid_glass_ = false;
+    bool counted_glass_ = false;
     bool dcomp_commit_pending_ = false;
 };
 

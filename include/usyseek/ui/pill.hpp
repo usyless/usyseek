@@ -90,8 +90,9 @@ public:
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
             sync_shadow(false, true);
             invalidate();
-        } else if (!should_show_shadow()) {
-            hide_shadow(!custom_pill_frame());
+        } else {
+            if (hwnd_ && visible()) ensure_window_capture_affinity(hwnd_, glass_active());
+            if (!should_show_shadow()) hide_shadow(!custom_pill_frame());
         }
     }
 
@@ -323,6 +324,7 @@ public:
         if (!ensure_target()) return;
         if (!prepare_preview_media()) return;
         rendering_ = true;
+        const auto clear_rendering = wil::scope_exit([&] { rendering_ = false; });
         dirty_ = false;
 
         const float prev_scroll = scroll_;
@@ -1627,7 +1629,7 @@ private:
 
         const bool glass = glass_active();
         const bool need_scene = glass_scene_needed();
-        const bool has_scene = need_scene && glass_.begin_scene(target_, sh_.gfx);
+        const bool has_scene = need_scene && glass_.begin_scene(cv, target_);
         if (glass) {
             if (!glass_.draw_desktop_glass(sh_.desktop_dupl, cv, target_, sh_.gfx, hwnd_, pr,
                                            make_desktop_glass_style(cv.theme(), outer_r, fullscreen_))) {
@@ -4478,12 +4480,13 @@ private:
                                     .x = wpos->x + (cur_origin.x - win_rc.left),
                                     .y = wpos->y + (cur_origin.y - win_rc.top),
                                 };
-                                if (next_origin.x != glass_.last_rendered_origin().x ||
-                                    next_origin.y != glass_.last_rendered_origin().y) {
+                                if (!rendering_ &&
+                                    (next_origin.x != glass_.last_rendered_origin().x ||
+                                     next_origin.y != glass_.last_rendered_origin().y)) {
                                     glass_.set_origin_override(next_origin);
+                                    const auto clear_override = wil::scope_exit([&] { glass_.set_origin_override(std::nullopt); });
                                     full_dirty_ = true;
                                     render();
-                                    glass_.set_origin_override(std::nullopt);
                                     if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
                                 }
                             }
@@ -4544,6 +4547,8 @@ private:
                 if (glass_active() && visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
                 return 0;
             case WM_DISPLAYCHANGE:
+                sh_.desktop_dupl.reset();
+                glass_.invalidate_backdrop();
                 if (visible()) {
                     if (sh_.gfx.adapter_stale(hwnd_)) recover();
                     invalidate();
