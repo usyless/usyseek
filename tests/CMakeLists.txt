@@ -31,11 +31,27 @@ if(MSVC)
     target_compile_options(usyseek_tests_sqlite3 PRIVATE /W0)
 endif()
 
+set(USYSEEK_TEST_USYLIBPP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../build/_deps/usylibpp-src/include")
+if(NOT EXISTS "${USYSEEK_TEST_USYLIBPP_INCLUDE_DIR}/usylibpp/strings.hpp")
+    include(FetchContent)
+    FetchContent_Declare(
+        usylibpp
+        GIT_REPOSITORY https://github.com/usyless/usylibpp.git
+        GIT_TAG main
+        GIT_SHALLOW TRUE
+        EXCLUDE_FROM_ALL
+        SYSTEM
+    )
+    FetchContent_MakeAvailable(usylibpp)
+    set(USYSEEK_TEST_USYLIBPP_INCLUDE_DIR "${usylibpp_SOURCE_DIR}/include")
+endif()
+
 file(GLOB test_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp")
 foreach(src IN LISTS test_sources)
     get_filename_component(name "${src}" NAME_WE)
     add_executable(${name} "${src}")
     target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../include")
+    target_include_directories(${name} SYSTEM PRIVATE "${USYSEEK_TEST_USYLIBPP_INCLUDE_DIR}")
     if(name STREQUAL "tag_store_test")
         target_link_libraries(${name} PRIVATE usyseek_tests_sqlite3)
     endif()
