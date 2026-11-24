@@ -33,11 +33,15 @@ public:
         gif_.shutdown();
         video_.shutdown();
         glass_.release();
+        shadow_bmp_.reset();
+        shadow_target_.release();
         target_.release();
+        if (shadow_hwnd_) DestroyWindow(shadow_hwnd_);
         if (hwnd_) DestroyWindow(hwnd_);
     }
 
     bool create(HINSTANCE inst) {
+        inst_ = inst;
         WNDCLASSEXW wc{.cbSize = sizeof(wc)};
         wc.style = CS_DBLCLKS;
         wc.lpfnWndProc = &Pill::wndproc;
@@ -51,7 +55,6 @@ public:
                                 WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN, 0, 0, 100, 100, nullptr, nullptr, inst, this);
         if (!hwnd_) return false;
         SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
-        applied_pad_ = active_pad();
         apply_window_theme(hwnd_, sh_.theme, true, true);
         if (!target_.attach(sh_.gfx, hwnd_, glass_active())) return false;
         gfx_epoch_ = sh_.gfx.epoch();
@@ -70,7 +73,7 @@ public:
     [[nodiscard]] bool visible() const noexcept { return IsWindowVisible(hwnd_) != FALSE; }
     WindowTarget& target() noexcept { return target_; }
 
-    void apply_theme() noexcept {
+    void apply_theme() {
         target_.set_liquid_glass(glass_active());
         if (glass_active()) {
             if (visible() && !fading_out_ && !sh_.test_mode) SetTimer(hwnd_, TIMER_GLASS, 16, nullptr);
@@ -80,28 +83,15 @@ public:
             sh_.desktop_dupl.reset();
         }
         full_dirty_ = true;
+        apply_shadow_window_dwm();
         if (hwnd_ && visible() && !fading_out_) {
-            const ShadowPad prev = applied_pad_;
-            const ShadowPad next = active_pad();
-            applied_pad_ = next;
             apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
-            if (!fullscreen_ && prev != next) {
-                RECT wr{};
-                GetWindowRect(hwnd_, &wr);
-                const UINT dpi = GetDpiForWindow(hwnd_);
-                const float s = dpi > 0 ? static_cast<float>(dpi) / 96.0f : target_.scale();
-                const LONG pl = static_cast<LONG>(std::lround((next.left - prev.left) * s));
-                const LONG pt = static_cast<LONG>(std::lround((next.top - prev.top) * s));
-                const LONG pr = static_cast<LONG>(std::lround((next.right - prev.right) * s));
-                const LONG pb = static_cast<LONG>(std::lround((next.bottom - prev.bottom) * s));
-                SetWindowPos(hwnd_, nullptr, wr.left - pl, wr.top - pt,
-                             (wr.right - wr.left) + pl + pr, (wr.bottom - wr.top) + pt + pb,
-                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-            } else {
-                SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-            }
+            SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            sync_shadow(false, true);
             invalidate();
+        } else if (!should_show_shadow()) {
+            hide_shadow(!custom_pill_frame());
         }
     }
 
@@ -109,7 +99,10 @@ public:
         blur_hide_tick_ = 0;
         const bool was_visible = visible() && !fading_out_;
         apply_window_theme(hwnd_, sh_.theme, true, !fullscreen_);
-        if (!was_visible || applied_pad_ != active_pad()) {
+        apply_shadow_window_dwm();
+        showing_ = true;
+        const auto clear_showing = wil::scope_exit([&] { showing_ = false; });
+        if (!was_visible) {
             place();
             if (!visible()) fade_ = sh_.test_mode ? 1.0f : 0.0f;
         }
@@ -140,6 +133,8 @@ public:
         last_tooltip_dirty_.reset();
         render();
         ValidateRect(hwnd_, nullptr);
+        showing_ = false;
+        sync_shadow(false, true);
         if (!sh_.test_mode && fade_ < 1.0f) {
             last_fade_ = std::chrono::steady_clock::now();
             SetTimer(hwnd_, TIMER_FADE, 15, nullptr);
@@ -190,6 +185,7 @@ public:
         pending_dirty_.clear();
         last_tooltip_dirty_.reset();
         full_dirty_ = true;
+        hide_shadow(false);
         ShowWindow(hwnd_, SW_HIDE);
         ValidateRect(hwnd_, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
@@ -567,20 +563,34 @@ private:
         float bottom = 0.0f;
         [[nodiscard]] bool operator==(const ShadowPad&) const noexcept = default;
     };
+    static constexpr ShadowPad SHADOW_PAD{.left = 52.0f, .top = 34.0f, .right = 52.0f, .bottom = 78.0f};
+
+    struct ShadowPadPx {
+        int left = 0;
+        int top = 0;
+        int right = 0;
+        int bottom = 0;
+    };
+
+    [[nodiscard]] static ShadowPadPx shadow_pad_px(float s) noexcept {
+        return {
+            .left = static_cast<int>(std::lround(SHADOW_PAD.left * s)),
+            .top = static_cast<int>(std::lround(SHADOW_PAD.top * s)),
+            .right = static_cast<int>(std::lround(SHADOW_PAD.right * s)),
+            .bottom = static_cast<int>(std::lround(SHADOW_PAD.bottom * s)),
+        };
+    }
 
     [[nodiscard]] bool custom_pill_frame() const noexcept {
         return !fullscreen_ && sh_.theme.pill_radius.has_value();
     }
 
-    [[nodiscard]] ShadowPad active_pad() const noexcept {
-        return custom_pill_frame() ? ShadowPad{.left = 52.0f, .top = 34.0f, .right = 52.0f, .bottom = 78.0f} : ShadowPad{};
+    [[nodiscard]] bool should_show_shadow() const noexcept {
+        return custom_pill_frame() && sh_.theme.shadow_alpha_scale > 0.002f;
     }
 
-    [[nodiscard]] D2D1_RECT_F pill_bounds(D2D1_SIZE_F sz) const noexcept {
-        const ShadowPad p = active_pad();
-        return D2D1::RectF(p.left, p.top,
-                           std::max(p.left + 1.0f, sz.width - p.right),
-                           std::max(p.top + 1.0f, sz.height - p.bottom));
+    [[nodiscard]] static D2D1_RECT_F pill_bounds(D2D1_SIZE_F sz) noexcept {
+        return D2D1::RectF(0.0f, 0.0f, std::max(1.0f, sz.width), std::max(1.0f, sz.height));
     }
 
     [[nodiscard]] float effective_pill_radius(D2D1_RECT_F pr) const noexcept {
@@ -596,8 +606,6 @@ private:
         HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
         const POINT saved{.x = sh_.settings.pill_x, .y = sh_.settings.pill_y};
         bool use_saved = sh_.settings.pill_x != INT32_MIN;
-        const ShadowPad pad = active_pad();
-        applied_pad_ = pad;
         const auto content_size_on = [&](HMONITOR m) noexcept {
             const float s = static_cast<float>(monitor_dpi(m)) / 96.0f;
             return SIZE{.cx = static_cast<LONG>((sh_.settings.pill_w > 0 ? static_cast<float>(sh_.settings.pill_w) : DEFAULT_W) * s),
@@ -616,21 +624,16 @@ private:
             }
         }
         const UINT dpi = monitor_dpi(mon);
-        const float s = static_cast<float>(dpi) / 96.0f;
         const SIZE csz = content_size_on(mon);
-        const int pad_l = static_cast<int>(std::lround(pad.left * s));
-        const int pad_t = static_cast<int>(std::lround(pad.top * s));
-        const int pad_r = static_cast<int>(std::lround(pad.right * s));
-        const int pad_b = static_cast<int>(std::lround(pad.bottom * s));
         MONITORINFO mi{.cbSize = sizeof(mi)};
         GetMonitorInfoW(mon, &mi);
         const RECT& wa = mi.rcWork;
         const int wa_w = std::max<int>(1, wa.right - wa.left);
         const int wa_h = std::max<int>(1, wa.bottom - wa.top);
-        const int w = std::min<int>(csz.cx + pad_l + pad_r, wa_w);
-        const int h = std::min<int>(csz.cy + pad_t + pad_b, wa_h);
-        int x = (use_saved ? saved.x : wa.left + ((wa_w - csz.cx) / 2)) - pad_l;
-        int y = (use_saved ? saved.y : wa.top + ((wa_h - csz.cy) / 5)) - pad_t;
+        const int w = std::min<int>(csz.cx, wa_w);
+        const int h = std::min<int>(csz.cy, wa_h);
+        int x = use_saved ? saved.x : wa.left + ((wa_w - csz.cx) / 2);
+        int y = use_saved ? saved.y : wa.top + ((wa_h - csz.cy) / 5);
         x = std::clamp<int>(x, wa.left, wa.right - w);
         y = std::clamp<int>(y, wa.top, wa.bottom - h);
         set_pos_for_dpi(HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE, dpi);
@@ -780,13 +783,12 @@ private:
         GetWindowRect(hwnd_, &wr);
         const UINT dpi = GetDpiForWindow(hwnd_);
         const float s = dpi > 0 ? static_cast<float>(dpi) / 96.0f : target_.scale();
-        const ShadowPad pad = active_pad();
         MONITORINFO mi{.cbSize = sizeof(mi)};
         int max_h = INT_MAX;
         if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) {
             max_h = std::max<int>(1, mi.rcWork.bottom - mi.rcWork.top);
         }
-        const int h = std::min(static_cast<int>(std::lround((current_height_dip() + pad.top + pad.bottom) * s)), max_h);
+        const int h = std::min(static_cast<int>(std::lround(current_height_dip() * s)), max_h);
         if (wr.bottom - wr.top != h) SetWindowPos(hwnd_, nullptr, 0, 0, wr.right - wr.left, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
@@ -795,12 +797,11 @@ private:
         RECT wr;
         GetWindowRect(hwnd_, &wr);
         const float s = target_.scale();
-        const ShadowPad pad = active_pad();
-        sh_.settings.pill_x = wr.left + static_cast<int32_t>(std::lround(pad.left * s));
-        sh_.settings.pill_y = wr.top + static_cast<int32_t>(std::lround(pad.top * s));
-        sh_.settings.pill_w = std::max<int32_t>(1, static_cast<int32_t>(std::lround((static_cast<float>(wr.right - wr.left) / s) - pad.left - pad.right)));
+        sh_.settings.pill_x = wr.left;
+        sh_.settings.pill_y = wr.top;
+        sh_.settings.pill_w = std::max<int32_t>(1, static_cast<int32_t>(std::lround(static_cast<float>(wr.right - wr.left) / s)));
         if (expanded()) {
-            sh_.settings.pill_h = std::max<int32_t>(1, static_cast<int32_t>(std::lround((static_cast<float>(wr.bottom - wr.top) / s) - pad.top - pad.bottom)));
+            sh_.settings.pill_h = std::max<int32_t>(1, static_cast<int32_t>(std::lround(static_cast<float>(wr.bottom - wr.top) / s)));
         }
         sh_.save();
     }
@@ -809,44 +810,34 @@ private:
         if (!fullscreen_) {
             GetWindowRect(hwnd_, &restore_rect_);
             restore_dpi_ = GetDpiForWindow(hwnd_);
-            const float rs = (restore_dpi_ > 0 ? static_cast<float>(restore_dpi_) : 96.0f) / 96.0f;
-            restore_rect_.left += static_cast<LONG>(std::lround(applied_pad_.left * rs));
-            restore_rect_.top += static_cast<LONG>(std::lround(applied_pad_.top * rs));
-            restore_rect_.right -= static_cast<LONG>(std::lround(applied_pad_.right * rs));
-            restore_rect_.bottom -= static_cast<LONG>(std::lround(applied_pad_.bottom * rs));
             HMONITOR mon = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
             MONITORINFO mi{.cbSize = sizeof(mi)};
             GetMonitorInfoW(mon, &mi);
             fullscreen_ = true;
-            applied_pad_ = active_pad();
+            hide_shadow(false);
             apply_window_theme(hwnd_, sh_.theme, true, false);
             const RECT& r = mi.rcMonitor;
             set_pos_for_dpi(HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED, monitor_dpi(mon));
         } else {
             fullscreen_ = false;
-            applied_pad_ = active_pad();
             apply_window_theme(hwnd_, sh_.theme, true, true);
             // The restore rect was captured at `restore_dpi_`; rescale it if that monitor's scale changed meanwhile.
             const RECT& r = restore_rect_;
             HMONITOR mon = MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST);
             const UINT dpi_now = monitor_dpi(mon);
             const float k = restore_dpi_ > 0 ? static_cast<float>(dpi_now) / static_cast<float>(restore_dpi_) : 1.0f;
-            const float ns = static_cast<float>(dpi_now) / 96.0f;
-            const int pad_l = static_cast<int>(std::lround(applied_pad_.left * ns));
-            const int pad_t = static_cast<int>(std::lround(applied_pad_.top * ns));
-            const int pad_r = static_cast<int>(std::lround(applied_pad_.right * ns));
-            const int pad_b = static_cast<int>(std::lround(applied_pad_.bottom * ns));
             MONITORINFO mi{.cbSize = sizeof(mi)};
             GetMonitorInfoW(mon, &mi);
             const RECT& wa = mi.rcWork;
             const int wa_w = std::max<int>(1, wa.right - wa.left);
             const int wa_h = std::max<int>(1, wa.bottom - wa.top);
-            const int w = std::min<int>(static_cast<int>(std::lround(static_cast<float>(r.right - r.left) * k)) + pad_l + pad_r, wa_w);
-            const int h = std::min<int>(static_cast<int>(std::lround(static_cast<float>(r.bottom - r.top) * k)) + pad_t + pad_b, wa_h);
-            const int x = std::clamp<int>(r.left - pad_l, wa.left, wa.right - w);
-            const int y = std::clamp<int>(r.top - pad_t, wa.top, wa.bottom - h);
+            const int w = std::min<int>(static_cast<int>(std::lround(static_cast<float>(r.right - r.left) * k)), wa_w);
+            const int h = std::min<int>(static_cast<int>(std::lround(static_cast<float>(r.bottom - r.top) * k)), wa_h);
+            const int x = std::clamp<int>(r.left, wa.left, wa.right - w);
+            const int y = std::clamp<int>(r.top, wa.top, wa.bottom - h);
             set_pos_for_dpi(HWND_TOPMOST, x, y, w, h, SWP_FRAMECHANGED, dpi_now);
             apply_height();
+            sync_shadow(false, true);
         }
         full_dirty_ = true;
         render();
@@ -885,6 +876,7 @@ private:
         if (std::exchange(preview_gpu_reset_, false) && preview_valid() && items_[preview_].pt.p.k != 1) {
             request_preview();
         }
+        if (visible() && !showing_ && should_show_shadow()) sync_shadow(false, true);
         return true;
     }
 
@@ -894,6 +886,9 @@ private:
         preview_gpu_reset_ = preview_valid();
         glass_.release();
         sh_.desktop_dupl.reset();
+        shadow_bmp_.reset();
+        shadow_target_.release();
+        shadow_render_key_ = {};
         target_.release();
         sh_.gfx.recover(hwnd_);
         sh_.thumbs.reset_gpu();
@@ -1141,6 +1136,7 @@ private:
         if (a != last_alpha_) {
             last_alpha_ = a;
             SetLayeredWindowAttributes(hwnd_, 0, a, LWA_ALPHA);
+            if (shadow_hwnd_) SetLayeredWindowAttributes(shadow_hwnd_, 0, a, LWA_ALPHA);
         }
     }
 
@@ -1308,6 +1304,200 @@ private:
         return glass_active() && (preview_ >= 0 || menu_open_ || drop_open_ || show_help() || tooltip_visible());
     }
 
+    static LRESULT CALLBACK shadow_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        if (msg == WM_NCCREATE) {
+            auto* self = static_cast<Pill*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
+            self->shadow_hwnd_ = hwnd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        }
+        if (msg == WM_NCDESTROY) {
+            if (auto* self = reinterpret_cast<Pill*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) {
+                self->shadow_hwnd_ = nullptr;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        switch (msg) {
+            case WM_NCCALCSIZE:
+                if (wp) return 0;
+                break;
+            case WM_NCHITTEST: return HTTRANSPARENT;
+            case WM_MOUSEACTIVATE: return MA_NOACTIVATEANDEAT;
+            case WM_ERASEBKGND: return 1;
+            case WM_DPICHANGED: return 0; // Pill computes and owns shadow_hwnd_'s exact screen rect.
+            case WM_PAINT: {
+                PAINTSTRUCT ps;
+                BeginPaint(hwnd, &ps);
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+            default: break;
+        }
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    void apply_shadow_window_dwm() noexcept {
+        if (!shadow_hwnd_) return;
+        ensure_window_capture_affinity(shadow_hwnd_, sh_.theme.is_liquid_glass);
+        constexpr DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_DONOTROUND;
+        DwmSetWindowAttribute(shadow_hwnd_, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+        constexpr int backdrop = DWMSBT_NONE;
+        DwmSetWindowAttribute(shadow_hwnd_, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
+        constexpr COLORREF border = DWMWA_COLOR_NONE;
+        DwmSetWindowAttribute(shadow_hwnd_, DWMWA_BORDER_COLOR, &border, sizeof(border));
+        constexpr MARGINS m{.cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = 0, .cyBottomHeight = 0};
+        DwmExtendFrameIntoClientArea(shadow_hwnd_, &m);
+        constexpr DWMNCRENDERINGPOLICY disabled = DWMNCRP_DISABLED;
+        DwmSetWindowAttribute(shadow_hwnd_, DWMWA_NCRENDERING_POLICY, &disabled, sizeof(disabled));
+    }
+
+    bool ensure_shadow_window() noexcept {
+        if (shadow_hwnd_) return true;
+        if (!inst_) return false;
+        WNDCLASSEXW wc{.cbSize = sizeof(wc)};
+        wc.lpfnWndProc = &Pill::shadow_wndproc;
+        wc.hInstance = inst_;
+        wc.lpszClassName = PILL_SHADOW_CLASS;
+        RegisterClassExW(&wc);
+
+        // WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE makes the entire shadow window
+        // natively click-through to all windows behind it across all processes.
+        shadow_hwnd_ = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
+            PILL_SHADOW_CLASS, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, inst_, this);
+        if (!shadow_hwnd_) return false;
+        SetLayeredWindowAttributes(shadow_hwnd_, 0, last_alpha_, LWA_ALPHA);
+        apply_shadow_window_dwm();
+        return true;
+    }
+
+    void hide_shadow(bool release_gpu = false) noexcept {
+        if (shadow_hwnd_ && IsWindowVisible(shadow_hwnd_)) {
+            ShowWindow(shadow_hwnd_, SW_HIDE);
+        }
+        has_shadow_rect_ = false;
+        if (release_gpu) {
+            shadow_bmp_.reset();
+            shadow_target_.release();
+            shadow_render_key_ = {};
+        }
+    }
+
+    void move_shadow_for_pill_origin(int pill_x, int pill_y) noexcept {
+        if (!shadow_hwnd_ || !has_shadow_rect_ || !should_show_shadow() || !IsWindowVisible(shadow_hwnd_)) return;
+        const UINT dpi = GetDpiForWindow(hwnd_);
+        const float s = dpi > 0 ? static_cast<float>(dpi) / 96.0f : target_.scale();
+        const ShadowPadPx pad = shadow_pad_px(s);
+        const int sx = pill_x - pad.left;
+        const int sy = pill_y - pad.top;
+        const int sw = last_shadow_rect_.right - last_shadow_rect_.left;
+        const int sh = last_shadow_rect_.bottom - last_shadow_rect_.top;
+        if (sx == last_shadow_rect_.left && sy == last_shadow_rect_.top) return;
+        SetWindowPos(shadow_hwnd_, hwnd_, sx, sy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        last_shadow_rect_ = {.left = sx, .top = sy, .right = sx + sw, .bottom = sy + sh};
+    }
+
+    void sync_shadow(bool force_render = false, bool ensure_zorder = false) {
+        if (!hwnd_ || !visible() || !should_show_shadow()) {
+            hide_shadow(!custom_pill_frame());
+            return;
+        }
+        if (!ensure_shadow_window()) return;
+
+        RECT wr{};
+        if (!GetWindowRect(hwnd_, &wr)) return;
+        const int pill_pw = std::max<int>(1, wr.right - wr.left);
+        const int pill_ph = std::max<int>(1, wr.bottom - wr.top);
+        const UINT pill_dpi = GetDpiForWindow(hwnd_);
+        const float pill_s = pill_dpi > 0 ? static_cast<float>(pill_dpi) / 96.0f : target_.scale();
+        const ShadowPadPx pad = shadow_pad_px(pill_s);
+        const RECT sr{
+            .left = wr.left - pad.left,
+            .top = wr.top - pad.top,
+            .right = wr.right + pad.right,
+            .bottom = wr.bottom + pad.bottom,
+        };
+        const int sw = std::max<int>(1, sr.right - sr.left);
+        const int sh = std::max<int>(1, sr.bottom - sr.top);
+
+        const bool was_visible = IsWindowVisible(shadow_hwnd_) != FALSE;
+        const bool rect_changed = !has_shadow_rect_ || !EqualRect(&sr, &last_shadow_rect_);
+        const bool size_changed = !has_shadow_rect_ ||
+            (sr.right - sr.left) != (last_shadow_rect_.right - last_shadow_rect_.left) ||
+            (sr.bottom - sr.top) != (last_shadow_rect_.bottom - last_shadow_rect_.top);
+
+        if (rect_changed || (ensure_zorder && was_visible)) {
+            UINT flags = SWP_NOACTIVATE;
+            if (!ensure_zorder && was_visible) flags |= SWP_NOZORDER;
+            if (!rect_changed) {
+                flags |= SWP_NOMOVE | SWP_NOSIZE;
+            } else if (!size_changed) {
+                flags |= SWP_NOSIZE;
+            }
+            SetWindowPos(shadow_hwnd_, hwnd_, sr.left, sr.top, sw, sh, flags);
+            last_shadow_rect_ = sr;
+            has_shadow_rect_ = true;
+        }
+
+        if (!sh_.gfx.ready() || sh_.gfx.device_lost()) return;
+        if (!shadow_target_.ready() || shadow_gfx_epoch_ != sh_.gfx.epoch()) {
+            shadow_bmp_.reset();
+            if (!shadow_target_.attach(sh_.gfx, shadow_hwnd_, false)) return;
+            shadow_gfx_epoch_ = sh_.gfx.epoch();
+            shadow_render_key_ = {};
+        } else if (!shadow_target_.resize(static_cast<UINT>(sw), static_cast<UINT>(sh))) {
+            return;
+        }
+
+        const float shadow_s = shadow_target_.scale();
+        const D2D1_RECT_F pill_dip_self = D2D1::RectF(0.0f, 0.0f, static_cast<float>(pill_pw) / pill_s, static_cast<float>(pill_ph) / pill_s);
+        const float radius_px = effective_pill_radius(pill_dip_self) * pill_s;
+        const float radius_shadow_dip = radius_px / shadow_s;
+        const bool focused = window_active_ || GetForegroundWindow() == hwnd_;
+        const float theme_s = sh_.theme.shadow_alpha_scale;
+
+        const ShadowRenderKey rkey{
+            .gfx_epoch = sh_.gfx.epoch(),
+            .target_epoch = shadow_target_.target_epoch(),
+            .w = static_cast<UINT>(sw),
+            .h = static_cast<UINT>(sh),
+            .pad_l = pad.left,
+            .pad_t = pad.top,
+            .pill_w = pill_pw,
+            .pill_h = pill_ph,
+            .shadow_scale = shadow_s,
+            .pill_scale = pill_s,
+            .radius = radius_shadow_dip,
+            .strength = theme_s,
+            .focused = focused,
+        };
+
+        if (force_render || !was_visible || !(rkey == shadow_render_key_)) {
+            const D2D1_RECT_F pr = D2D1::RectF(
+                static_cast<float>(pad.left) / shadow_s,
+                static_cast<float>(pad.top) / shadow_s,
+                static_cast<float>(pad.left + pill_pw) / shadow_s,
+                static_cast<float>(pad.top + pill_ph) / shadow_s);
+            const bool ok = shadow_target_.render_frame(
+                true, {}, WindowTarget::PresentMode::Immediate,
+                [&](std::optional<D2D1_RECT_F>, bool) {
+                    draw_pill_shadow(pr, radius_shadow_dip, pill_s / shadow_s, focused);
+                });
+            if (!ok) {
+                shadow_bmp_.reset();
+                shadow_target_.release();
+                shadow_render_key_ = {};
+                return;
+            }
+            shadow_render_key_ = rkey;
+        }
+
+        if (!was_visible) {
+            SetLayeredWindowAttributes(shadow_hwnd_, 0, last_alpha_, LWA_ALPHA);
+            SetWindowPos(shadow_hwnd_, hwnd_, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    }
+
     struct ShadowLayer {
         float sigma; // Gaussian standard deviation (DIPs)
         float dy;    // downward offset (DIPs)
@@ -1318,26 +1508,18 @@ private:
     /// shadow cast downwards plus a tight ambient contact shadow. Each layer is the analytic Gaussian falloff of the
     /// rounded rect (0.5 * erfc(sdf / (sigma * sqrt2))), rasterised once into a small bitmap whose pill is shrunk to
     /// just its corners, then drawn 9-slice (straight edges are uniform along their length) so resizing is free.
-    void draw_pill_shadow(Canvas& cv, D2D1_RECT_F pr, float radius, bool focused) {
-        const float theme_s = cv.theme().shadow_alpha_scale;
+    void draw_pill_shadow(D2D1_RECT_F pr, float radius, float dpi_ratio, bool focused) {
+        const float theme_s = sh_.theme.shadow_alpha_scale;
         if (theme_s <= 0.002f) return;
-        if (const auto dc_clip = cv.dirty_clip()) {
-            const D2D1_RECT_F inner = inset(pr, 0.5f, 0.5f);
-            if (rect_inside_rounded_rect(*dc_clip, inner, std::max(0.0f, radius - 0.5f))) {
-                return;
-            }
-        }
         const std::array<ShadowLayer, 2> layers = focused
-            ? std::array<ShadowLayer, 2>{{{.sigma = 23.0f, .dy = 24.0f, .alpha = 0.52f}, {.sigma = 10.0f, .dy = 0.0f, .alpha = 0.28f}}}
-            : std::array<ShadowLayer, 2>{{{.sigma = 23.0f, .dy = 22.0f, .alpha = 0.34f}, {.sigma = 5.0f, .dy = 1.0f, .alpha = 0.23f}}};
+            ? std::array<ShadowLayer, 2>{{{.sigma = 23.0f * dpi_ratio, .dy = 24.0f * dpi_ratio, .alpha = 0.52f}, {.sigma = 10.0f * dpi_ratio, .dy = 0.0f, .alpha = 0.28f}}}
+            : std::array<ShadowLayer, 2>{{{.sigma = 23.0f * dpi_ratio, .dy = 22.0f * dpi_ratio, .alpha = 0.34f}, {.sigma = 5.0f * dpi_ratio, .dy = 1.0f * dpi_ratio, .alpha = 0.23f}}};
         const float reach_x = (layers[0].sigma * 2.8f) + 2.0f;
         const float reach_t = std::max(0.0f, (layers[0].sigma * 2.8f) - layers[0].dy) + 2.0f;
         const float reach_b = (layers[0].sigma * 2.8f) + layers[0].dy + 2.0f;
-        const D2D1_RECT_F shadow_bounds = D2D1::RectF(pr.left - reach_x, pr.top - reach_t, pr.right + reach_x, pr.bottom + reach_b);
-        if (!cv.intersects_clip(shadow_bounds, 1.0f)) return;
 
-        ID2D1DeviceContext6* dc = cv.dc();
-        const float s = target_.scale();
+        ID2D1DeviceContext6* dc = shadow_target_.dc();
+        const float s = shadow_target_.scale();
         const float r = std::clamp(radius, 0.0f, std::min(width(pr), height(pr)) * 0.5f);
         const float max_dy = std::max(layers[0].dy, layers[1].dy);
 
@@ -1364,8 +1546,9 @@ private:
         const auto bw = static_cast<UINT>(std::floor(br) + ex + 1.0f);
         const auto bh = static_cast<UINT>(std::floor(bb) + eb + 1.0f);
 
-        const ShadowKey key{.gfx_epoch = sh_.gfx.epoch(), .target_epoch = target_.target_epoch(), .scale = s, .radius = r,
-                            .strength = theme_s, .focused = focused, .left = bl, .top = bt, .right = br, .bottom = bb,};
+        const ShadowKey key{.gfx_epoch = sh_.gfx.epoch(), .target_epoch = shadow_target_.target_epoch(), .scale = s,
+                            .dpi_ratio = dpi_ratio, .radius = r, .strength = theme_s, .focused = focused,
+                            .left = bl, .top = bt, .right = br, .bottom = bb,};
         if (!shadow_bmp_ || !(key == shadow_key_)) {
             shadow_bmp_.reset();
             shadow_px_.assign(static_cast<size_t>(bw) * bh * 4u, 0);
@@ -1395,7 +1578,7 @@ private:
             const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_NONE,
                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
-                target_.dpi(), target_.dpi());
+                shadow_target_.dpi(), shadow_target_.dpi());
             if (FAILED(dc->CreateBitmap(D2D1::SizeU(bw, bh), shadow_px_.data(), bw * 4u, &props, &shadow_bmp_))) {
                 shadow_bmp_.reset();
                 return;
@@ -1427,7 +1610,12 @@ private:
 
         // Punch out the pill interior so translucent themes/glass never darken from the shadow fill underneath.
         dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
-        cv.fill_round(inset(pr, 0.5f, 0.5f), std::max(0.0f, radius - 0.5f), D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+        if (auto* brush = shadow_target_.solid_brush()) {
+            brush->SetColor(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+            const D2D1_RECT_F hole = inset(pr, 0.5f, 0.5f);
+            const float hole_r = std::max(0.0f, radius - 0.5f);
+            dc->FillRoundedRectangle(D2D1::RoundedRect(hole, hole_r, hole_r), brush);
+        }
         dc->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
     }
 
@@ -1436,10 +1624,6 @@ private:
         const D2D1_RECT_F pr = pill_bounds(sz);
         const bool custom_frame = custom_pill_frame();
         const float outer_r = effective_pill_radius(pr);
-        if (custom_frame) {
-            const bool focused = window_active_ || (hwnd_ && GetForegroundWindow() == hwnd_);
-            draw_pill_shadow(cv, pr, outer_r, focused);
-        }
 
         const bool glass = glass_active();
         const bool need_scene = glass_scene_needed();
@@ -4195,12 +4379,6 @@ private:
         const float s = target_.scale();
         const D2D1_POINT_2F p{.x = static_cast<float>(pt.x) / s, .y = static_cast<float>(pt.y) / s};
         const D2D1_RECT_F pr = pill_bounds(target_.size());
-        if (custom_pill_frame()) {
-            constexpr float margin = 2.0f;
-            if (p.x < pr.left - margin || p.x >= pr.right + margin || p.y < pr.top - margin || p.y >= pr.bottom + margin) {
-                return HTNOWHERE;
-            }
-        }
         constexpr float b = 6.0f;
         const bool l = p.x < pr.left + b;
         const bool r = p.x >= pr.right - b;
@@ -4284,7 +4462,7 @@ private:
                 return 0;
             }
             case WM_WINDOWPOSCHANGING: {
-                if (glass_active() && visible() && in_sizemove_) {
+                if (visible() && in_sizemove_) {
                     const auto* wpos = reinterpret_cast<const WINDOWPOS*>(lp);
                     if (wpos) {
                         RECT win_rc{};
@@ -4293,24 +4471,35 @@ private:
                             (wpos->cx == (win_rc.right - win_rc.left) && wpos->cy == (win_rc.bottom - win_rc.top));
                         resize_pending_ = !size_same;
                         if (size_same && !(wpos->flags & SWP_NOMOVE)) {
-                            POINT cur_origin{.x = 0, .y = 0};
-                            ClientToScreen(hwnd_, &cur_origin);
-                            const POINT next_origin{
-                                .x = wpos->x + (cur_origin.x - win_rc.left),
-                                .y = wpos->y + (cur_origin.y - win_rc.top),
-                            };
-                            if (next_origin.x != glass_.last_rendered_origin().x ||
-                                next_origin.y != glass_.last_rendered_origin().y) {
-                                glass_.set_origin_override(next_origin);
-                                full_dirty_ = true;
-                                render();
-                                glass_.set_origin_override(std::nullopt);
-                                if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
+                            if (glass_active()) {
+                                POINT cur_origin{.x = 0, .y = 0};
+                                ClientToScreen(hwnd_, &cur_origin);
+                                const POINT next_origin{
+                                    .x = wpos->x + (cur_origin.x - win_rc.left),
+                                    .y = wpos->y + (cur_origin.y - win_rc.top),
+                                };
+                                if (next_origin.x != glass_.last_rendered_origin().x ||
+                                    next_origin.y != glass_.last_rendered_origin().y) {
+                                    glass_.set_origin_override(next_origin);
+                                    full_dirty_ = true;
+                                    render();
+                                    glass_.set_origin_override(std::nullopt);
+                                    if (visible() && !anim_active_) ValidateRect(hwnd_, nullptr);
+                                }
                             }
+                            move_shadow_for_pill_origin(wpos->x, wpos->y);
                         }
                     }
                 }
                 break;
+            }
+            case WM_WINDOWPOSCHANGED: {
+                const LRESULT r = DefWindowProcW(hwnd_, msg, wp, lp);
+                const auto* wpos = reinterpret_cast<const WINDOWPOS*>(lp);
+                if (wpos && !showing_ && (wpos->flags & SWP_HIDEWINDOW) == 0 && visible()) {
+                    sync_shadow(false, (wpos->flags & SWP_NOZORDER) == 0);
+                }
+                return r;
             }
             case WM_SIZE:
                 resize_pending_ = false;
@@ -4359,6 +4548,9 @@ private:
                     if (sh_.gfx.adapter_stale(hwnd_)) recover();
                     invalidate();
                 } else if (sh_.gfx.adapter_stale(hwnd_)) {
+                    shadow_bmp_.reset();
+                    shadow_target_.release();
+                    shadow_render_key_ = {};
                     target_.release();
                     glass_.release();
                     full_dirty_ = true;
@@ -4398,10 +4590,9 @@ private:
                 auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
                 const UINT dpi = placing_dpi_ ? placing_dpi_ : GetDpiForWindow(hwnd_);
                 const float s = static_cast<float>(dpi > 0 ? dpi : 96u) / 96.0f;
-                const ShadowPad pad = active_pad();
                 mmi->ptMinTrackSize = {
-                    .x = static_cast<LONG>((520.0f + pad.left + pad.right) * s),
-                    .y = static_cast<LONG>((HEADER_H + STATUS_H + pad.top + pad.bottom) * s),
+                    .x = static_cast<LONG>(520.0f * s),
+                    .y = static_cast<LONG>((HEADER_H + STATUS_H) * s),
                 };
                 return 0;
             }
@@ -4411,10 +4602,8 @@ private:
                     window_active_ = active;
                     if (!active) tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
                     sync_caret_timer();
-                    if (visible() && (custom_pill_frame() || caret_field_focused())) {
-                        if (custom_pill_frame()) full_dirty_ = true;
-                        invalidate();
-                    }
+                    if (visible() && !showing_ && !fading_out_ && should_show_shadow()) sync_shadow(false, false);
+                    if (visible() && caret_field_focused()) invalidate();
                 }
                 if (!active && sh_.settings.hide_on_focus_loss && !fullscreen_ && !sh_.test_mode && !dragging_out_ &&
                     GetTickCount64() - shown_tick_ > 250) {
@@ -4676,7 +4865,7 @@ private:
 
     bool fullscreen_ = false;
     bool window_active_ = false;
-    ShadowPad applied_pad_{};
+    bool showing_ = false;
     bool placing_ = false;
     UINT placing_dpi_ = 0;
     RECT restore_rect_{};
@@ -4736,17 +4925,42 @@ private:
     int clipboard_attempts_ = 0;
     bool clipboard_flushing_ = false;
 
-    /// Pill drop shadow, rasterised once per key into a small 9-slice bitmap (see `draw_pill_shadow`).
+    /// Pill drop shadow, rendered into a dedicated click-through HWND behind `hwnd_` and rasterised
+    /// once per key into a small 9-slice bitmap (see `draw_pill_shadow` / `sync_shadow`).
     struct ShadowKey {
         uint64_t gfx_epoch = 0;
         uint64_t target_epoch = 0;
         float scale = 0.0f;
+        float dpi_ratio = 1.0f;
         float radius = 0.0f;
         float strength = 0.0f;
         bool focused = false;
         float left = 0.0f, top = 0.0f, right = 0.0f, bottom = 0.0f; // pill rect inside the bitmap, in pixels
         [[nodiscard]] bool operator==(const ShadowKey&) const noexcept = default;
     };
+    struct ShadowRenderKey {
+        uint64_t gfx_epoch = 0;
+        uint64_t target_epoch = 0;
+        UINT w = 0;
+        UINT h = 0;
+        int pad_l = 0;
+        int pad_t = 0;
+        int pill_w = 0;
+        int pill_h = 0;
+        float shadow_scale = 0.0f;
+        float pill_scale = 0.0f;
+        float radius = 0.0f;
+        float strength = 0.0f;
+        bool focused = false;
+        [[nodiscard]] bool operator==(const ShadowRenderKey&) const noexcept = default;
+    };
+    HINSTANCE inst_ = nullptr;
+    HWND shadow_hwnd_ = nullptr;
+    WindowTarget shadow_target_;
+    uint64_t shadow_gfx_epoch_ = 0;
+    ShadowRenderKey shadow_render_key_{};
+    RECT last_shadow_rect_{};
+    bool has_shadow_rect_ = false;
     ShadowKey shadow_key_{};
     wil::com_ptr<ID2D1Bitmap1> shadow_bmp_;
     std::vector<uint8_t> shadow_px_;

@@ -407,8 +407,15 @@ private:
         IdScrollbar,
     };
 
+    bool refresh_startup_state() noexcept {
+        const bool now = is_startup_enabled();
+        if (now == startup_enabled_) return false;
+        startup_enabled_ = now;
+        return true;
+    }
+
     void sync_fields() {
-        sh_.settings.launch_on_startup = is_startup_enabled();
+        startup_enabled_ = is_startup_enabled();
         model_field_.set(to_wide(sh_.settings.model_name));
         batch_field_.set(sh_.settings.batch_size > 0 ? to_fixed_wstr(sh_.settings.batch_size).str() : std::wstring{});
         py_ver_field_.set(to_wide(sh_.settings.python_version.empty() ? "3.14" : sh_.settings.python_version));
@@ -1858,7 +1865,7 @@ private:
             Flow startup{12.0f, 0.0f};
             flow_text(cv, startup, L"Open on PC startup", Font::Body, cv.theme().on_surface, rw, 32.0f);
             startup.add(44.0f, 32.0f, [&](D2D1_RECT_F r) {
-                draw_switch(cv, r.right, (r.top + r.bottom) * 0.5f, sh_.settings.launch_on_startup, IdToggleStartup);
+                draw_switch(cv, r.right, (r.top + r.bottom) * 0.5f, startup_enabled_, IdToggleStartup);
             });
             Flow hide_on_blur{12.0f, 0.0f};
             flow_text(cv, hide_on_blur, L"Hide pill when clicking outside", Font::Body, cv.theme().on_surface, rw, 32.0f);
@@ -3062,7 +3069,7 @@ private:
 
     void sync_switch_targets(bool animate) noexcept {
         sw_hotkey_.set(sh_.settings.hotkey_enabled ? 1.0f : 0.0f, animate);
-        sw_startup_.set(sh_.settings.launch_on_startup ? 1.0f : 0.0f, animate);
+        sw_startup_.set(startup_enabled_ ? 1.0f : 0.0f, animate);
         sw_hide_focus_.set(sh_.settings.hide_on_focus_loss ? 1.0f : 0.0f, animate);
         sw_auto_update_.set(sh_.settings.auto_check_updates ? 1.0f : 0.0f, animate);
     }
@@ -3617,13 +3624,11 @@ private:
                 update_switch_anims();
                 break;
             case IdToggleStartup: {
-                const bool want = !sh_.settings.launch_on_startup;
+                const bool want = !startup_enabled_;
                 if (!set_startup_enabled(want)) {
                     sh_.notify("error", "Settings", "Failed to update Windows startup setting", win32_error_utf8(), "startup-reg");
-                } else {
-                    sh_.settings.launch_on_startup = want;
-                    sh_.save();
                 }
+                startup_enabled_ = is_startup_enabled();
                 update_switch_anims();
                 break;
             }
@@ -4201,7 +4206,11 @@ private:
                 const bool active = wm_activate_is_active(LOWORD(wp), HIWORD(wp) != 0);
                 if (window_active_ != active) {
                     window_active_ = active;
-                    if (!active) {
+                    bool startup_changed = false;
+                    if (active) {
+                        startup_changed = refresh_startup_state();
+                        if (startup_changed) update_switch_anims();
+                    } else {
                         tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
                         if (recording_hotkey_) {
                             stop_recording();
@@ -4209,7 +4218,7 @@ private:
                         }
                     }
                     sync_caret_timer();
-                    if (active_field_ && visible()) invalidate();
+                    if ((active_field_ || startup_changed) && visible()) invalidate();
                 }
                 break;
             }
@@ -4437,6 +4446,7 @@ private:
     AnimFloat tab_anim_;
     AnimFloat sw_hotkey_;
     AnimFloat sw_startup_;
+    bool startup_enabled_ = false;
     AnimFloat sw_hide_focus_;
     AnimFloat sw_auto_update_;
     int raw_hover_id_ = IdNone;

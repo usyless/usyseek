@@ -41,6 +41,7 @@ inline constexpr const wchar_t* LAUNCHER_CLASS = L"usyseek.launcher";
 inline constexpr const wchar_t* LAUNCHER_MUTEX = L"Local\\usyseek.launcher";
 inline constexpr const wchar_t* UI_MUTEX = L"Local\\usyseek.ui";
 inline constexpr const wchar_t* PILL_CLASS = L"usyseek.pill";
+inline constexpr const wchar_t* PILL_SHADOW_CLASS = L"usyseek.pill_shadow";
 inline constexpr const wchar_t* SETTINGS_CLASS = L"usyseek.settings";
 inline constexpr const wchar_t* THEME_EDITOR_CLASS = L"usyseek.theme_editor";
 inline constexpr const wchar_t* STATUS_SHM = L"Local\\usyseek.indexer.status";
