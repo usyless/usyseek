@@ -3,16 +3,24 @@
 #include <usyseek/indexer/media_exts.hpp>
 #include <usyseek/string_helpers.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace usyseek::indexer {
 
 /// Extension used for temporary per-volume USN journal fence files (kept in `include_only_files`).
 inline constexpr std::string_view USN_SENTINEL_EXT_ASCII = "usyseek-sync";
 inline constexpr std::wstring_view USN_SENTINEL_EXT = L"usyseek-sync";
+
+/// Non-empty payload written to each per-volume USN fence sentinel so Everything's asynchronous
+/// metadata reader (`size` + `date_modified`) must populate a known non-zero size before the fence clears.
+inline constexpr std::string_view USN_SENTINEL_PAYLOAD = "usyseek-usn-fence-v2\r\n";
 
 /// Static headless, IPC-only overrides applied via Everything 1.5 `-add-config`.
 inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
@@ -32,9 +40,12 @@ inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
     "run_in_background=1\r\n"
     "monitor_pause=0\r\n"
     "monitor_stop=0\r\n"
+    "results_changed_delay=50\r\n"
     "monitor_notify_results_changed_delay=50\r\n"
     "monitor_thread_mode_background=0\r\n"
     "ntfs_update_thread_mode_background=0\r\n"
+    "refs_update_thread_mode_background=0\r\n"
+    "folder_update_thread_mode_background=0\r\n"
     "exclude_list_enabled=1\r\n"
     "exclude_hidden_files_and_folders=0\r\n"
     "allow_plugins=0\r\n"
@@ -192,6 +203,73 @@ inline constexpr std::string_view EVERYTHING_LEAN_CONFIG =
     if (dir.empty() || filename.empty()) return {};
     std::wstring out;
     append_to(out, dir, L"\\", filename);
+    return out;
+}
+
+/// Returns true only when Everything has indexed both the sentinel's exact non-zero byte size and
+/// a valid (non-unknown, non-zero) modification timestamp, proving that both USN filename ingestion
+/// and asynchronous NTFS/ReFS `fd` metadata updates have committed for that volume.
+[[nodiscard]] constexpr bool is_usn_sentinel_metadata_ready(
+    std::uint64_t indexed_size,
+    std::uint64_t indexed_mtime,
+    std::uint64_t expected_size
+) noexcept {
+    constexpr std::uint64_t unknown = std::numeric_limits<std::uint64_t>::max();
+    return expected_size > 0 &&
+           indexed_size != unknown &&
+           indexed_size == expected_size &&
+           indexed_mtime != unknown &&
+           indexed_mtime != 0;
+}
+
+/// Builds a canonical, sorted, deduplicated semicolon-separated `-exclude-folders` argument so
+/// identical logical exclusion sets do not appear modified across Everything launches.
+[[nodiscard]] inline std::wstring format_everything_exclude_folders(
+    std::span<const std::wstring> abs_excludes,
+    std::span<const std::wstring> name_excludes
+) {
+    std::vector<std::wstring> entries;
+    entries.reserve(abs_excludes.size() + name_excludes.size());
+    for (const auto& e : abs_excludes) {
+        // Skip whole-drive excludes (e.g. "d:") since they are already omitted from -volumes.
+        if (e.empty() || (e.size() == 2 && e[1] == L':')) continue;
+        entries.push_back(e);
+    }
+    for (const auto& n : name_excludes) {
+        // `n` is stored as "\name\" -> Everything folder filter wants "**\name".
+        if (n.size() > 2) {
+            std::wstring pat;
+            append_to(pat, L"**\\", std::wstring_view{n}.substr(1, n.size() - 2));
+            entries.push_back(std::move(pat));
+        }
+    }
+    std::ranges::sort(entries);
+    const auto dupes = std::ranges::unique(entries);
+    entries.erase(dupes.begin(), dupes.end());
+
+    std::size_t total = 0;
+    for (const auto& item : entries) {
+        if (total > 0) ++total;
+        total += item.size();
+    }
+    std::wstring out;
+    out.reserve(total);
+    for (const auto& item : entries) {
+        if (!out.empty()) out.push_back(L';');
+        out.append(item);
+    }
+    return out;
+}
+
+/// Builds the Everything minimum-size clause that retains files whose indexed size is still
+/// `unknown` (pending metadata fetch) so the indexer can resolve them directly from disk instead
+/// of silently missing newly created files.
+[[nodiscard]] inline FixedWString<48> build_everything_min_size_filter(std::uint32_t min_kb) noexcept {
+    FixedWString<48> out;
+    if (min_kb == 0) return out;
+    out.append(L"<size:>=");
+    out.append(to_fixed_wstr(min_kb));
+    out.append(L"kb|size:unknown>");
     return out;
 }
 

@@ -2,16 +2,22 @@
 #include "usyseek/indexer/everything_config.hpp"
 
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <vector>
 
 using usyseek::indexer::EVERYTHING_LEAN_CONFIG;
 using usyseek::indexer::USN_SENTINEL_EXT_ASCII;
+using usyseek::indexer::USN_SENTINEL_PAYLOAD;
 using usyseek::indexer::build_everything_args;
 using usyseek::indexer::build_everything_include_only_files;
 using usyseek::indexer::build_everything_lean_config;
+using usyseek::indexer::build_everything_min_size_filter;
+using usyseek::indexer::format_everything_exclude_folders;
 using usyseek::indexer::is_usn_journal_filesystem;
+using usyseek::indexer::is_usn_sentinel_metadata_ready;
 using usyseek::indexer::join_sentinel_path;
 using usyseek::indexer::make_usn_sentinel_name;
 
@@ -60,9 +66,12 @@ void run_everything_config_tests() {
     CHECK(has_line(cfg, "run_in_background=1"));
     CHECK(has_line(cfg, "monitor_pause=0"));
     CHECK(has_line(cfg, "monitor_stop=0"));
+    CHECK(has_line(cfg, "results_changed_delay=50"));
     CHECK(has_line(cfg, "monitor_notify_results_changed_delay=50"));
     CHECK(has_line(cfg, "monitor_thread_mode_background=0"));
     CHECK(has_line(cfg, "ntfs_update_thread_mode_background=0"));
+    CHECK(has_line(cfg, "refs_update_thread_mode_background=0"));
+    CHECK(has_line(cfg, "folder_update_thread_mode_background=0"));
     CHECK(has_line(cfg, "exclude_list_enabled=1"));
     CHECK(has_line(cfg, "exclude_hidden_files_and_folders=0"));
 
@@ -129,6 +138,28 @@ void run_everything_config_tests() {
           L"C:\\Users\\usy\\AppData\\Roaming\\.usyseek-sync-1-2.usyseek-sync");
     CHECK(join_sentinel_path(L"", L".usyseek-sync-1-2.usyseek-sync").empty());
     CHECK(join_sentinel_path(L"C:\\", L"").empty());
+
+    // Sentinel payload and metadata readiness checks.
+    CHECK(!USN_SENTINEL_PAYLOAD.empty());
+    constexpr auto unknown = std::numeric_limits<std::uint64_t>::max();
+    constexpr std::uint64_t valid_ft = 133800000000000000ull;
+    CHECK(is_usn_sentinel_metadata_ready(USN_SENTINEL_PAYLOAD.size(), valid_ft, USN_SENTINEL_PAYLOAD.size()));
+    CHECK(!is_usn_sentinel_metadata_ready(unknown, valid_ft, USN_SENTINEL_PAYLOAD.size()));
+    CHECK(!is_usn_sentinel_metadata_ready(0, valid_ft, USN_SENTINEL_PAYLOAD.size()));
+    CHECK(!is_usn_sentinel_metadata_ready(USN_SENTINEL_PAYLOAD.size() - 1, valid_ft, USN_SENTINEL_PAYLOAD.size()));
+    CHECK(!is_usn_sentinel_metadata_ready(USN_SENTINEL_PAYLOAD.size(), unknown, USN_SENTINEL_PAYLOAD.size()));
+    CHECK(!is_usn_sentinel_metadata_ready(USN_SENTINEL_PAYLOAD.size(), 0, USN_SENTINEL_PAYLOAD.size()));
+    CHECK(!is_usn_sentinel_metadata_ready(0, valid_ft, 0));
+
+    // Canonical sorted/deduplicated exclude folder formatting (omitting whole-drive excludes).
+    const std::vector<std::wstring> abs_ex = {L"e:\\temp", L"d:", L"c:\\windows", L"e:\\temp", L""};
+    const std::vector<std::wstring> name_ex = {L"\\node_modules\\", L"\\.git\\", L"\\node_modules\\"};
+    CHECK(format_everything_exclude_folders(abs_ex, name_ex) ==
+          L"**\\.git;**\\node_modules;c:\\windows;e:\\temp");
+
+    // Minimum-size clause must keep size:unknown so newly created files are never silently dropped.
+    CHECK(build_everything_min_size_filter(0).empty());
+    CHECK(build_everything_min_size_filter(16).view() == L"<size:>=16kb|size:unknown>");
 }
 
 } // namespace

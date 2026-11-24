@@ -193,7 +193,7 @@ struct Scope {
         };
         if (images) add(media::IMAGE_EXTS);
         if (videos) add(media::VIDEO_EXTS);
-        if (min_kb > 0) append_to(q, L" size:>=", to_fixed_wstr(min_kb), L"kb");
+        if (min_kb > 0) append_to(q, L" ", usyseek::indexer::build_everything_min_size_filter(min_kb));
         if (!whole_pc && !includes.empty()) {
             q += L" <";
             for (size_t i = 0; i < includes.size(); ++i) {
@@ -208,24 +208,7 @@ struct Scope {
     }
 
     [[nodiscard]] std::wstring everything_exclude_folders() const {
-        std::wstring out;
-        const auto append = [&](std::wstring_view item) {
-            if (!out.empty()) out += L';';
-            out += item;
-        };
-        for (const auto& e : abs_excludes) {
-            // Skip whole-drive excludes (e.g. "d:") since they are already omitted from -volumes
-            if (e.size() == 2 && e[1] == L':') continue;
-            append(e);
-        }
-        for (const auto& n : name_excludes) {
-            // n is stored as "\name\" -> Everything folder filter wants "**\name" or just "name"
-            if (n.size() > 2) {
-                if (!out.empty()) out.push_back(L';');
-                append_to(out, L"**\\", std::wstring_view{n}.substr(1, n.size() - 2));
-            }
-        }
-        return out;
+        return usyseek::indexer::format_everything_exclude_folders(abs_excludes, name_excludes);
     }
 };
 
@@ -284,6 +267,13 @@ bool write_everything_lean_config(const fs::path& target) {
 
 class EverythingSession {
 public:
+    EverythingSession() = default;
+    EverythingSession(const EverythingSession&) = delete;
+    EverythingSession& operator=(const EverythingSession&) = delete;
+    EverythingSession(EverythingSession&&) = delete;
+    EverythingSession& operator=(EverythingSession&&) = delete;
+    ~EverythingSession() { close_and_wait(); }
+
     bool open(const Scope& scope, std::wstring& error) {
         const auto drives = scope.drives();
         if (drives.empty() || (!scope.images && !scope.videos)) {
@@ -316,6 +306,21 @@ public:
         }
 
         owned_ = std::make_unique<ulp::Everything3>(ulp::everything3::InstanceName{EVERYTHING_INSTANCE}, exe);
+
+        // If a prior private Everything instance is still flushing its DB on exit, wait briefly
+        // before launching a new one so CLI arguments are not forwarded into a dying process.
+        if (owned_->is_ipc_running()) {
+            owned_->close_everything(true);
+            const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (owned_->is_ipc_running() && !stopping() && std::chrono::steady_clock::now() < exit_deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            if (stopping()) {
+                error = L"Stopped";
+                return false;
+            }
+        }
+
         const std::wstring args = usyseek::indexer::build_everything_args(vols, scope.everything_exclude_folders(), lean_ini_arg);
 
         bool launched = false;
@@ -460,10 +465,10 @@ public:
         }
 
         // Fallback when any volume could not be fenced via the NTFS/ReFS USN journal
-        // (e.g. non-USN filesystem, read-only volume, or fence timeout): wait briefly for
+        // (e.g. non-USN filesystem, read-only volume, or fence timeout): wait for
         // DB busy / monitor result changes to settle and re-fetch updated results.
         if (!usn_synced) {
-            constexpr auto settle_quiet = std::chrono::milliseconds(350);
+            constexpr auto settle_quiet = std::chrono::milliseconds(500);
             constexpr auto settle_max = std::chrono::seconds(10);
             const auto max_deadline = std::chrono::steady_clock::now() + settle_max;
             auto quiet_deadline = std::chrono::steady_clock::now() + settle_quiet;
@@ -487,6 +492,14 @@ public:
                 if (std::chrono::steady_clock::now() >= quiet_deadline) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(25));
             }
+        } else if (owned_->is_ipc_db_busy() || client.is_result_list_change()) {
+            // Catch a concurrent DB rebuild/update commit that landed right as the query ran.
+            wait_for_db_idle(std::chrono::seconds(5));
+            if (!stopping()) {
+                if (auto updated = client.get_results(state)) {
+                    results = std::move(updated);
+                }
+            }
         }
         stop_guard.release();
         if (stopping()) {
@@ -499,6 +512,7 @@ public:
         const std::size_t reserve_count = results.file_count();
         out.reserve(reserve_count > 0 && reserve_count <= count ? reserve_count : count);
 
+        const uint64_t min_bytes = static_cast<uint64_t>(scope.min_kb) * 1024;
         std::wstring path_buf(1024, L'\0');
         std::wstring lower_buf;
         lower_buf.reserve(1024);
@@ -528,13 +542,31 @@ public:
             const int kind = kind_of_lower(lpath, scope.images, scope.videos);
             if (kind < 0 || !scope.in_scope_lower(lpath)) continue;
 
-            const std::uint64_t raw_size = Everything3_GetResultSize(raw, i);
-            const std::uint64_t raw_dm = Everything3_GetResultDateModified(raw, i);
+            std::uint64_t raw_size = Everything3_GetResultSize(raw, i);
+            std::uint64_t raw_dm = Everything3_GetResultDateModified(raw, i);
+
+            // If Everything has not yet gathered size or mtime for a newly created/locked file,
+            // fall back to a direct Win32 stat so we neither drop it nor record bogus zeros.
+            if (raw_size == EVERYTHING3_UINT64_MAX || raw_dm == EVERYTHING3_UINT64_MAX) {
+                WIN32_FILE_ATTRIBUTE_DATA fad{};
+                if (!GetFileAttributesExW(path_buf.data(), GetFileExInfoStandard, &fad) ||
+                    (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                    continue;
+                }
+                if (raw_size == EVERYTHING3_UINT64_MAX) {
+                    raw_size = (static_cast<std::uint64_t>(fad.nFileSizeHigh) << 32u) | fad.nFileSizeLow;
+                }
+                if (raw_dm == EVERYTHING3_UINT64_MAX) {
+                    raw_dm = (static_cast<std::uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32u) |
+                             fad.ftLastWriteTime.dwLowDateTime;
+                }
+            }
+            if (min_bytes > 0 && raw_size < min_bytes) continue;
 
             auto& e = out.emplace_back();
             e.path.assign(path_buf.data(), len);
-            e.size = (raw_size == EVERYTHING3_UINT64_MAX) ? 0 : raw_size;
-            e.mtime = (raw_dm == EVERYTHING3_UINT64_MAX) ? 0 : filetime_to_unix(raw_dm);
+            e.size = raw_size;
+            e.mtime = filetime_to_unix(raw_dm);
             e.kind = kind;
             e.id = rapidhash(lower_buf.data(), len * sizeof(wchar_t));
         }
@@ -547,17 +579,25 @@ public:
     }
 
 private:
-    /// Drops a unique hidden temp sentinel file on each indexed NTFS/ReFS volume and waits until
-    /// Everything's RAM index observes all of them. Because each volume's USN Journal is strictly
-    /// ordered, seeing the sentinel guarantees Everything has processed every prior USN record on
-    /// that volume. Returns true only when every drive in `scope.drives()` was fenced and observed.
-    static bool wait_for_usn_fence(
+    /// Drops a unique non-empty hidden temp sentinel file on each indexed NTFS/ReFS volume and waits
+    /// until Everything's RAM index AND search engine observe all of them with their real size and
+    /// date modified populated. Because Everything 1.5 ingests NTFS USN records in two stages
+    /// (filename insertion followed by asynchronous `fd` size/mtime updates), verifying the sentinel's
+    /// non-zero byte size + valid mtime guarantees both stages have committed for every prior USN
+    /// record on every volume. Returns true only when every drive in `scope.drives()` was fenced and observed.
+    [[nodiscard]] bool wait_for_usn_fence(
         const ulp::everything3::Client& client,
         const Scope& scope,
         std::chrono::milliseconds timeout
-    ) {
+    ) const {
+        struct Sentinel {
+            std::wstring path;
+            std::wstring lower_path;
+            std::uint64_t expected_size = 0;
+            wchar_t drive = 0;
+        };
         struct UsnFence {
-            std::vector<std::wstring> paths;
+            std::vector<Sentinel> sentinels;
             UsnFence() = default;
             UsnFence(const UsnFence&) = delete;
             UsnFence& operator=(const UsnFence&) = delete;
@@ -565,10 +605,10 @@ private:
             UsnFence& operator=(UsnFence&&) = delete;
             ~UsnFence() { cleanup(); }
             void cleanup() noexcept {
-                for (const auto& p : paths) {
-                    DeleteFileW(p.c_str());
+                for (const auto& s : sentinels) {
+                    DeleteFileW(s.path.c_str());
                 }
-                paths.clear();
+                sentinels.clear();
             }
         } fence;
 
@@ -585,10 +625,15 @@ private:
             &FOLDERID_Desktop,
         };
         std::vector<std::wstring> known_dirs;
-        known_dirs.reserve(known_ids.size());
+        known_dirs.reserve(known_ids.size() + 1);
         for (const KNOWNFOLDERID* id : known_ids) {
             std::wstring p = known_folder(*id);
             if (!p.empty()) known_dirs.push_back(std::move(p));
+        }
+        std::array<wchar_t, MAX_PATH + 2> temp_buf{};
+        const DWORD temp_len = GetTempPathW(static_cast<DWORD>(temp_buf.size()), temp_buf.data());
+        if (temp_len > 0 && temp_len < temp_buf.size()) {
+            known_dirs.emplace_back(temp_buf.data(), temp_len);
         }
 
         const std::uint32_t pid = GetCurrentProcessId();
@@ -597,7 +642,7 @@ private:
         std::uint64_t seq = 0;
 
         bool all_fenced = true;
-        fence.paths.reserve(drives.size());
+        fence.sentinels.reserve(drives.size());
 
         for (const wchar_t drive : drives) {
             const std::array<wchar_t, 4> root = {drive, L':', L'\\', L'\0'};
@@ -606,6 +651,7 @@ private:
                     root.data(), nullptr, 0, nullptr, nullptr, nullptr,
                     fs_name.data(), static_cast<DWORD>(fs_name.size())) ||
                 !usyseek::indexer::is_usn_journal_filesystem(fs_name.data())) {
+                wlog(L"Everything USN fence skipped for {}:\\ (filesystem '{}')\n", drive, fs_name.data());
                 all_fenced = false;
                 continue;
             }
@@ -627,9 +673,29 @@ private:
                     FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY,
                     nullptr)};
                 if (!h) return false;
-                // Close immediately so Windows emits USN_REASON_FILE_CREATE | USN_REASON_CLOSE.
+
+                constexpr std::string_view payload = usyseek::indexer::USN_SENTINEL_PAYLOAD;
+                DWORD written = 0;
+                const BOOL wrote = WriteFile(
+                    h.get(),
+                    payload.data(),
+                    static_cast<DWORD>(payload.size()),
+                    &written,
+                    nullptr);
+                // Close immediately so Windows emits USN_REASON_FILE_CREATE | USN_REASON_DATA_EXTEND | USN_REASON_CLOSE.
                 h.reset();
-                fence.paths.push_back(std::move(probe));
+                if (!wrote || written != payload.size()) {
+                    DeleteFileW(probe.c_str());
+                    return false;
+                }
+
+                std::wstring lprobe = lower(probe);
+                fence.sentinels.push_back(Sentinel{
+                    .path = std::move(probe),
+                    .lower_path = std::move(lprobe),
+                    .expected_size = payload.size(),
+                    .drive = drive,
+                });
                 return true;
             };
 
@@ -654,26 +720,72 @@ private:
                 placed = try_dir(std::wstring_view{root.data(), 3});
             }
             if (!placed) {
+                // Fallback for drives whose root directory denies write access to standard users:
+                // probe up to 64 top-level non-excluded, non-system, non-reparse directories.
+                const std::array<wchar_t, 5> pattern = {drive, L':', L'\\', L'*', L'\0'};
+                WIN32_FIND_DATAW fd{};
+                const wil::unique_hfind hfind{FindFirstFileExW(
+                    pattern.data(), FindExInfoBasic, &fd, FindExSearchLimitToDirectories, nullptr, FIND_FIRST_EX_LARGE_FETCH)};
+                if (hfind) {
+                    std::size_t scanned = 0;
+                    do {
+                        if (++scanned > 64) break;
+                        if (fd.cFileName[0] == L'.' &&
+                            (fd.cFileName[1] == L'\0' || (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0'))) {
+                            continue;
+                        }
+                        constexpr DWORD skip_attrs =
+                            static_cast<DWORD>(FILE_ATTRIBUTE_REPARSE_POINT) | static_cast<DWORD>(FILE_ATTRIBUTE_SYSTEM);
+                        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                            (fd.dwFileAttributes & skip_attrs) != 0) {
+                            continue;
+                        }
+                        std::wstring sub;
+                        append_to(sub, std::wstring_view{root.data(), 3}, std::wstring_view{fd.cFileName});
+                        if (try_dir(sub)) {
+                            placed = true;
+                            break;
+                        }
+                    } while (FindNextFileW(hfind.get(), &fd));
+                }
+            }
+            if (!placed) {
+                wlog(L"Everything USN fence could not place sentinel on {}:\\\n", drive);
                 all_fenced = false;
             }
         }
 
-        if (fence.paths.empty()) return false;
+        if (fence.sentinels.empty()) return false;
 
         std::vector<std::size_t> pending;
-        pending.reserve(fence.paths.size());
-        for (std::size_t i = 0; i < fence.paths.size(); ++i) {
+        pending.reserve(fence.sentinels.size());
+        for (std::size_t i = 0; i < fence.sentinels.size(); ++i) {
             pending.push_back(i);
         }
 
+        const auto is_fatal_ipc_error = [](DWORD err) noexcept {
+            return err == EVERYTHING3_ERROR_DISCONNECTED ||
+                   err == EVERYTHING3_ERROR_SHUTDOWN ||
+                   err == EVERYTHING3_ERROR_IPC_PIPE_NOT_FOUND ||
+                   err == EVERYTHING3_ERROR_CANCELLED;
+        };
+
+        // Phase 1: Wait until Everything's RAM index reports every sentinel with its non-zero
+        // byte size and valid mtime populated (proving both USN filename and async `fd` updates ran).
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         bool ipc_error = false;
         while (!pending.empty() && !stopping()) {
             std::erase_if(pending, [&](std::size_t idx) {
-                if (client.get_file_attributes(fence.paths[idx]).has_value()) {
-                    return true;
+                const Sentinel& s = fence.sentinels[idx];
+                if (const auto fd = client.get_file_attributes_ex(s.path)) {
+                    const std::uint64_t indexed_size =
+                        (static_cast<std::uint64_t>(fd->nFileSizeHigh) << 32u) | fd->nFileSizeLow;
+                    const std::uint64_t indexed_mtime =
+                        (static_cast<std::uint64_t>(fd->ftLastWriteTime.dwHighDateTime) << 32u) |
+                        fd->ftLastWriteTime.dwLowDateTime;
+                    return usyseek::indexer::is_usn_sentinel_metadata_ready(indexed_size, indexed_mtime, s.expected_size);
                 }
-                if (Everything3_GetLastError() != EVERYTHING3_OK) {
+                if (is_fatal_ipc_error(Everything3_GetLastError())) {
                     ipc_error = true;
                 }
                 return false;
@@ -683,12 +795,110 @@ private:
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
-        fence.cleanup();
-        if (!pending.empty() && !stopping()) {
-            wlog(L"Everything USN fence did not observe {} volume(s) before timeout; using fallback settle\n",
-                 pending.size());
+        // Phase 2: Confirm DB is idle and verify all sentinels (with size + mtime) through
+        // Everything3_Search itself before cleaning them up, guaranteeing the search index view
+        // reflects every volume's committed metadata.
+        bool search_verified = false;
+        if (pending.empty() && !ipc_error && !stopping()) {
+            const auto rem_ms = [&] {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::max(std::chrono::steady_clock::duration::zero(), deadline - std::chrono::steady_clock::now()));
+            };
+            wait_for_db_idle(rem_ms());
+
+            ulp::everything3::SearchState probe_state;
+            if (probe_state && !stopping()) {
+                std::wstring probe_query;
+                append_to(probe_query, L"file: ext:", usyseek::indexer::USN_SENTINEL_EXT);
+                probe_state.set_text(probe_query)
+                           .request_properties(
+                               ulp::everything3::PropertyId::FullPath,
+                               ulp::everything3::PropertyId::Size,
+                               ulp::everything3::PropertyId::DateModified
+                           );
+
+                std::unordered_map<std::wstring_view, std::uint64_t> expected;
+                expected.reserve(fence.sentinels.size());
+                for (const auto& s : fence.sentinels) {
+                    expected.emplace(s.lower_path, s.expected_size);
+                }
+
+                std::wstring path_buf(512, L'\0');
+                std::wstring lower_buf;
+                lower_buf.reserve(512);
+                bool first_search = true;
+
+                while (!stopping()) {
+                    if (owned_ && owned_->is_ipc_db_busy()) {
+                        wait_for_db_idle(rem_ms());
+                        if (stopping()) break;
+                    }
+
+                    const ulp::everything3::ResultList res =
+                        first_search ? client.search(probe_state) : client.get_results(probe_state);
+                    first_search = false;
+                    if (!res) {
+                        if (is_fatal_ipc_error(Everything3_GetLastError())) {
+                            ipc_error = true;
+                            break;
+                        }
+                    } else {
+                        const EVERYTHING3_RESULT_LIST* raw = res.native_handle();
+                        const std::size_t n = res.viewport_count();
+                        std::size_t matched = 0;
+                        for (std::size_t i = 0; i < n; ++i) {
+                            if (Everything3_IsFolderResult(raw, i) != FALSE) continue;
+                            std::size_t len = Everything3_GetResultFullPathNameW(raw, i, path_buf.data(), path_buf.size());
+                            if (len >= path_buf.size() - 1) {
+                                const std::size_t req = Everything3_GetResultFullPathNameW(raw, i, nullptr, 0);
+                                if (req <= 1) continue;
+                                if (req > path_buf.size()) {
+                                    path_buf.resize(req);
+                                    len = Everything3_GetResultFullPathNameW(raw, i, path_buf.data(), path_buf.size());
+                                }
+                            }
+                            if (len == 0) continue;
+                            lower_buf.assign(path_buf.data(), len);
+                            CharLowerBuffW(lower_buf.data(), static_cast<DWORD>(len));
+                            const auto it = expected.find(std::wstring_view{lower_buf.data(), len});
+                            if (it == expected.end()) continue;
+
+                            const std::uint64_t raw_size = Everything3_GetResultSize(raw, i);
+                            const std::uint64_t raw_dm = Everything3_GetResultDateModified(raw, i);
+                            if (usyseek::indexer::is_usn_sentinel_metadata_ready(raw_size, raw_dm, it->second)) {
+                                ++matched;
+                            }
+                        }
+                        if (matched == expected.size()) {
+                            search_verified = true;
+                            break;
+                        }
+                    }
+                    if (std::chrono::steady_clock::now() >= deadline) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                }
+            }
         }
-        return all_fenced && pending.empty() && !ipc_error && !stopping();
+
+        fence.cleanup();
+        if ((!pending.empty() || !search_verified) && !stopping()) {
+            wlog(L"Everything USN fence did not confirm {} volume(s) before timeout (search_verified={}); using fallback settle\n",
+                 pending.size(), search_verified ? L"true" : L"false");
+        }
+        return all_fenced && pending.empty() && search_verified && !ipc_error && !stopping();
+    }
+
+    void close_and_wait() noexcept {
+        if (!owned_) return;
+        const bool was_stopping = stopping();
+        owned_->close_everything(!was_stopping);
+        if (!was_stopping) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (owned_->is_ipc_running() && !stopping() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }
+        owned_.reset();
     }
 
     bool wait_for_db_idle(std::chrono::milliseconds timeout = std::chrono::minutes(2)) const {
