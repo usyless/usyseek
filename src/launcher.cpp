@@ -866,8 +866,6 @@ void cleanup_update_artifacts(const fs::path& update_dir, const fs::path& target
 } // namespace
 
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int) {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc >= 5 && std::wstring_view{argv[1]} == L"--apply-update") {

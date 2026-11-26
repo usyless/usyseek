@@ -138,7 +138,6 @@ int run_automated_test(Shared& sh, Pill& pill, SettingsWindow& settings_win, con
 } // namespace
 
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int) {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const ulp::win::COMWrapper<false> com{static_cast<DWORD>(COINIT_APARTMENTTHREADED) | static_cast<DWORD>(COINIT_DISABLE_OLE1DDE)};
     // OLE proper (not just COM) for dragging media out and putting it on the clipboard.
     // Keep alive across Pill/SettingsWindow/Shared destruction.

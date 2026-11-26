@@ -266,6 +266,7 @@ endif()
 add_executable(usyseek WIN32
     src/launcher.cpp
     resources/app.rc
+    resources/app.manifest
 )
 set_target_properties(usyseek PROPERTIES CXX_SCAN_FOR_MODULES OFF)
 target_link_libraries(usyseek PRIVATE usyseek_common shell32 user32 ole32)
@@ -274,6 +275,7 @@ target_link_libraries(usyseek PRIVATE usyseek_common shell32 user32 ole32)
 add_executable(usyseek-ui WIN32
     src/ui.cpp
     resources/app.rc
+    resources/app.manifest
 )
 set_target_properties(usyseek-ui PROPERTIES CXX_SCAN_FOR_MODULES OFF)
 target_compile_definitions(usyseek-ui PRIVATE USYSEEK_TARGET_UI)
@@ -296,6 +298,7 @@ configure_file("${PROJECT_SOURCE_DIR}/resources/indexer.rc.in" "${CMAKE_BINARY_D
 add_executable(usyseek-indexer
     src/indexer.cpp
     "${CMAKE_BINARY_DIR}/indexer.rc"
+    resources/app.manifest
 )
 set_target_properties(usyseek-indexer PROPERTIES CXX_SCAN_FOR_MODULES OFF)
 target_compile_definitions(usyseek-indexer PRIVATE USYSEEK_TARGET_INDEXER)

@@ -2175,7 +2175,6 @@ int wmain(int argc, wchar_t* const* argv) {
     if (export_only) {
         return export_text_only(load_settings());
     }
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     PROCESS_POWER_THROTTLING_STATE throttling{};
     throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
     throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
