@@ -40,7 +40,7 @@ endmacro()
 
 set_tracked_cache_version(USYSEEK_USYLIBPP_VERSION "main" "usylibpp git tag/branch")
 set_tracked_cache_version(USYSEEK_GLAZE_VERSION "v9.1.0" "glaze git tag")
-set_tracked_cache_version(USYSEEK_MIMALLOC_VERSION "v3.5.3" "Version (git tag/branch) to use for mimalloc")
+set_tracked_cache_version(USYSEEK_MIMALLOC_VERSION "v3.7.1" "Version (git tag/branch) to use for mimalloc")
 set_tracked_cache_version(USYSEEK_ORT_VERSION "1.32.0" "onnxruntime release")
 set_tracked_cache_version(USYSEEK_EVERYTHING_VERSION "1.5.0.1424b" "Voidtools Everything release")
 set_tracked_cache_version(USYSEEK_SQLITE_VERSION "3540100" "SQLite amalgamation release")
