@@ -2,6 +2,12 @@
 
 Guidelines for working in the `usyseek` repository (C++23 + Rust).
 
+## Shared Library (`usylibpp`)
+
+- Many shared components used by this app live in `usylibpp`.
+- If a task requires changes to `usylibpp`, make those changes directly in the `usylibpp` repository, then commit and push them there.
+- If new reusable code or utilities would fit well in `usylibpp`, place them there instead of duplicating them in this repo, and commit and push the changes in `usylibpp`.
+
 ## Versioning
 
 - **usyseek version**: Bump `VERSION` in `project(usyseek VERSION ...)` in `CMakeLists.txt` — nowhere else.
