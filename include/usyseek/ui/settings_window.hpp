@@ -4279,12 +4279,20 @@ private:
                         queue_hover_dirty(vid, vidx);
                     }
                     const bool vis_changed = hover_.set(vid, vidx, animate);
-                    tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, tooltip_text(id) != nullptr, animate);
+                    const wchar_t* tip = tooltip_text(id);
+                    bool tip_changed = false;
+                    if (tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h ? &h->r : nullptr, tip != nullptr, animate)) {
+                        const bool allow_now = live_visible() && window_active_ && id != IdNone && tip != nullptr;
+                        tip_changed = tooltip_.show_now(allow_now, tip ? tip : L"", {}, animate);
+                    }
                     const bool tip_fading = animate && tooltip_.alpha.active();
                     if ((vis_changed && animate) || tip_fading) {
                         start_anim();
                     } else if (vis_changed) {
                         invalidate();
+                    } else if (tip_changed) {
+                        dirty_ = true;
+                        if (live_visible()) InvalidateRect(hwnd_, nullptr, FALSE);
                     }
                 }
                 return 0;

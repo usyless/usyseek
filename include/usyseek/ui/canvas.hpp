@@ -5,6 +5,8 @@
 #include "gfx.hpp"
 #include "theme.hpp"
 
+#include <usylibpp/ui/tooltip.hpp>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -759,50 +761,7 @@ struct HoverTracker {
     }
 };
 
-/// Shared delayed-hover tooltip state with smooth fade-in/out and zero idle repaints.
-struct HoverTooltip {
-    static constexpr UINT DELAY_MS = 380;
-    D2D1_RECT_F anchor{};
-    D2D1_RECT_F pending_anchor{};
-    std::wstring title;
-    std::wstring subtitle;
-    bool shown = false;
-    AnimFloat alpha;
-
-    void on_hover_changed(HWND hwnd, UINT_PTR timer_id, const Hit* h, bool eligible, bool animate) noexcept {
-        if (hwnd) KillTimer(hwnd, timer_id);
-        if (shown) {
-            shown = false;
-            alpha.set(0.0f, animate);
-        } else if (!animate) {
-            alpha.snap(0.0f);
-        }
-        pending_anchor = h ? h->r : D2D1_RECT_F{};
-        if (eligible && hwnd) SetTimer(hwnd, timer_id, DELAY_MS, nullptr);
-    }
-
-    bool on_timer(HWND hwnd, UINT_PTR timer_id, bool allow, std::wstring new_title, std::wstring new_subtitle, bool animate) noexcept {
-        if (hwnd) KillTimer(hwnd, timer_id);
-        if (!allow || (new_title.empty() && new_subtitle.empty())) return false;
-        anchor = pending_anchor;
-        title = std::move(new_title);
-        subtitle = std::move(new_subtitle);
-        shown = true;
-        alpha.snap(0.0f);
-        alpha.set(1.0f, animate);
-        return true;
-    }
-
-    void clear(HWND hwnd, UINT_PTR timer_id, bool animate = false) noexcept {
-        if (hwnd) KillTimer(hwnd, timer_id);
-        shown = false;
-        alpha.set(0.0f, animate);
-    }
-
-    bool step(float dt) noexcept {
-        return alpha.step(dt, shown ? 32.0f : 36.0f, 0.008f);
-    }
-};
+using usylibpp::ui::HoverTooltip;
 
 struct TooltipLayout {
     D2D1_RECT_F box{};

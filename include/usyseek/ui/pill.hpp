@@ -3946,7 +3946,11 @@ private:
             std::wstring tt;
             std::wstring ts;
             const bool can_tip = !menu_open_ && !drop_open_ && !drag_pending_ && !dragging_out_ && tooltip_for(id, idx, tt, ts);
-            tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h, can_tip, animate);
+            bool tip_changed = false;
+            if (tooltip_.on_hover_changed(hwnd_, TIMER_TOOLTIP, h ? &h->r : nullptr, can_tip, animate)) {
+                const bool allow_now = visible() && !fading_out_ && window_active_ && can_tip;
+                tip_changed = tooltip_.show_now(allow_now, std::move(tt), std::move(ts), animate);
+            }
             const bool tip_fading = animate && tooltip_.alpha.active();
             if (show_help() != was_help) {
                 full_dirty_ = true;
@@ -3956,6 +3960,9 @@ private:
                 start_anim();
             } else if (vis_changed) {
                 invalidate();
+            } else if (tip_changed) {
+                dirty_ = true;
+                if (visible()) InvalidateRect(hwnd_, nullptr, FALSE);
             }
         }
     }
