@@ -263,6 +263,9 @@ if(USYSEEK_USE_MIMALLOC)
     target_link_libraries(usyseek_common INTERFACE
         mimalloc-obj
     )
+    target_sources(usyseek_common INTERFACE
+        $<TARGET_OBJECTS:mimalloc-obj>
+    )
 endif()
 
 ##### usyseek.exe - launcher (tray, hotkey, process supervision)
