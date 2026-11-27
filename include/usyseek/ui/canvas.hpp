@@ -356,6 +356,12 @@ public:
 
     ID2D1SolidColorBrush* brush(D2D1_COLOR_F c) noexcept {
         c.a *= opacity_;
+        if (target_.is_hdr()) {
+            const float scale = target_.sdr_white_scale();
+            c.r = srgb_to_linear_channel(c.r) * scale;
+            c.g = srgb_to_linear_channel(c.g) * scale;
+            c.b = srgb_to_linear_channel(c.b) * scale;
+        }
         ID2D1SolidColorBrush* b = target_.solid_brush();
         if (b && (!has_color_ || c.r != last_color_.r || c.g != last_color_.g || c.b != last_color_.b || c.a != last_color_.a)) {
             b->SetColor(c);
@@ -452,9 +458,19 @@ public:
         const float sy = fit == ThumbFit::Contain ? (height(drawn) / bs.height) : sx;
         const float tx = fit == ThumbFit::Contain ? drawn.left : dest.left;
         const float ty = fit == ThumbFit::Contain ? drawn.top : dest.top;
+        const D2D1_MATRIX_3X2_F xf = D2D1::Matrix3x2F::Scale(sx, sy) * D2D1::Matrix3x2F::Translation(tx, ty);
+        if (target_.is_hdr() && bmp->GetPixelFormat().format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            if (ID2D1ImageBrush* ib = target_.sdr_image_brush(bmp, D2D1::RectF(0.0f, 0.0f, bs.width, bs.height),
+                                                              D2D1_INTERPOLATION_MODE_LINEAR)) {
+                ib->SetOpacity(opacity_);
+                ib->SetTransform(xf);
+                dc_->FillRoundedRectangle(D2D1::RoundedRect(drawn, radius, radius), ib);
+                return;
+            }
+        }
         if (ID2D1BitmapBrush1* bb = target_.bitmap_brush(bmp)) {
             bb->SetOpacity(opacity_);
-            bb->SetTransform(D2D1::Matrix3x2F::Scale(sx, sy) * D2D1::Matrix3x2F::Translation(tx, ty));
+            bb->SetTransform(xf);
             dc_->FillRoundedRectangle(D2D1::RoundedRect(drawn, radius, radius), bb);
         }
     }
@@ -465,6 +481,18 @@ public:
         if (!bmp) return;
         dest = snap(dest);
         if (!intersects_clip(dest, 1.0f)) return;
+        if (target_.is_hdr() && bmp->GetPixelFormat().format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            const D2D1_SIZE_F bs = bmp->GetSize();
+            if (bs.width > 0.0f && bs.height > 0.0f) {
+                if (ID2D1ImageBrush* ib = target_.sdr_image_brush(bmp, D2D1::RectF(0.0f, 0.0f, bs.width, bs.height), mode)) {
+                    ib->SetOpacity(opacity_);
+                    ib->SetTransform(D2D1::Matrix3x2F::Scale(width(dest) / bs.width, height(dest) / bs.height) *
+                                     D2D1::Matrix3x2F::Translation(dest.left, dest.top));
+                    dc_->FillRectangle(dest, ib);
+                    return;
+                }
+            }
+        }
         dc_->DrawBitmap(bmp, &dest, opacity_, mode, nullptr, nullptr);
     }
 
@@ -474,6 +502,20 @@ public:
         if (!bmp) return;
         dest = snap(dest);
         if (!intersects_clip(dest, 1.0f)) return;
+        if (target_.is_hdr() && bmp->GetPixelFormat().format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            const float sw = width(src);
+            const float sh = height(src);
+            if (sw > 0.0f && sh > 0.0f) {
+                if (ID2D1ImageBrush* ib = target_.sdr_image_brush(bmp, src, mode)) {
+                    ib->SetOpacity(opacity_);
+                    ib->SetTransform(D2D1::Matrix3x2F::Translation(-src.left, -src.top) *
+                                     D2D1::Matrix3x2F::Scale(width(dest) / sw, height(dest) / sh) *
+                                     D2D1::Matrix3x2F::Translation(dest.left, dest.top));
+                    dc_->FillRectangle(dest, ib);
+                    return;
+                }
+            }
+        }
         dc_->DrawBitmap(bmp, &dest, opacity_, mode, &src, nullptr);
     }
 
@@ -569,6 +611,12 @@ private:
 
     [[nodiscard]] const D2D1_RECT_F& current_clip() const noexcept {
         return clips_[std::min(clip_depth_, clips_.size()) - 1];
+    }
+
+    [[nodiscard]] static float srgb_to_linear_channel(float x) noexcept {
+        x = std::clamp(x, 0.0f, 1.0f);
+        if (x <= 0.04045f) return x / 12.92f;
+        return std::pow((x + 0.055f) / 1.055f, 2.4f);
     }
 
     static DWRITE_TEXT_ALIGNMENT text_alignment(Align a) noexcept {

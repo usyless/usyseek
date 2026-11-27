@@ -4550,7 +4550,11 @@ private:
                 sh_.desktop_dupl.reset();
                 glass_.invalidate_backdrop();
                 if (visible()) {
-                    if (sh_.gfx.adapter_stale(hwnd_)) recover();
+                    if (sh_.gfx.adapter_stale(hwnd_)) {
+                        recover();
+                    } else {
+                        (void)target_.sync_hdr(true);
+                    }
                     invalidate();
                 } else if (sh_.gfx.adapter_stale(hwnd_)) {
                     shadow_bmp_.reset();

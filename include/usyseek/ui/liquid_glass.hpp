@@ -82,7 +82,7 @@ struct alignas(16) LiquidGlassShaderParams {
     std::array<float, 4> glare_params{};   // glareRange, glareHardness, glareFactor, glareAngleDeg
     std::array<float, 4> shape_params{};   // glareConvergence, glareOppositeFactor, cornerRadiusDip, roundnessN
     std::array<float, 4> misc_params{};    // dpr (overridden from the effect context), forceOpaque, edgeAaPx, shapeMarginDip
-    std::array<float, 4> extra_params{};   // opacity, centeredEdge, rimInsetDip, reserved
+    std::array<float, 4> extra_params{};   // opacity, centeredEdge, rimInsetDip, hdrWhiteScale (0 = SDR, >= 1 = linear scRGB HDR)
 };
 static_assert(sizeof(LiquidGlassShaderParams) == 144);
 
@@ -138,8 +138,16 @@ cbuffer LiquidGlassParams : register(b0)
     float4 glareParams;   // x=glareRange, y=glareHardness, z=glareFactor, w=glareAngleDeg
     float4 shapeParams;   // x=glareConvergence, y=glareOppositeFactor, z=cornerRadiusDip, w=roundnessN
     float4 miscParams;    // x=dpr, y=forceOpaque, z=edgeAaPx, w=shapeMarginDip
-    float4 extraParams;   // x=opacity, y=centeredEdge, z=rimInsetDip, w=reserved
+    float4 extraParams;   // x=opacity, y=centeredEdge, z=rimInsetDip, w=hdrWhiteScale (0=SDR, >=1=linear scRGB HDR)
 };
+
+float3 SrgbToLinear(float3 x)
+{
+    x = saturate(x);
+    float3 lo = x / 12.92;
+    float3 hi = pow(max((x + 0.055) / 1.055, 1e-6), 2.4);
+    return (x <= 0.04045) ? lo : hi;
+}
 
 float superellipseCornerSDF(float2 p, float r, float n)
 {
@@ -351,9 +359,14 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
 
         // The alpha floor keeps 8-bit quantisation noise in near-transparent texels (e.g. rgb 2/255 over a 1/255)
         // from being amplified into a fully saturated colour; such texels fade to black instead.
-        blurredPixel.rgb = saturate(blurredPixel.rgb / max(chanA, 0.04));
+        float hdrScale = extraParams.w;
+        float3 unpremul = blurredPixel.rgb / max(chanA, 0.04);
+        blurredPixel.rgb = (hdrScale > 0.5)
+            ? ((unpremul == unpremul) ? clamp(unpremul, -100.0, 1000.0) : float3(0.0, 0.0, 0.0))
+            : saturate(unpremul);
 
-        float3 tintRgb = tintColor.rgb;
+        float3 tintRgb = (hdrScale > 0.5) ? (SrgbToLinear(tintColor.rgb) * hdrScale) : tintColor.rgb;
+        float3 whiteRef = (hdrScale > 0.5) ? float3(hdrScale, hdrScale, hdrScale) : float3(1.0, 1.0, 1.0);
         float tintA = tintColor.a;
         outColor = lerp(blurredPixel, float4(tintRgb, 1.0), tintA * 0.85);
 
@@ -367,9 +380,10 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
             float ffBase = saturate(1.0 + merged * res.y / (1500.0 * dpr) * fresnelK + fresnelHardness);
             float ff2 = ffBase * ffBase;
             float fresnelFactor = ff2 * ff2 * ffBase;
-            float3 fresnelBase = lerp(float3(1.0, 1.0, 1.0), tintRgb, tintA * 0.5);
+            float3 fresnelBase = lerp(whiteRef, tintRgb, tintA * 0.5);
             float lighten = clamp(0.2 * fresnelFactor * fresnelFactorN, 0.0, 1.0);
-            float3 fresnelTint = lerp(fresnelBase, float3(1.0, 1.0, 1.0), lighten);
+            float3 fresnelTint = lerp(fresnelBase, whiteRef, lighten);
+            if (hdrScale > 0.5) fresnelTint = max(fresnelTint, outColor.rgb);
             float fresnelCoverage = smoothstep(0.0, 2.0, fresnelParams.x * dpr);
             outColor = lerp(outColor, float4(fresnelTint, 1.0), fresnelFactor * fresnelFactorN * 0.7 * fresnelCoverage);
         }
@@ -401,7 +415,9 @@ float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 u
 
             float g = glareAngleFactor * glareGeoFactor;
             float3 glareBase = lerp(blurredPixel.rgb, tintRgb, tintA * 0.5);
-            float3 glareColor = lerp(glareBase, float3(1.0, 1.0, 1.0), clamp(g, 0.0, 1.0));
+            float3 glareHighlight = (hdrScale > 0.5) ? max(whiteRef, glareBase * 1.15) : whiteRef;
+            float3 glareColor = lerp(glareBase, glareHighlight, clamp(g, 0.0, 1.0));
+            if (hdrScale > 0.5) glareColor = max(glareColor, outColor.rgb);
             float glareCoverage = smoothstep(0.0, 2.0, glareParams.x * dpr);
             outColor = lerp(outColor, float4(glareColor, 1.0), saturate(g) * glareCoverage);
         }
@@ -520,6 +536,11 @@ float3 TonemapNormalizedLinear(float3 lin)
 float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET
 {
     float3 raw = InputTexture0.SampleLevel(InputSampler0, uv0.xy, 0.0).rgb;
+    if (mode > 2.5)
+    {
+        // Unclamped HDR10 PQ BT.2020 -> linear scRGB (1.0 = 80 nits) for true FP16 HDR preservation.
+        return float4(Bt2020ToBt709(PqToNits(raw) / 80.0), 1.0);
+    }
     if (mode > 1.5)
     {
         return float4(saturate(raw), 1.0);
@@ -926,7 +947,6 @@ public:
         if (!draw_info_) return E_INVALIDARG;
         const HRESULT hr = draw_info_->SetPixelShader(GUID_UsyseekHdrToSdrPS);
         if (FAILED(hr)) return hr;
-        (void)draw_info_->SetOutputBuffer(D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_CHANNEL_DEPTH_4);
         const D2D1_INPUT_DESCRIPTION desc{
             .filter = D2D1_FILTER_MIN_MAG_MIP_POINT,
             .levelOfDetailCount = 0,
@@ -996,7 +1016,8 @@ public:
         ULONGLONG color_refresh_tick = 0;
         wil::com_ptr<IDXGIOutputDuplication> dupl;
         usylibpp::ui::wgc::MonitorCaptureSession wgc_session;
-        wil::com_ptr<ID3D11Texture2D> desktop_tex; // always desktop-oriented BGRA8, `tex_w` x `tex_h` == monitor size
+        wil::com_ptr<ID3D11Texture2D> desktop_tex; // desktop-oriented (`BGRA8` on SDR, `R16G16B16A16_FLOAT` on HDR)
+        DXGI_FORMAT desktop_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
         bool desktop_is_rt = false;
         uint64_t tex_id = 0;
         UINT tex_w = 0;
@@ -1230,10 +1251,11 @@ private:
             D3D11_TEXTURE2D_DESC sd{};
             tex->GetDesc(&sd);
             const bool is_sdr_bgra = (sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM || sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
-            const bool is_hdr_fmt = (sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || sd.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
-            if (sd.Width == 0 || sd.Height == 0 || (!is_sdr_bgra && !is_hdr_fmt)) break;
+            const bool is_fp16 = (sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+            const bool is_r10 = (sd.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+            if (sd.Width == 0 || sd.Height == 0 || (!is_sdr_bgra && !is_fp16 && !is_r10)) break;
 
-            if (is_hdr_fmt && now_tick >= st->color_refresh_tick) {
+            if ((is_fp16 || is_r10) && now_tick >= st->color_refresh_tick) {
                 const float fresh_scale = usylibpp::ui::query_monitor_sdr_white_scale(st->mon);
                 if (std::fabs(fresh_scale - st->color_info.sdr_white_scale) > 1e-3f) {
                     st->color_info.sdr_white_scale = fresh_scale;
@@ -1243,13 +1265,17 @@ private:
                 st->color_refresh_tick = now_tick + 2000u;
             }
 
+            const bool direct_copy_fmt = is_sdr_bgra || is_fp16;
+            const DXGI_FORMAT desk_fmt = (is_fp16 || (is_r10 && st->color_info.is_hdr))
+                ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                : DXGI_FORMAT_B8G8R8A8_UNORM;
             const bool rotated = st->rotation != DesktopRotation::Identity;
             const bool swap = st->rotation == DesktopRotation::Rot90 || st->rotation == DesktopRotation::Rot270;
             const UINT want_w = swap ? sd.Height : sd.Width;
             const UINT want_h = swap ? sd.Width : sd.Height;
-            const bool need_rt = rotated || is_hdr_fmt;
-            const bool need_native_sdr = rotated && is_sdr_bgra;
-            if (!ensure_desktop_surface(gfx, *st, want_w, want_h, need_rt, need_native_sdr, sd.Width, sd.Height, next_tex_id_)) {
+            const bool need_rt = rotated || !direct_copy_fmt;
+            const bool need_native_direct = rotated && direct_copy_fmt;
+            if (!ensure_desktop_surface(gfx, *st, want_w, want_h, desk_fmt, need_rt, need_native_direct, sd.Width, sd.Height, next_tex_id_)) {
                 break;
             }
 
@@ -1259,8 +1285,9 @@ private:
             delta.dirty_all = !st->has_frame || st->needs_full_copy || !have_meta;
             const bool full = delta.dirty_all || copy_rects_.size() > MAX_REGION_COPIES;
 
-            if (is_sdr_bgra) {
-                // Zero-overhead SDR fast path: direct GPU copy (plus D2D rotation only when rotated).
+            if (direct_copy_fmt) {
+                // Zero-shader direct GPU copy for both SDR (BGRA8) and native HDR (FP16 scRGB),
+                // preserving full unclamped HDR luminance & wide color gamut (plus D2D rotation only when rotated).
                 ID3D11Texture2D* dst = rotated ? st->native_tex.get() : st->desktop_tex.get();
                 const IntRect masked = (mask && st->has_frame) ? screen_to_native(*st, *mask) : IntRect{};
                 if (full && int_rect_empty(masked)) {
@@ -1284,8 +1311,8 @@ private:
                     break;
                 }
             } else {
-                // Native HDR / 10-bit path: single-pass GPU tone-map (+ rotation & dirty/mask clipping) into BGRA8.
-                if (!convert_hdr_into_desktop(gfx, *st, tex.get(), sd,
+                // R10G10B10A2 path: decode HDR10 PQ BT.2020 into unclamped FP16 scRGB (or 10-bit SDR into BGRA8).
+                if (!convert_r10_into_desktop(gfx, *st, tex.get(), sd,
                                               full ? nullptr : &delta.dirty_rects,
                                               (mask && st->has_frame) ? mask : nullptr)) {
                     st->has_frame = false;
@@ -1327,7 +1354,7 @@ private:
                 const UINT want_w = (content_sz.Width > 0) ? std::min<UINT>(td.Width, static_cast<UINT>(content_sz.Width)) : td.Width;
                 const UINT want_h = (content_sz.Height > 0) ? std::min<UINT>(td.Height, static_cast<UINT>(content_sz.Height)) : td.Height;
                 if (want_w == 0 || want_h == 0) return;
-                if (!ensure_desktop_surface(gfx, st, want_w, want_h, false, false, want_w, want_h, next_tex_id_)) {
+                if (!ensure_desktop_surface(gfx, st, want_w, want_h, DXGI_FORMAT_B8G8R8A8_UNORM, false, false, want_w, want_h, next_tex_id_)) {
                     return;
                 }
 
@@ -1481,9 +1508,9 @@ private:
         return SUCCEEDED(hr);
     }
 
-    /// Converts a native HDR / 10-bit DXGI duplication frame (FP16 scRGB or R10G10B10A2) directly into
-    /// `st.desktop_tex` (BGRA8) in one GPU pass, handling rotation, dirty rects, and drag cursor masking.
-    bool convert_hdr_into_desktop(Gfx& gfx, OutputState& st, ID3D11Texture2D* src, const D3D11_TEXTURE2D_DESC& sd,
+    /// Converts an R10G10B10A2 DXGI duplication frame into `st.desktop_tex` (`R16G16B16A16_FLOAT` unclamped
+    /// linear scRGB when HDR10 PQ, or `BGRA8` when 10-bit SDR) in one GPU pass, with rotation and dirty/mask clipping.
+    bool convert_r10_into_desktop(Gfx& gfx, OutputState& st, ID3D11Texture2D* src, const D3D11_TEXTURE2D_DESC& sd,
                                   const std::vector<RECT>* dirty, const RECT* mask) noexcept {
         if (!ensure_conv_dc(gfx) || !st.desktop_target_bmp) return false;
         if (!hdr_fx_) {
@@ -1512,12 +1539,15 @@ private:
         }
         if (!src_bmp) return false;
 
+        const bool hdr_pq = st.color_info.is_hdr && (st.desktop_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT);
         const HdrToSdrParams params{
-            .mode = (sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 0.0f : (st.color_info.is_hdr ? 1.0f : 2.0f),
+            .mode = hdr_pq ? 3.0f : 2.0f,
             .sdr_white_scale = st.color_info.sdr_white_scale,
             .max_nits = st.color_info.max_luminance,
             .reserved = 0.0f,
         };
+        (void)hdr_fx_->SetValue(D2D1_PROPERTY_PRECISION,
+                                hdr_pq ? D2D1_BUFFER_PRECISION_16BPC_FLOAT : D2D1_BUFFER_PRECISION_8BPC_UNORM);
         if (FAILED(hdr_fx_->SetValue(0, reinterpret_cast<const BYTE*>(&params), sizeof(params)))) return false;
 
         hdr_fx_->SetInput(0, src_bmp);
@@ -1677,14 +1707,14 @@ private:
         return false;
     }
 
-    bool ensure_desktop_surface(Gfx& gfx, OutputState& st, UINT want_w, UINT want_h, bool need_rt,
-                                bool need_native_sdr, UINT native_w, UINT native_h, uint64_t& next_tex_id) noexcept {
+    bool ensure_desktop_surface(Gfx& gfx, OutputState& st, UINT want_w, UINT want_h, DXGI_FORMAT desk_fmt,
+                                bool need_rt, bool need_native_direct, UINT native_w, UINT native_h, uint64_t& next_tex_id) noexcept {
         if (want_w == 0 || want_h == 0) return false;
         const bool rt_ok = need_rt ? (st.desktop_is_rt && st.desktop_target_bmp != nullptr) : !st.desktop_is_rt;
-        const bool native_ok = need_native_sdr
-            ? (st.native_tex && st.native_bmp && st.native_fmt == DXGI_FORMAT_B8G8R8A8_UNORM)
+        const bool native_ok = need_native_direct
+            ? (st.native_tex && st.native_bmp && st.native_fmt == desk_fmt)
             : true;
-        if (st.desktop_tex && st.tex_w == want_w && st.tex_h == want_h && rt_ok && native_ok) {
+        if (st.desktop_tex && st.tex_w == want_w && st.tex_h == want_h && st.desktop_fmt == desk_fmt && rt_ok && native_ok) {
             return true;
         }
 
@@ -1693,6 +1723,7 @@ private:
         st.native_tex.reset();
         st.native_fmt = DXGI_FORMAT_UNKNOWN;
         st.desktop_tex.reset();
+        st.desktop_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
         st.desktop_is_rt = false;
         st.tex_id = 0;
         st.tex_w = st.tex_h = 0;
@@ -1703,12 +1734,13 @@ private:
         td.Height = want_h;
         td.MipLevels = 1;
         td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.Format = desk_fmt;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = static_cast<UINT>(D3D11_BIND_SHADER_RESOURCE) |
                        (need_rt ? static_cast<UINT>(D3D11_BIND_RENDER_TARGET) : 0u);
         if (FAILED(gfx.d3d()->CreateTexture2D(&td, nullptr, &st.desktop_tex))) return false;
+        st.desktop_fmt = desk_fmt;
         st.desktop_is_rt = need_rt;
 
         if (need_rt) {
@@ -1719,7 +1751,7 @@ private:
             }
             const auto desk_surf = st.desktop_tex.try_query<IDXGISurface>();
             const auto target_props = D2D1::BitmapProperties1(
-                D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
+                D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(desk_fmt, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
             if (!desk_surf || FAILED(conv_dc_->CreateBitmapFromDxgiSurface(desk_surf.get(), &target_props, &st.desktop_target_bmp))) {
                 st.desktop_target_bmp.reset();
                 st.desktop_tex.reset();
@@ -1728,7 +1760,7 @@ private:
             }
         }
 
-        if (need_native_sdr && !ensure_native_surface(gfx, st, native_w, native_h, DXGI_FORMAT_B8G8R8A8_UNORM)) {
+        if (need_native_direct && !ensure_native_surface(gfx, st, native_w, native_h, desk_fmt)) {
             st.native_bmp.reset();
             st.desktop_target_bmp.reset();
             st.native_tex.reset();
@@ -1815,15 +1847,23 @@ public:
     void release() noexcept {
         detach_fx_inputs(desktop_fx_);
         for (auto& fx : lens_pool_) detach_fx_inputs(fx);
+        if (hdr_to_sdr_fx_) hdr_to_sdr_fx_->SetInput(0, nullptr);
+        hdr_to_sdr_fx_.reset();
         views_.clear();
         outs_.clear();
         std::vector<uint8_t>{}.swap(black_px_);
         win_bmp_[0].reset();
         win_bmp_[1].reset();
         win_bmp_idx_ = 0;
+        win_bmp_fmt_ = DXGI_FORMAT_UNKNOWN;
+        win_bmp_is_target_ = false;
+        gdi_sdr_bmp_.reset();
+        gdi_sdr_w_ = gdi_sdr_h_ = 0;
         cached_glass_bmp_.reset();
         cached_glass_valid_ = false;
+        cached_glass_fmt_ = DXGI_FORMAT_UNKNOWN;
         scene_bmp_.reset();
+        scene_fmt_ = DXGI_FORMAT_UNKNOWN;
         scene_prev_target_.reset();
         scene_saved_clip_.reset();
         desktop_fx_ = {};
@@ -1923,12 +1963,13 @@ public:
         ID2D1Bitmap1* gdi_bmp = nullptr;
         if (!use_dupl) {
             if (detail::is_input_desktop_accessible()) {
-                gdi_bmp = capture_gdi_backdrop(target, origin, pw, ph);
+                gdi_bmp = capture_gdi_backdrop(cv, target, origin, pw, ph);
             }
             if (!gdi_bmp) {
                 if (cached_glass_valid_ && cached_glass_bmp_ &&
                     cached_key_.pw == pw && cached_key_.ph == ph &&
-                    cached_key_.dpi == target.dpi() && cached_key_.epoch == target.target_epoch()) {
+                    cached_key_.dpi == target.dpi() && cached_key_.epoch == target.target_epoch() &&
+                    cached_key_.is_hdr == target.is_hdr()) {
                     cv.dc()->DrawBitmap(cached_glass_bmp_.get(), &full_dest, 1.0f,
                                         D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &full_dest, nullptr);
                     return true;
@@ -1937,7 +1978,8 @@ public:
             }
         }
 
-        const GlassCacheKey key = make_cache_key(pw, ph, target.dpi(), target.target_epoch(), origin, panel_rect, s, use_dupl, backdrop_ver_);
+        const GlassCacheKey key = make_cache_key(pw, ph, target.dpi(), target.target_epoch(), origin, panel_rect, s,
+                                                 use_dupl, backdrop_ver_, target.is_hdr(), target.sdr_white_scale());
         if (cached_glass_valid_ && cached_glass_bmp_ && cached_key_ == key) {
             cv.dc()->DrawBitmap(cached_glass_bmp_.get(), &full_dest, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &full_dest, nullptr);
             return true;
@@ -1945,7 +1987,7 @@ public:
 
         ID2D1Bitmap1* src_bmp = nullptr;
         if (use_dupl) {
-            src_bmp = composite_outputs(gfx, target, origin, pw, ph);
+            src_bmp = composite_outputs(gfx, cv, target, origin, pw, ph);
             if (!src_bmp) return false;
         } else {
             src_bmp = gdi_bmp;
@@ -2007,22 +2049,26 @@ public:
         const UINT ph = target.pixel_height();
         if (pw == 0 || ph == 0) return false;
 
-        const bool same_env = scene_bmp_ && scene_dpi_ == target.dpi() && scene_epoch_ == target.target_epoch();
+        const DXGI_FORMAT want_fmt = target.pixel_format();
+        const bool same_env = scene_bmp_ && scene_dpi_ == target.dpi() && scene_epoch_ == target.target_epoch() &&
+                              scene_fmt_ == want_fmt;
         const auto [want_w, want_h] = desired_bitmap_size(scene_w_, scene_h_, pw, ph, same_env);
         if (!same_env || scene_w_ != want_w || scene_h_ != want_h) {
             scene_bmp_.reset();
             const auto props = D2D1::BitmapProperties1(
                 D2D1_BITMAP_OPTIONS_TARGET,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+                D2D1::PixelFormat(want_fmt, D2D1_ALPHA_MODE_PREMULTIPLIED),
                 target.dpi(), target.dpi());
             if (FAILED(target.dc()->CreateBitmap(D2D1::SizeU(want_w, want_h), nullptr, 0, &props, &scene_bmp_))) {
                 scene_w_ = scene_h_ = 0;
+                scene_fmt_ = DXGI_FORMAT_UNKNOWN;
                 return false;
             }
             scene_w_ = want_w;
             scene_h_ = want_h;
             scene_dpi_ = target.dpi();
             scene_epoch_ = target.target_epoch();
+            scene_fmt_ = want_fmt;
         }
         ID2D1DeviceContext6* dc = target.dc();
         dc->GetTarget(&scene_prev_target_);
@@ -2122,6 +2168,8 @@ private:
         float rim_inset_dip = 0.0f;
         bool use_dupl = false;
         uint64_t backdrop_ver = 0;
+        bool is_hdr = false;
+        float sdr_white_scale = 1.0f;
 
         [[nodiscard]] bool operator==(const GlassCacheKey& o) const noexcept {
             return pw == o.pw && ph == o.ph && dpi == o.dpi && epoch == o.epoch &&
@@ -2140,13 +2188,15 @@ private:
                    tint.r == o.tint.r && tint.g == o.tint.g && tint.b == o.tint.b && tint.a == o.tint.a &&
                    force_opaque == o.force_opaque && opacity == o.opacity &&
                    centered_edge == o.centered_edge && rim_inset_dip == o.rim_inset_dip &&
-                   use_dupl == o.use_dupl && backdrop_ver == o.backdrop_ver;
+                   use_dupl == o.use_dupl && backdrop_ver == o.backdrop_ver &&
+                   is_hdr == o.is_hdr && sdr_white_scale == o.sdr_white_scale;
         }
     };
 
     [[nodiscard]] static GlassCacheKey make_cache_key(UINT pw, UINT ph, float dpi, uint64_t epoch, POINT origin,
                                                       D2D1_RECT_F panel_rect, const GlassStyle& s,
-                                                      bool use_dupl, uint64_t backdrop_ver) noexcept {
+                                                      bool use_dupl, uint64_t backdrop_ver,
+                                                      bool is_hdr, float sdr_white_scale) noexcept {
         return GlassCacheKey{
             .pw = pw,
             .ph = ph,
@@ -2180,6 +2230,8 @@ private:
             .rim_inset_dip = s.rim_inset_dip,
             .use_dupl = use_dupl,
             .backdrop_ver = backdrop_ver,
+            .is_hdr = is_hdr,
+            .sdr_white_scale = sdr_white_scale,
         };
     }
 
@@ -2189,9 +2241,11 @@ private:
         uint64_t seen_tex_id = 0;
         uint64_t seen_seq = 0;
         wil::com_ptr<ID2D1Bitmap1> bmp; // D2D view of the output's desktop texture
+        DXGI_FORMAT bmp_fmt = DXGI_FORMAT_UNKNOWN;
         uint64_t bmp_tex_id = 0;
         uint64_t bmp_epoch = 0;
         wil::com_ptr<ID3D11Texture2D> probe_tex;
+        DXGI_FORMAT probe_fmt = DXGI_FORMAT_UNKNOWN;
         UINT probe_tex_w = 0, probe_tex_h = 0;
         uint64_t probe_epoch = 0;
         std::vector<uint8_t> probe_px;
@@ -2282,55 +2336,64 @@ private:
     }
 
     /// Composites every output under the window into the next `win_bmp_` (black where no monitor is).
-    ID2D1Bitmap1* composite_outputs(Gfx& gfx, WindowTarget& target, POINT origin, UINT pw, UINT ph) {
+    /// Supports native FP16 scRGB on HDR targets, zero-overhead BGRA8 on SDR targets, and mixed HDR+SDR straddling.
+    ID2D1Bitmap1* composite_outputs(Gfx& gfx, Canvas& cv, WindowTarget& target, POINT origin, UINT pw, UINT ph) {
         if (outs_.empty() || outs_.size() != views_.size()) return nullptr;
         const RECT rc = screen_rect(origin, pw, ph);
+        const DXGI_FORMAT dst_fmt = target.pixel_format();
 
         uint64_t covered = 0;
+        bool mixed_fmt = false;
         for (size_t i = 0; i < outs_.size(); ++i) {
             const auto& st = *outs_[i];
             OutputView& v = views_[i];
             if (!st.desktop_tex) return nullptr;
-            if (!v.bmp || v.bmp_tex_id != st.tex_id || v.bmp_epoch != target.target_epoch()) {
+            if (!v.bmp || v.bmp_tex_id != st.tex_id || v.bmp_epoch != target.target_epoch() || v.bmp_fmt != st.desktop_fmt) {
                 v.bmp.reset();
                 v.bmp_tex_id = 0;
+                v.bmp_fmt = DXGI_FORMAT_UNKNOWN;
                 const auto surf = st.desktop_tex.try_query<IDXGISurface>();
                 if (!surf) return nullptr;
                 const auto props = D2D1::BitmapProperties1(
                     D2D1_BITMAP_OPTIONS_NONE,
-                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+                    D2D1::PixelFormat(st.desktop_fmt, D2D1_ALPHA_MODE_IGNORE),
                     target.dpi(), target.dpi());
                 if (FAILED(target.dc()->CreateBitmapFromDxgiSurface(surf.get(), &props, &v.bmp))) return nullptr;
                 v.bmp_tex_id = st.tex_id;
                 v.bmp_epoch = target.target_epoch();
+                v.bmp_fmt = st.desktop_fmt;
             }
             const IntRect tr = st.tex_rect_for(rc);
             if (!int_rect_empty(tr)) {
                 covered += static_cast<uint64_t>(tr.right - tr.left) * static_cast<uint64_t>(tr.bottom - tr.top);
+                if (st.desktop_fmt != dst_fmt) mixed_fmt = true;
             }
         }
         if (covered == 0) return nullptr;
 
-        if (!ensure_win_bmp(target, pw, ph)) return nullptr;
+        if (!ensure_win_bmp(target, pw, ph, mixed_fmt)) return nullptr;
         win_bmp_idx_ ^= 1u;
         seeded_gdi_ = false;
         ID2D1Bitmap1* dst_bmp = win_bmp_[win_bmp_idx_].get();
+        const UINT px_bytes = (dst_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8u : 4u;
 
         // Parts of the window off every monitor would otherwise keep whatever this buffer held two frames ago.
         if (covered < static_cast<uint64_t>(pw) * ph) {
             constexpr UINT STRIP_ROWS = 64u;
             const UINT strip_h = std::min(ph, STRIP_ROWS);
-            const size_t need_bytes = static_cast<size_t>(pw) * strip_h * 4u;
+            const size_t need_bytes = static_cast<size_t>(pw) * strip_h * px_bytes;
             if (black_px_.size() < need_bytes) black_px_.resize(need_bytes, 0u);
             for (UINT y = 0; y < ph; y += strip_h) {
                 const UINT h = std::min(strip_h, ph - y);
                 const D2D1_RECT_U band{.left = 0, .top = y, .right = pw, .bottom = y + h};
-                if (FAILED(dst_bmp->CopyFromMemory(&band, black_px_.data(), pw * 4u))) return nullptr;
+                if (FAILED(dst_bmp->CopyFromMemory(&band, black_px_.data(), pw * px_bytes))) return nullptr;
             }
         }
 
+        // Fast path: direct copy for all outputs matching `dst_fmt`.
         for (size_t i = 0; i < outs_.size(); ++i) {
             const auto& st = *outs_[i];
+            if (st.desktop_fmt != dst_fmt) continue;
             const IntRect tr = st.tex_rect_for(rc);
             if (int_rect_empty(tr)) continue;
             const D2D1_POINT_2U dst_pt{
@@ -2344,6 +2407,80 @@ private:
                 .bottom = static_cast<UINT32>(tr.bottom),
             };
             if (FAILED(dst_bmp->CopyFromBitmap(&dst_pt, views_[i].bmp.get(), &src_rc))) return nullptr;
+        }
+
+        // Mixed HDR + SDR straddling: convert mismatched output strips into `dst_bmp` on the GPU.
+        if (mixed_fmt) {
+            ID2D1DeviceContext6* dc = target.dc();
+            wil::com_ptr<ID2D1Image> prev_target;
+            dc->GetTarget(&prev_target);
+            D2D1_MATRIX_3X2_F prev_xf{};
+            dc->GetTransform(&prev_xf);
+            const auto dc_clip = scene_active_ ? std::nullopt : cv.dirty_clip();
+            if (dc_clip) dc->PopAxisAlignedClip();
+            const float inv_scale = 1.0f / std::max(target.scale(), 0.25f);
+            bool conv_ok = true;
+            {
+                const auto restore_dc = wil::scope_exit([&] {
+                    if (hdr_to_sdr_fx_) hdr_to_sdr_fx_->SetInput(0, nullptr);
+                    dc->SetTarget(prev_target.get());
+                    dc->SetTransform(prev_xf);
+                    if (dc_clip) dc->PushAxisAlignedClip(*dc_clip, D2D1_ANTIALIAS_MODE_ALIASED);
+                });
+                dc->SetTarget(dst_bmp);
+                dc->SetTransform(D2D1::Matrix3x2F::Identity());
+                for (size_t i = 0; i < outs_.size(); ++i) {
+                    const auto& st = *outs_[i];
+                    if (st.desktop_fmt == dst_fmt) continue;
+                    const IntRect tr = st.tex_rect_for(rc);
+                    if (int_rect_empty(tr)) continue;
+                    const float dx = static_cast<float>(static_cast<int64_t>(st.mon_rect.left) + tr.left - origin.x) * inv_scale;
+                    const float dy = static_cast<float>(static_cast<int64_t>(st.mon_rect.top) + tr.top - origin.y) * inv_scale;
+                    const float sx = static_cast<float>(tr.left) * inv_scale;
+                    const float sy = static_cast<float>(tr.top) * inv_scale;
+                    const float w = static_cast<float>(tr.right - tr.left) * inv_scale;
+                    const float h = static_cast<float>(tr.bottom - tr.top) * inv_scale;
+                    const D2D1_RECT_F src_dip = D2D1::RectF(sx, sy, sx + w, sy + h);
+                    const D2D1_RECT_F dst_dip = D2D1::RectF(dx, dy, dx + w, dy + h);
+                    if (target.is_hdr()) {
+                        // SDR output strip -> linear FP16 scRGB target
+                        if (ID2D1ImageBrush* ib = target.sdr_image_brush(views_[i].bmp.get(), src_dip,
+                                                                          D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR)) {
+                            ib->SetOpacity(1.0f);
+                            ib->SetTransform(D2D1::Matrix3x2F::Translation(dx - sx, dy - sy));
+                            dc->FillRectangle(dst_dip, ib);
+                        } else {
+                            conv_ok = false;
+                        }
+                    } else {
+                        // HDR FP16 output strip -> tone-mapped SDR BGRA8 target
+                        if (!hdr_to_sdr_fx_ || hdr_to_sdr_epoch_ != target.target_epoch()) {
+                            hdr_to_sdr_fx_.reset();
+                            if (HdrToSdrEffectImpl::register_once(gfx)) {
+                                (void)dc->CreateEffect(CLSID_UsyseekHdrToSdr, &hdr_to_sdr_fx_);
+                                hdr_to_sdr_epoch_ = target.target_epoch();
+                            }
+                        }
+                        if (hdr_to_sdr_fx_) {
+                            const HdrToSdrParams p{
+                                .mode = 0.0f,
+                                .sdr_white_scale = st.color_info.sdr_white_scale,
+                                .max_nits = st.color_info.max_luminance,
+                                .reserved = 0.0f,
+                            };
+                            (void)hdr_to_sdr_fx_->SetValue(D2D1_PROPERTY_PRECISION, D2D1_BUFFER_PRECISION_8BPC_UNORM);
+                            (void)hdr_to_sdr_fx_->SetValue(0, reinterpret_cast<const BYTE*>(&p), sizeof(p));
+                            hdr_to_sdr_fx_->SetInput(0, views_[i].bmp.get());
+                            dc->DrawImage(hdr_to_sdr_fx_.get(), D2D1::Point2F(dx, dy), src_dip,
+                                          D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_COPY);
+                        } else {
+                            conv_ok = false;
+                        }
+                    }
+                }
+                if (FAILED(dc->Flush())) conv_ok = false;
+            }
+            if (!conv_ok) return nullptr;
         }
 
         if (!sizemove_ && !origin_override_) {
@@ -2384,7 +2521,9 @@ private:
 
         const UINT cw = static_cast<UINT>(tr.right - tr.left);
         const UINT ch = static_cast<UINT>(tr.bottom - tr.top);
-        if (!v.probe_tex || v.probe_tex_w != cw || v.probe_tex_h != ch || v.probe_epoch != gfx.epoch()) {
+        const DXGI_FORMAT fmt = st.desktop_fmt;
+        const size_t px_bytes = (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8u : 4u;
+        if (!v.probe_tex || v.probe_tex_w != cw || v.probe_tex_h != ch || v.probe_fmt != fmt || v.probe_epoch != gfx.epoch()) {
             v.probe_tex.reset();
             v.probe_valid = false;
             D3D11_TEXTURE2D_DESC td{};
@@ -2392,13 +2531,14 @@ private:
             td.Height = ch;
             td.MipLevels = 1;
             td.ArraySize = 1;
-            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.Format = fmt;
             td.SampleDesc.Count = 1;
             td.Usage = D3D11_USAGE_STAGING;
             td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
             if (FAILED(gfx.d3d()->CreateTexture2D(&td, nullptr, &v.probe_tex))) return true;
             v.probe_tex_w = cw;
             v.probe_tex_h = ch;
+            v.probe_fmt = fmt;
             v.probe_epoch = gfx.epoch();
         }
 
@@ -2416,7 +2556,7 @@ private:
         if (FAILED(gfx.d3d_context()->Map(v.probe_tex.get(), 0, D3D11_MAP_READ, 0, &mapped))) return true;
         const auto unmap = wil::scope_exit([&] { gfx.d3d_context()->Unmap(v.probe_tex.get(), 0); });
 
-        const size_t row_bytes = static_cast<size_t>(cw) * 4;
+        const size_t row_bytes = static_cast<size_t>(cw) * px_bytes;
         if (!mapped.pData || mapped.RowPitch < row_bytes) return true;
         const bool same_meta = v.probe_valid && v.probe_rc == tr && v.probe_src_tex == st.tex_id &&
                                v.probe_px.size() == row_bytes * ch;
@@ -2465,7 +2605,9 @@ private:
 
     bool ensure_cached_glass_bmp(WindowTarget& target, UINT pw, UINT ph) noexcept {
         if (pw == 0 || ph == 0) return false;
-        const bool same_env = cached_glass_bmp_ && cached_glass_dpi_ == target.dpi() && cached_glass_epoch_ == target.target_epoch();
+        const DXGI_FORMAT want_fmt = target.pixel_format();
+        const bool same_env = cached_glass_bmp_ && cached_glass_dpi_ == target.dpi() &&
+                              cached_glass_epoch_ == target.target_epoch() && cached_glass_fmt_ == want_fmt;
         const auto [want_w, want_h] = desired_bitmap_size(cached_glass_w_, cached_glass_h_, pw, ph, same_env);
         if (same_env && cached_glass_w_ == want_w && cached_glass_h_ == want_h) {
             return true;
@@ -2474,53 +2616,109 @@ private:
         cached_glass_valid_ = false;
         const auto props = D2D1::BitmapProperties1(
             D2D1_BITMAP_OPTIONS_TARGET,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            D2D1::PixelFormat(want_fmt, D2D1_ALPHA_MODE_PREMULTIPLIED),
             target.dpi(), target.dpi());
         if (FAILED(target.dc()->CreateBitmap(D2D1::SizeU(want_w, want_h), nullptr, 0, &props, &cached_glass_bmp_))) {
             cached_glass_w_ = cached_glass_h_ = 0;
+            cached_glass_fmt_ = DXGI_FORMAT_UNKNOWN;
             return false;
         }
         cached_glass_w_ = want_w;
         cached_glass_h_ = want_h;
         cached_glass_dpi_ = target.dpi();
         cached_glass_epoch_ = target.target_epoch();
+        cached_glass_fmt_ = want_fmt;
         return true;
     }
 
-    bool ensure_win_bmp(WindowTarget& target, UINT pw, UINT ph) noexcept {
+    bool ensure_win_bmp(WindowTarget& target, UINT pw, UINT ph, bool need_target = false) noexcept {
         if (pw == 0 || ph == 0) return false;
-        const bool same_env = win_bmp_[0] && win_bmp_[1] && win_bmp_dpi_ == target.dpi() && win_bmp_epoch_ == target.target_epoch();
+        const DXGI_FORMAT want_fmt = target.pixel_format();
+        const bool target_ok = !need_target || win_bmp_is_target_;
+        const bool same_env = win_bmp_[0] && win_bmp_[1] && win_bmp_dpi_ == target.dpi() &&
+                              win_bmp_epoch_ == target.target_epoch() && win_bmp_fmt_ == want_fmt && target_ok;
         const auto [want_w, want_h] = desired_bitmap_size(win_bmp_w_, win_bmp_h_, pw, ph, same_env);
         if (same_env && win_bmp_w_ == want_w && win_bmp_h_ == want_h) {
             return true;
         }
         win_bmp_[0].reset();
         win_bmp_[1].reset();
+        const D2D1_BITMAP_OPTIONS opts = need_target ? D2D1_BITMAP_OPTIONS_TARGET : D2D1_BITMAP_OPTIONS_NONE;
         const auto props = D2D1::BitmapProperties1(
-            D2D1_BITMAP_OPTIONS_NONE,
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+            opts,
+            D2D1::PixelFormat(want_fmt, D2D1_ALPHA_MODE_IGNORE),
             target.dpi(), target.dpi());
         if (FAILED(target.dc()->CreateBitmap(D2D1::SizeU(want_w, want_h), nullptr, 0, &props, &win_bmp_[0])) ||
             FAILED(target.dc()->CreateBitmap(D2D1::SizeU(want_w, want_h), nullptr, 0, &props, &win_bmp_[1]))) {
             win_bmp_[0].reset();
             win_bmp_[1].reset();
             win_bmp_w_ = win_bmp_h_ = 0;
+            win_bmp_fmt_ = DXGI_FORMAT_UNKNOWN;
+            win_bmp_is_target_ = false;
             return false;
         }
         win_bmp_w_ = want_w;
         win_bmp_h_ = want_h;
         win_bmp_dpi_ = target.dpi();
         win_bmp_epoch_ = target.target_epoch();
+        win_bmp_fmt_ = want_fmt;
+        win_bmp_is_target_ = need_target;
         seeded_gdi_ = false;
         gdi_pw_ = gdi_ph_ = 0;
         return true;
     }
 
-    ID2D1Bitmap1* capture_gdi_backdrop(WindowTarget& target, POINT origin, UINT pw, UINT ph) noexcept {
-        if (!ensure_win_bmp(target, pw, ph)) return nullptr;
+    ID2D1Bitmap1* capture_gdi_backdrop(Canvas& cv, WindowTarget& target, POINT origin, UINT pw, UINT ph) noexcept {
+        const bool hdr = target.is_hdr();
+        if (!ensure_win_bmp(target, pw, ph, hdr)) return nullptr;
         if (!seeded_gdi_ || origin.x != gdi_origin_.x || origin.y != gdi_origin_.y || pw > gdi_pw_ || ph > gdi_ph_) {
             const uint32_t next_idx = win_bmp_idx_ ^ 1u;
-            if (!seed_from_screen_dc(win_bmp_[next_idx].get(), origin, pw, ph)) return nullptr;
+            if (!hdr) {
+                if (!seed_from_screen_dc(win_bmp_[next_idx].get(), origin, pw, ph)) return nullptr;
+            } else {
+                if (!gdi_sdr_bmp_ || gdi_sdr_w_ != pw || gdi_sdr_h_ != ph || gdi_sdr_epoch_ != target.target_epoch()) {
+                    gdi_sdr_bmp_.reset();
+                    const auto props = D2D1::BitmapProperties1(
+                        D2D1_BITMAP_OPTIONS_NONE,
+                        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+                        target.dpi(), target.dpi());
+                    if (FAILED(target.dc()->CreateBitmap(D2D1::SizeU(pw, ph), nullptr, 0, &props, &gdi_sdr_bmp_))) {
+                        gdi_sdr_w_ = gdi_sdr_h_ = 0;
+                        return nullptr;
+                    }
+                    gdi_sdr_w_ = pw;
+                    gdi_sdr_h_ = ph;
+                    gdi_sdr_epoch_ = target.target_epoch();
+                }
+                if (!seed_from_screen_dc(gdi_sdr_bmp_.get(), origin, pw, ph)) return nullptr;
+                ID2D1DeviceContext6* dc = target.dc();
+                wil::com_ptr<ID2D1Image> prev_target;
+                dc->GetTarget(&prev_target);
+                D2D1_MATRIX_3X2_F prev_xf{};
+                dc->GetTransform(&prev_xf);
+                const auto dc_clip = scene_active_ ? std::nullopt : cv.dirty_clip();
+                if (dc_clip) dc->PopAxisAlignedClip();
+                bool ok = false;
+                {
+                    const auto restore_dc = wil::scope_exit([&] {
+                        dc->SetTarget(prev_target.get());
+                        dc->SetTransform(prev_xf);
+                        if (dc_clip) dc->PushAxisAlignedClip(*dc_clip, D2D1_ANTIALIAS_MODE_ALIASED);
+                    });
+                    const D2D1_SIZE_F sz = target.size();
+                    const D2D1_RECT_F full = D2D1::RectF(0.0f, 0.0f, sz.width, sz.height);
+                    dc->SetTarget(win_bmp_[next_idx].get());
+                    dc->SetTransform(D2D1::Matrix3x2F::Identity());
+                    if (ID2D1ImageBrush* ib = target.sdr_image_brush(gdi_sdr_bmp_.get(), full,
+                                                                      D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR)) {
+                        ib->SetOpacity(1.0f);
+                        ib->SetTransform(D2D1::Matrix3x2F::Identity());
+                        dc->FillRectangle(full, ib);
+                        ok = SUCCEEDED(dc->Flush());
+                    }
+                }
+                if (!ok) return nullptr;
+            }
             win_bmp_idx_ = next_idx;
             seeded_gdi_ = true;
             gdi_origin_ = origin;
@@ -2623,6 +2821,8 @@ private:
                                        const GlassStyle& style, LensFx& fx) {
         if (!src_bmp || !fx.glass || width(panel_rect) <= 2.0f || height(panel_rect) <= 2.0f) return false;
 
+        const bool hdr = target.is_hdr();
+        const D2D1_BUFFER_PRECISION prec = hdr ? D2D1_BUFFER_PRECISION_16BPC_FLOAT : D2D1_BUFFER_PRECISION_8BPC_UNORM;
         const LiquidGlassShaderParams params{
             .panel_rect = {panel_rect.left, panel_rect.top, width(panel_rect), height(panel_rect)},
             .src_bounds = {src_bounds.left, src_bounds.top, src_bounds.right, src_bounds.bottom},
@@ -2633,7 +2833,7 @@ private:
             .shape_params = {style.glare_convergence, style.glare_opposite_factor, style.corner_radius, style.roundness},
             .misc_params = {target.scale(), style.force_opaque ? 1.0f : 0.0f, 1.5f, style.margin_dip},
             .extra_params = {std::clamp(style.opacity, 0.0f, 1.0f), style.centered_edge ? 1.0f : 0.0f,
-                             std::max(style.rim_inset_dip, 0.0f), 0.0f,},
+                             std::max(style.rim_inset_dip, 0.0f), hdr ? target.sdr_white_scale() : 0.0f,},
         };
 
         if (fx.blur && style.blur_std_dev > 0.05f) {
@@ -2650,11 +2850,14 @@ private:
                     fx.crop_in->SetInput(0, nullptr);
                     fx.crop_in->SetInput(0, src_bmp);
                     fx.crop_in->SetValue(D2D1_CROP_PROP_RECT, src_bounds);
+                    fx.crop_in->SetValue(D2D1_PROPERTY_PRECISION, prec);
                     fx.border->SetInputEffect(0, fx.crop_in.get());
                     fx.border->SetValue(D2D1_BORDER_PROP_EDGE_MODE_X, D2D1_BORDER_EDGE_MODE_CLAMP);
                     fx.border->SetValue(D2D1_BORDER_PROP_EDGE_MODE_Y, D2D1_BORDER_EDGE_MODE_CLAMP);
+                    fx.border->SetValue(D2D1_PROPERTY_PRECISION, prec);
                     fx.crop_pad->SetInputEffect(0, fx.border.get());
                     fx.crop_pad->SetValue(D2D1_CROP_PROP_RECT, inset(src_bounds, -blur_pad, -blur_pad));
+                    fx.crop_pad->SetValue(D2D1_PROPERTY_PRECISION, prec);
                     fx.blur->SetInput(0, nullptr);
                     fx.blur->SetInputEffect(0, fx.crop_pad.get());
                     clamped_ok = true;
@@ -2668,6 +2871,7 @@ private:
             fx.blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, std::max(0.0f, style.blur_std_dev));
             fx.blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD);
             fx.blur->SetValue(D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED);
+            fx.blur->SetValue(D2D1_PROPERTY_PRECISION, prec);
             fx.glass->SetInput(0, nullptr);
             fx.glass->SetInputEffect(0, fx.blur.get());
         } else {
@@ -2676,6 +2880,7 @@ private:
             fx.glass->SetInput(0, nullptr);
             fx.glass->SetInput(0, src_bmp);
         }
+        fx.glass->SetValue(D2D1_PROPERTY_PRECISION, prec);
         if (FAILED(fx.glass->SetValue(0, reinterpret_cast<const BYTE*>(&params), sizeof(params)))) return false;
 
         const float pad = (style.margin_dip < 1.5f && !style.force_opaque) ? 2.5f : 0.0f;
@@ -2696,13 +2901,22 @@ private:
     std::vector<uint8_t> black_px_;
     std::array<wil::com_ptr<ID2D1Bitmap1>, 2> win_bmp_;
     uint32_t win_bmp_idx_ = 0;
+    DXGI_FORMAT win_bmp_fmt_ = DXGI_FORMAT_UNKNOWN;
+    bool win_bmp_is_target_ = false;
+    wil::com_ptr<ID2D1Bitmap1> gdi_sdr_bmp_;
+    UINT gdi_sdr_w_ = 0, gdi_sdr_h_ = 0;
+    uint64_t gdi_sdr_epoch_ = 0;
+    wil::com_ptr<ID2D1Effect> hdr_to_sdr_fx_;
+    uint64_t hdr_to_sdr_epoch_ = 0;
     wil::com_ptr<ID2D1Bitmap1> cached_glass_bmp_;
+    DXGI_FORMAT cached_glass_fmt_ = DXGI_FORMAT_UNKNOWN;
     GlassCacheKey cached_key_{};
     bool cached_glass_valid_ = false;
     UINT cached_glass_w_ = 0, cached_glass_h_ = 0;
     float cached_glass_dpi_ = 0.0f;
     uint64_t cached_glass_epoch_ = 0;
     wil::com_ptr<ID2D1Bitmap1> scene_bmp_;
+    DXGI_FORMAT scene_fmt_ = DXGI_FORMAT_UNKNOWN;
     wil::com_ptr<ID2D1Image> scene_prev_target_;
     std::optional<D2D1_RECT_F> scene_saved_clip_;
     LensFx desktop_fx_;
