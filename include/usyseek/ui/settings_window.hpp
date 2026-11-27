@@ -49,34 +49,6 @@ public:
         wc.lpszClassName = SETTINGS_CLASS;
         RegisterClassExW(&wc);
 
-        const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-        const auto initial_size = [style](UINT dpi) noexcept {
-            const float s = (dpi > 0 ? static_cast<float>(dpi) : 96.0f) / 96.0f;
-            RECT rc{.left = 0, .top = 0, .right = static_cast<LONG>(920 * s), .bottom = static_cast<LONG>(720 * s)};
-            AdjustWindowRectExForDpi(&rc, style, FALSE, 0, dpi);
-            return SIZE{.cx = rc.right - rc.left, .cy = rc.bottom - rc.top};
-        };
-        const UINT sys_dpi = GetDpiForSystem();
-        const SIZE guess = initial_size(sys_dpi);
-
-        hwnd_ = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, SETTINGS_CLASS, L"usyseek — Settings & Indexing",
-                                style, CW_USEDEFAULT, CW_USEDEFAULT, guess.cx, guess.cy,
-                                nullptr, nullptr, inst, this);
-        if (!hwnd_) return false;
-        // The window can land on a monitor whose scale differs from the (sign-in time) system DPI.
-        if (const UINT dpi = GetDpiForWindow(hwnd_); dpi != 0 && dpi != sys_dpi) {
-            SIZE sz = initial_size(dpi);
-            MONITORINFO mi{.cbSize = sizeof(mi)};
-            if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) {
-                sz.cx = std::min<LONG>(sz.cx, std::max<LONG>(1, mi.rcWork.right - mi.rcWork.left));
-                sz.cy = std::min<LONG>(sz.cy, std::max<LONG>(1, mi.rcWork.bottom - mi.rcWork.top));
-            }
-            SetWindowPos(hwnd_, nullptr, 0, 0, sz.cx, sz.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-        icons_.apply(hwnd_, inst, 101);
-        cloak_window(hwnd_, true);
-        if (!target_.attach(sh_.gfx, hwnd_, glass_active())) return false;
-
         cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
         cursor_hand_ = LoadCursorW(nullptr, IDC_HAND);
         cursor_ibeam_ = LoadCursorW(nullptr, IDC_IBEAM);
@@ -98,10 +70,11 @@ public:
     }
 
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
-    [[nodiscard]] bool visible() const noexcept { return IsWindowVisible(hwnd_) != FALSE; }
+    [[nodiscard]] bool visible() const noexcept { return hwnd_ != nullptr && IsWindowVisible(hwnd_) != FALSE; }
     WindowTarget& target() noexcept { return target_; }
 
     void apply_theme() noexcept {
+        if (!hwnd_) return;
         if (visible()) apply_window_theme(hwnd_, sh_.theme, false, true);
         target_.set_liquid_glass(glass_active());
         if (!glass_active()) {
@@ -127,6 +100,8 @@ public:
     }
 
     void show(int tab = -1) {
+        const bool was_visible = visible();
+        if (!hwnd_ && !ensure_hwnd()) return;
         if (tab >= 0) {
             const int next_tab = std::clamp(tab, 0, 3);
             if (next_tab != tab_) clear_active_field();
@@ -146,33 +121,52 @@ public:
         last_indexer_running_ = sh_.indexer_running;
         sh_.refresh_hotkey_state();
         if (!sh_.test_mode && sh_.on_ui_opened) sh_.on_ui_opened();
+        redraw_posted_.store(false, std::memory_order_release);
         full_dirty_ = true;
         pending_dirty_.clear();
         last_tooltip_dirty_.reset();
         apply_window_theme(hwnd_, sh_.theme, false, true);
-        cloak_window(hwnd_, false);
-        ShowWindow(hwnd_, SW_SHOWNORMAL);
         if (glass_active()) ensure_window_capture_affinity(hwnd_, true);
+        if (!was_visible) {
+            render(false, true);
+            ShowWindow(hwnd_, saved_maximized_ ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+        } else if (IsIconic(hwnd_)) {
+            ShowWindow(hwnd_, SW_RESTORE);
+        }
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
         window_active_ = hwnd_ != nullptr && (GetForegroundWindow() == hwnd_ || GetActiveWindow() == hwnd_);
         sync_caret_timer();
         sync_live_timers();
         if (sh_.visibility_changed) sh_.visibility_changed();
-        render();
+        if (was_visible || saved_maximized_) {
+            full_dirty_ = true;
+            render();
+        }
         ValidateRect(hwnd_, nullptr);
     }
 
     void hide() {
-        if (in_modal_) return;
+        if (!hwnd_ || in_modal_ || hiding_) return;
+        hiding_ = true;
+        const auto reset_hiding = wil::scope_exit([&] { hiding_ = false; });
+
         stop_recording();
         if (TextField* const tf = std::exchange(active_field_, nullptr)) {
             tf->focused = false;
             tf->caret_on = false;
             sync_caret_timer(false);
             commit_fields();
-            if (in_modal_) return;
+            if (in_modal_ || !hwnd_) return;
         }
+
+        WINDOWPLACEMENT wp{.length = sizeof(wp)};
+        if (GetWindowPlacement(hwnd_, &wp)) {
+            saved_placement_ = wp;
+            saved_maximized_ = (IsZoomed(hwnd_) != FALSE);
+        }
+
+        const HWND h = hwnd_;
         dragging_scroll_ = false;
         in_sizemove_ = false;
         resize_pending_ = false;
@@ -183,18 +177,24 @@ public:
         raw_hover_id_ = IdNone;
         raw_hover_index_ = 0;
         hover_.set(IdNone, 0, false);
-        tooltip_.clear(hwnd_, TIMER_TOOLTIP, false);
+        tooltip_.clear(h, TIMER_TOOLTIP, false);
         pending_dirty_.clear();
         last_tooltip_dirty_.reset();
         full_dirty_ = true;
         window_active_ = false;
-        KillTimer(hwnd_, TIMER_CARET);
-        KillTimer(hwnd_, TIMER_POLL);
-        KillTimer(hwnd_, TIMER_DEVICE);
-        KillTimer(hwnd_, TIMER_GLASS);
+        KillTimer(h, TIMER_CARET);
+        KillTimer(h, TIMER_POLL);
+        KillTimer(h, TIMER_DEVICE);
+        KillTimer(h, TIMER_GLASS);
+        atomic_hwnd_.store(nullptr, std::memory_order_release);
+        redraw_posted_.store(false, std::memory_order_release);
+
+        // Destroy the HWND so Windows plays its native close animation on every close
+        // and its native open animation on every subsequent reopen.
+        DestroyWindow(h);
         glass_.release();
-        ShowWindow(hwnd_, SW_HIDE);
-        ValidateRect(hwnd_, nullptr);
+        app_icon_.reset();
+        target_.release();
         if (sh_.visibility_changed) sh_.visibility_changed();
     }
 
@@ -228,8 +228,8 @@ public:
         }
     }
 
-    void render(bool from_drag_pump = false) {
-        if (rendering_ || (!live_visible() && !sh_.test_mode)) return;
+    void render(bool from_drag_pump = false, bool allow_hidden = false) {
+        if (!hwnd_ || rendering_ || (!allow_hidden && !live_visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         rendering_ = true;
         const auto clear_rendering = wil::scope_exit([&] { rendering_ = false; });
@@ -2448,8 +2448,11 @@ private:
 
     /// Any thread.
     void request_redraw() noexcept {
-        if (!redraw_posted_.exchange(true) && !PostMessageW(hwnd_, WM_APP_REDRAW, 0, 0)) {
-            redraw_posted_ = false;
+        if (!redraw_posted_.exchange(true, std::memory_order_acq_rel)) {
+            const HWND h = atomic_hwnd_.load(std::memory_order_acquire);
+            if (!h || !PostMessageW(h, WM_APP_REDRAW, 0, 0)) {
+                redraw_posted_.store(false, std::memory_order_release);
+            }
         }
     }
 
@@ -4048,14 +4051,55 @@ private:
     // Window procedure
     // ------------------------------------------------------------------------------------------
 
+    bool ensure_hwnd() {
+        if (hwnd_) return true;
+        const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+        const auto initial_size = [style](UINT dpi) noexcept {
+            const float s = (dpi > 0 ? static_cast<float>(dpi) : 96.0f) / 96.0f;
+            RECT rc{.left = 0, .top = 0, .right = static_cast<LONG>(920 * s), .bottom = static_cast<LONG>(720 * s)};
+            AdjustWindowRectExForDpi(&rc, style, FALSE, 0, dpi);
+            return SIZE{.cx = rc.right - rc.left, .cy = rc.bottom - rc.top};
+        };
+        const UINT sys_dpi = GetDpiForSystem();
+        const SIZE guess = initial_size(sys_dpi);
+
+        hwnd_ = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, SETTINGS_CLASS, L"usyseek — Settings & Indexing",
+                                style, CW_USEDEFAULT, CW_USEDEFAULT, guess.cx, guess.cy,
+                                nullptr, nullptr, inst_, this);
+        if (!hwnd_) return false;
+        if (saved_placement_) {
+            WINDOWPLACEMENT wp = *saved_placement_;
+            wp.showCmd = SW_HIDE;
+            SetWindowPlacement(hwnd_, &wp);
+        } else if (const UINT dpi = GetDpiForWindow(hwnd_); dpi != 0 && dpi != sys_dpi) {
+            // The window can land on a monitor whose scale differs from the (sign-in time) system DPI.
+            SIZE sz = initial_size(dpi);
+            MONITORINFO mi{.cbSize = sizeof(mi)};
+            if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) {
+                sz.cx = std::min<LONG>(sz.cx, std::max<LONG>(1, mi.rcWork.right - mi.rcWork.left));
+                sz.cy = std::min<LONG>(sz.cy, std::max<LONG>(1, mi.rcWork.bottom - mi.rcWork.top));
+            }
+            SetWindowPos(hwnd_, nullptr, 0, 0, sz.cx, sz.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        icons_.apply(hwnd_, inst_, 101);
+        if (!target_.attach(sh_.gfx, hwnd_, glass_active())) {
+            DestroyWindow(hwnd_);
+            return false;
+        }
+        atomic_hwnd_.store(hwnd_, std::memory_order_release);
+        return true;
+    }
+
     static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (msg == WM_NCCREATE) {
             auto* self = static_cast<SettingsWindow*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);
             self->hwnd_ = hwnd;
+            self->atomic_hwnd_.store(hwnd, std::memory_order_release);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
         }
         if (msg == WM_NCDESTROY) {
             if (auto* self = reinterpret_cast<SettingsWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA))) {
+                self->atomic_hwnd_.store(nullptr, std::memory_order_release);
                 self->hwnd_ = nullptr;
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
@@ -4432,6 +4476,10 @@ private:
     Shared& sh_;
     HINSTANCE inst_ = nullptr;
     HWND hwnd_ = nullptr;
+    std::atomic<HWND> atomic_hwnd_{nullptr};
+    std::optional<WINDOWPLACEMENT> saved_placement_;
+    bool saved_maximized_ = false;
+    bool hiding_ = false;
     WindowTarget target_;
     LiquidGlassWindow glass_;
     wil::com_ptr<ID2D1Bitmap1> app_icon_;

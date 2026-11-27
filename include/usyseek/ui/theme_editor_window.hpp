@@ -40,34 +40,6 @@ public:
         wc.lpszClassName = THEME_EDITOR_CLASS;
         RegisterClassExW(&wc);
 
-        const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-        const auto initial_size = [style](UINT dpi) noexcept {
-            const float s = (dpi > 0 ? static_cast<float>(dpi) : 96.0f) / 96.0f;
-            RECT rc{.left = 0, .top = 0, .right = static_cast<LONG>(740.0f * s), .bottom = static_cast<LONG>(760.0f * s)};
-            AdjustWindowRectExForDpi(&rc, style, FALSE, 0, dpi);
-            return SIZE{.cx = rc.right - rc.left, .cy = rc.bottom - rc.top};
-        };
-        const UINT sys_dpi = GetDpiForSystem();
-        const SIZE guess = initial_size(sys_dpi);
-
-        hwnd_ = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, THEME_EDITOR_CLASS, L"usyseek \u2014 Theme Editor", style,
-                                CW_USEDEFAULT, CW_USEDEFAULT, guess.cx, guess.cy,
-                                nullptr, nullptr, inst, this);
-        if (!hwnd_) return false;
-        if (const UINT dpi = GetDpiForWindow(hwnd_); dpi != 0 && dpi != sys_dpi) {
-            SIZE sz = initial_size(dpi);
-            MONITORINFO mi{.cbSize = sizeof(mi)};
-            if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) {
-                sz.cx = std::min<LONG>(sz.cx, std::max<LONG>(1, mi.rcWork.right - mi.rcWork.left));
-                sz.cy = std::min<LONG>(sz.cy, std::max<LONG>(1, mi.rcWork.bottom - mi.rcWork.top));
-            }
-            SetWindowPos(hwnd_, nullptr, 0, 0, sz.cx, sz.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-
-        icons_.apply(hwnd_, inst_, 101);
-        cloak_window(hwnd_, true);
-        if (!target_.attach(sh_.gfx, hwnd_, glass_active())) return false;
-
         cursor_arrow_ = LoadCursorW(nullptr, IDC_ARROW);
         cursor_hand_ = LoadCursorW(nullptr, IDC_HAND);
         cursor_ibeam_ = LoadCursorW(nullptr, IDC_IBEAM);
@@ -79,7 +51,7 @@ public:
     }
 
     [[nodiscard]] HWND hwnd() const noexcept { return hwnd_; }
-    [[nodiscard]] bool visible() const noexcept { return IsWindowVisible(hwnd_) != FALSE; }
+    [[nodiscard]] bool visible() const noexcept { return hwnd_ != nullptr && IsWindowVisible(hwnd_) != FALSE; }
     WindowTarget& target() noexcept { return target_; }
 
     void open_new() {
@@ -131,8 +103,12 @@ public:
     }
 
     void hide(bool revert_preview = true) {
-        if (in_modal_) return;
-        if (hwnd_) KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
+        if (!hwnd_ || in_modal_ || hiding_) return;
+        hiding_ = true;
+        const auto reset_hiding = wil::scope_exit([&] { hiding_ = false; });
+
+        const HWND h = hwnd_;
+        KillTimer(h, TIMER_LIVE_PREVIEW);
         live_apply_pending_ = false;
         if (active_field_) {
             if (!revert_preview) commit_field(active_field_, false);
@@ -141,6 +117,13 @@ public:
             active_field_ = nullptr;
         }
         if (revert_preview) clear_unsaved_preview();
+
+        WINDOWPLACEMENT wp{.length = sizeof(wp)};
+        if (GetWindowPlacement(h, &wp)) {
+            saved_placement_ = wp;
+            saved_maximized_ = (IsZoomed(h) != FALSE);
+        }
+
         active_slider_ = -1;
         dragging_scroll_ = false;
         selecting_text_ = false;
@@ -156,14 +139,17 @@ public:
         pending_dirty_.clear();
         full_dirty_ = true;
         window_active_ = false;
-        KillTimer(hwnd_, TIMER_CARET);
-        KillTimer(hwnd_, TIMER_DEVICE);
-        KillTimer(hwnd_, TIMER_GLASS);
-        KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
+        KillTimer(h, TIMER_CARET);
+        KillTimer(h, TIMER_DEVICE);
+        KillTimer(h, TIMER_GLASS);
+        KillTimer(h, TIMER_LIVE_PREVIEW);
         live_apply_pending_ = false;
+
+        // Destroy the HWND so Windows plays its native close animation on every close
+        // and its native open animation on every subsequent reopen.
+        DestroyWindow(h);
         glass_.release();
-        ShowWindow(hwnd_, SW_HIDE);
-        ValidateRect(hwnd_, nullptr);
+        target_.release();
         if (sh_.visibility_changed) sh_.visibility_changed();
     }
 
@@ -187,8 +173,8 @@ public:
         }
     }
 
-    void render(bool from_drag_pump = false) {
-        if (rendering_ || (!live_visible() && !sh_.test_mode)) return;
+    void render(bool from_drag_pump = false, bool allow_hidden = false) {
+        if (!hwnd_ || rendering_ || (!allow_hidden && !live_visible() && !sh_.test_mode)) return;
         if (!ensure_target()) return;
         rendering_ = true;
         const auto clear_rendering = wil::scope_exit([&] { rendering_ = false; });
@@ -414,22 +400,69 @@ private:
 
     [[nodiscard]] bool glass_active() const noexcept { return sh_.theme.is_liquid_glass; }
 
+    bool ensure_hwnd() {
+        if (hwnd_) return true;
+        const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
+        const auto initial_size = [style](UINT dpi) noexcept {
+            const float s = (dpi > 0 ? static_cast<float>(dpi) : 96.0f) / 96.0f;
+            RECT rc{.left = 0, .top = 0, .right = static_cast<LONG>(740.0f * s), .bottom = static_cast<LONG>(760.0f * s)};
+            AdjustWindowRectExForDpi(&rc, style, FALSE, 0, dpi);
+            return SIZE{.cx = rc.right - rc.left, .cy = rc.bottom - rc.top};
+        };
+        const UINT sys_dpi = GetDpiForSystem();
+        const SIZE guess = initial_size(sys_dpi);
+
+        hwnd_ = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, THEME_EDITOR_CLASS, L"usyseek \u2014 Theme Editor", style,
+                                CW_USEDEFAULT, CW_USEDEFAULT, guess.cx, guess.cy,
+                                nullptr, nullptr, inst_, this);
+        if (!hwnd_) return false;
+        if (saved_placement_) {
+            WINDOWPLACEMENT wp = *saved_placement_;
+            wp.showCmd = SW_HIDE;
+            SetWindowPlacement(hwnd_, &wp);
+        } else if (const UINT dpi = GetDpiForWindow(hwnd_); dpi != 0 && dpi != sys_dpi) {
+            SIZE sz = initial_size(dpi);
+            MONITORINFO mi{.cbSize = sizeof(mi)};
+            if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &mi)) {
+                sz.cx = std::min<LONG>(sz.cx, std::max<LONG>(1, mi.rcWork.right - mi.rcWork.left));
+                sz.cy = std::min<LONG>(sz.cy, std::max<LONG>(1, mi.rcWork.bottom - mi.rcWork.top));
+            }
+            SetWindowPos(hwnd_, nullptr, 0, 0, sz.cx, sz.cy, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
+        icons_.apply(hwnd_, inst_, 101);
+        if (!target_.attach(sh_.gfx, hwnd_, glass_active())) {
+            DestroyWindow(hwnd_);
+            return false;
+        }
+        return true;
+    }
+
     void show_window() {
+        const bool was_visible = visible();
+        if (!hwnd_ && !ensure_hwnd()) return;
         sync_switch_targets(false);
         snap_anims();
         full_dirty_ = true;
         pending_dirty_.clear();
         apply_window_theme(hwnd_, sh_.theme, false, true);
-        cloak_window(hwnd_, false);
-        ShowWindow(hwnd_, SW_SHOWNORMAL);
         if (glass_active()) ensure_window_capture_affinity(hwnd_, true);
+        if (!was_visible) {
+            render(false, true);
+            ShowWindow(hwnd_, saved_maximized_ ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
+        } else if (IsIconic(hwnd_)) {
+            ShowWindow(hwnd_, SW_RESTORE);
+        }
         SetForegroundWindow(hwnd_);
         SetFocus(hwnd_);
         window_active_ = hwnd_ != nullptr && (GetForegroundWindow() == hwnd_ || GetActiveWindow() == hwnd_);
         sync_caret_timer();
         sync_live_timers();
         if (sh_.visibility_changed) sh_.visibility_changed();
-        render();
+        if (was_visible || saved_maximized_) {
+            full_dirty_ = true;
+            render();
+        }
         ValidateRect(hwnd_, nullptr);
     }
 
@@ -2369,6 +2402,9 @@ private:
     Shared& sh_;
     HINSTANCE inst_ = nullptr;
     HWND hwnd_ = nullptr;
+    std::optional<WINDOWPLACEMENT> saved_placement_;
+    bool saved_maximized_ = false;
+    bool hiding_ = false;
     WindowTarget target_;
     LiquidGlassWindow glass_;
     WindowIcons icons_;
