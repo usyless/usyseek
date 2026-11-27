@@ -193,7 +193,6 @@ public:
         KillTimer(hwnd_, TIMER_DEVICE);
         KillTimer(hwnd_, TIMER_GLASS);
         glass_.release();
-        cloak_window(hwnd_, true);
         ShowWindow(hwnd_, SW_HIDE);
         ValidateRect(hwnd_, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();

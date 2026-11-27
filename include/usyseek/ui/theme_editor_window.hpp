@@ -162,7 +162,6 @@ public:
         KillTimer(hwnd_, TIMER_LIVE_PREVIEW);
         live_apply_pending_ = false;
         glass_.release();
-        cloak_window(hwnd_, true);
         ShowWindow(hwnd_, SW_HIDE);
         ValidateRect(hwnd_, nullptr);
         if (sh_.visibility_changed) sh_.visibility_changed();
