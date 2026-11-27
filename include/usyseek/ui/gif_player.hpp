@@ -19,8 +19,6 @@
 
 namespace usyseek::ui {
 
-enum class MediaTickStatus : uint8_t { NoChange, FrameReady, DeviceLost };
-
 /// Decodes and plays animated GIFs in the preview viewer without locking files or exhausting GPU/RAM.
 /// Fits small/medium GIFs into a 96 MB frame cache; streams huge GIFs via a bounded sliding lookahead queue.
 /// GPU bitmap creation and drawing occur strictly on the UI thread and survive D3D/D2D device resets cleanly.
