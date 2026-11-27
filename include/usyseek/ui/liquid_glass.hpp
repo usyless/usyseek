@@ -3,11 +3,13 @@
 #include "canvas.hpp"
 #include "desktop_rotation.hpp"
 
+#include <usylibpp/ui/wgc.hpp>
+
 #include <d2d1effectauthor.h>
 #include <d2d1effecthelpers.h>
 #include <d2d1effects.h>
 #include <d3dcompiler.h>
-#include <dxgi1_2.h>
+#include <dxgi1_6.h>
 
 #include <algorithm>
 #include <array>
@@ -44,6 +46,31 @@ inline constexpr GUID GUID_UsyseekLiquidGlassPS = {
     .Data3=0x4e2f, 
     .Data4={0x8a, 0x10, 0x91, 0x4d, 0x2c, 0x77, 0xe5, 0x02},
 };
+
+// {D7C24E18-5B91-4A63-9C4E-318F7D20B645}
+inline constexpr GUID CLSID_UsyseekHdrToSdr = {
+    .Data1 = 0xd7c24e18,
+    .Data2 = 0x5b91,
+    .Data3 = 0x4a63,
+    .Data4 = {0x9c, 0x4e, 0x31, 0x8f, 0x7d, 0x20, 0xb6, 0x45},
+};
+
+// {F2A9106C-3E74-4D8B-B102-8E45C9A3D711}
+inline constexpr GUID GUID_UsyseekHdrToSdrPS = {
+    .Data1 = 0xf2a9106c,
+    .Data2 = 0x3e74,
+    .Data3 = 0x4d8b,
+    .Data4 = {0xb1, 0x02, 0x8e, 0x45, 0xc9, 0xa3, 0xd7, 0x11},
+};
+
+/// Constant buffer matching `cbuffer HdrToSdrParams : register(b0)` in the HDR conversion shader.
+struct alignas(16) HdrToSdrParams {
+    float mode = 0.0f;            // 0 = FP16 scRGB linear, 1 = R10G10B10A2 HDR10 PQ BT.2020, 2 = R10G10B10A2 10-bit sRGB
+    float sdr_white_scale = 1.0f; // sdr_white_nits / 80.0 (linear scRGB white reference)
+    float max_nits = 1000.0f;
+    float reserved = 0.0f;
+};
+static_assert(sizeof(HdrToSdrParams) == 16);
 
 /// Constant buffer matching `cbuffer LiquidGlassParams : register(b0)` in the D2D shader.
 struct alignas(16) LiquidGlassShaderParams {
@@ -422,6 +449,135 @@ inline std::span<const BYTE> liquid_glass_ps_bytecode() noexcept {
     return bytecode;
 }
 
+// HLSL shader converting native HDR / WCG desktop duplication frames (FP16 scRGB linear or R10G10B10A2
+// HDR10 PQ BT.2020 / 10-bit SDR) into white-level-accurate sRGB BGRA8. SDR pixels [0, 1] pass through
+// bit-exact so the glass matches the surrounding desktop seamlessly; HDR peaks > 1.0 roll off smoothly.
+inline constexpr const char* HDR_TO_SDR_HLSL = R"hlsl(
+Texture2D<float4> InputTexture0 : register(t0);
+SamplerState InputSampler0 : register(s0);
+
+cbuffer HdrToSdrParams : register(b0)
+{
+    float mode;          // 0 = FP16 scRGB, 1 = R10G10B10A2 PQ BT.2020, 2 = R10G10B10A2 10-bit sRGB
+    float sdrWhiteScale; // sdr_white_nits / 80.0
+    float maxNits;
+    float reserved;
+};
+
+float3 LinearToSrgb(float3 x)
+{
+    x = saturate(x);
+    float3 lo = x * 12.92;
+    float3 hi = 1.055 * pow(max(x, 1e-6), 1.0 / 2.4) - 0.055;
+    return (x <= 0.0031308) ? lo : hi;
+}
+
+float3 PqToNits(float3 v)
+{
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    v = saturate(v);
+    float3 vp = pow(max(v, 0.0), 1.0 / m2);
+    float3 num = max(vp - c1, 0.0);
+    float3 den = max(c2 - c3 * vp, 1e-6);
+    return pow(num / den, 1.0 / m1) * 10000.0;
+}
+
+float3 Bt2020ToBt709(float3 c)
+{
+    return float3(
+         1.6604910 * c.r - 0.5876411 * c.g - 0.0728499 * c.b,
+        -0.1245505 * c.r + 1.1328999 * c.g - 0.0083494 * c.b,
+        -0.0181508 * c.r - 0.1005789 * c.g + 1.1187297 * c.b
+    );
+}
+
+float3 TonemapNormalizedLinear(float3 lin)
+{
+    float luma = max(dot(lin, float3(0.2126, 0.7152, 0.0722)), 0.0);
+    float mn = min(lin.r, min(lin.g, lin.b));
+    if (mn < 0.0 && luma > 1e-6)
+    {
+        float t = luma / (luma - mn);
+        lin = lerp(luma.xxx, lin, t);
+    }
+    lin = max(lin, 0.0);
+
+    float peak = max(lin.r, max(lin.g, lin.b));
+    if (peak > 1.0)
+    {
+        float3 base = lin / peak;
+        float excess = peak - 1.0;
+        float desat = excess / (excess + 1.5);
+        lin = lerp(base, float3(1.0, 1.0, 1.0), desat);
+    }
+    return lin;
+}
+
+float4 main(float4 pos : SV_POSITION, float4 scenePos : SCENE_POSITION, float4 uv0 : TEXCOORD0) : SV_TARGET
+{
+    float3 raw = InputTexture0.SampleLevel(InputSampler0, uv0.xy, 0.0).rgb;
+    if (mode > 1.5)
+    {
+        return float4(saturate(raw), 1.0);
+    }
+
+    float scale = max(sdrWhiteScale, 1.0);
+    float3 lin;
+    if (mode > 0.5)
+    {
+        float3 bt2020 = PqToNits(raw) / (scale * 80.0);
+        lin = Bt2020ToBt709(bt2020);
+    }
+    else
+    {
+        float3 safeRaw = (raw == raw) ? clamp(raw, -100.0, 1000.0) : float3(0.0, 0.0, 0.0);
+        lin = safeRaw / scale;
+    }
+
+    return float4(LinearToSrgb(TonemapNormalizedLinear(lin)), 1.0);
+}
+)hlsl";
+
+inline std::span<const BYTE> hdr_to_sdr_ps_bytecode() noexcept {
+    static std::mutex mtx;
+    static std::vector<BYTE> bytecode;
+    const std::scoped_lock lk{mtx};
+    if (!bytecode.empty()) return bytecode;
+
+    wil::com_ptr<ID3DBlob> code;
+    wil::com_ptr<ID3DBlob> err;
+    const HRESULT hr = D3DCompile(
+        HDR_TO_SDR_HLSL,
+        std::strlen(HDR_TO_SDR_HLSL),
+        "HdrToSdr.hlsl",
+        nullptr,
+        nullptr,
+        "main",
+        "ps_4_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3,
+        0,
+        &code,
+        &err);
+    if (FAILED(hr) || !code || code->GetBufferSize() == 0) {
+        if (err) {
+            OutputDebugStringA(static_cast<const char*>(err->GetBufferPointer()));
+        }
+        return {};
+    }
+    try {
+        const auto* bytes = static_cast<const BYTE*>(code->GetBufferPointer());
+        bytecode.assign(bytes, bytes + code->GetBufferSize());
+    } catch (...) {
+        bytecode.clear();
+        return {};
+    }
+    return bytecode;
+}
+
 inline D2D1_RECT_L expand_rect_safe(const D2D1_RECT_L& r, LONG pad) noexcept {
     const auto clamp_add = [](LONG v, LONG delta) -> LONG {
         const long long s = static_cast<long long>(v) + static_cast<long long>(delta);
@@ -652,9 +808,167 @@ private:
     std::array<std::byte, sizeof(LiquidGlassShaderParams)> params_{};
 };
 
-/// Captures the live monitor desktops on the GPU via DXGI Output Duplication.
-/// Shared across all windows on the same D3D11 device so `DuplicateOutput` is only
-/// acquired once per monitor (DXGI rejects a second duplication on the same device & output).
+/// Native Direct2D custom effect converting HDR/WCG (FP16 scRGB or R10G10B10A2) textures into SDR BGRA8.
+class HdrToSdrEffectImpl final : public ID2D1EffectImpl, public ID2D1DrawTransform {
+public:
+    HdrToSdrEffectImpl(const HdrToSdrEffectImpl&) = delete;
+    HdrToSdrEffectImpl& operator=(const HdrToSdrEffectImpl&) = delete;
+    HdrToSdrEffectImpl(HdrToSdrEffectImpl&&) = delete;
+    HdrToSdrEffectImpl& operator=(HdrToSdrEffectImpl&&) = delete;
+
+    static bool register_once(Gfx& gfx) noexcept {
+        ID2D1Factory1* factory = gfx.d2d_factory();
+        if (!factory) return false;
+        if (gfx.is_effect_registered(CLSID_UsyseekHdrToSdr)) return true;
+
+        static constexpr PCWSTR xml = LR"(<?xml version='1.0'?>
+<Effect>
+  <Property name='DisplayName' type='string' value='UsyseekHdrToSdr'/>
+  <Property name='Author' type='string' value='usyseek'/>
+  <Property name='Category' type='string' value='Color'/>
+  <Property name='Description' type='string' value='HDR scRGB/PQ to sRGB converter'/>
+  <Inputs>
+    <Input name='Source'/>
+  </Inputs>
+  <Property name='Params' type='blob'>
+    <Property name='DisplayName' type='string' value='Params'/>
+  </Property>
+</Effect>)";
+
+        const std::array<D2D1_PROPERTY_BINDING, 1> bindings = {{
+            D2D1_BLOB_TYPE_BINDING(L"Params", &HdrToSdrEffectImpl::set_params, &HdrToSdrEffectImpl::get_params),
+        },};
+        const HRESULT hr = factory->RegisterEffectFromString(
+            CLSID_UsyseekHdrToSdr,
+            xml,
+            bindings.data(),
+            static_cast<UINT32>(bindings.size()),
+            &HdrToSdrEffectImpl::create_effect);
+        if (SUCCEEDED(hr)) {
+            gfx.mark_effect_registered(CLSID_UsyseekHdrToSdr);
+            return true;
+        }
+        return false;
+    }
+
+    static HRESULT CALLBACK create_effect(IUnknown** out) noexcept {
+        if (!out) return E_POINTER;
+        auto* p = new (std::nothrow) HdrToSdrEffectImpl();
+        if (!p) return E_OUTOFMEMORY;
+        *out = static_cast<ID2D1EffectImpl*>(p);
+        return S_OK;
+    }
+
+    HRESULT set_params(const BYTE* data, UINT32 size) noexcept {
+        if (!data || size != params_.size()) return E_INVALIDARG;
+        std::memcpy(params_.data(), data, params_.size());
+        return S_OK;
+    }
+
+    HRESULT get_params(BYTE* data, UINT32 size, UINT32* actual) const noexcept {
+        if (actual) *actual = static_cast<UINT32>(params_.size());
+        if (!data) return S_OK;
+        if (size < params_.size()) return E_NOT_SUFFICIENT_BUFFER;
+        std::memcpy(data, params_.data(), params_.size());
+        return S_OK;
+    }
+
+    IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) noexcept override {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ID2D1EffectImpl)) {
+            *ppv = static_cast<ID2D1EffectImpl*>(this);
+        } else if (riid == __uuidof(ID2D1DrawTransform)) {
+            *ppv = static_cast<ID2D1DrawTransform*>(this);
+        } else if (riid == __uuidof(ID2D1Transform)) {
+            *ppv = static_cast<ID2D1Transform*>(this);
+        } else if (riid == __uuidof(ID2D1TransformNode)) {
+            *ppv = static_cast<ID2D1TransformNode*>(this);
+        }
+        if (*ppv) {
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    IFACEMETHODIMP_(ULONG) AddRef() noexcept override { return static_cast<ULONG>(InterlockedIncrement(&refs_)); }
+    IFACEMETHODIMP_(ULONG) Release() noexcept override {
+        const auto r = static_cast<ULONG>(InterlockedDecrement(&refs_));
+        if (r == 0) delete this;
+        return r;
+    }
+
+    IFACEMETHODIMP Initialize(ID2D1EffectContext* ctx, ID2D1TransformGraph* graph) noexcept override {
+        if (!ctx || !graph) return E_INVALIDARG;
+        if (!ctx->IsShaderLoaded(GUID_UsyseekHdrToSdrPS)) {
+            const std::span<const BYTE> ps = detail::hdr_to_sdr_ps_bytecode();
+            if (ps.empty()) return E_FAIL;
+            const HRESULT hr = ctx->LoadPixelShader(
+                GUID_UsyseekHdrToSdrPS,
+                ps.data(),
+                static_cast<UINT32>(ps.size()));
+            if (FAILED(hr)) return hr;
+        }
+        return graph->SetSingleTransformNode(this);
+    }
+
+    IFACEMETHODIMP PrepareForRender(D2D1_CHANGE_TYPE) noexcept override {
+        if (!draw_info_) return E_UNEXPECTED;
+        return draw_info_->SetPixelShaderConstantBuffer(reinterpret_cast<const BYTE*>(params_.data()),
+                                                        static_cast<UINT32>(params_.size()));
+    }
+
+    IFACEMETHODIMP SetGraph(ID2D1TransformGraph*) noexcept override { return E_NOTIMPL; }
+
+    IFACEMETHODIMP SetDrawInfo(ID2D1DrawInfo* info) noexcept override {
+        draw_info_ = info;
+        if (!draw_info_) return E_INVALIDARG;
+        const HRESULT hr = draw_info_->SetPixelShader(GUID_UsyseekHdrToSdrPS);
+        if (FAILED(hr)) return hr;
+        (void)draw_info_->SetOutputBuffer(D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_CHANNEL_DEPTH_4);
+        const D2D1_INPUT_DESCRIPTION desc{
+            .filter = D2D1_FILTER_MIN_MAG_MIP_POINT,
+            .levelOfDetailCount = 0,
+        };
+        return draw_info_->SetInputDescription(0, desc);
+    }
+
+    IFACEMETHODIMP MapOutputRectToInputRects(const D2D1_RECT_L* output_rect, D2D1_RECT_L* input_rects, UINT32 count) const noexcept override {
+        if (!output_rect || !input_rects || count != 1) return E_INVALIDARG;
+        input_rects[0] = *output_rect;
+        return S_OK;
+    }
+
+    IFACEMETHODIMP MapInputRectsToOutputRect(const D2D1_RECT_L* input_rects, const D2D1_RECT_L*, UINT32 count,
+                                             D2D1_RECT_L* output_rect, D2D1_RECT_L* opaque_sub_rect) noexcept override {
+        if (!input_rects || !output_rect || !opaque_sub_rect || count != 1) return E_INVALIDARG;
+        *output_rect = input_rects[0];
+        *opaque_sub_rect = input_rects[0];
+        return S_OK;
+    }
+
+    IFACEMETHODIMP MapInvalidRect(UINT32, D2D1_RECT_L invalid_input, D2D1_RECT_L* invalid_output) const noexcept override {
+        if (!invalid_output) return E_INVALIDARG;
+        *invalid_output = invalid_input;
+        return S_OK;
+    }
+
+    IFACEMETHODIMP_(UINT32) GetInputCount() const noexcept override { return 1; }
+
+private:
+    HdrToSdrEffectImpl() = default;
+    ~HdrToSdrEffectImpl() = default;
+
+    volatile long refs_ = 1;
+    wil::com_ptr<ID2D1DrawInfo> draw_info_;
+    std::array<std::byte, sizeof(HdrToSdrParams)> params_{};
+};
+
+/// Captures the live monitor desktops on the GPU via DXGI 1.5/1.6 Output Duplication (`DuplicateOutput1` with
+/// native HDR/WCG support), falling back to shared Windows.Graphics.Capture (`usylibpp::ui::wgc`) per monitor
+/// when DXGI duplication is unavailable (e.g. cross-adapter / hybrid-GPU displays).
+/// Shared across all windows on the same D3D11 device so duplication is only acquired once per monitor.
 class DesktopDuplicator {
 public:
     DesktopDuplicator() = default;
@@ -662,7 +976,9 @@ public:
     DesktopDuplicator& operator=(const DesktopDuplicator&) = delete;
     DesktopDuplicator(DesktopDuplicator&&) = delete;
     DesktopDuplicator& operator=(DesktopDuplicator&&) = delete;
-    ~DesktopDuplicator() = default;
+    ~DesktopDuplicator() { reset(); }
+
+    enum class CaptureBackend : uint8_t { None, Dxgi, Wgc };
 
     struct FrameDelta {
         uint64_t seq = 0;
@@ -675,14 +991,19 @@ public:
         HMONITOR mon = nullptr;
         RECT mon_rect{}; // virtual-desktop coordinates (already rotated)
         DesktopRotation rotation = DesktopRotation::Identity;
+        CaptureBackend backend = CaptureBackend::None;
+        usylibpp::ui::MonitorColorInfo color_info{};
+        ULONGLONG color_refresh_tick = 0;
         wil::com_ptr<IDXGIOutputDuplication> dupl;
-        wil::com_ptr<ID3D11Texture2D> desktop_tex; // always desktop-oriented, `tex_w` x `tex_h` == monitor size
+        usylibpp::ui::wgc::MonitorCaptureSession wgc_session;
+        wil::com_ptr<ID3D11Texture2D> desktop_tex; // always desktop-oriented BGRA8, `tex_w` x `tex_h` == monitor size
+        bool desktop_is_rt = false;
         uint64_t tex_id = 0;
         UINT tex_w = 0;
         UINT tex_h = 0;
-        // Rotated outputs only: duplication frames arrive in the panel's native orientation, so they are copied
-        // here and drawn rotated into `desktop_tex`.
+        // Rotated SDR outputs (or HDR fallback when direct DXGI surface wrapping fails): holds native-oriented frame.
         wil::com_ptr<ID3D11Texture2D> native_tex;
+        DXGI_FORMAT native_fmt = DXGI_FORMAT_UNKNOWN;
         wil::com_ptr<ID2D1Bitmap1> native_bmp;
         wil::com_ptr<ID2D1Bitmap1> desktop_target_bmp;
         bool has_frame = false;
@@ -727,8 +1048,12 @@ public:
     };
 
     void reset() noexcept {
+        if (hdr_fx_) hdr_fx_->SetInput(0, nullptr);
+        for (const auto& o : outputs_) o->wgc_session.stop();
         outputs_.clear();
-        rot_dc_.reset();
+        hdr_fx_.reset();
+        conv_dc_.reset();
+        wgc_dev_.reset();
         epoch_ = 0;
     }
 
@@ -790,8 +1115,12 @@ private:
 
     void sync_epoch(Gfx& gfx) noexcept {
         if (epoch_ != gfx.epoch()) {
+            if (hdr_fx_) hdr_fx_->SetInput(0, nullptr);
+            for (const auto& o : outputs_) o->wgc_session.stop();
             outputs_.clear();
-            rot_dc_.reset();
+            hdr_fx_.reset();
+            conv_dc_.reset();
+            wgc_dev_.reset();
             epoch_ = gfx.epoch();
         }
     }
@@ -875,6 +1204,9 @@ private:
     const OutputState* poll_output(Gfx& gfx, HMONITOR mon, ULONGLONG now_tick, const RECT* mask) {
         OutputState* st = find_or_create(mon);
         if (!ensure_duplication(gfx, *st, now_tick)) return st->has_frame ? st : nullptr;
+        if (st->backend == CaptureBackend::Wgc) {
+            return poll_output_wgc(gfx, *st);
+        }
 
         for (int attempt = 0; attempt < 4; ++attempt) {
             DXGI_OUTDUPL_FRAME_INFO info{};
@@ -893,36 +1225,73 @@ private:
             if (info.LastPresentTime.QuadPart == 0) continue;
 
             const auto tex = res.try_query<ID3D11Texture2D>();
-            if (!tex || !ensure_desktop_surface(gfx, *st, tex.get(), next_tex_id_)) break;
+            if (!tex) break;
+
+            D3D11_TEXTURE2D_DESC sd{};
+            tex->GetDesc(&sd);
+            const bool is_sdr_bgra = (sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM || sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+            const bool is_hdr_fmt = (sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || sd.Format == DXGI_FORMAT_R10G10B10A2_UNORM);
+            if (sd.Width == 0 || sd.Height == 0 || (!is_sdr_bgra && !is_hdr_fmt)) break;
+
+            if (is_hdr_fmt && now_tick >= st->color_refresh_tick) {
+                const float fresh_scale = usylibpp::ui::query_monitor_sdr_white_scale(st->mon);
+                if (std::fabs(fresh_scale - st->color_info.sdr_white_scale) > 1e-3f) {
+                    st->color_info.sdr_white_scale = fresh_scale;
+                    st->color_info.sdr_white_nits = fresh_scale * 80.0f;
+                    st->needs_full_copy = true;
+                }
+                st->color_refresh_tick = now_tick + 2000u;
+            }
+
+            const bool rotated = st->rotation != DesktopRotation::Identity;
+            const bool swap = st->rotation == DesktopRotation::Rot90 || st->rotation == DesktopRotation::Rot270;
+            const UINT want_w = swap ? sd.Height : sd.Width;
+            const UINT want_h = swap ? sd.Width : sd.Height;
+            const bool need_rt = rotated || is_hdr_fmt;
+            const bool need_native_sdr = rotated && is_sdr_bgra;
+            if (!ensure_desktop_surface(gfx, *st, want_w, want_h, need_rt, need_native_sdr, sd.Width, sd.Height, next_tex_id_)) {
+                break;
+            }
 
             FrameDelta& delta = scratch_delta_;
             delta.seq = 0;
             const bool have_meta = collect_frame_rects(*st, info.TotalMetadataBufferSize, delta);
             delta.dirty_all = !st->has_frame || st->needs_full_copy || !have_meta;
-
-            const bool rotated = st->rotation != DesktopRotation::Identity;
-            ID3D11Texture2D* dst = rotated ? st->native_tex.get() : st->desktop_tex.get();
             const bool full = delta.dirty_all || copy_rects_.size() > MAX_REGION_COPIES;
-            const IntRect masked = (mask && st->has_frame) ? screen_to_native(*st, *mask) : IntRect{};
-            if (full && int_rect_empty(masked)) {
-                gfx.d3d_context()->CopyResource(dst, tex.get());
+
+            if (is_sdr_bgra) {
+                // Zero-overhead SDR fast path: direct GPU copy (plus D2D rotation only when rotated).
+                ID3D11Texture2D* dst = rotated ? st->native_tex.get() : st->desktop_tex.get();
+                const IntRect masked = (mask && st->has_frame) ? screen_to_native(*st, *mask) : IntRect{};
+                if (full && int_rect_empty(masked)) {
+                    gfx.d3d_context()->CopyResource(dst, tex.get());
+                } else {
+                    if (full) {
+                        const IntRect b = native_bounds(*st);
+                        copy_rects_.assign(1, RECT{.left = b.left, .top = b.top, .right = b.right, .bottom = b.bottom});
+                    }
+                    // Only changed regions differ from the previous frame already held in `dst`.
+                    std::array<IntRect, 4> pieces{};
+                    for (const RECT& r : copy_rects_) {
+                        const IntRect ir{.left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom};
+                        const size_t n = int_rect_subtract(ir, masked, pieces);
+                        for (size_t i = 0; i < n; ++i) copy_region(gfx, dst, tex.get(), pieces[i]);
+                    }
+                }
+                if (rotated && !rotate_into_desktop(*st, full ? nullptr : &delta.dirty_rects)) {
+                    st->has_frame = false; // desktop_tex is now out of step with native_tex: force a full copy next time
+                    st->needs_full_copy = true;
+                    break;
+                }
             } else {
-                if (full) {
-                    const IntRect b = native_bounds(*st);
-                    copy_rects_.assign(1, RECT{.left = b.left, .top = b.top, .right = b.right, .bottom = b.bottom});
+                // Native HDR / 10-bit path: single-pass GPU tone-map (+ rotation & dirty/mask clipping) into BGRA8.
+                if (!convert_hdr_into_desktop(gfx, *st, tex.get(), sd,
+                                              full ? nullptr : &delta.dirty_rects,
+                                              (mask && st->has_frame) ? mask : nullptr)) {
+                    st->has_frame = false;
+                    st->needs_full_copy = true;
+                    break;
                 }
-                // Only changed regions differ from the previous frame already held in `dst`.
-                std::array<IntRect, 4> pieces{};
-                for (const RECT& r : copy_rects_) {
-                    const IntRect ir{.left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom};
-                    const size_t n = int_rect_subtract(ir, masked, pieces);
-                    for (size_t i = 0; i < n; ++i) copy_region(gfx, dst, tex.get(), pieces[i]);
-                }
-            }
-            if (rotated && !rotate_into_desktop(*st, full ? nullptr : &delta.dirty_rects)) {
-                st->has_frame = false; // desktop_tex is now out of step with native_tex: force a full copy next time
-                st->needs_full_copy = true;
-                break;
             }
 
             st->has_frame = true;
@@ -933,6 +1302,79 @@ private:
             break;
         }
         return st->has_frame ? st : nullptr;
+    }
+
+    const OutputState* poll_output_wgc(Gfx& gfx, OutputState& st) {
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(st.mon, &mi)) {
+            drop_duplication(st);
+            return st.has_frame ? &st : nullptr;
+        }
+        st.mon_rect = mi.rcMonitor;
+
+        if (!st.has_frame) {
+            if (HANDLE ev = st.wgc_session.event_handle()) {
+                (void)WaitForSingleObject(ev, 25u);
+            }
+        }
+
+        bool dirty_valid = false;
+        (void)st.wgc_session.consume_latest_frame_with_dirty(
+            [&](ID3D11Texture2D* tex, ABI::Windows::Graphics::SizeInt32 content_sz) noexcept {
+                D3D11_TEXTURE2D_DESC td{};
+                tex->GetDesc(&td);
+                const UINT want_w = (content_sz.Width > 0) ? std::min<UINT>(td.Width, static_cast<UINT>(content_sz.Width)) : td.Width;
+                const UINT want_h = (content_sz.Height > 0) ? std::min<UINT>(td.Height, static_cast<UINT>(content_sz.Height)) : td.Height;
+                if (want_w == 0 || want_h == 0) return;
+                if (!ensure_desktop_surface(gfx, st, want_w, want_h, false, false, want_w, want_h, next_tex_id_)) {
+                    return;
+                }
+
+                FrameDelta& delta = scratch_delta_;
+                delta.seq = 0;
+                delta.dirty_rects.clear();
+
+                const bool use_dirty = dirty_valid && st.has_frame && !st.needs_full_copy &&
+                                       wgc_dirty_scratch_.size() <= MAX_REGION_COPIES;
+                if (use_dirty) {
+                    const IntRect bounds{.left = 0, .top = 0, .right = static_cast<long>(want_w), .bottom = static_cast<long>(want_h)};
+                    try {
+                        for (const RECT& r : wgc_dirty_scratch_) {
+                            const IntRect clamped = int_rect_intersect(
+                                IntRect{.left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom}, bounds);
+                            if (int_rect_empty(clamped)) continue;
+                            copy_region(gfx, st.desktop_tex.get(), tex, clamped);
+                            delta.dirty_rects.push_back(RECT{
+                                .left = clamped.left + st.mon_rect.left,
+                                .top = clamped.top + st.mon_rect.top,
+                                .right = clamped.right + st.mon_rect.left,
+                                .bottom = clamped.bottom + st.mon_rect.top,
+                            });
+                        }
+                    } catch (...) {
+                        delta.dirty_rects.clear();
+                    }
+                    delta.dirty_all = delta.dirty_rects.empty();
+                    if (delta.dirty_all) {
+                        usylibpp::ui::wgc::gpu_copy_clamped(gfx.d3d_context(), st.desktop_tex.get(), st.tex_w, st.tex_h,
+                                                            0, 0, tex, content_sz, 0, 0, want_w, want_h);
+                    }
+                } else {
+                    usylibpp::ui::wgc::gpu_copy_clamped(gfx.d3d_context(), st.desktop_tex.get(), st.tex_w, st.tex_h,
+                                                        0, 0, tex, content_sz, 0, 0, want_w, want_h);
+                    delta.dirty_all = true;
+                }
+
+                st.has_frame = true;
+                st.needs_full_copy = false;
+                ++st.frame_seq;
+                delta.seq = st.frame_seq;
+                st.push_history(delta);
+            },
+            wgc_dirty_scratch_, dirty_valid);
+
+        return st.has_frame ? &st : nullptr;
     }
 
     /// Reads the frame's move/dirty rects into `copy_rects_` (texture space, clamped) and `delta.dirty_rects`
@@ -1001,10 +1443,20 @@ private:
         return outputs_.back().get();
     }
 
-    /// Draws the native-orientation frame into the desktop-oriented texture, limited to the bounding box of
+    bool ensure_conv_dc(Gfx& gfx) noexcept {
+        if (conv_dc_) return true;
+        if (!gfx.d2d_device()) return false;
+        if (FAILED(gfx.d2d_device()->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &conv_dc_)) || !conv_dc_) {
+            return false;
+        }
+        conv_dc_->SetDpi(96.0f, 96.0f);
+        return true;
+    }
+
+    /// Draws the native-orientation SDR frame into the desktop-oriented texture, limited to the bounding box of
     /// `dirty` (virtual-desktop rects) when given.
     bool rotate_into_desktop(OutputState& st, const std::vector<RECT>* dirty) noexcept {
-        if (!rot_dc_ || !st.native_bmp || !st.desktop_target_bmp) return false;
+        if (!conv_dc_ || !st.native_bmp || !st.desktop_target_bmp) return false;
         std::optional<D2D1_RECT_F> clip;
         if (dirty) {
             if (dirty->empty()) return true;
@@ -1016,29 +1468,149 @@ private:
         const Affine2D m = tex_to_desktop_xform(st.rotation, static_cast<long>(st.tex_w), static_cast<long>(st.tex_h), 0.0f, 0.0f);
         const D2D1_SIZE_U native = st.native_bmp->GetPixelSize();
         const D2D1_RECT_F src = D2D1::RectF(0.0f, 0.0f, static_cast<float>(native.width), static_cast<float>(native.height));
-        rot_dc_->SetTarget(st.desktop_target_bmp.get());
-        rot_dc_->BeginDraw();
-        rot_dc_->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
-        if (clip) rot_dc_->PushAxisAlignedClip(*clip, D2D1_ANTIALIAS_MODE_ALIASED);
-        rot_dc_->SetTransform(D2D1::Matrix3x2F(m.m11, m.m12, m.m21, m.m22, m.dx, m.dy));
-        rot_dc_->DrawBitmap(st.native_bmp.get(), &src, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src, nullptr);
-        rot_dc_->SetTransform(D2D1::Matrix3x2F::Identity());
-        if (clip) rot_dc_->PopAxisAlignedClip();
-        const HRESULT hr = rot_dc_->EndDraw();
-        rot_dc_->SetTarget(nullptr);
+        conv_dc_->SetTarget(st.desktop_target_bmp.get());
+        conv_dc_->BeginDraw();
+        conv_dc_->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+        if (clip) conv_dc_->PushAxisAlignedClip(*clip, D2D1_ANTIALIAS_MODE_ALIASED);
+        conv_dc_->SetTransform(D2D1::Matrix3x2F(m.m11, m.m12, m.m21, m.m22, m.dx, m.dy));
+        conv_dc_->DrawBitmap(st.native_bmp.get(), &src, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src, nullptr);
+        conv_dc_->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (clip) conv_dc_->PopAxisAlignedClip();
+        const HRESULT hr = conv_dc_->EndDraw();
+        conv_dc_->SetTarget(nullptr);
         return SUCCEEDED(hr);
     }
 
-    /// Releases a lost duplication session while retaining `desktop_tex` (if any) so glass windows keep their
+    /// Converts a native HDR / 10-bit DXGI duplication frame (FP16 scRGB or R10G10B10A2) directly into
+    /// `st.desktop_tex` (BGRA8) in one GPU pass, handling rotation, dirty rects, and drag cursor masking.
+    bool convert_hdr_into_desktop(Gfx& gfx, OutputState& st, ID3D11Texture2D* src, const D3D11_TEXTURE2D_DESC& sd,
+                                  const std::vector<RECT>* dirty, const RECT* mask) noexcept {
+        if (!ensure_conv_dc(gfx) || !st.desktop_target_bmp) return false;
+        if (!hdr_fx_) {
+            if (!HdrToSdrEffectImpl::register_once(gfx)) return false;
+            if (FAILED(conv_dc_->CreateEffect(CLSID_UsyseekHdrToSdr, &hdr_fx_)) || !hdr_fx_) return false;
+        }
+
+        // Fast zero-copy path: wrap the acquired DXGI surface directly as a D2D bitmap.
+        wil::com_ptr<ID2D1Bitmap1> transient_bmp;
+        ID2D1Bitmap1* src_bmp = nullptr;
+        if ((sd.BindFlags & static_cast<UINT>(D3D11_BIND_SHADER_RESOURCE)) != 0u) {
+            if (const auto surf = wil::try_com_query<IDXGISurface>(src)) {
+                const auto props = D2D1::BitmapProperties1(
+                    D2D1_BITMAP_OPTIONS_NONE,
+                    D2D1::PixelFormat(sd.Format, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
+                if (SUCCEEDED(conv_dc_->CreateBitmapFromDxgiSurface(surf.get(), &props, &transient_bmp)) && transient_bmp) {
+                    src_bmp = transient_bmp.get();
+                }
+            }
+        }
+        // Fallback when a driver omits D3D11_BIND_SHADER_RESOURCE on acquired frames: copy to `native_tex`.
+        if (!src_bmp) {
+            if (!ensure_native_surface(gfx, st, sd.Width, sd.Height, sd.Format)) return false;
+            gfx.d3d_context()->CopyResource(st.native_tex.get(), src);
+            src_bmp = st.native_bmp.get();
+        }
+        if (!src_bmp) return false;
+
+        const HdrToSdrParams params{
+            .mode = (sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 0.0f : (st.color_info.is_hdr ? 1.0f : 2.0f),
+            .sdr_white_scale = st.color_info.sdr_white_scale,
+            .max_nits = st.color_info.max_luminance,
+            .reserved = 0.0f,
+        };
+        if (FAILED(hdr_fx_->SetValue(0, reinterpret_cast<const BYTE*>(&params), sizeof(params)))) return false;
+
+        hdr_fx_->SetInput(0, src_bmp);
+        const auto detach = wil::scope_exit([&] { hdr_fx_->SetInput(0, nullptr); });
+
+        const Affine2D m = tex_to_desktop_xform(st.rotation, static_cast<long>(st.tex_w), static_cast<long>(st.tex_h), 0.0f, 0.0f);
+        const D2D1_MATRIX_3X2_F rot_xf = D2D1::Matrix3x2F(m.m11, m.m12, m.m21, m.m22, m.dx, m.dy);
+        const IntRect full_local{.left = 0, .top = 0, .right = static_cast<long>(st.tex_w), .bottom = static_cast<long>(st.tex_h)};
+        const IntRect masked_local = mask ? st.tex_rect_for(*mask) : IntRect{};
+
+        conv_dc_->SetTarget(st.desktop_target_bmp.get());
+        conv_dc_->BeginDraw();
+        conv_dc_->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+
+        const auto draw_piece = [&](const IntRect& piece) noexcept {
+            if (int_rect_empty(piece)) return;
+            conv_dc_->SetTransform(D2D1::Matrix3x2F::Identity());
+            const D2D1_RECT_F clip = D2D1::RectF(
+                static_cast<float>(piece.left), static_cast<float>(piece.top),
+                static_cast<float>(piece.right), static_cast<float>(piece.bottom));
+            conv_dc_->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            conv_dc_->SetTransform(rot_xf);
+            conv_dc_->DrawImage(hdr_fx_.get(), nullptr, nullptr, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_COPY);
+            conv_dc_->SetTransform(D2D1::Matrix3x2F::Identity());
+            conv_dc_->PopAxisAlignedClip();
+        };
+
+        if (!dirty && int_rect_empty(masked_local)) {
+            conv_dc_->SetTransform(rot_xf);
+            conv_dc_->DrawImage(hdr_fx_.get(), nullptr, nullptr, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_COMPOSITE_MODE_SOURCE_COPY);
+            conv_dc_->SetTransform(D2D1::Matrix3x2F::Identity());
+        } else if (!dirty) {
+            std::array<IntRect, 4> pieces{};
+            const size_t n = int_rect_subtract(full_local, masked_local, pieces);
+            for (size_t i = 0; i < n; ++i) draw_piece(pieces[i]);
+        } else {
+            std::array<IntRect, 4> pieces{};
+            for (const RECT& r : *dirty) {
+                const IntRect local = st.tex_rect_for(r);
+                if (int_rect_empty(local)) continue;
+                const size_t n = int_rect_subtract(local, masked_local, pieces);
+                for (size_t i = 0; i < n; ++i) draw_piece(pieces[i]);
+            }
+        }
+
+        const HRESULT hr = conv_dc_->EndDraw();
+        conv_dc_->SetTarget(nullptr);
+        return SUCCEEDED(hr);
+    }
+
+    /// Releases a lost duplication/WGC session while retaining `desktop_tex` (if any) so glass windows keep their
     /// last valid backdrop across transient desktop switches (e.g. UAC Secure Desktop) instead of flashing.
     static void drop_duplication(OutputState& st) noexcept {
         st.dupl.reset();
+        st.wgc_session.stop();
+        st.backend = CaptureBackend::None;
         st.needs_full_copy = true;
         st.clear_history();
     }
 
-    static bool ensure_duplication(Gfx& gfx, OutputState& st, ULONGLONG now_tick) noexcept {
-        if (st.dupl) return true;
+    bool try_start_wgc(Gfx& gfx, OutputState& st) noexcept {
+        if (!gfx.d3d() || !st.mon) return false;
+        if (!ro_scope_) {
+            ro_scope_.emplace(RO_INIT_SINGLETHREADED);
+        }
+        if (!ro_scope_->ok()) return false;
+        if (!wgc_dev_.winrt_dev && !wgc_dev_.init(gfx.d3d(), false)) return false;
+
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        if (!GetMonitorInfoW(st.mon, &mi)) return false;
+
+        if (!st.wgc_session.start(
+                wgc_dev_.winrt_dev.get(),
+                st.mon,
+                /*include_cursor=*/false,
+                /*num_buffers=*/2,
+                /*min_update_interval_100ns=*/0,
+                ABI::Windows::Graphics::DirectX::DirectXPixelFormat_B8G8R8A8UIntNormalized,
+                /*report_dirty_regions=*/true)) {
+            return false;
+        }
+        st.backend = CaptureBackend::Wgc;
+        st.mon_rect = mi.rcMonitor;
+        st.rotation = DesktopRotation::Identity; // WGC delivers pre-rotated desktop frames
+        st.needs_full_copy = true;
+        st.clear_history();
+        return true;
+    }
+
+    bool ensure_duplication(Gfx& gfx, OutputState& st, ULONGLONG now_tick) noexcept {
+        if (st.backend == CaptureBackend::Dxgi && st.dupl) return true;
+        if (st.backend == CaptureBackend::Wgc && st.wgc_session.active()) return true;
         if (now_tick < st.retry_after_tick) return false;
         if (!detail::is_input_desktop_accessible()) {
             st.retry_after_tick = now_tick + 100;
@@ -1047,23 +1619,38 @@ private:
 
         const auto try_adapter = [&](IDXGIAdapter* adapter) noexcept -> bool {
             if (!adapter) return false;
+            static constexpr std::array<DXGI_FORMAT, 3> supported_formats = {
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+                DXGI_FORMAT_R10G10B10A2_UNORM,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+            };
             for (UINT i = 0;; ++i) {
                 wil::com_ptr<IDXGIOutput> out;
                 if (FAILED(adapter->EnumOutputs(i, &out)) || !out) break;
                 DXGI_OUTPUT_DESC desc{};
                 if (SUCCEEDED(out->GetDesc(&desc)) && desc.Monitor == st.mon) {
-                    if (const auto out1 = out.try_query<IDXGIOutput1>()) {
-                        wil::com_ptr<IDXGIOutputDuplication> dupl;
-                        if (SUCCEEDED(out1->DuplicateOutput(gfx.d3d(), &dupl)) && dupl) {
-                            DXGI_OUTDUPL_DESC dd{};
-                            dupl->GetDesc(&dd);
-                            st.dupl = std::move(dupl);
-                            st.mon_rect = desc.DesktopCoordinates;
-                            st.rotation = to_rotation(dd.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED ? dd.Rotation : desc.Rotation);
-                            st.needs_full_copy = true;
-                            st.clear_history();
-                            return true;
+                    wil::com_ptr<IDXGIOutputDuplication> dupl;
+                    if (const auto out5 = out.try_query<IDXGIOutput5>()) {
+                        (void)out5->DuplicateOutput1(gfx.d3d(), 0, static_cast<UINT>(supported_formats.size()),
+                                                     supported_formats.data(), &dupl);
+                    }
+                    if (!dupl) {
+                        if (const auto out1 = out.try_query<IDXGIOutput1>()) {
+                            (void)out1->DuplicateOutput(gfx.d3d(), &dupl);
                         }
+                    }
+                    if (dupl) {
+                        DXGI_OUTDUPL_DESC dd{};
+                        dupl->GetDesc(&dd);
+                        st.backend = CaptureBackend::Dxgi;
+                        st.dupl = std::move(dupl);
+                        st.mon_rect = desc.DesktopCoordinates;
+                        st.rotation = to_rotation(dd.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED ? dd.Rotation : desc.Rotation);
+                        st.color_info = usylibpp::ui::query_monitor_color_info(st.mon, out.get());
+                        st.color_refresh_tick = now_tick + 2000u;
+                        st.needs_full_copy = true;
+                        st.clear_history();
+                        return true;
                     }
                     break;
                 }
@@ -1071,6 +1658,7 @@ private:
             return false;
         };
 
+        // Tier 1: DXGI 1.5/1.6 Output Duplication (native HDR/WCG, lowest latency, dirty rects).
         if (const auto fresh_adapter = gfx.current_adapter()) {
             if (try_adapter(fresh_adapter.get())) return true;
         }
@@ -1078,33 +1666,38 @@ private:
         if (SUCCEEDED(gfx.dxgi_device()->GetAdapter(&adapter)) && try_adapter(adapter.get())) {
             return true;
         }
+
+        // Tier 2: Shared Windows.Graphics.Capture fallback (cross-adapter / hybrid-GPU / duplicator slot exhaustion).
+        if (try_start_wgc(gfx, st)) {
+            return true;
+        }
+
+        // Tier 3 (GDI BitBlt) is handled by `LiquidGlassWindow::draw_desktop_glass` when polling returns false.
         st.retry_after_tick = now_tick + 250;
         return false;
     }
 
-    bool ensure_desktop_surface(Gfx& gfx, OutputState& st, ID3D11Texture2D* src, uint64_t& next_tex_id) noexcept {
-        D3D11_TEXTURE2D_DESC sd{};
-        src->GetDesc(&sd);
-        if (sd.Width == 0 || sd.Height == 0 ||
-            (sd.Format != DXGI_FORMAT_B8G8R8A8_UNORM && sd.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
-            return false;
+    bool ensure_desktop_surface(Gfx& gfx, OutputState& st, UINT want_w, UINT want_h, bool need_rt,
+                                bool need_native_sdr, UINT native_w, UINT native_h, uint64_t& next_tex_id) noexcept {
+        if (want_w == 0 || want_h == 0) return false;
+        const bool rt_ok = need_rt ? (st.desktop_is_rt && st.desktop_target_bmp != nullptr) : !st.desktop_is_rt;
+        const bool native_ok = need_native_sdr
+            ? (st.native_tex && st.native_bmp && st.native_fmt == DXGI_FORMAT_B8G8R8A8_UNORM)
+            : true;
+        if (st.desktop_tex && st.tex_w == want_w && st.tex_h == want_h && rt_ok && native_ok) {
+            return true;
         }
-        const bool rotated = st.rotation != DesktopRotation::Identity;
-        const bool swap = st.rotation == DesktopRotation::Rot90 || st.rotation == DesktopRotation::Rot270;
-        const UINT want_w = swap ? sd.Height : sd.Width;
-        const UINT want_h = swap ? sd.Width : sd.Height;
-        const bool rot_surfaces_ok = rotated
-            ? (st.native_tex && st.native_bmp && st.desktop_target_bmp)
-            : (!st.native_tex && !st.native_bmp && !st.desktop_target_bmp);
-        if (st.desktop_tex && st.tex_w == want_w && st.tex_h == want_h && rot_surfaces_ok) return true;
 
         st.native_bmp.reset();
         st.desktop_target_bmp.reset();
         st.native_tex.reset();
+        st.native_fmt = DXGI_FORMAT_UNKNOWN;
         st.desktop_tex.reset();
+        st.desktop_is_rt = false;
         st.tex_id = 0;
         st.tex_w = st.tex_h = 0;
         st.has_frame = false; // a fresh texture is empty until this frame lands in it
+
         D3D11_TEXTURE2D_DESC td{};
         td.Width = want_w;
         td.Height = want_h;
@@ -1113,57 +1706,97 @@ private:
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = static_cast<UINT>(D3D11_BIND_SHADER_RESOURCE) | (rotated ? static_cast<UINT>(D3D11_BIND_RENDER_TARGET) : 0u);
+        td.BindFlags = static_cast<UINT>(D3D11_BIND_SHADER_RESOURCE) |
+                       (need_rt ? static_cast<UINT>(D3D11_BIND_RENDER_TARGET) : 0u);
         if (FAILED(gfx.d3d()->CreateTexture2D(&td, nullptr, &st.desktop_tex))) return false;
+        st.desktop_is_rt = need_rt;
 
-        if (rotated && !create_rotation_surfaces(gfx, st, td, sd)) {
+        if (need_rt) {
+            if (!ensure_conv_dc(gfx)) {
+                st.desktop_tex.reset();
+                st.desktop_is_rt = false;
+                return false;
+            }
+            const auto desk_surf = st.desktop_tex.try_query<IDXGISurface>();
+            const auto target_props = D2D1::BitmapProperties1(
+                D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
+            if (!desk_surf || FAILED(conv_dc_->CreateBitmapFromDxgiSurface(desk_surf.get(), &target_props, &st.desktop_target_bmp))) {
+                st.desktop_target_bmp.reset();
+                st.desktop_tex.reset();
+                st.desktop_is_rt = false;
+                return false;
+            }
+        }
+
+        if (need_native_sdr && !ensure_native_surface(gfx, st, native_w, native_h, DXGI_FORMAT_B8G8R8A8_UNORM)) {
             st.native_bmp.reset();
             st.desktop_target_bmp.reset();
             st.native_tex.reset();
+            st.native_fmt = DXGI_FORMAT_UNKNOWN;
             st.desktop_tex.reset();
+            st.desktop_is_rt = false;
             return false;
         }
+
         st.tex_id = ++next_tex_id;
         st.tex_w = want_w;
         st.tex_h = want_h;
         return true;
     }
 
-    bool create_rotation_surfaces(Gfx& gfx, OutputState& st, const D3D11_TEXTURE2D_DESC& desk_desc,
-                                  const D3D11_TEXTURE2D_DESC& native_desc) noexcept {
-        if (!rot_dc_) {
-            if (FAILED(gfx.d2d_device()->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &rot_dc_))) {
-                return false;
-            }
-            rot_dc_->SetDpi(96.0f, 96.0f);
+    bool ensure_native_surface(Gfx& gfx, OutputState& st, UINT w, UINT h, DXGI_FORMAT fmt) noexcept {
+        if (!ensure_conv_dc(gfx)) return false;
+        if (st.native_tex && st.native_bmp && st.native_fmt == fmt) {
+            D3D11_TEXTURE2D_DESC cur{};
+            st.native_tex->GetDesc(&cur);
+            if (cur.Width == w && cur.Height == h) return true;
         }
-        D3D11_TEXTURE2D_DESC nd = desk_desc;
-        nd.Width = native_desc.Width;
-        nd.Height = native_desc.Height;
+        st.native_bmp.reset();
+        st.native_tex.reset();
+        st.native_fmt = DXGI_FORMAT_UNKNOWN;
+
+        D3D11_TEXTURE2D_DESC nd{};
+        nd.Width = w;
+        nd.Height = h;
+        nd.MipLevels = 1;
+        nd.ArraySize = 1;
+        nd.Format = fmt;
+        nd.SampleDesc.Count = 1;
+        nd.Usage = D3D11_USAGE_DEFAULT;
         nd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(gfx.d3d()->CreateTexture2D(&nd, nullptr, &st.native_tex))) return false;
         const auto native_surf = st.native_tex.try_query<IDXGISurface>();
-        const auto desk_surf = st.desktop_tex.try_query<IDXGISurface>();
-        if (!native_surf || !desk_surf) return false;
+        if (!native_surf) {
+            st.native_tex.reset();
+            return false;
+        }
         const auto native_props = D2D1::BitmapProperties1(
-            D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
-        const auto target_props = D2D1::BitmapProperties1(
-            D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
-        return SUCCEEDED(rot_dc_->CreateBitmapFromDxgiSurface(native_surf.get(), &native_props, &st.native_bmp)) &&
-               SUCCEEDED(rot_dc_->CreateBitmapFromDxgiSurface(desk_surf.get(), &target_props, &st.desktop_target_bmp));
+            D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(fmt, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
+        if (FAILED(conv_dc_->CreateBitmapFromDxgiSurface(native_surf.get(), &native_props, &st.native_bmp))) {
+            st.native_bmp.reset();
+            st.native_tex.reset();
+            return false;
+        }
+        st.native_fmt = fmt;
+        return true;
     }
 
+    // Destruction order matters: `outputs_` (WGC sessions) -> `wgc_dev_` -> `ro_scope_` (RoUninitialize).
+    std::optional<usylibpp::ui::wgc::RoScope> ro_scope_;
+    usylibpp::ui::wgc::WgcDevice wgc_dev_;
     std::vector<std::unique_ptr<OutputState>> outputs_; // stable addresses: windows hold pointers across a frame
     std::vector<HMONITOR> mons_scratch_;
-    std::vector<RECT> copy_rects_; // texture-space regions to copy for the frame being acquired
-    FrameDelta scratch_delta_;     // swapped with the evicted history slot, so rect storage is recycled
+    std::vector<RECT> copy_rects_;        // texture-space regions to copy for the frame being acquired
+    std::vector<RECT> wgc_dirty_scratch_; // monitor-local dirty rects accumulated from Win11 24H2+ WGC frames
+    FrameDelta scratch_delta_;            // swapped with the evicted history slot, so rect storage is recycled
     int drag_depth_ = 0;
     HCURSOR cursor_handle_ = nullptr;
     POINT cursor_hotspot_{};
     SIZE cursor_size_{};
     RECT last_cursor_{};
     bool has_last_cursor_ = false;
-    wil::com_ptr<ID2D1DeviceContext> rot_dc_; // only created once a rotated output is duplicated
+    wil::com_ptr<ID2D1DeviceContext> conv_dc_; // lazily created only for rotated or HDR outputs
+    wil::com_ptr<ID2D1Effect> hdr_fx_;         // lazily created only for HDR/10-bit outputs
     uint64_t epoch_ = 0;
     uint64_t next_tex_id_ = 0;
     std::vector<uint8_t> metadata_buf_;
