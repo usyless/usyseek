@@ -4,54 +4,10 @@
 #include "shared.hpp"
 
 #include <algorithm>
-#include <functional>
 #include <string>
 #include <string_view>
-#include <vector>
 
 namespace usyseek::ui {
-
-class Flow {
-public:
-    Flow(float gap_x, float gap_y) noexcept : gap_x_{gap_x}, gap_y_{gap_y} {}
-
-    void add(float w, float h, std::function<void(D2D1_RECT_F)> draw, bool grow = false) {
-        items_.emplace_back(w, h, grow);
-        draws_.push_back(std::move(draw));
-    }
-
-    void add_group(Flow inner, float avail, bool grow = false) {
-        const float group_w = std::min(inner.natural_width(), avail);
-        const float group_h = inner.height(group_w);
-        add(group_w, group_h, [inner = std::move(inner)](D2D1_RECT_F r) { inner.draw(r.left, r.top, width(r)); }, grow);
-    }
-
-    [[nodiscard]] float natural_width() const noexcept {
-        float total = 0.0f;
-        for (const FlowItem& item : items_) {
-            total += item.width;
-        }
-        return items_.empty() ? 0.0f : (total + (gap_x_ * static_cast<float>(items_.size() - 1)));
-    }
-
-    [[nodiscard]] float height(float avail) const {
-        return flow_layout(items_, gap_x_, gap_y_, avail).height;
-    }
-
-    void draw(float x, float y, float avail) const {
-        const FlowResult layout = flow_layout(items_, gap_x_, gap_y_, avail);
-        for (size_t i = 0; i < items_.size(); ++i) {
-            const FlowPlacement& p = layout.placements[i];
-            draws_[i](rect(x + p.x, y + p.y, p.width, items_[i].height));
-        }
-    }
-
-private:
-    float gap_x_;
-    float gap_y_;
-    std::vector<FlowItem> items_;
-    std::vector<std::function<void(D2D1_RECT_F)>> draws_;
-};
 
 [[nodiscard]] inline float text_height(Canvas& cv, std::wstring_view s, Font f, float w, float min_h) {
     return std::max(min_h, cv.measure_height(s, f, w));

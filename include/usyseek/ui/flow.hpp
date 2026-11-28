@@ -4,6 +4,8 @@
 
 namespace usyseek::ui {
 
+using usylibpp::ui::BasicFlow;
+using usylibpp::ui::Flow;
 using usylibpp::ui::FlowItem;
 using usylibpp::ui::FlowPlacement;
 using usylibpp::ui::FlowResult;
